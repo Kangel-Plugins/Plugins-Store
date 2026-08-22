@@ -1,0 +1,1602 @@
+"""Dev: @exoseo | Channel: t.me/HzzzPlugins"""
+
+"""Assist in develop: @Exorned | t.me/ExerealPlugins"""
+
+"""Форкать можно, но указывайте автора"""
+
+from typing import Any, List, Dict, Optional
+from base_plugin import BasePlugin, HookResult
+from ui.settings import Header, Divider, Text
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment, get_messages_storage, get_user_config, send_text
+from android_utils import log, run_on_ui_thread
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities, UserConfig, MessagesController
+from org.telegram.tgnet import TLRPC, ConnectionsManager
+from android.view import Gravity
+from android.widget import LinearLayout, EditText, ScrollView, TextView
+from android.text import InputType
+from android.content import Intent, Context
+from android.net import Uri
+from android.os import PowerManager
+from java.io import File
+from hook_utils import get_private_field
+import json
+import os
+import time
+import threading
+import random
+import re
+import ssl
+import urllib.request
+import urllib.error
+
+__id__ = "ai_clone"
+__name__ = "Ai Clone"
+__description__ = "AI клон юзера. Может отвечать/писать первым, используя контекст и другие факторы"
+__author__ = "@ExerealPlugins | @HzzzPlugins"
+__version__ = "0.3.6"
+__icon__ = "hzzzicons/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+FLASH_MODEL = "inclusionai/ling-3.0-flash:free"
+CACHE_TTL = 30
+
+MODEL_CHAIN = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "inclusionai/ling-3.0-flash:free",
+    "openai/gpt-oss-120b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openrouter/free"
+]
+
+
+def now():
+    return time.time()
+
+
+def format_time(timestamp=None):
+    return time.strftime("%H:%M:%S", time.localtime(timestamp or now()))
+
+
+def format_date(timestamp=None):
+    return time.strftime("%H:%M:%S %d.%m.%Y", time.localtime(timestamp or now()))
+
+
+def parse_time(time_str):
+    try:
+        if not time_str:
+            return None
+        parts = str(time_str).strip().split(":")
+        if len(parts) == 3:
+            hour, minute, second = int(parts[0]), int(parts[1]), int(parts[2])
+            current_time = time.localtime()
+            target_time = time.mktime((current_time.tm_year, current_time.tm_mon, current_time.tm_mday, hour, minute, second, 0, 0, -1))
+            diff = target_time - time.mktime(current_time)
+            if diff < 0:
+                return 5
+            return max(5, int(diff))
+    except:
+        pass
+    return None
+
+
+def lock_wake():
+    try:
+        context = ApplicationLoader.applicationContext
+        power_manager = context.getSystemService(Context.POWER_SERVICE)
+        wake_lock = power_manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AiClone::BgTask")
+        wake_lock.setReferenceCounted(False)
+        wake_lock.acquire(60000)
+        return wake_lock
+    except:
+        return None
+
+
+def free_wake(wake_lock):
+    try:
+        if wake_lock and wake_lock.isHeld():
+            wake_lock.release()
+    except:
+        pass
+
+
+class AiClonePlugin(BasePlugin):
+    def normalize_text(self, text):
+        if not text:
+            return text
+        return str(text).replace("ё", "е").replace("Ё", "Е").replace("—", "").replace("–", "")
+        
+    def split_messages(self, text):
+        if not text:
+            return []
+        text = str(text).strip()
+        
+        if "///" in text:
+            return [chunk.strip() for chunk in text.split("///") if chunk.strip()]
+        
+        if "\n" in text:
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            if len(lines) > 1:
+                return lines
+                
+        return [text]
+
+    def on_plugin_load(self):
+        hooks = [
+            "TL_updateNewMessage",
+            "TL_updateNewChannelMessage",
+            "TL_updateShortMessage",
+            "TL_updateShortChatMessage",
+            "TL_updates",
+            "TL_updatesCombined",
+            "TL_updateShort"
+        ]
+        for hook in hooks:
+            self.add_hook(hook)
+
+        self.ensure_dir()
+        self.lock = threading.Lock()
+        self.processing_chats = set()
+        self.scheduled_chats = set()
+        self.send_timers = {}
+        self.read_timers = {}
+        self.typing_timers = {}
+        self.is_running = True
+        self.context_cache = {}
+        self.progress_dialog = None
+        self.init_thread = threading.Thread(target=self.initiate_loop, daemon=True)
+        self.init_thread.start()
+        self.last_message_ids = {}
+        self.last_check_times = {}
+        self.watch_thread = threading.Thread(target=self.watcher_loop, daemon=True)
+        self.watch_thread.start()
+
+        def delayed_welcome():
+            if not self.get_setting("welcome_shown", False):
+                run_on_ui_thread(self.show_welcome)
+        threading.Timer(0.1, delayed_welcome).start()
+
+    def on_plugin_unload(self):
+        self.is_running = False
+        with self.lock:
+            for thread_id in list(self.send_timers.keys()):
+                timer = self.send_timers.pop(thread_id, None)
+                if timer:
+                    try:
+                        timer.cancel()
+                    except:
+                        pass
+            for thread_id in list(self.read_timers.keys()):
+                timer = self.read_timers.pop(thread_id, None)
+                if timer:
+                    try:
+                        timer.cancel()
+                    except:
+                        pass
+            for thread_id in list(self.typing_timers.keys()):
+                timer = self.typing_timers.pop(thread_id, None)
+                if timer:
+                    try:
+                        timer.cancel()
+                    except:
+                        pass
+        self.hide_progress()
+
+    def ensure_dir(self):
+        directory = self.get_dir()
+        if not directory.exists():
+            directory.mkdirs()
+
+    def get_dir(self):
+        return File(ApplicationLoader.applicationContext.getExternalFilesDir(None), "AiClone")
+
+    def log_file(self):
+        return File(self.get_dir(), "logs.json")
+
+    def get_logs(self):
+        try:
+            file_path = self.log_file()
+            if not file_path.exists():
+                return []
+            with open(file_path.getAbsolutePath(), "r") as file:
+                return json.loads(file.read())
+        except:
+            return []
+
+    def add_log(self, tag, dialog_id, message):
+        try:
+            logs = self.get_logs()
+            logs.append({"time": format_time(), "tag": tag, "dialog_id": str(dialog_id), "message": message})
+            if len(logs) > 300:
+                logs = logs[-300:]
+            with open(self.log_file().getAbsolutePath(), "w") as file:
+                file.write(json.dumps(logs))
+            self.set_setting("_logs_ts", int(now()), reload_settings=True)
+        except:
+            pass
+
+    def fetch_logs(self, count=5, dialog_id=None):
+        logs = self.get_logs()
+        if dialog_id:
+            logs = [item for item in logs if item.get("dialog_id") == str(dialog_id)]
+        return logs[-count:] if logs else []
+
+    def get_chats(self):
+        try:
+            data = self.get_setting("chat_list", "[]")
+            return json.loads(data) if data else []
+        except:
+            return []
+
+    def save_chats(self, chat_list):
+        self.set_setting("chat_list", json.dumps(chat_list))
+
+    def get_config(self, dialog_id):
+        chat_list = self.get_chats()
+        target_id = str(dialog_id)
+        for chat in chat_list:
+            if str(chat.get("id")) == target_id:
+                return chat
+        return {
+            "id": target_id,
+            "enabled": False,
+            "min_delay": 20,
+            "max_delay": 300,
+            "reply_chance": 100,
+            "initiate_chance": 15,
+            "initiate_interval": 45,
+            "system_prompt": "",
+            "custom_personality": "",
+            "last_ai_activity": 0,
+            "last_initiative_time": 0,
+            "consecutive_ignores": 0,
+            "initiative_cooldown_until": 0,
+            "last_initiate_check": 0
+        }
+
+    def save_config(self, dialog_id, config):
+        chat_list = self.get_chats()
+        target_id = str(dialog_id)
+        found = False
+        for index, chat in enumerate(chat_list):
+            if str(chat.get("id")) == target_id:
+                chat_list[index] = config
+                found = True
+                break
+        if not found:
+            chat_list.append(config)
+        self.save_chats(chat_list)
+        self.set_setting("_chat_ts", int(now()), reload_settings=True)
+
+    def chat_enabled(self, dialog_id):
+        return self.get_config(dialog_id).get("enabled", False)
+
+    def get_prompt(self):
+        return self.get_setting("system_prompt", "")
+
+    def get_depth(self):
+        try:
+            return int(self.get_setting("context_depth", "30"))
+        except:
+            return 30
+
+    def build_prompt(self, dialog_id, mode=""):
+        custom_prompt = self.get_config(dialog_id).get("system_prompt", "")
+        global_prompt = self.get_prompt()
+        base = custom_prompt if custom_prompt else (global_prompt if global_prompt else "ты - нейро-клон пользователя. твоя задача это вести переписку как живой человек. критические условия: без тонны текста, без длинных тире, вместо ё пиши е, повторяй все исходя из контекста. не используй смайлики в сообщениях (очень редко можешь и то в рофл). не пались что ты ии. не пиши \"а как прошел твой день?)\" пиши \"эй как день прошеел\" это чисто пример, но пойми что с вероятностью 20% ты можешь допустить ошибку в тексте, можешь не ставить запятые, но опять же все зависит из контекста как общается пользователь. не смейся АХАХАХА это видно, что ии, если собеседник шутит кидай разные вариации ЫХВХАЭЫЭ так выглядит реалистичнее, но не повторяйся каждый смех должен реалистично отличаться и так далее в разных делах. правила: 1) анализируй стиль из контекста: сленг, сокращения, эмодзи, пунктуацию ( не ставь точку в конце предложения если в контексте так не ставит юзер ), длину, тон. 2) отвечаешь коротко в базовых диалогах ( 1 - 8 слов ) , можешь и побольше, но делай это естественно 3) не отвечай мгновенно. реальные люди: 20-100 сек если онлайн и разговор активный, 2-5 минут если отвлеклись, 15-40 минут если заняты, ночью (00:00-08:00) отвечают только если срочно. 4) если сообщение не требует ответа - response пустой. 5) не упоминай что ты ии, не используй формальности. 6) будь непредсказуемым: вопросы, шутки, вайб. 7) можешь писать лесенкой (несколько коротких сообщений подряд) если это уместно в диалоге. для этого разделяй сообщения через /// внутри response. 8) всегда json без markdown: {\"response\":\"текст\",\"send_at\":\"HH:MM:SS\",\"reasoning\":\"почему\"} или для лесенки: {\"response\":\"сообщ1///сообщ2\",\"send_at\":\"HH:MM:SS\",\"reasoning\":\"почему\"}")
+
+        personality = self.get_config(dialog_id).get("custom_personality", "")
+        if not personality:
+            personality = self.get_setting("custom_personality", "")
+        if personality:
+            base += "\n\nПожелания пользователя в твоем поведении: " + personality
+
+        if mode == "init":
+            base += " сейчас ты пишешь первым. критические условия: если нет естественной причины написать — response оставь ПУСТЫМ. если твою прошлую инициативу проигнорировали — не пиши без веской причины, лучше промолчи. запрещено начинать с 'кстати' более 1 раза за 5 инициатив. одна инициатива = одно короткое сообщение, не лесенка. не повторяй темы из истории диалога. придумай естественную причину: увидел мемас, вспомнил, скучаешь, хочешь спросить мнение. не пиши 'привет как дела' это ботово. пиши конкретно. учитывай время суток. ночью не пиши без причины"
+        elif mode == "force":
+            base += " пользователь принудительно вызвал тебя. придумай сообщение"
+        return base
+
+    def get_dialog(self, message):
+        try:
+            if hasattr(message, 'dialog_id') and message.dialog_id:
+                return int(message.dialog_id)
+            if hasattr(message, 'peer_id') and message.peer_id:
+                peer = message.peer_id
+                if hasattr(peer, 'user_id') and peer.user_id:
+                    return int(peer.user_id)
+                if hasattr(peer, 'channel_id') and peer.channel_id:
+                    return -int(peer.channel_id)
+                if hasattr(peer, 'chat_id') and peer.chat_id:
+                    return -int(peer.chat_id)
+            return None
+        except:
+            return None
+
+    def get_sender(self, message):
+        try:
+            if hasattr(message, 'from_id') and message.from_id:
+                if hasattr(message.from_id, 'user_id'):
+                    return int(message.from_id.user_id)
+            if hasattr(message, 'peer_id') and message.peer_id:
+                if hasattr(message.peer_id, 'user_id'):
+                    return int(message.peer_id.user_id)
+            return 0
+        except:
+            return 0
+
+    def get_context(self, account, dialog_id, limit=None):
+        if limit is None:
+            limit = self.get_depth()
+        target_id = str(dialog_id)
+        current_time = now()
+        with self.lock:
+            if target_id in self.context_cache:
+                timestamp, data = self.context_cache[target_id]
+                if current_time - timestamp < CACHE_TTL:
+                    return data
+        messages = self.fetch_context(account, dialog_id, limit)
+        with self.lock:
+            self.context_cache[target_id] = (current_time, messages)
+        return messages
+
+    def fetch_context(self, account, dialog_id, limit):
+        messages = []
+        try:
+            storage = get_messages_storage()
+            database = get_private_field(storage, "database")
+            if not database:
+                return messages
+            query = f"SELECT data, date FROM messages_v2 WHERE uid = {dialog_id} ORDER BY date DESC LIMIT {limit}"
+            cursor = database.queryFinalized(query)
+            client_user_id = UserConfig.getInstance(account).getClientUserId()
+            temp_messages = []
+            while cursor.next():
+                raw_data = None
+                try:
+                    raw_data = cursor.byteBufferValue(0)
+                    if not raw_data:
+                        continue
+                    msg_obj = None
+                    try:
+                        msg_obj = TLRPC.Message.TLdeserialize(raw_data, raw_data.readInt32(False), False)
+                    except:
+                        pass
+                    if msg_obj:
+                        text = getattr(msg_obj, 'message', '') or ''
+                        text = str(text).strip()
+                        if text:
+                            is_out = getattr(msg_obj, 'out', False)
+                            from_id = 0
+                            if hasattr(msg_obj, 'from_id') and msg_obj.from_id:
+                                if hasattr(msg_obj.from_id, 'user_id'):
+                                    from_id = int(msg_obj.from_id.user_id)
+                            role = "assistant" if (is_out or from_id == client_user_id) else "user"
+                            temp_messages.append({"role": role, "content": text})
+                except:
+                    pass
+                finally:
+                    if raw_data:
+                        try:
+                            raw_data.reuse()
+                        except:
+                            pass
+            cursor.dispose()
+            temp_messages.reverse()
+            filtered_messages = []
+            last_role = None
+            for item in temp_messages:
+                if item["role"] == last_role and filtered_messages:
+                    filtered_messages[-1]["content"] += "\n" + item["content"]
+                else:
+                    filtered_messages.append(item)
+                    last_role = item["role"]
+            return filtered_messages
+        except:
+            return messages
+
+    def get_activity(self, dialog_id):
+        try:
+            storage = get_messages_storage()
+            database = get_private_field(storage, "database")
+            if not database:
+                return 0
+            query = f"SELECT MAX(date) FROM messages_v2 WHERE uid = {dialog_id}"
+            cursor = database.queryFinalized(query)
+            if cursor.next():
+                value = cursor.intValue(0)
+                cursor.dispose()
+                return value
+            cursor.dispose()
+        except:
+            pass
+        return 0
+
+    def get_last_peer_activity(self, account, dialog_id):
+        msg = self.get_message(account, dialog_id, incoming_only=True)
+        if msg and msg.get("date"):
+            return int(msg["date"])
+        return 0
+
+    def parse_json(self, text):
+        if text is None:
+            return {"response": "", "send_at": None, "reasoning": "null text", "responses": []}
+        text = str(text).strip()
+        
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+            
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except:
+            pass
+            
+        try:
+            match = re.search(r'\{[\s\S]*\}', text)
+            if match:
+                json_str = match.group(0)
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict):
+                    return parsed
+        except:
+            pass
+            
+        return {"response": text.strip(), "send_at": None, "reasoning": "fallback", "responses": []}
+
+    def request_api(self, api_key, model, messages, temperature=0.75, dialog_id=0):
+        wake_lock = lock_wake()
+        try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 800
+            }
+            data = json.dumps(payload).encode('utf-8')
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://t.me/HzzzPlugins",
+                "X-Title": "AiClone"
+            }
+            req = urllib.request.Request(API_URL, data=data, headers=headers, method="POST")
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
+                resp_data = json.loads(resp.read().decode('utf-8'))
+                if "choices" in resp_data and len(resp_data["choices"]) > 0:
+                    choice = resp_data["choices"][0]
+                    msg_obj = choice.get("message") or {}
+                    content = msg_obj.get("content")
+                    return self.parse_json(content)
+                return None
+        except urllib.error.HTTPError as e:
+            free_wake(wake_lock)
+            wake_lock = None
+            self.add_log("sys", dialog_id, f"HTTPError {e.code} на модели {model}")
+            return None
+        except Exception as e:
+            self.add_log("sys", dialog_id, f"ошибка запроса {model}: {e}")
+            return None
+        finally:
+            if wake_lock:
+                free_wake(wake_lock)
+
+    def call_ai(self, api_key, messages, temperature=0.75, dialog_id=0):
+        for model_idx, model in enumerate(MODEL_CHAIN):
+            for attempt in range(3):
+                result = self.request_api(api_key, model, messages, temperature, dialog_id)
+                if not result or not isinstance(result, dict):
+                    self.add_log("sys", dialog_id, f"модель {model} не ответила, переход к след.")
+                    break
+                text_out = str(result.get("response") or "").strip()
+                
+                text_out = text_out.replace("ё", "е").replace("Ё", "Е").replace("—", "").replace("–", "")
+                result["response"] = text_out
+                
+                if "send_at" in text_out.lower():
+                    self.add_log("sys", dialog_id, f"галлюцинация, попытка {attempt+1}, модель {model}")
+                    if attempt < 2:
+                        time.sleep(1.5)
+                        continue
+                    break
+                if len(text_out.split()) > 100:
+                    msgs_copy = list(messages)
+                    last_msg = dict(msgs_copy[-1])
+                    last_msg["content"] = last_msg.get("content", "") + " ответь не более 20 слов."
+                    msgs_copy[-1] = last_msg
+                    result = self.request_api(api_key, model, msgs_copy, temperature, dialog_id)
+                    if result and isinstance(result, dict):
+                        txt2 = str(result.get("response") or "").strip()
+                        if "send_at" in txt2.lower():
+                            self.add_log("sys", dialog_id, "галлюцинация  после сокращения")
+                            continue
+                    return result
+                return result
+        return {"response": "", "send_at": None, "reasoning": "all models failed", "responses": []}
+
+    def send_message(self, dialog_id, text):
+        try:
+            send_text(int(dialog_id), text)
+            return True
+        except:
+            return False
+
+    def send_typing(self, account, dialog_id):
+        try:
+            req = TLRPC.TL_messages_setTyping()
+            req.peer = MessagesController.getInstance(account).getInputPeer(int(dialog_id))
+            req.action = TLRPC.TL_sendMessageTypingAction()
+            ConnectionsManager.getInstance(account).sendRequest(req, None)
+            self.add_log("sys", dialog_id, "typing отправлен")
+        except Exception as e:
+            self.add_log("err", dialog_id, f"typing fail: {e}")
+
+    def mark_read(self, account, dialog_id, msg_id=None, read_all=False):
+        try:
+            def execute_read(message_id):
+                if not message_id:
+                    return
+                m_int = int(message_id)
+                d_long = int(dialog_id)
+
+                try:
+                    req = TLRPC.TL_messages_readHistory()
+                    req.peer = MessagesController.getInstance(account).getInputPeer(d_long)
+                    req.max_id = m_int
+                    ConnectionsManager.getInstance(account).sendRequest(req, None)
+                except Exception as e:
+                    self.add_log("err", dialog_id, f"RPC readHistory fail: {e}")
+
+                try:
+                    MessagesController.getInstance(account).markDialogAsRead(d_long, m_int, m_int, 0, False, 0, 0, True, 0)
+                except Exception as e:
+                    self.add_log("err", dialog_id, f"markDialogAsRead fail: {e}")
+
+                try:
+                    MessagesController.getInstance(account).markReactionsAsRead(d_long, 0)
+                except:
+                    pass
+                self.add_log("sys", dialog_id, f"прочитано до msg_id={m_int}")
+
+            def run_ui(func):
+                try:
+                    from org.telegram.messenger import AndroidUtilities
+                    AndroidUtilities.runOnUIThread(func)
+                except:
+                    run_on_ui_thread(func)
+
+            target_mid = msg_id
+            if target_mid is None or read_all:
+                last_msg = self.get_message(account, dialog_id, incoming_only=True)
+                if last_msg:
+                    target_mid = last_msg.get("id", 0)
+
+            if target_mid:
+                m_val = int(target_mid)
+                run_ui(lambda: execute_read(m_val))
+            else:
+                self.add_log("sys", dialog_id, "прочтение пропущено: нет входящего msg_id")
+        except Exception as e:
+            self.add_log("err", dialog_id, f"_mr error: {e}")
+
+    def cancel_scheduled(self, dialog_id):
+        target_id = str(dialog_id)
+        with self.lock:
+            timer = self.send_timers.pop(target_id, None)
+            read_timer = self.read_timers.pop(target_id, None)
+            typing_timer = self.typing_timers.pop(target_id, None)
+            self.scheduled_chats.discard(target_id)
+        if timer:
+            try:
+                timer.cancel()
+            except:
+                pass
+        if read_timer:
+            try:
+                timer.cancel()
+            except:
+                pass
+        if typing_timer:
+            try:
+                timer.cancel()
+            except:
+                pass
+
+    def schedule_response(self, account, dialog_id, texts, send_at_str, source="in"):
+        if isinstance(texts, str):
+            texts = [texts]
+        target_id = str(dialog_id)
+        if target_id in self.scheduled_chats:
+            self.add_log("sys", dialog_id, "переназначение таймера")
+        self.cancel_scheduled(dialog_id)
+
+        delay = parse_time(send_at_str)
+        if delay is None:
+            config = self.get_config(dialog_id)
+            delay = random.randint(config.get("min_delay", 20), config.get("max_delay", 300))
+            send_at_str = format_time(now() + delay)
+
+        if source == "in":
+            if delay > 40:
+                delay = random.randint(15, 40)
+                send_at_str = format_time(now() + delay)
+            elif delay < 15:
+                delay = 15
+                send_at_str = format_time(now() + delay)
+        elif source == "init":
+            if delay < 45:
+                delay = 45
+                send_at_str = format_time(now() + delay)
+
+        with self.lock:
+            self.scheduled_chats.add(target_id)
+
+        if source == "init":
+            read_delay = random.randint(3, 8)
+            typing_delay = read_delay + random.randint(20, 40)
+            if typing_delay >= delay - 1:
+                typing_delay = delay - 2
+        else:
+            read_delay = delay - random.randint(3, 8)
+            typing_delay = read_delay + 2
+
+        if read_delay > 0:
+            read_timer = threading.Timer(read_delay, lambda: self.mark_read(account, dialog_id, read_all=True))
+            read_timer.daemon = True
+            read_timer.start()
+            with self.lock:
+                self.read_timers[target_id] = read_timer
+        else:
+            self.mark_read(account, dialog_id, read_all=True)
+            read_delay = 0
+
+        if typing_delay > 0 and typing_delay < delay - 1:
+            typing_timer = threading.Timer(typing_delay, lambda: self.send_typing(account, dialog_id))
+            typing_timer.daemon = True
+            typing_timer.start()
+            with self.lock:
+                self.typing_timers[target_id] = typing_timer
+
+        def task():
+            wake_lock = lock_wake()
+            try:
+                self.add_log("sys", dialog_id, "выполняю отправку...")
+                for idx, text in enumerate(texts):
+                    if idx > 0:
+                        time.sleep(random.uniform(2, 6))
+                    if not self.send_message(dialog_id, text):
+                        self.add_log("err", dialog_id, f"ошибка send_text {dialog_id}")
+                        break
+                    self.add_log("ai", dialog_id, f"отправлено [{idx+1}/{len(texts)}]: {text[:60]}")
+                config = self.get_config(dialog_id)
+                config["last_ai_activity"] = int(now())
+                self.save_config(dialog_id, config)
+            except Exception as e:
+                self.add_log("err", dialog_id, f"сбой таймера: {e}")
+            finally:
+                with self.lock:
+                    self.scheduled_chats.discard(target_id)
+                    self.send_timers.pop(target_id, None)
+                free_wake(wake_lock)
+
+        timer = threading.Timer(delay, task)
+        timer.daemon = True
+        timer.start()
+        with self.lock:
+            self.send_timers[target_id] = timer
+
+        action = "ответ" if source == "in" else "инициатива" if source == "init" else "форс"
+        first_text = texts[0] if texts else ""
+        self.add_log("ai", dialog_id, f"запланирован {action} ({len(texts)}msg, через {delay}с в {send_at_str}): {first_text[:60]}")
+
+    def process_incoming(self, account, dialog_id, incoming_text, msg_id=0):
+        target_id = str(dialog_id)
+        try:
+            config = self.get_config(dialog_id)
+            if not config.get("enabled", False):
+                return
+
+            chance = config.get("reply_chance", 100)
+            if random.randint(1, 100) > chance:
+                self.add_log("ai", dialog_id, "пропущено по шансу")
+                return
+
+            context = self.get_context(account, dialog_id)
+            history = "\n".join([f"{'ты' if item['role'] == 'assistant' else 'собеседник'}: {item['content']}" for item in context[-20:]])
+
+            prompt = self.build_prompt(dialog_id)
+            datetime_str = format_date()
+
+            content = prompt + "\n\nтекущее время: " + datetime_str + "\n\nистория:\n" + history + '\n\nтолько что пришло: "' + incoming_text + '"\n\nзадача:\n1. проанализируй стиль.\n2. реши, стоит ли отвечать (нет - response пустой).\n3. если да - пиши естественно, как живой человек.\n4. send_at в формате HH:MM:SS (сегодня). не мгновенно.\n5. json: {"response":"...","send_at":"HH:MM:SS","reasoning":"..."}'
+
+            api_key = self.get_setting("api_key", "")
+            self.add_log("sys", dialog_id, "запрос в api...")
+            result = self.call_ai(api_key, [{"role": "system", "content": content}], dialog_id=dialog_id)
+
+            if not result or not isinstance(result, dict):
+                self.add_log("err", dialog_id, "пустой ответ api")
+                return
+
+            raw = str(result.get("response") or "").strip()
+            texts = self.split_messages(raw)
+
+            send_at = str(result.get("send_at") or "").strip()
+            reasoning = str(result.get("reasoning") or "").strip()
+
+            if not texts:
+                self.add_log("ai", dialog_id, f"не отвечает | причина: {reasoning}")
+                return
+
+            self.schedule_response(account, dialog_id, texts, send_at, source="in")
+
+        except Exception as e:
+            self.add_log("err", dialog_id, f"ошибка обработки: {e}")
+        finally:
+            with self.lock:
+                self.processing_chats.discard(target_id)
+
+    def initiate_loop(self):
+        while self.is_running:
+            try:
+                time.sleep(300)
+                api_key = self.get_setting("api_key", "")
+                if not api_key:
+                    continue
+
+                account = UserConfig.selectedAccount
+                for chat in self.get_chats():
+                    if not self.is_running:
+                        break
+                    if not chat.get("enabled", False):
+                        continue
+
+                    dialog_id = chat.get("id")
+                    target_id = str(dialog_id)
+                    if target_id in self.scheduled_chats or target_id in self.processing_chats:
+                        continue
+
+                    config = self.get_config(dialog_id)
+
+                    if now() < config.get("initiative_cooldown_until", 0):
+                        continue
+
+                    last_check = config.get("last_initiate_check", 0)
+                    if now() - last_check < 3600:
+                        continue
+                    config["last_initiate_check"] = int(now())
+
+                    lt = time.localtime()
+                    hour = lt.tm_hour
+                    if hour < 10 or hour >= 23:
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    last_peer = self.get_last_peer_activity(account, dialog_id)
+                    last_ai = config.get("last_ai_activity", 0)
+                    last_any = max(last_peer, last_ai)
+                    hours_since = (now() - last_any) / 3600 if last_any > 0 else 999
+
+                    if hours_since < 2:
+                        interval = 2 * 3600
+                    elif hours_since < 6:
+                        interval = 4 * 3600
+                    else:
+                        interval = 8 * 3600
+
+                    last_initiative = config.get("last_initiative_time", 0)
+                    if now() - last_initiative < interval:
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    base_chance = 3
+                    if last_peer > 0 and now() - last_peer < 1800:
+                        base_chance += 2
+                    if hours_since < 2 and config.get("consecutive_ignores", 0) == 0:
+                        base_chance += 3
+                    ignores = config.get("consecutive_ignores", 0)
+                    if ignores > 0:
+                        base_chance -= ignores * 5
+                    if 0 <= lt.tm_wday <= 4 and 9 <= hour <= 18:
+                        base_chance = int(base_chance * 0.5)
+                    chance = max(0, min(100, base_chance))
+
+                    if random.randint(1, 100) > chance:
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    context = self.get_context(account, dialog_id, limit=30)
+                    if not context:
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    history = "\n".join([f"{'ты' if item['role'] == 'assistant' else 'собеседник'}: {item['content']}" for item in context[-15:]])
+                    last_time = format_time(last_any) if last_any > 0 else "никогда"
+                    mins_ago = int((now() - last_any) / 60) if last_any > 0 else "∞"
+                    datetime_str = format_date()
+
+                    prompt = self.build_prompt(dialog_id, "init")
+                    content = prompt + "\n\nтекущее время: " + datetime_str + "\nпоследняя активность: " + last_time + " (" + str(mins_ago) + " мин назад)\n\nистория:\n" + history + '\n\nзадача: ты пишешь первым. если нет естественной причины — response ПУСТОЙ. json: {"response":"...","send_at":"HH:MM:SS","reasoning":"..."}'
+
+                    result = self.call_ai(api_key, [{"role": "system", "content": content}], temperature=0.8, dialog_id=dialog_id)
+
+                    if not result or not isinstance(result, dict):
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    raw = str(result.get("response") or "").strip()
+                    texts = self.split_messages(raw)
+
+                    send_at = str(result.get("send_at") or "").strip()
+                    if not texts:
+                        self.save_config(dialog_id, config)
+                        continue
+
+                    last_initiative_time = config.get("last_initiative_time", 0)
+                    if last_initiative_time > 0 and last_peer <= last_initiative_time:
+                        config["consecutive_ignores"] = ignores + 1
+                        if config["consecutive_ignores"] == 1:
+                            config["initiative_cooldown_until"] = int(now()) + 12 * 3600
+                        elif config["consecutive_ignores"] == 2:
+                            config["initiative_cooldown_until"] = int(now()) + 24 * 3600
+                        else:
+                            config["initiative_cooldown_until"] = int(now()) + 48 * 3600
+                    else:
+                        config["consecutive_ignores"] = 0
+                        config["initiative_cooldown_until"] = 0
+
+                    config["last_initiative_time"] = int(now())
+                    config["last_ai_activity"] = int(now())
+                    self.save_config(dialog_id, config)
+
+                    self.schedule_response(account, dialog_id, texts, send_at, source="init")
+
+            except Exception as e:
+                pass
+
+    def force_task(self, account, dialog_id):
+        target_id = str(dialog_id)
+        try:
+            config = self.get_config(dialog_id)
+            context = self.get_context(account, dialog_id, limit=30)
+            history = "\n".join([f"{'ты' if item['role'] == 'assistant' else 'собеседник'}: {item['content']}" for item in context[-15:]])
+            datetime_str = format_date()
+            prompt = config.get("system_prompt", "") or self.get_prompt() or self.build_prompt(dialog_id, "force")
+
+            content = prompt + "\n\nтекущее время: " + datetime_str + "\n\nистория:\n" + history + '\n\nзадача: пользователь принудительно вызвал тебя. придумай сообщение. json: {"response":"...","send_at":"HH:MM:SS","reasoning":"..."}'
+
+            api_key = self.get_setting("api_key", "")
+            result = self.call_ai(api_key, [{"role": "system", "content": content}], dialog_id=dialog_id)
+
+            if result and isinstance(result, dict):
+                raw = str(result.get("response") or "").strip()
+                texts = self.split_messages(raw)
+                send_at = str(result.get("send_at") or "").strip()
+                if texts:
+                    self.schedule_response(account, dialog_id, texts, send_at, source="force")
+                    run_on_ui_thread(lambda: self.show_toast(f"запланировано: {texts[0][:40]}... ({len(texts)}msg)"))
+                else:
+                    self.add_log("err", dialog_id, "форс: пустой ответ")
+                    run_on_ui_thread(lambda: self.show_toast("не придумал"))
+            else:
+                self.add_log("err", dialog_id, "форс: пустой ответ")
+                run_on_ui_thread(lambda: self.show_toast("не придумал"))
+        except Exception as e:
+            self.add_log("err", dialog_id, f"ошибка форса: {e}")
+            run_on_ui_thread(lambda: self.show_toast(f"ошибка: {e}"))
+        finally:
+            with self.lock:
+                self.processing_chats.discard(target_id)
+            run_on_ui_thread(self.hide_progress)
+
+    def force_send(self, account, dialog_id):
+        target_id = str(dialog_id)
+        with self.lock:
+            if target_id in self.processing_chats:
+                self.show_toast("уже генерирую!")
+                return
+            self.processing_chats.add(target_id)
+
+        self.add_log("sys", dialog_id, "принудительный вызов")
+        self.show_progress("генерирую...")
+        thread = threading.Thread(target=self.force_task, args=(account, dialog_id))
+        thread.daemon = True
+        thread.start()
+
+    def show_progress(self, text):
+        def execute():
+            try:
+                self.hide_progress()
+                activity = get_last_fragment().getParentActivity()
+                if not activity:
+                    return
+                self.progress_dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_LOADING)
+                self.progress_dialog.set_title(text)
+                self.progress_dialog.set_cancelable(False)
+                self.progress_dialog.show()
+            except:
+                pass
+        run_on_ui_thread(execute)
+
+    def hide_progress(self):
+        def execute():
+            try:
+                if self.progress_dialog:
+                    self.progress_dialog.dismiss()
+                    self.progress_dialog = None
+            except:
+                pass
+        run_on_ui_thread(execute)
+
+    def show_toast(self, text):
+        try:
+            from android.widget import Toast
+            Toast.makeText(ApplicationLoader.applicationContext, str(text), Toast.LENGTH_SHORT).show()
+        except:
+            pass
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        try:
+            if container_name in ("TL_updates", "TL_updatesCombined"):
+                inner_updates = getattr(updates, 'updates', []) or []
+                for up in inner_updates:
+                    up_name = up.__class__.__name__
+                    if up_name in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
+                        self.on_update_hook(up_name, account, up)
+
+            elif container_name == "TL_updateShort":
+                inner = getattr(updates, 'update', None)
+                if inner:
+                    up_name = inner.__class__.__name__
+                    self.on_update_hook(up_name, account, inner)
+
+        except:
+            pass
+        return HookResult()
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        try:
+            dialog_id = None
+            text = ""
+            is_out = False
+            from_id = 0
+            msg_id = 0
+
+            if update_name in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
+                msg = getattr(update, 'message', None)
+                if not msg:
+                    return HookResult()
+                is_out = getattr(msg, 'out', False)
+                text = getattr(msg, 'message', '') or ''
+                dialog_id = self.get_dialog(msg)
+                from_id = self.get_sender(msg)
+                msg_id = getattr(msg, 'id', 0)
+
+            elif update_name == "TL_updateShortMessage":
+                is_out = getattr(update, 'out', False)
+                text = getattr(update, 'message', '') or ''
+                dialog_id = getattr(update, 'user_id', None)
+                from_id = getattr(update, 'user_id', 0)
+                msg_id = getattr(update, 'id', 0)
+
+            elif update_name == "TL_updateShortChatMessage":
+                is_out = getattr(update, 'out', False)
+                text = getattr(update, 'message', '') or ''
+                chat_id = getattr(update, 'chat_id', None)
+                dialog_id = -chat_id if chat_id else None
+                from_id = 0
+                if hasattr(update, 'from_id') and update.from_id:
+                    if hasattr(update.from_id, 'user_id'):
+                        from_id = int(update.from_id.user_id)
+                msg_id = getattr(update, 'id', 0)
+
+            else:
+                return HookResult()
+
+            if from_id == UserConfig.getInstance(account).getClientUserId():
+                return HookResult()
+
+            if is_out or not dialog_id or not str(text).strip():
+                return HookResult()
+
+            target_id = str(dialog_id)
+            if not self.chat_enabled(dialog_id):
+                return HookResult()
+
+            with self.lock:
+                if target_id in self.processing_chats:
+                    return HookResult()
+                self.processing_chats.add(target_id)
+
+            if not self.get_setting("api_key", ""):
+                self.add_log("err", dialog_id, "нет api key")
+                with self.lock:
+                    self.processing_chats.discard(target_id)
+                return HookResult()
+
+            self.add_log("chat", dialog_id, f"захвачено [{update_name}]: {str(text)[:80]}")
+
+            thread = threading.Thread(target=self.process_incoming, args=(account, dialog_id, str(text).strip(), msg_id))
+            thread.daemon = True
+            thread.start()
+            return HookResult()
+        except:
+            return HookResult()
+
+    def get_message(self, account, dialog_id, incoming_only=False):
+        try:
+            storage = get_messages_storage()
+            database = get_private_field(storage, "database")
+            if not database:
+                return None
+            limit = 15 if incoming_only else 1
+            query = f"SELECT data, date FROM messages_v2 WHERE uid = {dialog_id} ORDER BY date DESC LIMIT {limit}"
+            cursor = database.queryFinalized(query)
+            result = None
+            client_user_id = UserConfig.getInstance(account).getClientUserId()
+            while cursor.next():
+                raw_data = cursor.byteBufferValue(0)
+                if not raw_data:
+                    continue
+                try:
+                    msg_obj = TLRPC.Message.TLdeserialize(raw_data, raw_data.readInt32(False), False)
+                    if msg_obj:
+                        text = getattr(msg_obj, 'message', '') or ''
+                        msg_id = getattr(msg_obj, 'id', 0)
+                        is_out = getattr(msg_obj, 'out', False)
+                        from_id = 0
+                        if hasattr(msg_obj, 'from_id') and msg_obj.from_id:
+                            if hasattr(msg_obj.from_id, 'user_id'):
+                                from_id = int(msg_obj.from_id.user_id)
+                        is_from_us = is_out or from_id == client_user_id
+                        msg_date = getattr(msg_obj, 'date', 0)
+                        if incoming_only:
+                            if not is_from_us:
+                                result = {"id": msg_id, "text": str(text).strip(), "is_out": is_from_us, "date": int(msg_date)}
+                                break
+                        else:
+                            result = {"id": msg_id, "text": str(text).strip(), "is_out": is_from_us, "date": int(msg_date)}
+                            break
+                except:
+                    pass
+                finally:
+                    try:
+                        raw_data.reuse()
+                    except:
+                        pass
+            cursor.dispose()
+            return result
+        except:
+            pass
+        return None
+
+    def get_active_dialog_id(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return None
+            class_name = fragment.__class__.__name__
+            if class_name != "ChatActivity":
+                return None
+            dialog_id = fragment.getDialogId()
+            return int(dialog_id) if dialog_id else None
+        except:
+            return None
+
+    def watcher_loop(self):
+        TICK = 5
+        ACTIVE_INTERVAL = 6
+        IDLE_INTERVAL = 30
+
+        while self.is_running:
+            try:
+                time.sleep(TICK)
+                api_key = self.get_setting("api_key", "")
+                if not api_key:
+                    continue
+
+                chats = self.get_chats()
+                if not chats:
+                    continue
+
+                active_dialog_id = self.get_active_dialog_id()
+                current_time = now()
+                account = UserConfig.selectedAccount
+
+                for chat in chats:
+                    if not self.is_running:
+                        break
+                    if not chat.get("enabled", False):
+                        continue
+
+                    dialog_id = chat.get("id")
+                    if not dialog_id:
+                        continue
+
+                    target_id = str(dialog_id)
+
+                    is_active = active_dialog_id is not None and str(active_dialog_id) == target_id
+                    interval = ACTIVE_INTERVAL if is_active else IDLE_INTERVAL
+
+                    last_check = self.last_check_times.get(target_id, 0)
+                    if current_time - last_check < interval:
+                        continue
+                    self.last_check_times[target_id] = current_time
+
+                    with self.lock:
+                        if target_id in self.processing_chats or target_id in self.scheduled_chats:
+                            continue
+
+                    last_msg = self.get_message(account, dialog_id)
+                    if not last_msg:
+                        continue
+
+                    last_id = last_msg.get("id")
+                    is_out = last_msg.get("is_out", False)
+                    prev_id = self.last_message_ids.get(target_id)
+
+                    if prev_id is None:
+                        self.last_message_ids[target_id] = last_id
+                        continue
+
+                    if last_id != prev_id and not is_out:
+                        text = last_msg.get("text", "")
+                        if text and str(text).strip():
+                            self.last_message_ids[target_id] = last_id
+                            with self.lock:
+                                if target_id in self.processing_chats:
+                                    continue
+                                self.processing_chats.add(target_id)
+                            self.add_log("chat", dialog_id, f"watcher: новое [id={last_id}]: {str(text)[:80]}")
+                            thread = threading.Thread(target=self.process_incoming, args=(account, dialog_id, str(text).strip(), last_id))
+                            thread.daemon = True
+                            thread.start()
+                    else:
+                        self.last_message_ids[target_id] = last_id
+            except:
+                pass
+
+    def toggle_chat(self, chat):
+        dialog_id = chat.get("id")
+        config = self.get_config(dialog_id)
+        config["enabled"] = not config.get("enabled", False)
+        self.save_config(dialog_id, config)
+
+    def chat_menu(self, chat):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            dialog_id = chat.get("id")
+            config = self.get_config(dialog_id)
+            enabled_str = "вкл" if config.get("enabled") else "выкл"
+            items = [
+                f"AI: {enabled_str} (переключить)",
+                "Настройки чата",
+                "Принудительно вызвать AI",
+                "Логи чата",
+                "Удалить чат",
+                "Отмена"
+            ]
+
+            def callback(builder, which):
+                builder.dismiss()
+                if which == 0:
+                    self.toggle_chat(chat)
+                elif which == 1:
+                    self.chat_settings(dialog_id)
+                elif which == 2:
+                    self.force_send(UserConfig.selectedAccount, dialog_id)
+                elif which == 3:
+                    self.chat_logs(dialog_id)
+                elif which == 4:
+                    self.remove_chat(dialog_id)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(f"Чат {dialog_id}")
+            builder.set_items(items, callback)
+            builder.show()
+        except:
+            pass
+
+    def remove_chat(self, dialog_id):
+        chat_list = [chat for chat in self.get_chats() if str(chat.get("id")) != str(dialog_id)]
+        self.save_chats(chat_list)
+        self.cancel_scheduled(dialog_id)
+        self.set_setting("_chat_ts", int(now()), reload_settings=True)
+
+    def chat_settings(self, dialog_id):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            config = self.get_config(dialog_id)
+            scroll = ScrollView(activity)
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(16))
+
+            def make_edit(hint, val, input_type=InputType.TYPE_CLASS_NUMBER):
+                edit = EditText(activity)
+                edit.setText(str(val))
+                edit.setHint(hint)
+                edit.setInputType(input_type)
+                layout.addView(edit, -1, -2)
+                return edit
+
+            def make_label(label_text):
+                textview = TextView(activity)
+                textview.setText(label_text)
+                textview.setTextSize(1, 14)
+                textview.setTypeface(None, 1)
+                textview.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(4))
+                layout.addView(textview, -1, -2)
+
+            make_label("Задержка ответа (сек)")
+            edit_min = make_edit("Мин", config.get("min_delay", 20))
+            edit_max = make_edit("Макс", config.get("max_delay", 300))
+            make_label("Вероятность ответа (%)")
+            edit_reply = make_edit("Шанс ответа", config.get("reply_chance", 100))
+            make_label("Инициатива")
+            edit_init_chance = make_edit("Шанс первым (%)", config.get("initiate_chance", 15))
+            edit_init_interval = make_edit("Интервал (мин)", config.get("initiate_interval", 45))
+            make_label("System Prompt (пусто = глобальный)")
+            edit_prompt = make_edit("Prompt", config.get("system_prompt", ""), InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+            make_label("Кастомная личность чата (пусто = глобальная)")
+            edit_personality = make_edit("Личность", config.get("custom_personality", ""), InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+
+            def on_save(builder, which):
+                try:
+                    config["min_delay"] = int(str(edit_min.getText()) or 20)
+                    config["max_delay"] = int(str(edit_max.getText()) or 300)
+                    config["reply_chance"] = int(str(edit_reply.getText()) or 100)
+                    config["initiate_chance"] = int(str(edit_init_chance.getText()) or 15)
+                    config["initiate_interval"] = int(str(edit_init_interval.getText()) or 45)
+                    config["system_prompt"] = str(edit_prompt.getText()).strip()
+                    config["custom_personality"] = str(edit_personality.getText()).strip()
+                    self.save_config(dialog_id, config)
+                except:
+                    pass
+                builder.dismiss()
+                self.show_toast("Сохранено")
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(f"Настройки {dialog_id}")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", on_save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def chat_logs(self, dialog_id):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            logs = self.fetch_logs(50, dialog_id)
+            text = "\n\n".join([f"{item['time']} [{item['tag']}] {item['message']}" for item in logs]) if logs else "Логи пусты"
+
+            scroll = ScrollView(activity)
+            textview = TextView(activity)
+            textview.setText(text)
+            textview.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16))
+            textview.setTextIsSelectable(True)
+            scroll.addView(textview)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(f"Логи чата {dialog_id}")
+            builder.set_view(scroll)
+            builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def api_dialog(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            edit = EditText(activity)
+            edit.setText(self.get_setting("api_key", ""))
+            edit.setHint("sk-or-v1-...")
+            layout.addView(edit, -1, -2)
+
+            def save(builder, which):
+                self.set_setting("api_key", str(edit.getText()).strip(), reload_settings=True)
+                builder.dismiss()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("API Key")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def prompt_dialog(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            edit = EditText(activity)
+            edit.setText(self.get_prompt())
+            edit.setHint("System prompt...")
+            edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+            layout.addView(edit, -1, -2)
+
+            def save(builder, which):
+                self.set_setting("system_prompt", str(edit.getText()).strip(), reload_settings=True)
+                builder.dismiss()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Global System Prompt")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def personality_dialog(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            edit = EditText(activity)
+            edit.setText(self.get_setting("custom_personality", ""))
+            edit.setHint("Например: пиши развернуто, флиртуй..")
+            edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+            layout.addView(edit, -1, -2)
+
+            def save(builder, which):
+                self.set_setting("custom_personality", str(edit.getText()).strip(), reload_settings=True)
+                builder.dismiss()
+                self.show_toast("Сохранено")
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Кастомная личность")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def depth_dialog(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            edit = EditText(activity)
+            edit.setText(str(self.get_depth()))
+            edit.setHint("Глубина контекста (10-100)")
+            edit.setInputType(InputType.TYPE_CLASS_NUMBER)
+            layout.addView(edit, -1, -2)
+
+            def save(builder, which):
+                try:
+                    val = int(str(edit.getText()).strip())
+                    val = max(10, min(100, val))
+                    self.set_setting("context_depth", str(val), reload_settings=True)
+                    with self.lock:
+                        self.context_cache.clear()
+                except:
+                    pass
+                builder.dismiss()
+                self.show_toast("Сохранено")
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Глубина контекста")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def add_chat(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            edit = EditText(activity)
+            edit.setInputType(InputType.TYPE_CLASS_NUMBER)
+            edit.setHint("ID чата (123456789)")
+            layout.addView(edit, -1, -2)
+
+            def save(builder, which):
+                target = str(edit.getText()).strip()
+                if target and target.lstrip("-").isdigit():
+                    chat_list = self.get_chats()
+                    if not any(str(chat.get("id")) == target for chat in chat_list):
+                        chat_list.append({
+                            "id": target, "enabled": True,
+                            "min_delay": 20, "max_delay": 300,
+                            "reply_chance": 100, "initiate_chance": 15,
+                            "initiate_interval": 45, "system_prompt": "",
+                            "custom_personality": "",
+                            "last_ai_activity": 0
+                        })
+                        self.save_chats(chat_list)
+                        self.set_setting("_chat_ts", int(now()), reload_settings=True)
+                builder.dismiss()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Добавить чат")
+            builder.set_view(layout)
+            builder.set_positive_button("Добавить", save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def open_url(self, url):
+        try:
+            context = ApplicationLoader.applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        except:
+            pass
+
+    def open_telegram(self, username):
+        try:
+            context = ApplicationLoader.applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(f"tg://resolve?domain={username}"))
+            intent.setPackage(context.getPackageName())
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        except:
+            pass
+
+    def show_docs(self):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            scroll = ScrollView(activity)
+            textview = TextView(activity)
+            doc_text = (
+                "ДОКУМЕНТАЦИЯ\n\n"
+                "1. Как работает:\n"
+                "   Плагин является клоном тебя, он перехватывает входящие сообщения, может писать первым и вызываться принудительно. Тобиш все делает от твоего лица (читает сообщения собеседника, показывает статус typing и тд). Для чего это нужно? В основном чтобы поугорать, но применений достаточно много, например, автоматизировать рутинную работу с клиентами или пикапить девочек\n\n"
+                "2. Управление чатами:\n"
+                "   Для начала добавь ID чата через кнопку 'Добавить новый ID'. Ии работает только в введенных чатах и только если статус 'AI: вкл'\n\n"
+                "3. API и какие ии используются:\n"
+                "   Основная модель: nvidia/nemotron-3-ultra-550b-a55b, 550 млрд параметров эт мощно для фри плана, к слову, используется цепочка моделей с фоллбеком, т.к. модели на опенроутер часто удаляются/не работают\n\n"
+                "4. Настройки:\n"
+                "   В основных настройках можно добавить пожелания к стилю общения ии, которые уйдут в глобальный промпт и изменить колво сообщений контекста на чат, не ставь слишком большой параметр, т.к. будет лагать. Для расширенных настроек: нажми на чат в настройках плагина, который хочешь настроить -> «Настройки чата» -> там много разных параметров, если не разбираешься лучше закинь ии и спроси\n"
+            )
+            textview.setText(doc_text)
+            textview.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16))
+            textview.setTextSize(1, 14)
+            textview.setTextIsSelectable(True)
+            scroll.addView(textview)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Документация")
+            builder.set_view(scroll)
+            builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+    def show_welcome(self):
+        try:
+            if self.get_setting("welcome_shown", False):
+                return
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("AiClone")
+            builder.set_message("Подпишись плиз там беты и тд")
+
+            def on_hide(builder, which):
+                self.set_setting("welcome_shown", True)
+                builder.dismiss()
+
+            def on_channel(builder, which):
+                self.set_setting("welcome_shown", True)
+                self.open_telegram("HzzzPlugins")
+                builder.dismiss()
+
+            builder.set_positive_button("Перейти в канал 💅", on_channel)
+            builder.set_negative_button("Скрыть", on_hide)
+            builder.show()
+        except:
+            pass
+
+    def create_settings(self):
+        key = self.get_setting("api_key", "")
+        if not key:
+            settings = [Header(text="AiClone")]
+            settings.append(Divider(text="Что тебе делать? Есть сервис openrouter,который бесплатно дает апи для ии. Перейди туда по кнопке «Получить API key», зарегестрируйся через гугл и создай апи ключ (не забудь скопировать). Затем вставь его по кнопке «Вставить API key» и тебе откроется полный интерфейс плагина"))
+            settings.append(Divider(text="Если ваще не понимаешь шо да как,то скинь код плагина ии и попроси обьяснить"))
+            settings.append(Divider(text="ᅠ"))
+            settings.append(Text(text="Вставить API Key", subtext="Введи свой ключ от OpenRouter", on_click=lambda v: self.api_dialog()))
+            settings.append(Text(text="Получить API Key", subtext="Перейти на openrouter.ai", on_click=lambda v: self.open_url("https://openrouter.ai/keys")))
+            settings.append(Divider(text="ᅠ"))
+            settings.append(Text(text="Канал: @HzzzPlugins", on_click=lambda v: self.open_telegram("HzzzPlugins")))
+            settings.append(Text(text="Создатель: @exoseo", on_click=lambda v: self.open_telegram("exoseo")))
+            return settings
+
+        settings = [Header(text="AiClone by @exoseo | 0.3.6-public beta")]
+
+        settings.append(Text(text="Документация", subtext="описание функций и логики работы", on_click=lambda v: self.show_docs()))
+
+        settings.append(Text(text="API Key", subtext="••••••" + key[-4:], on_click=lambda v: self.api_dialog()))
+        settings.append(Text(text="Получить API", subtext="openrouter.ai", on_click=lambda v: self.open_url("https://openrouter.ai/keys")))
+
+        settings.append(Divider(text="ᅠ"))
+        settings.append(Header(text="Список активных чатов"))
+
+        chats = self.get_chats()
+        if chats:
+            for chat in chats:
+                cid = chat.get("id", "")
+                status = "вкл | ai работает" if chat.get("enabled") else "выкл | ai не работает"
+                settings.append(Text(text=f"{cid} - {status}", subtext="Нажми для управления", on_click=lambda v, item=chat: self.chat_menu(item)))
+        else:
+            settings.append(Text(text="Нет активных чатов", icon="msg_info"))
+
+        settings.append(Text(text="Добавить новый ID", on_click=lambda v: self.add_chat()))
+        settings.append(Divider(text="Важно: не используй плагин в переписках с важными и конфиденциальными данными. OpenRouter популярный сервис,но кто знает,что может произойти"))
+        settings.append(Header(text="Настройки"))
+        settings.append(Text(text="Глубина контекста", subtext=f"{self.get_depth()} сообщений", on_click=lambda v: self.depth_dialog()))
+        settings.append(Text(text="Кастомная личность", subtext="добавь пожелания к поведению ии", on_click=lambda v: self.personality_dialog()))
+
+        settings.append(Divider(text="ᅠ"))
+        settings.append(Header(text="Последние логи (нажимай шоб смотреть)"))
+
+        logs = self.fetch_logs(5)
+        if logs:
+            for entry in logs:
+                full = f"{entry['time']} [{entry['tag']}] - {entry['dialog_id']} - {entry['message']}"
+                settings.append(Text(text=full, on_click=lambda v, msg=entry['message']: self.log_dialog(msg)))
+        else:
+            settings.append(Text(text="Логи пусты"))
+
+        settings.append(Divider(text="ᅠ"))
+        settings.append(Text(text="Канал: @HzzzPlugins", on_click=lambda v: self.open_telegram("HzzzPlugins")))
+        settings.append(Text(text="Создатель: @exoseo", on_click=lambda v: self.open_telegram("exoseo")))
+        return settings
+
+    def log_dialog(self, message):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Лог")
+            builder.set_message(message)
+            builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+            builder.show()
+        except:
+            pass
+
+
+plugin = AiClonePlugin()
