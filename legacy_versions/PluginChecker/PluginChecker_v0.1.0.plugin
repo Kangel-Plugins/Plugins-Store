@@ -28,17 +28,9 @@ __id__ = "PluginChecker"
 __name__ = "Plugin Checker"
 __description__ = "Сканер безопасности плагинов. Находит скрытый и вредоносный код с помощью статического анализа."
 __author__ = "@HysteriaPlugins"
-__version__ = "0.1.1"
+__version__ = "0.1.0"
 __icon__ = "pluginchecker/0"
 __min_version__ = "12.5.1"
-
-# Увеличивайте при любом изменении правил детекции — старые записи в кэше,
-# посчитанные по устаревшим правилам, автоматически станут недействительными.
-RULES_VERSION = 2
-
-# Простое эвристическое определение "похоже на base64" (используется для
-# поиска закодированных полезных нагрузок рядом с exec/eval/b64decode).
-_B64_LIKE_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")
 
 def as_java_color(color: int) -> int:
     value = int(color)
@@ -75,14 +67,6 @@ class PluginChecker(BasePlugin):
     SENSITIVE_TELEGRAM_ATTRS = {
         'UserConfig', 'MessagesStorage', 'AccountInstance',
         'auth_key', 'session', 'phone', 'currentUser'
-    }
-
-    # Функции, через которые данные могут "утечь" наружу — используется
-    # вместе с sensitive_vars, чтобы ловить именно передачу чувствительных
-    # данных в сеть, а не просто факт импорта requests/socket.
-    EXFIL_SINKS = {
-        'post', 'get', 'put', 'patch', 'request',
-        'urlopen', 'send', 'sendall', 'sendto',
     }
 
     MALICIOUS_STRINGS = [
@@ -140,14 +124,9 @@ class PluginChecker(BasePlugin):
                         reports_json TEXT,
                         stats_json TEXT,
                         score INTEGER,
-                        badge TEXT,
-                        rules_version INTEGER DEFAULT 0
+                        badge TEXT
                     )
                 """)
-                try:
-                    conn.execute("ALTER TABLE scan_cache ADD COLUMN rules_version INTEGER DEFAULT 0")
-                except Exception:
-                    pass
                 conn.commit()
         except Exception:
             pass
@@ -236,7 +215,6 @@ class PluginChecker(BasePlugin):
 
         return [
             Header(text="Безопасный сканер"),
-            Text(text="ℹ️ Это эвристический статический анализ", subtext="Не гарантирует 100% безопасность — сложная обфускация может остаться незамеченной", icon="msg_info"),
             Header(text="Диагностика"),
             Text(text="Движок вычислений", subtext=engine_status, icon="msg_permissions"),
             Text(text="Время последней проверки", subtext=speed_sub, icon="msg_radar"),
@@ -282,17 +260,12 @@ class PluginChecker(BasePlugin):
                 with sqlite3.connect(db_path, timeout=10.0) as conn:
                     cursor = conn.cursor()
                     cursor.execute("""
-                        SELECT reports_json, stats_json, score, badge, rules_version
+                        SELECT reports_json, stats_json, score, badge 
                         FROM scan_cache 
                         WHERE sha256 = ?
                     """, (file_hash,))
                     row = cursor.fetchone()
                     if row:
-                        cached_rules_version = row[4] if len(row) > 4 else 0
-                        if (cached_rules_version or 0) != RULES_VERSION:
-                            # Правила детекции изменились с момента этой записи —
-                            # результат устарел, заставляем пересканировать файл.
-                            return None
                         reports = json.loads(row[0])
                         stats = json.loads(row[1])
                         score = row[2]
@@ -321,12 +294,12 @@ class PluginChecker(BasePlugin):
             with sqlite3.connect(db_path, timeout=10.0) as conn:
                 conn.execute(
                     """INSERT OR REPLACE INTO scan_cache 
-                       (sha256, file_name, timestamp, reports_json, stats_json, score, badge, rules_version) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (sha256, file_name, timestamp, reports_json, stats_json, score, badge) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (file_hash, file_name, time.time(), 
                      json.dumps(reports, ensure_ascii=False), 
                      json.dumps(stats, ensure_ascii=False),
-                     score, badge, RULES_VERSION)
+                     score, badge)
                 )
                 conn.commit()
         except Exception:
@@ -386,7 +359,6 @@ class PluginChecker(BasePlugin):
                 self.chunks = []
                 self.reports = []
                 self.sensitive_vars = set()
-                self.b64_like_literals = 0
 
             def visit_Import(self, node):
                 for alias in node.names:
@@ -442,66 +414,6 @@ class PluginChecker(BasePlugin):
                         "detail": f"Вызов опасной функции: {func_name}"
                     })
 
-                # Утечка данных: чувствительная переменная передаётся в функцию
-                # отправки по сети (requests.*, urlopen, socket.send и т.п.)
-                if func_name in PluginChecker.EXFIL_SINKS:
-                    for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                        leaked = None
-                        if isinstance(arg, ast.Name) and arg.id in self.sensitive_vars:
-                            leaked = arg.id
-                        elif isinstance(arg, ast.Attribute) and any(
-                            attr in arg.attr for attr in PluginChecker.SENSITIVE_TELEGRAM_ATTRS
-                        ):
-                            leaked = arg.attr
-                        if leaked:
-                            self.reports.append({
-                                "level": "CRITICAL",
-                                "line": getattr(node, "lineno", 0),
-                                "rule": "SENSITIVE_DATA_EXFIL",
-                                "detail": f"Похоже на отправку чувствительных данных ({leaked}) через {func_name}()"
-                            })
-
-                # Обфускация: exec/eval от результата decode/b64decode/decompress,
-                # или динамическая сборка имени опасной функции через getattr.
-                if func_name in ("exec", "eval") and node.args:
-                    first_arg = node.args[0]
-                    if isinstance(first_arg, ast.Call):
-                        inner_name = ""
-                        if isinstance(first_arg.func, ast.Attribute):
-                            inner_name = first_arg.func.attr
-                        elif isinstance(first_arg.func, ast.Name):
-                            inner_name = first_arg.func.id
-                        if inner_name in ("b64decode", "decode", "decompress", "unhexlify", "urlsafe_b64decode"):
-                            self.reports.append({
-                                "level": "CRITICAL",
-                                "line": getattr(node, "lineno", 0),
-                                "rule": "OBFUSCATED_DYNAMIC_EXEC",
-                                "detail": f"{func_name}() выполняет результат {inner_name}() — вероятная попытка спрятать код"
-                            })
-
-                if func_name == "getattr" and len(node.args) >= 2:
-                    base = node.args[0]
-                    if isinstance(base, ast.Name) and base.id in ("__builtins__", "builtins"):
-                        self.reports.append({
-                            "level": "HIGH",
-                            "line": getattr(node, "lineno", 0),
-                            "rule": "DYNAMIC_BUILTIN_ACCESS",
-                            "detail": "Динамический доступ к __builtins__ через getattr — частый способ обхода статического анализа"
-                        })
-
-                if func_name == "import_module" and node.args and not isinstance(node.args[0], ast.Constant):
-                    self.reports.append({
-                        "level": "WARNING",
-                        "line": getattr(node, "lineno", 0),
-                        "rule": "DYNAMIC_IMPORT",
-                        "detail": "importlib.import_module() с не-литеральным именем модуля — импортируемый модуль неизвестен на этапе анализа"
-                    })
-
-                self.generic_visit(node)
-
-            def visit_Constant(self, node):
-                if isinstance(node.value, str) and _B64_LIKE_RE.match(node.value):
-                    self.b64_like_literals += 1
                 self.generic_visit(node)
 
             def visit_Assign(self, node):
@@ -534,33 +446,10 @@ class PluginChecker(BasePlugin):
         visitor.visit(tree)
         reports.extend(visitor.reports)
 
-        # Длинные base64-подобные литералы + любой обфускационный/опасный
-        # вызов уже найден выше — вместе это куда более надёжный сигнал,
-        # чем каждый признак по отдельности.
-        has_exec_like = any(
-            r["rule"] in ("OBFUSCATED_DYNAMIC_EXEC", "DANGEROUS_FUNCTION_EXEC", "DANGEROUS_FUNCTION_EVAL")
-            for r in reports
-        )
-        if visitor.b64_like_literals > 0 and has_exec_like:
-            reports.append({
-                "level": "CRITICAL",
-                "line": 0,
-                "rule": "ENCODED_PAYLOAD_WITH_EXEC",
-                "detail": f"Найдено {visitor.b64_like_literals} закодированных строк рядом с exec/eval — вероятен спрятанный полезный груз"
-            })
-        elif visitor.b64_like_literals >= 3:
-            reports.append({
-                "level": "WARNING",
-                "line": 0,
-                "rule": "MULTIPLE_ENCODED_LITERALS",
-                "detail": f"Найдено {visitor.b64_like_literals} длинных base64-подобных строк — стоит проверить вручную"
-            })
-
-        # Проверка на вредоносные строки — по границам слов, чтобы не ловить
-        # ложные срабатывания на легитимных фичах (например, "screenshot"
-        # как название обычной команды плагина).
+        # Проверка на вредоносные строки
+        code_lower = code_str.lower()
         for pattern in self.MALICIOUS_STRINGS:
-            if re.search(r"\b" + re.escape(pattern) + r"\b", code_str, re.IGNORECASE):
+            if pattern in code_lower:
                 reports.append({
                     "level": "WARNING",
                     "line": 0,
@@ -779,13 +668,10 @@ class PluginChecker(BasePlugin):
                                 warn_parts.append(f"\n... и еще {len(warning_reports) - 4} предупреждений")
                             warn_msg = "\n".join(warn_parts)
                         else:
-                            warn_msg = "✅ Явных признаков вредоносного кода не обнаружено."
+                            warn_msg = "✅ Вредоносный код не обнаружен."
                         
                         builder.set_title(f"🛡️ Plugin Checker\nРейтинг: {score}/100")
-                        builder.set_message(
-                            f"Категория: {badge}\n\n📊 Статистика: Критических: 0, Высоких: {high_count}, Предупреждений: {warning_count}\n\n{warn_msg}"
-                            "\n\nℹ️ Это статический анализ, а не гарантия. Устанавливайте плагины только из проверенных источников."
-                        )
+                        builder.set_message(f"Категория: {badge}\n\n📊 Статистика: Критических: 0, Высоких: {high_count}, Предупреждений: {warning_count}\n\n{warn_msg}")
 
                     builder.set_positive_button("Закрыть", lambda d, w: d.dismiss() if hasattr(d, "dismiss") else None)
                     builder.set_cancelable(True)
@@ -1096,13 +982,11 @@ class PluginChecker(BasePlugin):
                 finally:
                     del param
 
-        found_any_class = False
         for class_name in target_classes:
             try:
                 cls = find_class(class_name)
                 if not cls:
                     continue
-                found_any_class = True
                 constructors = cls.getClass().getDeclaredConstructors() if hasattr(cls, "getClass") else cls.getDeclaredConstructors()
                 for ctor in constructors:
                     try:
@@ -1110,14 +994,10 @@ class PluginChecker(BasePlugin):
                         h = self.hook_method(ctor, _InstallSheetHook(self))
                         if h:
                             self._installed_hooks.append(h)
-                    except Exception as ctor_err:
-                        log(f"[PluginChecker] failed to hook constructor of {class_name}: {ctor_err}")
-            except Exception as find_err:
-                log(f"[PluginChecker] failed to resolve class {class_name}: {find_err}")
-
-        if not found_any_class:
-            log("[PluginChecker] none of the known InstallPluginBottomSheet classes were found — "
-                "the checker will not intercept installs on this exteraGram build")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def on_plugin_unload(self):
         global _ACTIVE_CHECKER_INSTANCE
