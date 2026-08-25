@@ -1,0 +1,902 @@
+import json
+
+from android.graphics.drawable import ColorDrawable
+from android.os import Bundle
+from extera_utils.classes import Base, java_subclass, joverride
+from java import dynamic_proxy, jint, jlong
+from java.lang import Boolean as JBoolean
+from java.lang import Long, Runnable, System
+from java.util import ArrayList
+from org.telegram.messenger import (
+    AndroidUtilities,
+    LocaleController,
+    MediaDataController,
+    MessageObject,
+    MessagesController,
+    R,
+    UserConfig,
+    UserObject,
+)
+from org.telegram.tgnet import TLRPC, SerializedData
+from org.telegram.ui import (
+    DialogsActivity,
+    LaunchActivity,
+    SelectAnimatedEmojiDialog,
+)
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Cells import UserCell
+from org.telegram.ui.Components import (
+    AnimatedEmojiDrawable,
+    ItemOptions,
+    UItem,
+)
+from org.telegram.ui.Components.Reactions import ReactionsLayoutInBubble
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from ui.settings import (
+    Custom,
+    Divider,
+    Header,
+    SimpleSettingFactory,
+    Switch,
+    Text,
+)
+
+__id__ = "personal_quick_reactions"
+__name__ = "Personal Quick Reactions"
+__description__ = "Позволяет назначать персональную быструю реакцию для каждого пользователя."
+__author__ = "@itsbodyq"
+__icon__ = "exteraplicons/4"
+__version__ = "1.0"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+
+GROUPS_SETTING_KEY = "enable_in_groups"
+USER_REQUEST_SELECTOR_MODE = 15
+USERS_STORAGE_KEY = "users_v1"
+USERS_STORAGE_VERSION = 2
+REACTION_PICKER_TYPE_SET_DEFAULT = 2
+REACTION_POPUP_WRAP_CONTENT = -2
+REACTION_POPUP_GRAVITY_TOP_RIGHT = 53
+DEFAULT_PERSONAL_REACTION = "❤"
+FOLLOW_GLOBAL_REACTION = "__follow_global__"
+
+PLUGIN_STRINGS = {
+    "ru": {
+        "groups_title": "Включить в группах",
+        "groups_description": (
+            "Если включено, персональные быстрые реакции будут работать не "
+            "только в личных чатах, но и в группах."
+        ),
+        "add_user": "Добавить нового пользователя",
+        "add_user_description": (
+            "Назначьте персональную быструю реакцию на выбранного пользователя."
+        ),
+        "added_users": "Добавленные пользователи",
+        "added_users_description": (
+            "Нажмите, чтобы изменить быструю реакцию. Удерживайте, чтобы удалить пользователя."
+        ),
+    },
+    "uk": {
+        "groups_title": "Увімкнути в групах",
+        "groups_description": (
+            "Якщо ввімкнено, персональні швидкі реакції працюватимуть не лише "
+            "в особистих чатах, а й у групах."
+        ),
+        "add_user": "Додати нового користувача",
+        "add_user_description": ("Призначте персональну швидку реакцію вибраному користувачу."),
+        "added_users": "Додані користувачі",
+        "added_users_description": (
+            "Натисніть, щоб змінити швидку реакцію. Натисніть і утримуйте, "
+            "щоб видалити користувача."
+        ),
+    },
+    "en": {
+        "groups_title": "Enable in groups",
+        "groups_description": (
+            "If enabled, personal quick reactions will work in groups as well as private chats."
+        ),
+        "add_user": "Add new user",
+        "add_user_description": ("Assign a personal quick reaction to the selected user."),
+        "added_users": "Added users",
+        "added_users_description": (
+            "Tap to change the quick reaction. Touch and hold to remove the user."
+        ),
+    },
+}
+
+RUSSIAN_FALLBACK_LANGUAGES = frozenset("ru be kk ky uz tg tt ba".split())
+
+JAVA_ERRORS = (AttributeError, RuntimeError, TypeError, ValueError)
+
+
+def locale_code(language_code=None):
+    if language_code is None:
+        controller = LocaleController.getInstance()
+        locale_info = controller.getCurrentLocaleInfo()
+        language_code = str(getattr(locale_info, "shortName", "") or "")
+        if not language_code:
+            language_code = str(controller.getCurrentLocale().getLanguage() or "")
+    normalized = str(language_code or "").strip().lower().replace("_", "-")
+    primary = normalized.split("-", 1)[0]
+    if primary == "uk":
+        return "uk"
+    if primary in RUSSIAN_FALLBACK_LANGUAGES:
+        return "ru"
+    return "en"
+
+
+def tr(key, language_code=None):
+    language = locale_code(language_code)
+    return PLUGIN_STRINGS.get(language, PLUGIN_STRINGS["en"]).get(
+        key,
+        PLUGIN_STRINGS["en"][key],
+    )
+
+
+def _animated_reaction_id(reaction):
+    value = str(reaction or "")
+    if not value.startswith("animated_"):
+        return None
+    try:
+        return int(value[9:])
+    except (TypeError, ValueError):
+        return None
+
+
+class _MethodHook(MethodHook):
+    def __init__(self, before=None, after=None):
+        self.before = before
+        self.after = after
+
+    def before_hooked_method(self, param):
+        if self.before is not None:
+            self.before(param)
+
+    def after_hooked_method(self, param):
+        if self.after is not None:
+            self.after(param)
+
+
+class _SelectorDelegate(dynamic_proxy(DialogsActivity.DialogsActivityDelegate)):
+    def __init__(self, plugin, account):
+        super().__init__()
+        self.plugin = plugin
+        self.account = account
+
+    def didSelectDialogs(
+        self,
+        fragment,
+        dialogs,
+        _message,
+        _param,
+        _topics_fragment,
+    ):
+        if dialogs is None or int(dialogs.size()) != 1:
+            return True
+        dialog_id = int(dialogs.get(0).dialogId)
+        self.plugin._add_selected_user(self.account, fragment, dialog_id)
+        return True
+
+
+class _Runnable(dynamic_proxy(Runnable)):
+    def __init__(self, callback, *args):
+        super().__init__()
+        self.callback = callback
+        self.args = args
+
+    def run(self):
+        self.callback(*self.args)
+
+
+@java_subclass(SelectAnimatedEmojiDialog)
+class _ReactionPicker(Base):
+    def __init__(self, owner, account, user_id, row, item):
+        self.owner = owner
+        self.account = int(account)
+        self.user_id = int(user_id)
+        self.row = row
+        self.item = item
+
+    @joverride()
+    def onEmojiSelected(self, *args):
+        document_id = args[1] if len(args) > 1 else None
+        if document_id is not None:
+            self.owner._select_personal_reaction(
+                self.account,
+                self.user_id,
+                f"animated_{int(document_id)}",
+                self.row,
+                self.item,
+            )
+
+    @joverride()
+    def onReactionClick(self, _view, reaction):
+        if reaction is None:
+            return
+        emojicon = reaction.emojicon
+        if emojicon:
+            self.owner._select_personal_reaction(
+                self.account,
+                self.user_id,
+                str(emojicon),
+                self.row,
+                self.item,
+            )
+
+
+@java_subclass(SelectAnimatedEmojiDialog.SelectAnimatedEmojiDialogWindow)
+class _ReactionPickerWindow(Base):
+    def __init__(self, owner):
+        self.owner = owner
+
+    @joverride()
+    def dismiss(self):
+        try:
+            super().dismiss()
+        finally:
+            self.owner._clear_reaction_popup(self.java)
+
+
+@java_subclass(UserCell)
+class _UserCell(Base):
+    def __init__(self):
+        self.image_drawable = AnimatedEmojiDrawable.SwapAnimatedEmojiDrawable(
+            self.java,
+            jint(AndroidUtilities.dp(24)),
+        )
+
+    def bind_reaction(self, account, reaction_value, animated=False):
+        media = MediaDataController.getInstance(int(account))
+        media.checkReactions()
+        reaction_value = str(reaction_value or DEFAULT_PERSONAL_REACTION)
+        document_id = _animated_reaction_id(reaction_value)
+        if document_id is not None:
+            self.image_drawable.set(jlong(document_id), bool(animated))
+            self.reaction_value = reaction_value
+            self.java.invalidate()
+            return
+        reaction = media.getReactionsMap().get(reaction_value)
+        if reaction is None:
+            reaction_value = DEFAULT_PERSONAL_REACTION
+            reaction = media.getReactionsMap().get(reaction_value)
+        if reaction is not None:
+            self.image_drawable.set(reaction.static_icon, bool(animated))
+        self.reaction_value = reaction_value
+        self.java.invalidate()
+
+    def update_image_bounds(self):
+        right = int(self.java.getWidth()) - AndroidUtilities.dp(21)
+        width = int(self.image_drawable.getIntrinsicWidth())
+        height = int(self.image_drawable.getIntrinsicHeight())
+        top = (int(self.java.getHeight()) - height) // 2
+        self.image_drawable.setBounds(
+            jint(right - width),
+            jint(top),
+            jint(right),
+            jint(top + height),
+        )
+
+    @joverride()
+    def dispatchDraw(self, canvas):
+        super().dispatchDraw(canvas)
+        self.update_image_bounds()
+        self.image_drawable.draw(canvas)
+
+    @joverride()
+    def onAttachedToWindow(self):
+        super().onAttachedToWindow()
+        self.image_drawable.attach()
+
+    @joverride()
+    def onDetachedFromWindow(self):
+        super().onDetachedFromWindow()
+        self.image_drawable.detach()
+
+
+def _create_user_view(
+    context,
+    _list_view,
+    _current_account,
+    _class_guid,
+    _resources_provider,
+):
+    return _UserCell.new_instance(
+        context,
+        jint(6),
+        jint(0),
+        False,
+        init_args=[],
+    ).java
+
+
+def _bind_user_view(view, item, _divider, _adapter, _list_view):
+    account = int(item.intValue)
+    user_id = int(item.dialogId)
+    user_item = UItem.asFilterChat(False, jlong(user_id))
+    controller = MessagesController.getInstance(account)
+    if controller.getUser(Long.valueOf(jlong(user_id))) is None:
+        user_item.chatType = tr("added_users")
+        user_item.text = str(item.text or user_id)
+    view.setFromUItem(account, user_item, False)
+    reaction = str(item.object2 or FOLLOW_GLOBAL_REACTION)
+    if reaction == FOLLOW_GLOBAL_REACTION:
+        reaction = str(
+            MediaDataController.getInstance(account).getDoubleTapReaction()
+            or DEFAULT_PERSONAL_REACTION
+        )
+    _UserCell.from_java(view).bind_reaction(
+        account,
+        reaction,
+    )
+
+
+class PersonalQuickReactionsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._user_row_factory = SimpleSettingFactory(
+            _create_user_view,
+            _bind_user_view,
+            is_clickable=True,
+            create_item=self._create_user_item,
+            on_click=self._click_user,
+            on_long_click=self._long_click_user,
+        )
+        self._settings_language = locale_code()
+        self._selectors = {}
+        self._reaction_popup = None
+        self._reaction_popup_window_peer = None
+
+    def _log_error(self, operation, error):
+        self.log(f"[PersonalQuickReactions] {operation}: {error!r}")
+
+    def create_settings(self):
+        language = locale_code()
+        self._settings_language = language
+        settings = [
+            Switch(
+                key=GROUPS_SETTING_KEY,
+                text=tr("groups_title", language),
+                default=True,
+            ),
+            Divider(text=tr("groups_description", language)),
+            Text(
+                text=tr("add_user", language),
+                icon="msg_add",
+                on_click=self._on_add_user_clicked,
+            ),
+            Divider(text=tr("add_user_description", language)),
+        ]
+        account = int(UserConfig.selectedAccount)
+        users = self._read_users().get(account, [])
+        if users:
+            settings.append(Header(text=tr("added_users", language)))
+            for user in users:
+                user_id = int(user["id"])
+                reaction = user.get("reaction") or FOLLOW_GLOBAL_REACTION
+                settings.append(
+                    Custom(
+                        factory=self._user_row_factory.instance.java,
+                        factory_args=(
+                            account,
+                            user_id,
+                            str(user["title"]),
+                            reaction,
+                        ),
+                    )
+                )
+            settings.append(Custom(item=UItem.asShadow(tr("added_users_description", language))))
+        return settings
+
+    def _create_user_item(self, _plugin_model, _setting, args):
+        account, user_id, title, reaction = tuple(args)
+        item = UItem(int(self._user_row_factory.instance.java.viewType), False)
+        item.intValue = int(account)
+        item.dialogId = jlong(int(user_id))
+        item.text = str(title)
+        item.object2 = str(reaction)
+        return item
+
+    def _click_user(self, _plugin_model, item, view):
+        return self._show_reaction_picker(
+            int(item.intValue),
+            int(item.dialogId),
+            view,
+            item,
+        )
+
+    def _long_click_user(self, _plugin_model, item, view):
+        return self._show_delete_option(
+            int(item.intValue),
+            int(item.dialogId),
+            view,
+        )
+
+    def on_plugin_load(self):
+        self._selectors.clear()
+        hooks = [
+            (
+                DialogsActivity,
+                "getDialogsArray",
+                _MethodHook(after=self._filter_selector_dialogs),
+            ),
+            (
+                DialogsActivity,
+                "didSelectResult",
+                _MethodHook(before=self._intercept_user_selection),
+            ),
+            (
+                DialogsActivity,
+                "onFragmentDestroy",
+                _MethodHook(after=lambda param: self._forget_selector(param.thisObject)),
+            ),
+            (
+                MessageObject,
+                "selectReaction",
+                _MethodHook(before=self._replace_quick_reaction),
+            ),
+        ]
+        settings_activity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+        if settings_activity is None:
+            self.log("[PersonalQuickReactions] settings activity unavailable")
+        else:
+            hooks.insert(
+                0,
+                (
+                    settings_activity,
+                    "createView",
+                    _MethodHook(before=self._refresh_settings_locale),
+                ),
+            )
+        for target, method, callback in hooks:
+            self.hook_all_methods(target, method, callback)
+
+    def on_plugin_unload(self):
+        self._dismiss_reaction_popup()
+        self._selectors.clear()
+
+    def _refresh_settings_locale(self, param):
+        try:
+            model = get_private_field(param.thisObject, "plugin")
+            if model is None or str(model.getId()) != __id__:
+                return
+            language = locale_code()
+            if language == self._settings_language:
+                return
+            self._settings_language = language
+            find_class(
+                "com.exteragram.messenger.plugins.PluginsController"
+            ).getInstance().loadPluginSettings(__id__)
+        except JAVA_ERRORS as error:
+            self._log_error("settings locale", error)
+
+    def _replace_quick_reaction(self, param):
+        args = param.args
+        if len(args) < 3 or not bool(args[2]):
+            return
+
+        message = param.thisObject
+        visible_reaction = args[0]
+        if message is None or visible_reaction is None:
+            return
+        if int(message.getDialogId()) < 0 and not bool(self.get_setting(GROUPS_SETTING_KEY, True)):
+            return
+
+        user_id = int(message.getFromChatId())
+        if user_id <= 0:
+            return
+        user = self._user_record(
+            self._read_users(),
+            int(message.currentAccount),
+            user_id,
+        )
+        reaction = user.get("reaction") if user is not None else None
+        if reaction is None:
+            return
+
+        replacement = ReactionsLayoutInBubble.VisibleReaction.fromEmojicon(str(reaction))
+        visible_reaction.emojicon = replacement.emojicon
+        visible_reaction.documentId = replacement.documentId
+        visible_reaction.hash = replacement.hash
+
+    def _on_add_user_clicked(self, *_args):
+        account = int(UserConfig.selectedAccount)
+        host = LaunchActivity.getSafeLastFragment()
+        if host is None or int(host.getCurrentAccount()) != account:
+            return
+
+        request_peer_type = self._serialize_user_request_peer_type()
+        if request_peer_type is None:
+            return
+
+        selector = None
+        try:
+            dialogs = self._build_allowed_dialogs(account)
+            args = Bundle()
+            args.putBoolean("onlySelect", True)
+            args.putBoolean("canSelectTopics", False)
+            args.putBoolean("allowUsers", True)
+            args.putBoolean("allowBots", False)
+            args.putBoolean("allowGroups", False)
+            args.putBoolean("allowMegagroups", False)
+            args.putBoolean("allowLegacyGroups", False)
+            args.putBoolean("allowChannels", False)
+            args.putBoolean("allowGlobalSearch", True)
+            args.putBoolean("allowSwitchAccount", False)
+            args.putBoolean("resetDelegate", False)
+            args.putInt("dialogsType", USER_REQUEST_SELECTOR_MODE)
+            args.putByteArray("requestPeerType", request_peer_type)
+            selector = DialogsActivity(args)
+            delegate = _SelectorDelegate(self, account)
+            selector.setDelegate(delegate)
+            selector_key = int(System.identityHashCode(selector))
+            self._selectors[selector_key] = {
+                "account": account,
+                "delegate": delegate,
+                "dialogs": dialogs,
+                "allowed": frozenset(
+                    int(dialogs.get(index).id) for index in range(int(dialogs.size()))
+                ),
+            }
+            if not host.presentFragment(selector):
+                self._selectors.pop(selector_key, None)
+                return
+            action_bar = selector.getActionBar()
+            if action_bar is not None:
+                action_bar.setTitle(
+                    LocaleController.getString(
+                        "ChooseUser",
+                        R.string.ChooseUser,
+                    )
+                )
+        except JAVA_ERRORS as error:
+            if selector is not None:
+                self._forget_selector(selector)
+            self._log_error("user selector", error)
+
+    def _serialize_user_request_peer_type(self):
+        buffer = None
+        try:
+            request_peer = TLRPC.TL_requestPeerTypeUser()
+            request_peer.bot = JBoolean(False)
+            buffer = SerializedData(request_peer.getObjectSize())
+            request_peer.serializeToStream(buffer)
+            return buffer.toByteArray()
+        except JAVA_ERRORS as error:
+            self._log_error("user selector filter", error)
+            return None
+        finally:
+            if buffer is not None:
+                buffer.cleanup()
+
+    def _filter_selector_dialogs(self, param):
+        session = self._selectors.get(int(System.identityHashCode(param.thisObject)))
+        if session is None or len(param.args) != 4:
+            return
+        param.setResult(session["dialogs"])
+
+    def _intercept_user_selection(self, param):
+        session = self._selectors.get(int(System.identityHashCode(param.thisObject)))
+        if session is None or not param.args:
+            return
+        dialog_id = int(param.args[0])
+        if dialog_id in session["allowed"]:
+            self._add_selected_user(
+                session["account"],
+                param.thisObject,
+                dialog_id,
+            )
+        param.setResult(None)
+
+    def _build_allowed_dialogs(self, account):
+        controller = MessagesController.getInstance(int(account))
+        source = controller.dialogsUsersOnly
+        filtered = ArrayList()
+        existing = {user["id"] for user in self._read_users().get(int(account), [])}
+        for index in range(int(source.size())):
+            dialog = source.get(index)
+            dialog_id = int(dialog.id)
+            if dialog_id <= 0:
+                continue
+            user = controller.getUser(Long.valueOf(jlong(dialog_id)))
+            if dialog_id not in existing and self._is_allowed_user(user, dialog_id):
+                filtered.add(dialog)
+        return filtered
+
+    @staticmethod
+    def _is_allowed_user(user, dialog_id):
+        return bool(
+            user is not None
+            and not (
+                bool(user.bot)
+                or UserObject.isUserSelf(user)
+                or UserObject.isDeleted(user)
+                or UserObject.isReplyUser(user)
+                or UserObject.isService(jlong(dialog_id))
+                or MessagesController.isSupportUser(user)
+            )
+        )
+
+    def _add_selected_user(self, account, selector, user_id):
+        session = self._selectors.get(int(System.identityHashCode(selector)))
+        if session is None or int(user_id) not in session["allowed"]:
+            return False
+        controller = MessagesController.getInstance(int(account))
+        user = controller.getUser(Long.valueOf(jlong(user_id)))
+        if not self._is_allowed_user(user, user_id):
+            return False
+        accounts = self._read_users()
+        users = accounts.setdefault(int(account), [])
+        if any(item["id"] == int(user_id) for item in users):
+            self._close_selector(selector)
+            return True
+        users.append(
+            {
+                "id": int(user_id),
+                "title": str(UserObject.getUserName(user) or user_id),
+                "reaction": None,
+            }
+        )
+        self._write_users(accounts)
+        self._close_selector(selector)
+        return True
+
+    def _show_reaction_picker(self, account, user_id, row, item):
+        window = self._reaction_popup
+        if window is not None:
+            if window.isShowing():
+                return False
+            self._clear_reaction_popup(window)
+
+        host = LaunchActivity.getSafeLastFragment()
+        if host is None or row is None or int(host.getCurrentAccount()) != int(account):
+            return False
+
+        try:
+            cell = _UserCell.from_java(row)
+            drawable = cell.image_drawable
+            drawable.play()
+            cell.update_image_bounds()
+            AndroidUtilities.rectTmp2.set(drawable.getBounds())
+            center_x = int(AndroidUtilities.rectTmp2.centerX())
+            center_y = int(AndroidUtilities.rectTmp2.centerY())
+            yoff = -(int(row.getHeight()) - center_y) - AndroidUtilities.dp(16)
+            popup_width = int(
+                min(
+                    AndroidUtilities.dp(324),
+                    int(AndroidUtilities.displaySize.x) * 0.95,
+                )
+            )
+            xoff = center_x - (int(row.getRight()) - popup_width)
+
+            popup_peer = _ReactionPicker.new_instance(
+                host,
+                host.getContext(),
+                False,
+                jint(xoff),
+                jint(REACTION_PICKER_TYPE_SET_DEFAULT),
+                None,
+                init_args=[self, account, user_id, row, item],
+            )
+            popup_layout = popup_peer.java
+
+            media = MediaDataController.getInstance(int(account))
+            media.checkReactions()
+            user = self._user_record(self._read_users(), account, user_id)
+            selected = (
+                str(user["reaction"])
+                if user is not None and user.get("reaction") is not None
+                else self._global_reaction(account)
+            )
+            document_id = _animated_reaction_id(selected)
+            if document_id is not None:
+                popup_layout.setSelected(jlong(document_id))
+
+            reactions = ArrayList()
+            available = media.getReactionsList()
+            for index in range(int(available.size())):
+                visible = ReactionsLayoutInBubble.VisibleReaction()
+                visible.emojicon = available.get(index).reaction
+                reactions.add(visible)
+            popup_layout.setRecentReactions(reactions)
+            popup_layout.setSaveState(3)
+            popup_layout.setScrimDrawable(drawable, row)
+
+            window_peer = _ReactionPickerWindow.new_instance(
+                popup_layout,
+                jint(REACTION_POPUP_WRAP_CONTENT),
+                jint(REACTION_POPUP_WRAP_CONTENT),
+                init_args=[self],
+            )
+            window = window_peer.java
+            self._reaction_popup = window
+            self._reaction_popup_window_peer = window_peer
+
+            window.showAsDropDown(
+                row,
+                jint(0),
+                jint(yoff),
+                jint(REACTION_POPUP_GRAVITY_TOP_RIGHT),
+            )
+            window.dimBehind()
+            return True
+        except JAVA_ERRORS as error:
+            self._dismiss_reaction_popup()
+            self._log_error("reaction picker", error)
+            return False
+
+    def _select_personal_reaction(
+        self,
+        account,
+        user_id,
+        reaction,
+        row,
+        item,
+    ):
+        account = int(account)
+        user_id = int(user_id)
+        reaction = str(reaction)
+        accounts = self._read_users()
+        user = self._user_record(accounts, account, user_id)
+        if user is None:
+            self._dismiss_reaction_popup()
+            return False
+        user["reaction"] = reaction
+        item.object2 = reaction
+        _UserCell.from_java(row).bind_reaction(
+            account,
+            reaction,
+            animated=True,
+        )
+        self._dismiss_reaction_popup()
+        self._write_users(accounts)
+        return True
+
+    @staticmethod
+    def _user_record(accounts, account, user_id):
+        user_id = int(user_id)
+        return next(
+            (user for user in accounts.get(int(account), []) if int(user.get("id", 0)) == user_id),
+            None,
+        )
+
+    @staticmethod
+    def _global_reaction(account):
+        return str(
+            MediaDataController.getInstance(int(account)).getDoubleTapReaction()
+            or DEFAULT_PERSONAL_REACTION
+        )
+
+    def _dismiss_reaction_popup(self):
+        window = self._reaction_popup
+        if window is None:
+            return
+        try:
+            window.dismiss()
+        finally:
+            self._clear_reaction_popup(window)
+
+    def _clear_reaction_popup(self, window):
+        if window is not None and self._reaction_popup is not window:
+            return
+        self._reaction_popup = None
+        self._reaction_popup_window_peer = None
+
+    def _show_delete_option(self, account, user_id, view):
+        host = LaunchActivity.getSafeLastFragment()
+        if host is None or view is None or int(host.getCurrentAccount()) != int(account):
+            return False
+        action = _Runnable(self._remove_user, account, user_id)
+        options = ItemOptions.makeOptions(host, view)
+        options.setScrimViewBackground(
+            ColorDrawable(Theme.getColor(Theme.key_windowBackgroundWhite))
+        )
+        options.add(
+            R.drawable.msg_delete,
+            LocaleController.getString("Delete", R.string.Delete),
+            True,
+            action,
+        )
+        options.setMinWidth(190).show()
+        return True
+
+    def _remove_user(self, account, user_id):
+        account = int(account)
+        user_id = int(user_id)
+        accounts = self._read_users()
+        users = accounts.get(account, [])
+        remaining = [user for user in users if int(user.get("id", 0)) != user_id]
+        if len(remaining) == len(users):
+            return False
+        if remaining:
+            accounts[account] = remaining
+        else:
+            accounts.pop(account, None)
+        self._write_users(accounts)
+        return True
+
+    def _read_users(self):
+        try:
+            payload = json.loads(str(self.get_setting(USERS_STORAGE_KEY, "{}") or "{}"))
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            return {}
+        try:
+            storage_version = int(payload.get("version", 1))
+        except (TypeError, ValueError):
+            storage_version = 1
+        source = payload.get("accounts", {})
+        if not isinstance(source, dict):
+            return {}
+
+        loaded = {}
+        for account_key, values in source.items():
+            try:
+                account = int(account_key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(values, list):
+                continue
+
+            users = []
+            seen = set()
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    user_id = int(value["id"])
+                    title = str(value.get("title", user_id))
+                    stored_reaction = value.get("reaction")
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if user_id <= 0 or user_id in seen:
+                    continue
+                seen.add(user_id)
+                users.append(
+                    {
+                        "id": user_id,
+                        "title": title,
+                        "reaction": (
+                            str(stored_reaction)
+                            if storage_version >= USERS_STORAGE_VERSION and stored_reaction
+                            else None
+                        ),
+                    }
+                )
+            if users:
+                loaded[account] = users
+        return loaded
+
+    def _write_users(self, users_by_account, reload_settings=True):
+        accounts = {
+            str(account): [
+                {
+                    "id": int(user["id"]),
+                    "title": str(user["title"]),
+                    "reaction": (
+                        str(user["reaction"]) if user.get("reaction") is not None else None
+                    ),
+                }
+                for user in users
+            ]
+            for account, users in users_by_account.items()
+            if users
+        }
+        self.set_setting(
+            USERS_STORAGE_KEY,
+            json.dumps(
+                {"version": USERS_STORAGE_VERSION, "accounts": accounts},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            reload_settings=reload_settings,
+        )
+
+    def _close_selector(self, selector):
+        self._forget_selector(selector)
+        selector.finishFragment()
+
+    def _forget_selector(self, selector):
+        self._selectors.pop(int(System.identityHashCode(selector)), None)
