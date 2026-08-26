@@ -1,0 +1,713 @@
+import time
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.lang import Integer as JInteger
+
+__id__ = "gifs_unlocker"
+__name__ = "GIFs Unlocker"
+__description__ = "Позволяет отправлять GIF там, где это запрещено, путем их отправки как цикличное видео без звука"
+__author__ = "@kchemi_projects"
+__version__ = "1.1"
+__icon__ = "METAHERO_unofficial/12"
+__app_version__ = ">=12.8.1"
+__sdk_version__ = ">=1.4.3.10"
+
+TAB_GIFS = 1
+
+
+class _Classes:
+    """Кэш ссылок на Java-классы."""
+    EmojiPagesAdapter = None
+    SendMessagesHelper = None
+    NotificationCenter = None
+    MessagesController = None
+    FileLoader = None
+    ChatObject = None
+    LaunchActivity = None
+    TL_document = None
+    TL_documentAttributeVideo = None
+    TL_documentAttributeFilename = None
+    ArrayList = None
+    Long = None
+
+    @classmethod
+    def init(cls):
+        cls.EmojiPagesAdapter = find_class("org.telegram.ui.Components.EmojiView$EmojiPagesAdapter")
+        cls.SendMessagesHelper = find_class("org.telegram.messenger.SendMessagesHelper")
+        cls.NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+        cls.MessagesController = find_class("org.telegram.messenger.MessagesController")
+        cls.FileLoader = find_class("org.telegram.messenger.FileLoader")
+        cls.ChatObject = find_class("org.telegram.messenger.ChatObject")
+        cls.LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+        cls.TL_document = find_class("org.telegram.tgnet.TLRPC$TL_document")
+        cls.TL_documentAttributeVideo = find_class("org.telegram.tgnet.TLRPC$TL_documentAttributeVideo")
+        cls.TL_documentAttributeFilename = find_class("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename")
+        cls.ArrayList = find_class("java.util.ArrayList")
+        cls.Long = find_class("java.lang.Long")
+
+
+class _CanScrollToTabHook(MethodHook):
+    """
+    Хукает EmojiPagesAdapter.canScrollToTab(int position).
+    Разблокирует вкладку GIF только если в чате запрещены GIF, но разрешены видео.
+    """
+
+    def __init__(self, plugin: "GifsUnlockerPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if param.args[0] != TAB_GIFS:
+                return
+
+            chat = self.plugin.get_current_chat(param.thisObject)
+            if not chat:
+                return
+
+            if not self.plugin.is_chat_gif_forbidden(chat) or self.plugin.is_chat_video_forbidden(chat):
+                return
+
+            param.setResult(True)
+        except Exception:
+            pass
+
+
+class _SendMessageHook(MethodHook):
+    """Перехватывает SendMessagesHelper.sendMessage и перенаправляет отправку GIF."""
+
+    def __init__(self, plugin: "GifsUnlockerPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._is_converting:
+            return
+
+        try:
+            this_obj = param.thisObject
+            account = getattr(this_obj, "currentAccount", 0) if this_obj else 0
+            args = param.args
+            if not args:
+                return
+
+            for arg in args:
+                if not arg:
+                    continue
+
+                if hasattr(arg, "document") or hasattr(arg, "peer"):
+                    if self.plugin.check_and_handle_send_params(arg, account):
+                        param.setResult(None)
+                        return
+
+                elif hasattr(arg, "size") and hasattr(arg, "get"):
+                    for i in range(arg.size()):
+                        item = arg.get(i)
+                        if item and (hasattr(item, "document") or hasattr(item, "peer")):
+                            if self.plugin.check_and_handle_send_params(item, account):
+                                param.setResult(None)
+                                return
+        except Exception as e:
+            self.plugin.log(f"Error in SendMessageHook: {e}")
+
+
+class _NotificationCenterHook(MethodHook):
+    """Перехватывает подтверждение отправки для кэширования созданного сервером Document."""
+
+    def __init__(self, plugin: "GifsUnlockerPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._pending_uploads and param.args:
+            self.plugin.handle_notification_args(param.args)
+
+
+class GifsUnlockerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._tab_unhook = None
+        self._send_unhooks = []
+        self._notif_unhooks = []
+        self._is_converting = False
+
+        self._memory_cache = {}
+        self._pending_uploads = {}
+
+    # ---------- Жизненный цикл ----------
+
+    def on_plugin_load(self):
+        _Classes.init()
+        self._load_cache_to_memory()
+        self._apply_hooks()
+
+    def on_plugin_unload(self):
+        self._remove_hooks()
+        self._memory_cache.clear()
+        self._pending_uploads.clear()
+
+    # ---------- Кэширование ----------
+
+    def _load_cache_to_memory(self):
+        """Предзагружает сохраненные документы в RAM при запуске."""
+        try:
+            stored = self.get_setting("cached_gifs_data", {})
+            if isinstance(stored, dict):
+                for orig_id, data in stored.items():
+                    doc = self._reconstruct_document(data)
+                    if doc:
+                        self._memory_cache[orig_id] = doc
+        except Exception:
+            pass
+
+    def _reconstruct_document(self, data: dict):
+        """Восстанавливает TLRPC.TL_document из сохраненного словаря."""
+        if not _Classes.TL_document or not _Classes.TL_documentAttributeVideo or not _Classes.ArrayList:
+            return None
+
+        try:
+            doc = _Classes.TL_document()
+            doc.id = int(data["id"])
+            doc.access_hash = int(data["access_hash"])
+            ref = data.get("file_reference")
+            doc.file_reference = bytes(ref) if ref else bytes()
+            doc.date = int(data.get("date", int(time.time())))
+            doc.mime_type = str(data.get("mime_type", "video/mp4"))
+            doc.size = int(data.get("size", 0))
+            doc.dc_id = int(data.get("dc_id", 1))
+
+            attrs = _Classes.ArrayList()
+            video_attr = _Classes.TL_documentAttributeVideo()
+            video_attr.w = int(data.get("w", 512))
+            video_attr.h = int(data.get("h", 512))
+            video_attr.duration = float(data.get("duration", 0.0))
+            video_attr.supports_streaming = True
+            video_attr.nosound = True
+            video_attr.round_message = False
+            attrs.add(video_attr)
+
+            if _Classes.TL_documentAttributeFilename:
+                fn_attr = _Classes.TL_documentAttributeFilename()
+                fn_attr.file_name = "animation.mp4"
+                attrs.add(fn_attr)
+
+            doc.attributes = attrs
+            return doc
+        except Exception:
+            return None
+
+    def get_cached_document(self, orig_id: str):
+        """Мгновенное получение объекта из оперативной памяти."""
+        return self._memory_cache.get(orig_id)
+
+    def save_doc_to_cache(self, orig_id: str, doc):
+        """Сохраняет документ в RAM и локальное хранилище настроек."""
+        try:
+            w = 512
+            h = 512
+            duration = 0.0
+            attributes = getattr(doc, "attributes", None)
+            if attributes:
+                for i in range(attributes.size()):
+                    attr = attributes.get(i)
+                    if attr and "TL_documentAttributeVideo" in attr.getClass().getName():
+                        w = getattr(attr, "w", 512) or 512
+                        h = getattr(attr, "h", 512) or 512
+                        duration = getattr(attr, "duration", 0.0) or 0.0
+                        break
+
+            file_ref = getattr(doc, "file_reference", None)
+            ref_list = list(file_ref) if file_ref is not None else []
+
+            data = {
+                "id": int(doc.id),
+                "access_hash": int(doc.access_hash),
+                "file_reference": ref_list,
+                "date": int(getattr(doc, "date", int(time.time()))),
+                "mime_type": str(getattr(doc, "mime_type", "video/mp4")),
+                "size": int(getattr(doc, "size", 0)),
+                "dc_id": int(getattr(doc, "dc_id", 1)),
+                "w": int(w),
+                "h": int(h),
+                "duration": float(duration),
+            }
+
+            self._memory_cache[str(orig_id)] = doc
+
+            stored_cache = self.get_setting("cached_gifs_data", {})
+            if not isinstance(stored_cache, dict):
+                stored_cache = {}
+
+            stored_cache[str(orig_id)] = data
+
+            if len(stored_cache) > 500:
+                del stored_cache[next(iter(stored_cache))]
+
+            self.set_setting("cached_gifs_data", stored_cache)
+            self.log(f"Cached server Document {doc.id} for GIF ID {orig_id}")
+        except Exception as e:
+            self.log(f"Failed to save document to cache: {e}")
+
+    def handle_notification_args(self, args):
+        """Сопоставляет подтверждение отправки сообщения с ID исходной гифки."""
+        if not self._pending_uploads:
+            return
+
+        try:
+            def _inspect_item(item):
+                if not item:
+                    return
+
+                msg = getattr(item, "messageOwner", None) or item
+                media = getattr(msg, "media", None)
+                if not media:
+                    return
+
+                doc = getattr(media, "document", None)
+                if not doc:
+                    return
+
+                doc_id = getattr(doc, "id", 0)
+                if not doc_id or int(doc_id) <= 0:
+                    return
+
+                attach_path = str(getattr(msg, "attachPath", "") or "")
+                peer_id = 0
+                peer_obj = getattr(msg, "peer_id", None)
+                if peer_obj:
+                    peer_id = getattr(peer_obj, "channel_id", 0) or getattr(peer_obj, "chat_id", 0) or getattr(peer_obj, "user_id", 0)
+                    if getattr(peer_obj, "channel_id", 0) or getattr(peer_obj, "chat_id", 0):
+                        peer_id = -peer_id
+                if not peer_id:
+                    peer_id = getattr(msg, "dialog_id", 0)
+
+                matched_key = None
+                orig_doc_id = None
+
+                # 1. Поиск по точному пути файла
+                if attach_path and attach_path in self._pending_uploads:
+                    matched_key = attach_path
+                    orig_doc_id, _, _ = self._pending_uploads[attach_path]
+
+                # 2. Поиск по peer_id и времени отправки (<60 сек)
+                if not matched_key:
+                    now = time.time()
+                    for path, (p_orig_id, p_peer, p_time) in list(self._pending_uploads.items()):
+                        if now - p_time > 60:
+                            self._pending_uploads.pop(path, None)
+                            continue
+                        if (peer_id and int(peer_id) == int(p_peer)) or len(self._pending_uploads) == 1:
+                            matched_key = path
+                            orig_doc_id = p_orig_id
+                            break
+
+                if matched_key and orig_doc_id:
+                    self._pending_uploads.pop(matched_key, None)
+                    self.save_doc_to_cache(orig_doc_id, doc)
+
+            for arg in args:
+                if not arg:
+                    continue
+                if hasattr(arg, "__len__") and not isinstance(arg, (str, bytes, dict)):
+                    try:
+                        for sub in list(arg):
+                            _inspect_item(sub)
+                    except Exception:
+                        _inspect_item(arg)
+                else:
+                    _inspect_item(arg)
+
+        except Exception as e:
+            self.log(f"Error handling notification: {e}")
+
+    # ---------- Проверка прав и файлов ----------
+
+    def get_current_chat(self, adapter_instance=None):
+        """Извлекает активный объект TLRPC.Chat из адаптера или текущего экрана."""
+        if adapter_instance:
+            try:
+                outer = None
+                try:
+                    field = adapter_instance.getClass().getDeclaredField("this$0")
+                    field.setAccessible(True)
+                    outer = field.get(adapter_instance)
+                except Exception:
+                    pass
+
+                if outer:
+                    chat = getattr(outer, "currentChat", None)
+                    if chat:
+                        return chat
+
+                    frag = getattr(outer, "parentFragment", None)
+                    if frag:
+                        chat = getattr(frag, "currentChat", None)
+                        if chat:
+                            return chat
+                        dialog_id = getattr(frag, "dialog_id", 0)
+                        account = getattr(frag, "currentAccount", 0)
+                        if dialog_id:
+                            chat = self.get_chat(dialog_id, account)
+                            if chat:
+                                return chat
+
+                    delegate = getattr(outer, "delegate", None)
+                    if delegate:
+                        chat = getattr(delegate, "currentChat", None)
+                        if chat:
+                            return chat
+                        parent_frag = getattr(delegate, "parentFragment", None)
+                        if parent_frag:
+                            chat = getattr(parent_frag, "currentChat", None)
+                            if chat:
+                                return chat
+                            dialog_id = getattr(parent_frag, "dialog_id", 0)
+                            account = getattr(parent_frag, "currentAccount", 0)
+                            if dialog_id:
+                                chat = self.get_chat(dialog_id, account)
+                                if chat:
+                                    return chat
+            except Exception:
+                pass
+
+        if _Classes.LaunchActivity:
+            try:
+                frag = _Classes.LaunchActivity.getLastFragment()
+                if frag:
+                    chat = getattr(frag, "currentChat", None)
+                    if chat:
+                        return chat
+                    dialog_id = getattr(frag, "dialog_id", 0)
+                    account = getattr(frag, "currentAccount", 0)
+                    if dialog_id:
+                        chat = self.get_chat(dialog_id, account)
+                        if chat:
+                            return chat
+            except Exception:
+                pass
+
+        return None
+
+    def is_gif_document(self, document) -> bool:
+        """Проверка документа на принадлежность к GIF."""
+        if not document:
+            return False
+
+        mime = str(getattr(document, "mime_type", "")).lower()
+        if mime == "image/gif":
+            return True
+
+        attributes = getattr(document, "attributes", None)
+        if attributes:
+            try:
+                for i in range(attributes.size()):
+                    attr = attributes.get(i)
+                    if attr and "TL_documentAttributeAnimated" in attr.getClass().getName():
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def is_chat_gif_forbidden(self, chat) -> bool:
+        """Проверяет серверные запреты чата на GIF/стикеры."""
+        if not chat or getattr(chat, "creator", False) or getattr(chat, "admin_rights", None) is not None:
+            return False
+
+        if _Classes.ChatObject:
+            try:
+                if not _Classes.ChatObject.canSendStickers(chat):
+                    return True
+            except Exception:
+                pass
+
+        for rights_field in ("banned_rights", "default_banned_rights"):
+            banned = getattr(chat, rights_field, None)
+            if banned:
+                if (
+                    getattr(banned, "send_messages", False)
+                    or getattr(banned, "send_media", False)
+                    or getattr(banned, "send_stickers", False)
+                    or getattr(banned, "send_gifs", False)
+                ):
+                    return True
+        return False
+
+    def is_chat_video_forbidden(self, chat) -> bool:
+        """Проверяет запреты чата на отправку видео/медиа."""
+        if not chat or getattr(chat, "creator", False) or getattr(chat, "admin_rights", None) is not None:
+            return False
+
+        if _Classes.ChatObject:
+            for method_name in ("canSendVideo", "canSendMedia"):
+                try:
+                    method = getattr(_Classes.ChatObject, method_name, None)
+                    if method and not method(chat):
+                        return True
+                except Exception:
+                    pass
+
+            for action_name in ("ACTION_SEND_VIDEOS", "ACTION_SEND_MEDIA", "ACTION_SEND_DOCS"):
+                try:
+                    action_val = getattr(_Classes.ChatObject, action_name, None)
+                    if action_val is not None and not _Classes.ChatObject.canSend(chat, int(action_val)):
+                        return True
+                except Exception:
+                    pass
+
+        for rights_field in ("banned_rights", "default_banned_rights"):
+            banned = getattr(chat, rights_field, None)
+            if banned:
+                if (
+                    getattr(banned, "send_messages", False)
+                    or getattr(banned, "send_media", False)
+                    or getattr(banned, "send_videos", False)
+                    or getattr(banned, "send_docs", False)
+                ):
+                    return True
+        return False
+
+    def get_chat(self, peer: int, account: int):
+        """Получение объекта TLRPC.Chat по ID чата."""
+        if not _Classes.MessagesController:
+            return None
+
+        try:
+            controller = _Classes.MessagesController.getInstance(int(account))
+            if not controller:
+                return None
+
+            chat_id = -int(peer) if int(peer) < 0 else int(peer)
+            if _Classes.Long:
+                try:
+                    return controller.getChat(_Classes.Long.valueOf(chat_id))
+                except Exception:
+                    pass
+            return controller.getChat(chat_id)
+        except Exception:
+            return None
+
+    def get_file_for_document(self, doc, account: int):
+        """Находит локальный кэшированный MP4-файл гифки."""
+        if not _Classes.FileLoader:
+            return None
+
+        try:
+            loader = _Classes.FileLoader.getInstance(int(account))
+            if not loader:
+                return None
+
+            for force_cache in (False, True):
+                try:
+                    f = loader.getPathToAttach(doc, force_cache)
+                    if f and f.exists() and f.length() > 0:
+                        return f
+                except Exception:
+                    pass
+
+            try:
+                f = loader.getPathToAttach(doc)
+                if f and f.exists() and f.length() > 0:
+                    return f
+            except Exception:
+                pass
+
+            try:
+                loader.loadFile(doc, "gif", 0, 1)
+            except Exception:
+                pass
+
+            for _ in range(15):
+                time.sleep(0.04)
+                for force_cache in (False, True):
+                    try:
+                        f = loader.getPathToAttach(doc, force_cache)
+                        if f and f.exists() and f.length() > 0:
+                            return f
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return None
+
+    def send_converted_video(self, peer: int, file_path: str, caption: str = ""):
+        """Отправка видео через метод client_utils.send_video."""
+        self._is_converting = True
+        try:
+            from client_utils import send_video
+            send_video(peer, file_path, caption=str(caption) if caption else "")
+            self.log(f"Dispatched video send for peer {peer}")
+        except Exception as e:
+            self.log(f"client_utils.send_video failed: {e}")
+        finally:
+            self._is_converting = False
+
+    def check_and_handle_send_params(self, params, account: int) -> bool:
+        """
+        Обработка параметров отправки:
+        - Cache HIT: подменяет document на готовый видео-документ (мгновенная отправка через MTProto).
+        - Cache MISS: загружает видеофайл на сервер и отменяет оригинальный запрос.
+        """
+        doc = getattr(params, "document", None)
+        if not doc or not self.is_gif_document(doc):
+            return False
+
+        peer = getattr(params, "peer", 0)
+        if peer == 0:
+            return False
+
+        chat = self.get_chat(peer, account)
+        if not chat:
+            return False
+
+        if not self.is_chat_gif_forbidden(chat) or self.is_chat_video_forbidden(chat):
+            return False
+
+        orig_doc_id = str(getattr(doc, "id", 0))
+
+        # 1. Мгновенная отправка из памяти (Cache HIT)
+        if orig_doc_id != "0":
+            cached_doc = self.get_cached_document(orig_doc_id)
+            if cached_doc:
+                self.log(f"Cache HIT for GIF ID {orig_doc_id}! Sending instantly.")
+                params.document = cached_doc
+                if hasattr(params, "isAnimated"):
+                    try:
+                        params.isAnimated = False
+                    except Exception:
+                        pass
+                if hasattr(params, "isGif"):
+                    try:
+                        params.isGif = False
+                    except Exception:
+                        pass
+                if hasattr(params, "isVideo"):
+                    try:
+                        params.isVideo = True
+                    except Exception:
+                        pass
+                return False
+
+        # 2. Первая отправка и постановка на кэширование (Cache MISS)
+        local_file = self.get_file_for_document(doc, account)
+        if not local_file or not local_file.exists():
+            return False
+
+        file_path = local_file.getAbsolutePath()
+        self.log(f"Cache MISS for GIF ID {orig_doc_id}. Uploading: {file_path}")
+
+        if orig_doc_id != "0":
+            self._pending_uploads[file_path] = (orig_doc_id, peer, time.time())
+
+        caption = str(getattr(params, "caption", "") or getattr(params, "message", "") or "")
+        self.send_converted_video(peer, file_path, caption)
+        return True
+
+    # ---------- Управление хуками ----------
+
+    def _apply_hooks(self):
+        self._apply_tab_hook()
+        self._apply_send_hooks()
+        self._apply_notif_hooks()
+
+    def _apply_tab_hook(self):
+        if self._tab_unhook or not _Classes.EmojiPagesAdapter:
+            return
+
+        try:
+            declared = []
+            try:
+                declared = _Classes.EmojiPagesAdapter.getDeclaredMethods()
+            except AttributeError:
+                try:
+                    declared = _Classes.EmojiPagesAdapter.getClass().getDeclaredMethods()
+                except Exception:
+                    pass
+
+            method = None
+            for m in declared:
+                if m.getName() == "canScrollToTab":
+                    method = m
+                    break
+
+            if not method:
+                try:
+                    method = _Classes.EmojiPagesAdapter.getDeclaredMethod("canScrollToTab", JInteger.TYPE)
+                except Exception:
+                    pass
+
+            if method:
+                method.setAccessible(True)
+                self._tab_unhook = self.hook_method(method, _CanScrollToTabHook(self), priority=10)
+        except Exception as e:
+            self.log(f"Failed to hook canScrollToTab: {e}")
+
+    def _apply_send_hooks(self):
+        if self._send_unhooks or not _Classes.SendMessagesHelper:
+            return
+
+        try:
+            declared = []
+            try:
+                declared = _Classes.SendMessagesHelper.getDeclaredMethods()
+            except AttributeError:
+                try:
+                    declared = _Classes.SendMessagesHelper.getClass().getDeclaredMethods()
+                except Exception:
+                    pass
+
+            handler = _SendMessageHook(self)
+            for m in declared:
+                if m.getName() == "sendMessage":
+                    try:
+                        m.setAccessible(True)
+                        tok = self.hook_method(m, handler, priority=10)
+                        if tok:
+                            self._send_unhooks.append(tok)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log(f"Failed to hook sendMessage: {e}")
+
+    def _apply_notif_hooks(self):
+        if self._notif_unhooks or not _Classes.NotificationCenter:
+            return
+
+        try:
+            declared = []
+            try:
+                declared = _Classes.NotificationCenter.getDeclaredMethods()
+            except AttributeError:
+                try:
+                    declared = _Classes.NotificationCenter.getClass().getDeclaredMethods()
+                except Exception:
+                    pass
+
+            handler = _NotificationCenterHook(self)
+            for m in declared:
+                if m.getName() == "postNotificationName":
+                    try:
+                        m.setAccessible(True)
+                        tok = self.hook_method(m, handler, priority=10)
+                        if tok:
+                            self._notif_unhooks.append(tok)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log(f"Failed to hook postNotificationName: {e}")
+
+    def _remove_hooks(self):
+        if self._tab_unhook:
+            self.unhook_method(self._tab_unhook)
+            self._tab_unhook = None
+
+        for tok in self._send_unhooks:
+            try:
+                self.unhook_method(tok)
+            except Exception:
+                pass
+        self._send_unhooks.clear()
+
+        for tok in self._notif_unhooks:
+            try:
+                self.unhook_method(tok)
+            except Exception:
+                pass
+        self._notif_unhooks.clear()
