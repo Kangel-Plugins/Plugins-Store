@@ -1,25 +1,36 @@
-from typing import Union, Optional
+import json
+import lzma
+import time
+import logging
+import os.path
+from pathlib import Path
+from datetime import datetime
+from typing import Any, List, Union, Optional, Dict
 
-from base_plugin import BasePlugin, MethodReplacement, MethodHook
-from hook_utils import get_private_field
-from client_utils import get_messages_controller, run_on_queue, get_last_fragment
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
+import file_utils
+from client_utils import _prepare_document, get_file_loader, get_messages_controller, get_send_messages_helper, get_user_config, run_on_queue, get_last_fragment
+from android_utils import run_on_ui_thread
 
 from java import jclass
+from java.util import HashMap
 from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import MessageObject
 
 __id__ = "user_info_saver"
 __name__ = "UserInfoSaver"
 __icon__ = "zwyPluginsIcons/7"
 __description__ = (
     "Saves user's short info (phone country, registration date, etc) before server doesn't return it more.\n\n"
-    "> Requires **[ZwyLib](https://t.me/zwyPlugins/48)** v2.0.2 or greater!"
+    "> Requires **[ZwyLib](https://t.me/zwyPlugins/48)** v2.0.6 or greater!"
 )
 __author__ = "@zwylair"
-__version__ = "1.0.0"
-__min_version__ = "12.0.1"
+__version__ = "1.1.0"
+__min_version__ = "12.1.1"
 
-REQUIRED_ZWYLIB_VERSION = "2.0.2"
+REQUIRED_ZWYLIB_VERSION = "2.0.6"
 
 
 try:
@@ -31,7 +42,7 @@ try:
     ):
         raise Exception("!!!")
 
-    from zwylib import SettingEntry
+    from zwylib import UI, Requests, HookUtils
 except Exception as _e:
     class RecursiveMock:
         def __call__(self, *args, **kwargs): return self
@@ -87,10 +98,199 @@ except Exception as _e:
     run_on_queue(force_stop, delay=50)
 
 
+def is_valid_peer_id(peer_id: str) -> bool:
+    if not isinstance(peer_id, str):
+        return False
+    clean_id = peer_id[1:] if peer_id.startswith("-") else peer_id
+    return clean_id.isdigit()
+
+
+def is_valid_data(data) -> bool:
+    if not isinstance(data, dict) or not data:
+        return False
+
+    for user_id, user_data in data.items():
+        if not is_valid_peer_id(user_id) or not isinstance(user_data, dict):
+            return False
+
+        for field, expected_type in EXPECTED_SCHEMA.items():
+            if field not in user_data:
+                return False
+
+            value = user_data[field]
+            if expected_type is bool:
+                if not isinstance(value, bool):
+                    return False
+            elif expected_type is int:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return False
+            else:
+                if not isinstance(value, expected_type):
+                    return False
+    return True
+
+
+def parse_markdown(text: str, parse_mode: str, is_caption=False) -> Dict[str, Union[str, List[Any]]]:
+    if zwylib.is_client_version_sufficient("12.4.1"):
+        from extera_utils import text_formatting
+        return text_formatting.parse_text(text, parse_mode=parse_mode, is_caption=is_caption)
+    else:
+        import markdown_utils
+        parsed = markdown_utils.parse_markdown(text)
+        return {
+            "caption" if is_caption else "message": parsed.text,
+            "entities": [i.to_tlrpc_object() for i in parsed.entities]
+        }
+
+
+def send_message_internal(params: dict, parse_mode: str = None):
+    send_messages_helper = get_send_messages_helper()
+    message_params = send_messages_helper.SendMessageParams()
+
+    defaults = {
+        "peer": 0,
+        "message": None,
+        "caption": None,
+        "photo": None,
+        "document": None,
+        "videoEditedInfo": None,
+        "path": None,
+        "replyToMsg": None,
+        "replyToTopMsg": None,
+        "entities": None,
+        "replyMarkup": None,
+        "params": None,
+        "searchLinks": True,
+        "notify": True,
+        "updateStickersOrder": False,
+        "hasMediaSpoilers": False,
+        "invert_media": False,
+        "sendingHighQuality": False,
+        "scheduleDate": 0,
+        "scheduleRepeatPeriod": 0,
+        "ttl": 0,
+        "effect_id": 0,
+        "stars": 0,
+        "payStars": 0,
+        "dice_stake": 0,
+        "monoForumPeer": 0,
+        "quick_reply_shortcut_id": 0,
+        "quick_reply_shortcut": None,
+        "parentObject": None,
+        "replyToStoryItem": None,
+        "sendingStory": None,
+        "replyQuote": None,
+        "suggestionParams": None
+    }
+
+    final_params = defaults.copy()
+    final_params.update(params)
+    if parse_mode:
+        if parse_mode.lower() not in ["html", "markdown"]:
+            raise ValueError(f"Invalid parse mode: {parse_mode}. Must be 'html' or 'markdown'.")
+
+        if text := final_params.get("message", None):
+            final_params.update(parse_markdown(text, parse_mode))
+        elif caption := final_params.get("caption", None):
+            final_params.update(parse_markdown(caption, parse_mode, True))
+
+    def cast_to_hash_map(py_dict):
+        if not py_dict:
+            return None
+        java_map = HashMap()
+        for k, v in py_dict.items():
+            java_map.put(str(k), str(v))
+        return java_map
+
+    for key, value in final_params.items():
+        try:
+            if key == "entities" and value is not None:
+                setattr(message_params, key, zwylib.iterable_to_arraylist(value))
+            elif key == "params" and value is not None:
+                setattr(message_params, key, cast_to_hash_map(value))
+            elif key == "notify":
+                message_params.getClass().getField("notify").setBoolean(message_params, value)
+            else:
+                setattr(message_params, key, value)
+        except Exception:
+            logger.error(f"Could not set parameter '{key}':", exc_info=True)
+
+    run_on_ui_thread(lambda: send_messages_helper.sendMessage(message_params))
+
+
 def settings_has_necessary_field(settings: Optional[TLRPC.TL_peerSettings | dict]) -> bool:
     if isinstance(settings, dict):
-        return settings.get("phone_country") is not None
-    return getattr(settings, "phone_country", None) is not None
+        return (
+            settings.get("phone_country") is not None
+            and settings.get("registration_month") is not None
+        )
+    return (
+        getattr(settings, "phone_country", None) is not None
+        and getattr(settings, "registration_month", None) is not None
+    )
+
+
+def refresh_pfp_set_date(user_id: int):
+    msg_controller = get_messages_controller()
+    user = msg_controller.getUser(user_id)
+    user_full = msg_controller.getUserFull(user_id)
+
+    if user is None:
+        return
+
+    def update_user_full_photo_date(user_full_obj: TLRPC.UserFull):
+        logger.debug("Updating photo_change_date for user_id:", user_id)
+        settings = get_peer_settings(user_id)
+        if not settings_has_necessary_field(settings):
+            return
+
+        settings.photo_change_date = user_full_obj.profile_photo.date
+        save_peer_settings(user_id, settings)
+
+        if logger.getEffectiveLevel() == logging.DEBUG:
+            date = datetime.fromtimestamp(settings.photo_change_date)
+            time_ago = datetime.now() - date
+
+            days = time_ago.days
+            seconds = time_ago.seconds
+            hours = seconds / 60 // 60
+
+            if days > 0:
+                time_ago_string = f"{days} days ago"
+            elif hours > 0:
+                time_ago_string = f"{hours} hours ago"
+            elif seconds > 0:
+                time_ago_string = f"{seconds} seconds ago"
+
+            logger.debug(f"Fetched photo set date:", time_ago_string)
+
+    async def delayed_update():
+        logger.debug("Executing delayed update for user_id:", user_id)
+        msg_controller.loadFullUser(
+            user,
+            HookUtils.get_private_field(get_last_fragment(), "classGuid"),
+            True,
+            zwylib.Callback1(lambda user_full: loop.call_soon_threadsafe(future.set_result, user_full))
+        )
+
+        user_full = await future
+        update_user_full_photo_date(user_full)
+
+    if user_full is None:
+        loop = zwylib.async_manager.loop
+        future = loop.create_future()
+        run_async(delayed_update())
+        return
+
+    if (
+        user_full is None
+        or user_full.profile_photo is None
+        or isinstance(user_full.profile_photo, TLRPC.TL_photoEmpty)
+        or user.photo.personal
+    ):
+        return
+
+    update_user_full_photo_date(user_full)
 
 
 def peer_settings_to_dict(settings: Optional[TLRPC.TL_peerSettings]) -> Optional[dict[str, Union[str, int, bool]]]:
@@ -124,8 +324,11 @@ def load_peer_settings(dialog_id: int) -> Optional[dict[str, Union[str, int, boo
 
 def save_peer_settings(dialog_id: int, settings: TLRPC.TL_peerSettings):
     new_settings = peer_settings_to_dict(settings)
-    old_settings = load_peer_settings(dialog_id)
+    if not new_settings:
+        logger.debug("Skipped saving: empty/invalid settings for dialog_id:", dialog_id)
+        return
 
+    old_settings = load_peer_settings(dialog_id)
     if old_settings:
         for field in PRECIOUS_FIELDS:
             new_val = new_settings.get(field)
@@ -145,7 +348,7 @@ def get_peer_settings(dialog_id: int) -> Optional[TLRPC.TL_peerSettings]:
         logger.debug("Loaded from user_full.")
         return user_full_settings
 
-    user_peer_settings = get_private_field(msg_controller, "userPeerSettings")
+    user_peer_settings = HookUtils.get_private_field(msg_controller, "userPeerSettings")
     if settings_has_necessary_field(msg_controller_settings := user_peer_settings.get(dialog_id)):
         logger.debug("Loaded from tg's array.")
         return msg_controller_settings
@@ -156,40 +359,237 @@ def get_peer_settings(dialog_id: int) -> Optional[TLRPC.TL_peerSettings]:
     return user_full_settings or msg_controller_settings or dict_to_peer_settings(generated_settings)
 
 
-class SavePeerSettings(MethodHook):
-    def before_hooked_method(self, param):
-        logger.debug("SavePeerSettings hook called.")
-        try:
-            save_peer_settings(param.args[0], param.args[1])
-        except Exception:
-            logger.error("An error occurred:", exc_info=True)
+def save_peer_settings_hook(param):
+    dialog_id = param.args[0]
+    settings = param.args[1]
+    save_peer_settings(dialog_id, settings)
+    refresh_pfp_set_date(dialog_id)
 
 
-class LoadPeerSettings(MethodReplacement):
-    def replace_hooked_method(self, param):
-        logger.debug("LoadPeerSettings hook called.")
-        try:
-            return get_peer_settings(param.args[0])
-        except Exception:
-            logger.error("An error occurred:", exc_info=True)
+def load_peer_settings_hook(param):
+    dialog_id = param.args[0]
+    return get_peer_settings(dialog_id)
 
 
-AUTOUPDATE_CHANNEL_ID = 2521243181
-AUTOUPDATE_MSG_ID = 100
+def document_handler_hook(param):
+    msg_obj = param.args[0]
 
-PRECIOUS_FIELDS = ("registration_month", "phone_country", "name_change_date", "photo_change_date")
+    media: Optional[TLRPC.MessageMedia] = MessageObject.getMedia(msg_obj)
+    if not media:
+        logger.debug(f"Media not found in MessageObject: {msg_obj}")
+        param.setResult(False)
+        return
+
+    attachment = media.photo or media.document
+    file_path = get_file_loader().getPathToAttach(attachment, True)
+
+    if Path(file_path.getAbsolutePath()).suffix != ".uis":
+        return
+
+    async def download_and_handle():
+        await zwylib.ensure_media_downloaded(msg_obj)
+        with open(file_path.getAbsolutePath(), "rb") as file:
+            if not (compressed_content := file.read()):
+                return
+        await show_import_alert(compressed_content)
+
+    if not (file_path and file_path.exists() and file_path.length() > 0):
+        run_async(download_and_handle())
+        param.setResult(False)
+        return
+
+    run_async(download_and_handle())
+    param.setResult(False)
+
+
+async def show_import_alert(compressed_content: bytes):
+    try:
+        loop = zwylib.async_manager.loop
+        future = loop.create_future()
+
+        run_on_ui_thread(UI.AlertDialog(
+            title=L.alert_title,
+            text=L.alert_text,
+            buttons=[
+                UI.AlertButton(L.alert_import, lambda _, __: loop.call_soon_threadsafe(future.set_result, False), type=AlertDialogBuilder.BUTTON_POSITIVE),
+                UI.AlertButton(L.alert_merge, lambda _, __:  loop.call_soon_threadsafe(future.set_result, True), type=AlertDialogBuilder.BUTTON_NEUTRAL),
+                UI.AlertButton(L.alert_close, type=AlertDialogBuilder.BUTTON_NEGATIVE),
+            ]
+        ).show)
+
+        merge = await future
+        begin_import(compressed_content, merge)
+    except Exception:
+        logger.error("An error occurred:", exc_info=True)
+
+
+def begin_import(compressed_content: bytes, merge: bool):
+    try:
+        data = json.loads(lzma.decompress(compressed_content).decode("utf-8"))
+        if not is_valid_data(data):
+            logger.error("Import failed: Invalid data structure.")
+            bulletin.show_error(L.import_failed)
+            return
+
+        if merge:
+            storage.content.update(data)
+            bulletin.show_success(L.merge_success)
+        else:
+            storage.content = data
+            bulletin.show_success(L.import_success)
+
+        storage.write()
+    except Exception:
+        logger.error("An error occurred during import:", exc_info=True)
+        bulletin.show_error(L.import_failed)
+
+
+async def begin_export(ctx):
+    chat_id: int = -ctx.get("dialog_id")
+    topic_id: int = get_last_fragment().getTopicId()
+    reply_to = None
+
+    try:
+        if topic_id != 0:
+            response = await Requests.get_message(-chat_id, topic_id)
+            messages = zwylib.arraylist_to_list(response.messages)
+            if messages:
+                reply_to = MessageObject(get_user_config().selectedAccount, messages[0], False, False)
+
+        data = lzma.compress(json.dumps(storage.content).encode("utf-8"), preset=9 | lzma.PRESET_EXTREME)
+        directory = os.path.join(file_utils.get_plugins_dir(), "cache")
+        file_path = os.path.join(directory, f"UserInfoSaver-export-{int(time.time())}.uis")
+        os.makedirs(directory, exist_ok=True)
+
+        with open(file_path, "wb+") as file:
+            file.write(data)
+            file.seek(0)
+
+            document = _prepare_document(file_path)
+            if not document:
+                logger.error(f"Failed to prepare document for {file_path}")
+                return
+
+            send_message_internal({
+                "peer": -chat_id,
+                "document": document,
+                "path": file_path,
+                "caption": L.export_success,
+                "replyToMsg": reply_to,
+                "replyToTopMsg": reply_to,
+            })
+
+        bulletin.show_success(L.export_success)
+        run_on_queue(lambda fp=file_path: os.remove(fp), delay=5000)
+    except:
+        logger.error("An error occurred:", exc_info=True)
+        bulletin.show_error(L.export_failed)
+
 
 storage = zwylib.JsonCacheFile("zwyUserInfoSaver__peer_settings_storage", default={}, compress=True)
 logger = zwylib.build_log(__name__)
+bulletin = zwylib.build_bulletin_helper()
+run_async = zwylib.async_manager.run_task
+locales = {
+    "en": {
+        "export_data": f"{__name__}: Export",
+        "export_success": "Exported successfully!",
+        "export_failed": "Export failed!",
+        "import_success": "Import successful!",
+        "merge_success": "Data merge successful!",
+        "import_failed": "Import failed!",
+        "alert_title": "Import Data",
+        "alert_text": "Are you sure you want to import this data? 'Import' will overwrite existing data, while 'Merge' will combine the new data with the existing one.",
+        "alert_import": "Import",
+        "alert_merge": "Merge",
+        "alert_close": "Close",
+    },
+    "ru": {
+        "export_data": f"{__name__}: Экспорт",
+        "export_success": "Экспорт завершен успешно!",
+        "export_failed": "Ошибка экспорта!",
+        "import_success": "Импорт завершен успешно!",
+        "merge_success": "Слияние данных завершено успешно!",
+        "import_failed": "Ошибка импорта!",
+        "alert_title": "Импорт данных",
+        "alert_text": "Вы уверены, что хотите импортировать эти данные? 'Импорт' перезапишет существующие данные, в то время как 'Слияние' объединит новые данные с существующими.",
+        "alert_import": "Импорт",
+        "alert_merge": "Слияние",
+        "alert_close": "Закрыть",
+    },
+    "uk": {
+        "export_data": f"{__name__}: Експорт",
+        "export_success": "Експорт успішно завершено!",
+        "export_failed": "Експорт не вдався!",
+        "import_success": "Імпорт успішно завершено!",
+        "merge_success": "Злиття даних успішно завершено!",
+        "import_failed": "Помилка імпорту!",
+        "alert_title": "Імпорт даних",
+        "alert_text": "Ви впевнені, що хочете імпортувати ці дані? 'Імпорт' перезапише існуючі дані, тоді як 'Злиття' об'єднає нові дані з існуючими.",
+        "alert_import": "Імпорт",
+        "alert_merge": "Злиття",
+        "alert_close": "Закрити",
+    },
+}
+
+AUTOUPDATE_CHANNEL_ID = 2521243181
+AUTOUPDATE_MSG_ID = 100
+PRECIOUS_FIELDS = ("registration_month", "phone_country", "name_change_date", "photo_change_date")
+EXPECTED_SCHEMA = {
+    "add_contact": bool,
+    "autoarchived": bool,
+    "block_contact": bool,
+    "business_bot_can_reply": bool,
+    "business_bot_id": int,
+    "business_bot_manage_url": (str, type(None)),
+    "business_bot_paused": bool,
+    "charge_paid_message_stars": int,
+    "flags": int,
+    "geo_distance": int,
+    "invite_members": bool,
+    "name_change_date": int,
+    "need_contacts_exception": bool,
+    "phone_country": (str, type(None)),
+    "photo_change_date": int,
+    "registration_month": (str, type(None)),
+    "report_geo": bool,
+    "report_spam": bool,
+    "request_chat_broadcast": bool,
+    "request_chat_date": int,
+    "request_chat_title": (str, type(None)),
+    "share_contact": bool,
+}
+L = zwylib.locales_controller.generate_locale_class(locales)
+
+logger.setLevel(logging.DEBUG)
 
 
 class UserInfoSaver(BasePlugin):
     def on_plugin_load(self):
-        clazz = jclass("org.telegram.messenger.MessagesController").getClass()
-        zwylib.hook_max_args_method(clazz, "getPeerSettings", LoadPeerSettings())
-        zwylib.hook_max_args_method(clazz, "savePeerSettings", SavePeerSettings())
-
         zwylib.add_autoupdater_task(AUTOUPDATE_CHANNEL_ID, AUTOUPDATE_MSG_ID)
+
+        clazz = jclass("org.telegram.messenger.MessagesController").getClass()
+        HookUtils.hook_replace(
+            HookUtils.find_max_args_method(clazz, "getPeerSettings"),
+            load_peer_settings_hook
+        )
+        HookUtils.hook_before(
+            HookUtils.find_max_args_method(clazz, "savePeerSettings"),
+            save_peer_settings_hook
+        )
+
+        clazz = jclass("org.telegram.messenger.AndroidUtilities").getClass()
+        HookUtils.hook_before(
+            HookUtils.find_method_by_args_count(clazz, "openForView", 4),
+            document_handler_hook
+        )
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text=L.export_data,
+            icon="msg_archive",
+            on_click=lambda ctx: run_async(begin_export(ctx))
+        ))
 
         logger.info("Loaded.")
 
