@@ -20,7 +20,7 @@ store.json               # метаданные всех плагинов (кл�
 
 Ключ корневого объекта — `id` плагина. Поля (пишутся только если есть):
 
-- `url` — `https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/<файл>` (обязательное)
+- `url` — `https://raw.githubusercontent.com/Kangel-Plugins/Plugins-Store/main/Plugins/<файл>` (обязательное)
 - `name`, `version`, `author`, `description`, `hash` — SHA256 файла
 - `icon`, `min_version`, `app_version`
 - `status` — один из: `utilities`, `customization`, `fun`, `informational`, `messages`, `library`
@@ -32,7 +32,7 @@ store.json               # метаданные всех плагинов (кл�
 ```json
 {
   "custom_profile": {
-    "url": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/custom_profile.plugin",
+    "url": "https://raw.githubusercontent.com/Kangel-Plugins/Plugins-Store/main/Plugins/custom_profile.plugin",
     "name": "Custom Profile",
     "version": "1.6",
     "author": "@RoflPlugins",
@@ -43,7 +43,7 @@ store.json               # метаданные всех плагинов (кл�
     "status": "customization",
     "legacy_version": {
       "1.1": {
-        "url": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/legacy_versions/custom_profile/Custom Profile_v1.1.plugin",
+        "url": "https://raw.githubusercontent.com/Kangel-Plugins/Plugins-Store/main/legacy_versions/custom_profile/Custom Profile_v1.1.plugin",
         "hash": "sha256..."
       }
     }
