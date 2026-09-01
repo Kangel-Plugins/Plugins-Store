@@ -1,0 +1,667 @@
+# fmt: off
+import base64
+import lzma
+import os
+import threading
+import traceback
+from typing import Any, Optional, cast
+
+from android.util import Log
+from android.webkit import ValueCallback
+from android_utils import copy_to_clipboard, run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment
+from dalvik.system import InMemoryDexClassLoader
+from java import dynamic_proxy
+from java.lang import Class, String
+from java.nio import ByteBuffer
+from org.telegram.messenger import ApplicationLoader, LocaleController
+from org.telegram.ui.ActionBar import AlertDialog
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, EditText, Header
+
+__id__ = "uname-in-name"
+__name__ = "UserName-In-Name"
+__description__ = "Отображение юзернейма в имени пользователя по заданному шаблону"
+__author__ = "@n08i40k_extera"
+__icon__ = "LedScreenEmoji/47"
+__version__ = "1.0.0"
+__min_version__ = "12.1.1"
+
+LOGCAT_TAG = __id__
+
+JVM_PLUGIN_CLASS = "ru.n08i40k.uname_in_name.Plugin"
+
+TEMPLATE_KEY = "uname-in-name.template"
+DEFAULT_TEMPLATE = "{o} | @{u}"
+
+DEX_COMMENT_BEGIN = "# === EMDEDDED DEX BEGIN ==="
+DEX_COMMENT_END = "# === EMDEDDED DEX END ==="
+
+
+I18N_SETTINGS: dict[str, dict[str, str]] = {
+    "settings.template.title": {
+        "en": "Formatting template",
+        "ru": "Шаблон форматирования",
+    },
+    "settings.template.hint": {
+        "en": "{o} | @{u}",
+    },
+    "settings.template.desc": {
+        "en": "You can write any template, and it will be used when a user name is displayed.\n\n{o} - The original user name.\n{u} - The username, if present.\n\nThe template is applied only to users that have a username.\nOtherwise the user name is displayed as usual.",
+        "ru": "Вы можете написать любой шаблон, который будет использоваться при отображении имени пользователя.\n\n{o} - Оригинальное имя пользователя.\n{u} - Юзернейм, если присутствует.\n\nШаблон применяется только если у пользователя есть юзернейм.\nВ противном случае имя пользователя будет отображаться как обычно.",
+    }
+}
+
+I18N_DIALOG: dict[str, dict[str, str]] = {
+    "dialog.load_crash.title": {
+        "en": "Plugin failed to load",
+        "ru": "Не удалось загрузить плагин",
+    },
+    "dialog.load_crash.message": {
+        "en": "The plugin crashed at stage `{stage}`. The report is copied to the clipboard.",
+        "ru": "Плагин упал на этапе `{stage}`. Отчёт скопирован в буфер обмена.",
+    },
+    "dialog.load_crash.ok": {
+        "en": "OK",
+        "ru": "ОК",
+    },
+}
+
+I18N_STATUS: dict[str, dict[str, str]] = {
+    "status.error.dex.missing": {
+        "en": "Plugin engine is missing from the source file",
+        "ru": "Движок плагина отсутствует в файле плагина",
+    },
+}
+
+I18N_STRINGS: dict[str, dict[str, str]] = {
+    **I18N_SETTINGS,
+    **I18N_DIALOG,
+    **I18N_STATUS,
+}
+
+# fmt: on
+
+
+def _detached(text: str) -> str:
+    """Copy of `text` that shares no object with the rest of the module.
+
+    exteraGram reads every field of a settings item as a PyObject and closes it
+    right after reading, while equal string constants of one module are a single
+    Python object. Two fields holding the same text would make the second read
+    hit an already closed object, and the whole settings list of the plugin is
+    then dropped with `ValueError: PyObject is closed`.
+    """
+    return "".join(iter(text))
+
+
+class JvmPluginBridge:
+    """Loads classes.dex embedded (as a base64 comment) into this very .py file."""
+
+    klass: Optional[Class]
+
+    def __init__(self, plugin: "Plugin"):
+        self.plugin = plugin
+        self.klass = None
+
+    def load(self):
+        dex_data = self._read_embedded_dex()
+        if dex_data is None:
+            self.plugin.log("Embedded DEX is unavailable; plugin will not load")
+            self.plugin._show_error(self.plugin._t("status.error.dex.missing"))
+            return
+
+        try:
+            loader = InMemoryDexClassLoader(
+                ByteBuffer.wrap(dex_data),  # ty:ignore[invalid-argument-type]
+                ApplicationLoader.applicationContext.getClassLoader(),
+            )
+            self.klass = loader.loadClass(String(JVM_PLUGIN_CLASS))
+        except Exception as e:
+            self.plugin.log_exception("Failed to load DEX", e)
+
+    def call(self, name: str, *args: Any, types: tuple = ()) -> Any:
+        """Invoke a static method of the loaded JVM plugin class.
+
+        Raises if the class is not loaded or the call itself fails; callers
+        decide whether that is fatal for them.
+        """
+        if self.klass is None:
+            raise RuntimeError(f"cannot call {name}: JVM plugin is not loaded")
+
+        return self.klass.getDeclaredMethod(String(name), *types).invoke(None, *args)
+
+    def _read_own_source(self) -> Optional[str]:
+        candidates: list[str] = []
+
+        own_file = globals().get("__file__")
+        if isinstance(own_file, str) and own_file:
+            candidates.append(own_file)
+
+        plugins_dir_getter = globals().get("get_plugins_dir")
+        if callable(plugins_dir_getter):
+            try:
+                candidates.append(os.path.join(plugins_dir_getter(), f"{__id__}.py"))
+            except Exception as e:
+                self.plugin.log_exception("Failed to resolve plugins directory", e)
+
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                self.plugin.log_exception(f"Failed to read plugin source at {path}", e)
+
+        return None
+
+    def _read_embedded_dex(self) -> Optional[bytes]:
+        source = self._read_own_source()
+        if source is None:
+            self.plugin.log("Failed to read plugin source for embedded DEX")
+            return None
+
+        payload = bytearray()
+        decompressor = lzma.LZMADecompressor()
+        collecting = False
+        completed = False
+
+        try:
+            for line in source.splitlines():
+                stripped = line.strip()
+
+                if not collecting:
+                    collecting = stripped == DEX_COMMENT_BEGIN
+                    continue
+
+                if stripped == DEX_COMMENT_END:
+                    completed = True
+                    break
+
+                if stripped.startswith("#"):
+                    chunk = base64.b64decode(stripped[1:].strip())
+                    payload += decompressor.decompress(chunk)
+        except (ValueError, lzma.LZMAError) as e:
+            self.plugin.log_exception("Failed to decode embedded DEX", e)
+            return None
+
+        if completed and not decompressor.eof:
+            self.plugin.log("Embedded DEX payload is truncated")
+            return None
+
+        if not completed or not payload:
+            self.plugin.log("Embedded DEX payload is empty")
+            return None
+
+        return bytes(payload)
+
+
+class SettingsActions:
+    """Builds the settings items shown in the plugin settings screen."""
+
+    def __init__(self, plugin: "Plugin"):
+        self.plugin = plugin
+
+    def build_settings(self) -> list[Any]:
+        try:
+            return [
+                Header(text=self.plugin._t("settings.template.title")),
+                EditText(
+                    key=TEMPLATE_KEY,
+                    hint=self.plugin._t("settings.template.hint"),
+                    default=_detached(DEFAULT_TEMPLATE),
+                    on_change=self._on_template_change,
+                ),
+                Divider(text=self.plugin._t("settings.template.desc")),
+            ]
+        except Exception as e:
+            self.plugin.log_exception("Failed to build settings items", e)
+
+            raise e
+
+    def _on_template_change(self, template: str):
+        try:
+            self.plugin.push_formatting_template(template or DEFAULT_TEMPLATE)
+        except Exception as e:
+            self.plugin.log_exception("Failed to apply formatting template", e)
+
+
+class Plugin(BasePlugin):
+    _full_load_lock = threading.Lock()
+    _eject_lock = threading.Lock()
+
+    _load_logging_active = False
+    _load_log_buffer: list[str] = []
+    _full_load_started = False
+    _ejected = False
+
+    jvm_plugin: JvmPluginBridge
+
+    def log(self, message: Any):
+        text = str(message)
+        super().log(text)
+
+        if self._load_logging_active:
+            self._load_log_buffer.append(text)
+
+        try:
+            Log.i(cast("String", LOGCAT_TAG), cast("String", text))
+        except Exception:
+            pass
+
+    def log_exception(self, message: str, exception: BaseException):
+        self.log(f"{message}: {exception}")
+
+        for chunk in traceback.format_exception(
+            type(exception),
+            exception,
+            exception.__traceback__,
+        ):
+            for line in chunk.rstrip().splitlines():
+                if line:
+                    self.log(line)
+
+    def create_settings(self) -> list[Any]:
+        return SettingsActions(self).build_settings()
+
+    def _show_error(self, message: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+
+    def _t(self, key: str, **kwargs: Any) -> str:
+        values = I18N_STRINGS.get(key)
+        if values is None:
+            text = key
+        else:
+            text = values.get(self._get_app_language_code()) or values.get("en") or key
+
+        try:
+            return text.format(**kwargs)
+        except Exception:
+            return text
+
+    def _get_app_language_code(self) -> str:
+        raw = None
+
+        try:
+            info = LocaleController.getInstance().getCurrentLocaleInfo()
+            if info.hasBaseLang():
+                raw = info.baseLangCode
+            else:
+                raw = info.getLangCode() or info.shortName
+        except Exception:
+            pass
+
+        if not raw:
+            try:
+                raw = LocaleController.getInstance().getCurrentLocale().getLanguage()
+            except Exception:
+                return "en"
+
+        return str(raw).strip().lower().replace("-", "_").split("_", 1)[0] or "en"
+
+    def _start_load_logging(self):
+        self._load_log_buffer = []
+        self._load_logging_active = True
+
+    def _stop_load_logging(self):
+        self._load_logging_active = False
+        self._load_log_buffer = []
+
+    def _handle_load_failure(self, stage: str, exception: BaseException):
+        self.log_exception(f"Plugin load failed ({stage})", exception)
+
+        logs = "\n".join(self._load_log_buffer)
+        report = (
+            f"Stage: `{stage}`\n"
+            f"Plugin version: `{__version__}`\n\n"
+            f"Error:\n```\n{exception}\n```\n\n"
+            f"Log:\n```\n{logs}\n```"
+        )
+
+        try:
+            copy_to_clipboard(report)
+        except Exception as e:
+            self.log_exception("Failed to copy load-crash report to clipboard", e)
+
+        self._show_load_crash_dialog(stage)
+
+    def _show_load_crash_dialog(self, stage: str):
+        def show():
+            try:
+                fragment = get_last_fragment()
+            except Exception:
+                fragment = None
+
+            message = self._t("dialog.load_crash.message", stage=stage)
+
+            if fragment is None:
+                self._show_error(message)
+                return
+
+            try:
+                fragment.showDialog(
+                    AlertDialog.Builder(fragment.getContext())
+                    .setTitle(String(self._t("dialog.load_crash.title")))
+                    .setMessage(String(message))
+                    .setPositiveButton(
+                        String(self._t("dialog.load_crash.ok")),
+                        None,  # ty:ignore[invalid-argument-type]
+                    )
+                    .create()
+                )
+            except Exception as e:
+                self.log_exception("Failed to show load crash dialog", e)
+                self._show_error(message)
+
+        run_on_ui_thread(show)
+
+    def _prepare_jvm_plugin(self) -> bool:
+        self.jvm_plugin = JvmPluginBridge(self)
+        self.jvm_plugin.load()
+
+        return self.jvm_plugin.klass is not None
+
+    def _inject_jvm_plugin(self):
+        try:
+            self.log(f"Loading JVM plugin {self.jvm_plugin.call('getBuildDate')}")
+        except Exception as e:
+            self.log_exception("Failed to infer JVM plugin version", e)
+
+        ref = self
+
+        class Logger(dynamic_proxy(ValueCallback)):
+            def onReceiveValue(self, arg0):
+                ref.log(str(arg0))
+
+        self.jvm_plugin.call(
+            "inject",
+            String(__version__),
+            Logger(),
+            types=(String.getClass(), ValueCallback.getClass()),
+        )
+        self.log("JVM plugin injected successfully")
+
+    def push_formatting_template(self, template: str):
+        self.jvm_plugin.call(
+            "setFormattingTemplate",
+            String(template),
+            types=(String.getClass(),),
+        )
+
+    def _apply_formatting_template(self):
+        self.push_formatting_template(self.get_setting(TEMPLATE_KEY, DEFAULT_TEMPLATE))
+        self.log("Formatting template applied")
+
+    def _finalize_jvm_plugin_inject(self):
+        self.jvm_plugin.call("finalizeInject")
+        self.log("JVM plugin finalizeInject completed")
+
+    def _run_plugin_load(self):
+        with self._full_load_lock:
+            if self._full_load_started:
+                return
+            self._full_load_started = True
+
+        if not self._prepare_jvm_plugin():
+            with self._full_load_lock:
+                self._full_load_started = False
+            return
+
+        for stage, action in (
+            ("inject", self._inject_jvm_plugin),
+            ("applyTemplate", self._apply_formatting_template),
+            ("finalizeInject", self._finalize_jvm_plugin_inject),
+        ):
+            try:
+                action()
+            except BaseException as e:
+                self._handle_load_failure(stage, e)
+                self.on_plugin_eject()
+                return
+
+        self._stop_load_logging()
+
+    def on_plugin_load(self):
+        self._start_load_logging()
+        self._ejected = False
+        self._full_load_started = False
+
+        thread = threading.Thread(
+            target=self._run_plugin_load,
+            name=f"{__id__}-continue-plugin-load",
+            daemon=True,
+        )
+        thread.start()
+
+        return thread
+
+    def on_plugin_unload(self):
+        jvm_plugin = getattr(self, "jvm_plugin", None)
+
+        if jvm_plugin is None or jvm_plugin.klass is None:
+            return
+
+        try:
+            jvm_plugin.call("eject")
+            self.log("JVM plugin ejected successfully")
+        except Exception as e:
+            self.log_exception("Failed to eject JVM plugin", e)
+
+        jvm_plugin.klass = None
+
+    def on_plugin_eject(self):
+        with self._eject_lock:
+            if self._ejected:
+                return
+            self._ejected = True
+
+        self.log("JVM plugin instance lost: ejected by a concurrent reload")
+
+        jvm_plugin = getattr(self, "jvm_plugin", None)
+        if jvm_plugin is not None:
+            jvm_plugin.klass = None
+
+
+# === EMDEDDED DEX BEGIN ===
+# /Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4MBTRmNdADIZS3CrFZXsBPTpopB7K7Awcxjd9Vk/plj76x7NMmp7iMb2BzEVcyjZGcdX3qC+b9HMQgaiC+46x0XR
+# y919V9BYJwxMVJP6B9RAyfWVk9INvJr3aAcVatvH2hXsiB3KeQ8AqdxKZcRjEZaSMUH/maf+1jDvUVOYEY1+NGVzoYXwwOjvXAPa9xJ7q/kh/VaQxr1kBF/w
+# fGLbn3QBPH/IYHyVCxDgEeUw/eXoqp84Nf9J1gsb4BZHJNa/VYzBefZSivw3aKFFhMiMXGaFTXyAK2arj0GgWQFaVaVk96nJLb54MOgLxv27jc4O/Mt10MYl
+# /8dokBinr7BkkSE/xQ/hU3x/RncgtWcVgsQyd5SOfVQ01UMIuFj1B0NIY5UJAMJPb9zl0Ia2yZBLrqqzxHJFwhgwZf74pd0S/oIoq9HtlNN2GRCIRRC59wNy
+# /+bXzsX+VsyxHpkIXrhsjLxXQ6vQNfbxxxADyDg0HUIKy03Z7TJrJYRot1zwWq0MGOZr4ctSRv4t6iiS6MC8CuTadIsRfa/0abH4cRou9//gSAOlVrklmFR6
+# wNF4q9eZAxReLT6QObNaDiSjkx7VZWOUmHf1PlEP3CykBhNRp7HiMfVHzS6uxVpvUJJ6cS190cO+dAOs0wYOTOyXFIl/yKnp0b7fqUiW1CeNIsBJMYZz06vA
+# 1VsxITwhq7Nnux9lIi8qx7h36k3PBORvh0dbW8RaU6bpqOi1Sz5NZO8MwY/BgYQ3oXzsit0Wj/wOkfDyz/ei6+BEgOSPcMSbApnaVTURITw+RlhRKxA45dUs
+# Ca6CamfFRS7eRxRtr+nn9fzjKjyeGqWCzkQxQrQAOrUXoyepWgJR/7D1Pzrrob6pif9I+be1fF81HBeCp6ihyRYjSQ8B3uOyEXgfZs2qFLzL8z+dBbDxA5EB
+# 32kaTBFeM4sAfZBd8yoOr2SvyZqrLKFRIn3OysYAZ/gslq+UJCBBTV8EuXZe8NM1JpTCOq0E9nRTJEApoPX16CQpo2pTYGM3/JaH9xJyoHjWHbXnVa/kaa12
+# 31DfUfi4MCabtI7TvfnIySgj/wJolg2Pe4lxSJl3fkLXTqOTDqYDS8vWzg6Vu7v7K/FNBvwzv5h814+iTkF/Dv1AfddiPQJlxCws0HRwd/KVE4FyLwYxD4YI
+# rT5QGVdiU05ZPqPp028SligdsiWI63uIAf6aqOkKF34JmhwdAip6fsOk+UKA3RuHFmeSZShSHXsRiiyB1ltUxsMr5kdmR4lMQ0JQlzn9UscZbGi7Mzs1eBhh
+# g+oaPaCk1H3KSw1OonQhCJ0h/N4yswYXGxuMXtl1+OUwYs6uv14V81rmC5VF7EoLF6H/sH6BBSfW/WJZuLnRw2AdqP+1LhsEd64LOmi5T10FbbjRKGqX+k5Q
+# e1JDIeUwEZxKpzGPQkyZKEa9dMi1HsMS3i+vvvrOg7/emxZ3h9W68mQEDSkZ5zEm6fDlZ4OUS2zI/N7rWqgyoMoO+/FYgqQbZhu+ZV02j2ryU+0xrCeQuo0h
+# hrh/n1yVUaqe79g4WRNFXSqGYj7qDDoke81fOJAKOscSsJuDlwrowBpxABV/nd5odJWrI6VOzxrZ+Otm2cOORqKlO3/+lA0Er+mtN3Vt5eP6yjoHU29OrLaQ
+# B1rPD7ntfzTSLVcPWU+eus20WNAQFdBq+xem2itFs8fAIR0TKYqUSckA0vVcreW4Ux8AaeX+X3RX90i+CcTKgQ/CuZLx9wrfP9h5OOWHY9Y6E/YRS8hfd1lS
+# qFWSadFIU94WKfUaLKBkc2pg1lnQyJBqvCSNTmKonODjnRrXhFDcDk67SoyJHe/p2FmF8z2sqd0Hf7GTI7zm90lJoM0fWxZV8wsRvzFUHpFZDmVwNwjpQ/1o
+# kCKBVUfkXhcDLCMSwe1ujbdlRvKrcc5JcoKUA2SREI2mIK7TjzU+8z+ik/rHC3U+BkGqmcrNsPVU2a31pQHnhARR4/EcVTHmhQHO1AfZnh9hM0Cx5DkzR3FC
+# Dk67oDvZBBDHw3X3ZFsgEypIoelMtfD3r95E86NwNxcl7bedR/KyOb/oFakweBSJ9M9Of0Gtjpd4NxwKH/oOEZR+omt8XVeS8laRIn0Fe2Q8jGiAFGCX+glC
+# pyf/jpBsAl5U/cp2meLmxurzWNE3am6VPPSLIoI4q838G2+FyeM5+gGNpn22UQo/BW7CtAL16iFhPow3/Gbs5DMcGSDahVmlXqJgwMb5hA2wTVHnruUy/7Z4
+# brloKeIw8hPwRHQp4/kyuqRmgu1732EfEgIwXJNJkFxCpWLA0q5ryD5RL4YD/iDbzk64UZ0Pi4+vvcAyF2nceOKQGHUICK78LhEETqHA/JbpUonb8fXQwb0R
+# Ngf7vTFZEpJMsmYa/JYHZk7Ncuha/8L7N8bbRXLAFlQmh+PycVV/i1hzv9NXihtk8JoPG5qX2hRdENwB3vlvzh8UpaegkoT7Rkn5lNORwJmBNXmKTDzq3GaD
+# kbhfaRUbSK02fcPvDyYUdvwFLixxf0EKqwwlyWJEJ4tKYcx4cf9yeom0u/D450wLqx6+TkHMIUNjO4lm9KSa6l2sHl50fubGrN4vU3QB4zCBufadvgAS+6TJ
+# fdf/5nfYleyAPy1Rnbfp8RD4HsGY7duSbml9uyJzKy0rwg55h/XuPWzn1OgyZOA/uhbfjNf3EcxpdodAnVElBmNLnItkrjLqOCBgK8dJEnGJsPlJZUpnS5Br
+# AZX1Z4NqmRkHHiVm6ARavmTtat/QSYKk6sbpmsppQe9SwcUF0QVndKanyQnX7iZpZdFsjykGgKJ89TT9O3tGV2I82ZUcsK+lzLCQmF21rdRAYDLqW3nNeBiH
+# gQmHd6rwurvxL6NmvL4RXQ4LvEQyrCfDGun72cwmyTCed6s7EBJ7YbJE2ZmRYpAkMyVWM8IjHVAeqSRYbUeOfbavjM7xJydtqo8sT/SV1HQkUze8dcztIfUN
+# iWN4zcRyXlnQAr2Vp/GbSVjI2YIa2LPNWnTMISbtmjX5CK+2zoXfSu1/w8s4ei8QrmGuxusbOWmgeP/U4hZTd3V2d+oZp2H64Ik4Sy68XxeUZntaGf+Xvc1o
+# 4Ho+4QOz4GdBcjHhbkGW4PFn1um6s1KTEmODrsU1c+uKcqzC5fy5dqhEENdii9BG6xvsJVe1vWZANo2iNcPgcgYBJ/MDb26ABEIHAG7jKxZo49iKAsifTpOS
+# dCv49B54geB+WmiO+YS8ADhdaXneAbRH8RfiUszh1BF3OC3lAyoDhppTtsi5eHG6JBiEd4x48h3lw1K2Xm5zAgNYC6mRrEIp2mcGqUmTq8Qu3B8q0uPDO4Yt
+# C+Uz9UWPupqS3NGzJVUZb6Tyhm4wYGa3bXWqeO4rMszOodBFr5M+8B5FTW7uPb2wMrWRq0e9MtsmcmqJQlOfCBr/lofcf2ONCQJrrdM7wqgBkDA+Q+bJ8q5D
+# xIlG/AUXCRQO+eTLAQPYu5KGsETze0gFMoTTab9hQ9Pk+Hqbny1UyJTzVx3BYiBAi+6s3FlzlgF3Xmh/DGcQibM7aituwr8m8WEoCxYet0AZjHr3PtwnVKBX
+# GWDU+qNlxXSyX5vQkKnW2Kj0Si+lQWoHsYyJPdGauLh6j8RWSg22kq8/LJkwst40V0GCHXK4v0pxI4M2zsshru41GJrZEsHtTjlEi6AaIEpqHmEnrP37kuRf
+# pCjK/047Vr7RRdACC2fD3H3aL2S2+hT4Ob4HIZdPMRRNmbewklXLSbNCW5wfVf8tDXjO4CksqR9zuoZHMTfY/NGrONzs7JGL7C8UQxiQ56iVZ1A7gEK9KfzQ
+# pRQdc/sBLe9CO95N3XtfRUJ8LNkxY7bSlgCvCvm7Ma65xzxxKlNJJ+1ZcAjQ3RrG0EYSpU1Pu+otZ2txZe5X7PqCmGqToVxUTzQaX+hej9CUdn0dNIBc2voH
+# gtTrYqrkkOT7D6uNnE6iAt46a1yWpdDgQ+u9xlBU68XQtOBUxnW0gR9pVx5Q2ggdikcT2Y4SE/y1EJCDGqvGTBottB4icy4530DcUKvai4FH0Hs8PPo1bpsr
+# tGeESjICqkOVfC2Qow5qbVL7j0WodVtZVZn1pE5qOW1Wbotw/nNQVPEiz/SpsUQpl4B/0sF3cPhI1tiA97U8kHwdiukYqhKeb+vEuG13yUOylmlw4gU5dxRc
+# JjCsJk7QBWkgHIvvvektByd+3jkWl4xQ6gqQwpABGGilIMx6u6W7/uFDYX3w0TicmHXiI5xwpEhpfI5x9zHONEmSviON/pVuBuYa1OMz9V6ShzL0W/amWvPT
+# N8MIZQNRRI46JeK/PSjfPDoi/Tc2xkk30W5KneN+k2NnW5Wzz5i98muQF4FqzP9VkVUNoyKjt/nU9S67ducz5Oc4YDzAe1USgxUSm31sEYOnykRuPKd2iXYo
+# PNPN9G1UBFgwgIrgovxyDB5+vdLWymUkX6ZdtTMotvMyFBjO9yaFKQAFL0mnqG9Kmjh7TCt04TR8mIx4u6UiBSNMGMr36UGK10qiOdcwvwphugLUftU9tkw9
+# EoXNGWOeUsnsCVpoFRyF5ZdjIDUkaDsfj4OfIcyPrylmtEPKJJELOxazsb0b/0SrZM+E6JuyMTGFceiEpr/Dw2gF0mtjL1NbVrMuKPbBnrzB2PQlVwzxCFtU
+# 7T4Ojfq4wXW/0fHolo/1UW3L73DB+GU0imrUWRbDR6/GfjWHc+gz66iPpBUN/IXNazPZzLk9lcNGnD65pu3XoZWokNGmAOQGh3rlT7r1feheb8eTUhKHe9Xc
+# eFtoR7rCmmtDZudMvfENC7stjCkx8NCQ/AEwtQy2ck7ERgQDAecSyszm8DfH79Cv0kRBoKRqfgsrNbMAQyPkUkr9UYpC4SrcatKvJlFK3uGtNpKp0NTvVW2L
+# JYamMn2VFk5sj6G6r58HVYFAs24stPBgO+HSbKk9UIDoVB/HNdjtVlMHpBoccXh02mm9ZF13BATRTy753zHN0i0jqnofnAfNq03JruJ4GKGtiIEGj6GeDAi2
+# 8fYWKILbG6qiK8IF6IIXS+IHUYXbW+BMHIMqJkb1qolbPIFBFfFHeyWWwMkCgGN58Xlt+fKQO7v7rorQQXyLU0hbVKYkbAKmxoj+cSy8tUD7vbqFS51JNeWI
+# zBIqYYMTZNHm9vnJGe5LE0CgVVPWViSk0ejP/kEImTV/oRnyFVA6alhr36sWwc0m5WUK39C8uLz64MPJ7Az63GInZObJePy4l2J9NX6bfYr3bROW5W4whC47
+# R7hH8RMJ60bKe3s0DhsFQIlHoUMdp6Kc/GVZ1GFGlpR80R7QCU2W4MTTufL3xG+AzMrPzUguuriY0XuMPT9EHBHlORYDTtD/oaxi1wB4kIxegFVHo2JzUqB5
+# t/AZaJFb+DzdMB7tQ97Kwogh7oq5zmkNspiBIfc02+E+W6JR9GDyMhTKZDNvmEFs40F7SXUpAJ7XA63bnrho4+6kQM25bzmEGBviP2UGkc9qfcfusoeLzfQI
+# CUph4BZ27GeHTw+bnAg8RKk94+74Xl+70Oulr09jbLBY4vdd7AMrEWJbe8kltDUx29Le48Dej7YUE+dIZ+VA5JrRNpWEbn9L6efSUaeRF/YrGNiBaBzLtbnI
+# pcEcSyRiQkbERO4DgYFSXISNbQugLbfIstfMFG7kWevG7qRt88EuVdQ9TXR/GphYdcSMe5WFKV2NNUfCSY5nPS69Cw8JMNfx4Ud38nWd9D3si57UuheD86Zj
+# or2jt7TRYoweC0x/zDfs06k16JknIvhmmZQsee+DI3lKlUaq5Q4nEv2AZyKLTLNgY72zFnRPWWKQlzPTCWf0Jvj/ABs13P+uFvjPwNAeEcj1c3xdK9nhyf2K
+# PivlPch3CqJXbOBC3q06ftziuaHpPoL7/N8KHQ2iM6WhkYl4jyh9qsSJb7CFnd3Yt4TDrlRdkOu2zU8Tw7SNA2nHItGFw+jdxZftfMYnu336OHabRiY/9LjA
+# TKiJh6ZNihMFS6IKQ8aqS76Vur/RG891Unx84KIJi5K/NnomcV6ZgjmJU7KEpYPDpOU9xrmf/g76UjEF1A7VMxERMa+tge/eP/dBR8rPlv081zhjeXoh/mzD
+# AqbKUXfNNEsVkXrudcgi9HHAeflbrhbK+mvl7DIEYmJNfAJPdAq/6mWj7tt5bIAMcgOXTM1whtgg8HO3YyymWh66koP0n1MZ+KBt+x6dgUHFeOF9PouUj2jY
+# YoSOHLls4JBJEHgk7jmlFYJcPY3ZrzFzJdL0TWgD6DinQPnONtK16l3gsBXm+SI+YnblYn/WhXLFPxXcqOkuJc+IytwtxpWXnUEvM1wYndwE3BoVzb6TSBFk
+# aklDbmbBxu0dYmsuMpwl6LY4ILPIaNU9zU3JsXnmqm2YOnjZI4hj67hampM2OLESa7U8AWUDAWDBKqgRZfsCu++PJfQyw1EtqyJJG2lDT4rzcsdVkwE7rsui
+# RuYXm1eDx1Xh1iYD0Q0zIKzVxN65REuuy3fWPZs5ejmEEYRxa8neSom73Bg65PCEIk2xYuhC/dAgjdTDtCj/QF82vNFgx2Pt5blhqWmHOBJVab7kR4avWWKj
+# HktmdWYPIHuXCvSXDOUPEeN5AYUQI1WtH/aK0f/TNRScQnkQMtbvkaxZ3yJp6eidxhs8sH3LcNo7wz8Q8pvDwUGg/L5ttb6wAt4PBj4nW/2XDegGCyZN71vj
+# lCe8vHz5VcKVGjZx0C2Dp7CnAs4o51k+mnVfJay/+yUxJ4ItPZGVSW3CCDNSFlerDfloQB6P7Uvi3dWAyUC/oOg2sm6NvQiVU1g5bk5xNf0TZSHwbHIZxkvk
+# 8GnA62hYOIfkAGxXMw9aAWEuTx7Sgr4CdxKZENSnOnkserk3hkABkCsVhpJoqbyjlqaCuUfKAyLdblrv9qndlwDf+QFBc87JiO5jjiZa9c5HO46IkiLChzi8
+# i/Zjr8eH6p8iGe1clQ5kWvkUCxdhL5ZIzRGvf6igVbkL3hQx55zEUSCvOXQrysLcb3HlK8ucad+kSxDrws3VWh/L6y2l++s+YBAtS0iRT+NeKL+nfIiY+TdG
+# bHb99oIxpJxUu1hjSwcBL6aLsDdZVbyc/nHLyehSXewvpQzNGOMerQvzj+heqg9I5biWq7zgGDNrI0N22lGOUVL8ABvJ/YKF8G98W0NYv6oRIkG8kiDuyAjo
+# ARDAwlJAWvd1Z/a55MT76c8rURnuda9JEW52OGhNtW9N5cyEQ47y+ch40bnOlj6BkXbOE/oF10LTZHT/zrxs2iI4iQ+kccU/4GvmZv6t+igVsDSxJE/W9wAt
+# 8nPyJAEQF2AWPHiBxmWKThgqA80UAVN5owcETTs0t2wBvDnu51IBbwcM7ce4odzImXBmWPmkzh0IWP9L04daRjd+aY3EF7ArZ5fYMjvPUfqlEhQSgt3lUeol
+# pXjc3ntvC8s/gFB34kWvSVJlv6Le53No0fwuJJCkKKAjtzYWhrHTY75H5szO3PPAbsqdCCjI3vXc4yQWJUfv4ZNAQade9Swwp9ITo8oNxNsttvabvWGAUe2q
+# HF529mxUeItucXUoiRklFpGk65Z/A5PlL+cY9tEP7YaKNlhmnUGB3bPzwblYFMgPhvqJUTR1wNpJ62C0OizEBxXeirLVs7FewsD7UZ9nUMj0JUPD5W7SBV1G
+# pck5CsMTpl9Po2zUnY60MYA+hwCiB5btgl76H3mxqEjsjBbBVPCkHOCP1V2Z1MwS9BtW8+peHkXY+kRDGmYBQRKdD6uU+3j+rnu0YwCsjnB6s4yQwkjuhiwf
+# D+Fvx91y8G8EOmlE0pA2Fuk1yq7nwnrXrSuUBlYEYaF9dxlm58fkBnQbfVpPCqwD4BP+0MRkbnJbbeB+AvcfBMNyhXjRxzgR4YRMyfguRpmDVox7wG/CSoKF
+# 5IzOIfhHohQO4CmQicZNddJSNrjnpBP7FXRqRFl/KKpCFyYu/kSgR01KutDplky83d73k/BVcXgEAtcn+Wd5qka94W0m+s4JRHvKIRB+2cCSD7DPh3xyyP3b
+# KpVfFaiDP/FVDLwGRMI/qA5vhk2/M2eGtPHeUC/oXdCRKMLUejDmL2HHajkO6QtzYizCD9OR+c3KcuyQOtAYik7LJ+VKUwqsY8JbSzP+Wn+Y974EPmLUBn3q
+# F3SqAuB1vpOMFtIvSZJMSPEpMb46lOEi9NsSQ1OMzHWFI0LnG9JixdIFIZSMtZ4zx5T0B/YZKXUBg9YSuAHqLBJIK/4oXfTZ4hmXjwLeBwzja9726sNZ8cES
+# hBcm77lWWT7MOWhA9d+g9EhzLaRLKzg5zwEVzCJXRXNLfOfHbvH9oZriRkGz+ozC6O+RiUWAbyPRMf4hbHyKt5gfu0H/yhn1Xvw33He/BRRfuDUkgN4Kg8aI
+# YGlMGn3YZO9tYgA3oIy3mrw3AN+f8oBnVZYh7lfDFXHk+TpAlqHn8VsnMYly4xXt0OUPF4UuQna0r8Wu4GjsUaZ0AFOgYFBNKQC/pOjI5KObHwHCQVk1WoW4
+# GKwT8bBcwHBK4yXj3+BuOqM+WylwKvuu5YiHB9Xe25dJYDxTIQZ6w/mOnOtbUWpTQWYhxNNqAqZ9ejSYGBIM4yLGG3JokDKByDmjNZjr+DcD/gTDQr9+jK7l
+# s9q/t4psJuHjghs2V/cZKTJsDWImLpNDN89S3KzKN+E2oPaM0fe9V8EbYlC+fk5gIayFZ9soOziMZpsvZLYel0zTp3ba4QyPbqsxZggjfhm3Of0oxkpAavb8
+# mFFk9YmIWGbn7XFwwVF77Ib0r5/gY797uIC26F/4IUJR0z/sAXHepbaMTUYF+XiA6HEI4X0+Bnq3Mg2yqNSxkD0il6LRssBrJaaz8FMy3hhmgx+uubbJdsly
+# Fdr6Su1bFGOz5/tbwTfW833dRlj6era1HrqCQdEvBaijY70/3LhRBJReSGF9VYue24tEqasZb4iO9Ocv0CUPYW945XWulfVaaBiE65eG+unoGWSSlyk5H/d3
+# wmcPm2/ml/WYY6DIjQ4abB/WFCOrhjjFEk949q6NBVBTrgLIIEZDDurwdvlrJpd73cSLlT8jJTAdsDOnuLurRHrQWVx2Q9RoZXxpqwRNSz5VFRrOq9hwdGL8
+# Ez/8SLP9T5+WvGsid9g2UpLAyiUTFGwzc8x8dnsw4R9iy5MKOJIbMet+UytQcKQZETbjwuf34E3W/+ijiFMUdfIrC7WX3N4UyBz4AxrPDMoEg0HVOzDcJKh2
+# ia95nyZyTRyeaUUj9icMwMzyhzIKCMbE5lm+UqX3GFBBFpMdZ6xjWOMFs1BhoKxy84khJuYHNxZhBF72EGfpBrDBeGcfwMAN6MrWsCb7bhqJnI/pEQRsZgxW
+# vZX1C8tceYHE2aTBc+Gk1aVx0Ho/VTEyhYfvhHhGdPov+Y6muO7Aj8/IQjOGSRA0eR8UjPmSUu0XYRRM1+Ue98fWQBjIjwkwtv41iNPf+700Pcjx4YkyXk6I
+# 3d7TJjbwGTBQ6k8yby9TqXnpvWuoN0kTLgc0ExSTsaP365gtwjuzx7rtru2bFfKK2GbbSavhUK6fMH2ue8bxIXc/2qA+Y0dxMgmxmqwnhf1v/VRC7qIKZwtB
+# A9UAskc23hJ57/COEGYFFyq0J8d+9uqkJbD/k1+3XVl7kmZ5ivhriWYSgk5oo7HI6UHfUbje73pphikapB4oiUFSXTgMww6u86MCBaqt/fuy9879NJUMJm5o
+# 8mb8VyG+3c/jOy/kkCMPMD0AWRIwqs1x3b+M7oCFEUkSvJfR4eZ848Cud2lg8E0W16/rR+ghh0DU3wR3R04WEooBEOvvfcx0rVAKoC7j4zRmV6T8g3dplOcu
+# gvYMpajZKHm+ypa2EUf7OWj066nKXm9OQZ73wJEaEjH7QP21aLX5nAzhajnUwtPWlNaSaDACYNq2cPLoPxpYv8Akk94Oh+eXbNIYIxfCFmxhduULslzRoDOS
+# QUJ2lYQY0rAiH8NyrbqlLIYyrucRIkNiyQqeEzb3PqYQs1ERlSVglTbFz+ys86LTv5zCGyhF9Yra5jVlZiixBMo4wERT0taJ7npCLJ7njFnUiU4ieRIXzY5u
+# 9jxA+g4Ww1idy2Aw4NU8l1Qxw2Tj0ScX9n3Ar9sadJkS4Q6khFVufUuDQ7pB48aMCyoza0T6rnOZQNJhURGzsIrvaEiN99gyt9AquxMt5q8cB0zH8crYywO3
+# sew8BoTDCWgBb5fMivsiW5sBNYAe2CdCQ91YUxwTzQZbX7t5juCUR8payB4b/ScY9n0aCoueekOWzf9H+oqIwrZYIuzTfDmow/eE5c0jQNE8KXKIbd62s2gH
+# AJOx+UaQF4zkd44x+vEjx+LpZ6bb/ZItXWGfK+wOMB2GDYtRK/6LWC/hPHaQrCFC2Z0ol3AuM7DnOTH4/ms4yKYt1l33dsZxEubplq2Szhu13qFAGx1u7xHp
+# ++vkqp1SxZEGgdnVBNqA16mqU40LweN6wuo59MXuFlp+gSG9yakMQWSCVmqeWRBc7rSRtqKtQz2a+ykr7u2pHFEj/cG4yC4kDxU67bhEAX8h8I8d1E7aHuxN
+# LED65pxhX7aOomTlQd3iypP89zA9SbidCFTQfSYVRgmTK2pzrJ0dSnbadgpE0Byf+ctG9O3XoLdEvg6C4PeTU9MYL32PXir7BVFZ4gY0LtccaVfTHKFnx6CW
+# ffhEmhTnooVX6KyprbfJ4LMJGyDqNrWR+TQg74oqD8tFYb1NOWwz3zi8J4a5dV38EvKsx1H87bOEJzCkyL1PiH9j0+QUDz3VOArgK24BEx6o6Nd+He9Jkx+p
+# fONvNDGsL66VbGhxd+V+s3JZrD6BQ9FkdSj5c/kiHuRmw94UYPT2zVW8q3h0/ZtbTik4VYn0SF53E3okWkZU0HUpnuYP6Y6fq0vJQuWEdemiM1G+PD1PwJoP
+# 4pOuS+BipEajuEs4Jze7abPAWT2N8nFzGrm92ojf9EqvffpqSJU9Ih3Ur+coSDCLWYFs+hSx2d4RwIMjcdom2sq/Xd3DKE/aVECd+AfDhLT6GOFTtgw0nGWF
+# PZECzSiKiGIAzKhFJq0OFSCCLbWNjueZjJlnUH62EsvvmoSIZEUhi1A5+/QFcq4nf2Z0c8R0e+lyIVR5X7aKUBslQyB9Ud8DbdZnWDFW9lALx8BCy5dxjpTs
+# j5aSeBR4wxsHil5sLa1btNCNhw+yJnH5tWv9q8i8B8BsA29rLBu/Vw2oPiMZljr2QWeiwNSZltG7xe+TRkT0s7iYKMQPvNxy4vzfAPLP3yNf/Dg3W1fgiNzE
+# kSlvYUglOF7+zeSoJp3sdWKY8Maq5p5oQgd+h/OV0Bg2+xtOSRJU4LWUG/q5uQLJbgk6x4PJ80l7rVO+U6vgCUXKL2ifDdpUw1LTVohSP4USN6Qi70G170SY
+# TwCMe/+xiVADVI375zqyqyM7XyAh5wrF2xkz4PZ/69t0XuS3TsHksng+t0M2BNgVMmDQ8Iyp8UtRQCbJoM1qcBe71jd7bx0D5uaoF7e7ROZaRn4l25H0qLSM
+# tpuvJ62hy/RmpQ9gwfso14zgf10dDV8+iSVuIfc7Eur8i9ZcT4xynp5Uf5mX52senY2cqUAKnbpGrZhaDHNRY5ZKe4XuJfY/gJanb63I+XHnUntAItdixXRg
+# tdvwQmSDt4uAsi+yhiKeqyzbYshhkcWA0OkTWSo47jdzJFEXh+RoE6Ga5aYIUD4WAeg3kU4OukB3ZYOloNq3pa9zReHEEurG7wPmsftbxpogmpbPapPI3LRw
+# juqCgHRP8o/BjWAr91MWclFPg5cvO8IdaZbIbFhwpUB+F/KvbAb0L2SxU0ODXQ+POhVETv02f3nRyk2NSzyH1iMIIldrcWgFyrzkaecy/KDu7fvOc99aPHSf
+# 00bHD7cnGcvzTl/2KfgPtItUFw1loOVrPb91DBYwlgq8ts6Ordj+4+UZDbav/eiydPs1ufT6z7lxzjcBCTorEw335YFoSylWyUsrXDoKN8BUasTlp0lOTkpU
+# DaJzuFp7lMm1ozZ/SGZk3liPYnI9DKN0YwBjBzG/TaM7epg8lbPKzS6lfm0LYT6u/UT/Y3qzkGKq2W72q0/6TRWcNudDxR5+lEqyDnMjgE8owaYT5pRIMZyz
+# QatnBcJ1+1IEaHUyzvkn5dMN/uR7oHoutu1d5gZ9nAhqV0S6DAKfKTh0WwjkTYO8cwe/j9tukftZyxrnXFSAEyZTQahsxrt76hXoUdABG++YVUOwyjIzDJg4
+# R/964PMuV+8uu9mAaiEU6e4O+A+thkvCb1uuZCp0JTXzJwyuoLILyiqr70/vrZp1V1FUfxnfpFtA7jlXeaQu5zYxo059RKAKYRbNwDO5cHarhxfScDGMPeZK
+# jY/yRB+rcCbQDVaPkJa8/TmlUHgFyMbguhJJj6E0AgvtGlUy0QTB0yCA3ZHpSqQJfHa2f6EdGX+dbB66pckF3fZ+g83k+yHNaiBk9WvOMkHYJediw2ofAGIu
+# bErMG2xAKTtAlhcukiScINRE3XI0nb9ro8n7iJLPXbDmdoFbd6737fxtSWms+5nSGxmKk5grmZL9Cr93RKkz9uXoFm17E6qay7AtdwMSr4l5BsqKWBpndscJ
+# mQy6y5yqzsmyiSqnyo9YYv4LFqQF2jSIGc3Tl+isrcijj+M4PtWkjrjTRdkHY0UeWwUzhfx1uw7xq5CEihldVqlrfr+C/28ZctWLux/dTg9IsZwkJAnD465F
+# elAWi1MrQVf5tKgTuiH5Cb9q8omhqgySL3tarind0MKI1V1trTgfyu6Vcklq2bAqBYcgHR9m4DN1eAJFRQBm1pUSHfj8dMc4y6hwh2f/koUwuJ+aA0P0BO/z
+# uLOBCu36Si17hC5UGDoD72ft5ZwZSgo30vDIy/10QCWAK3XvcygNjFM0iNpyeipiqEph0h+kqslZo67GAcRXlAJT0LU7AKym51ChpzAcx7KMaGcvBKd3O0oo
+# S1ThvdCY2RkGt2gs/jjlYoFC8HccUrfMIvgBDx8XmGQXJS4bZvJnsL6lqLsOR//1FYNwNlzP68bAV8+KsatCPWByZKoB97L6ehieYDXCnZf//xrF05e6uvlD
+# /gi2qrqz7pKqmWaP28RNMic5mIEtiW0+2g/N50zGZfnIAZ6JLHmMYSK5qPx4OFJrvKL+klOvrtAsyavZr5pLNugfZIJqoAqKspSjNLHEY6q6dvWid5KLSX67
+# PKOvDJTIDaWhcKETXOBPH5A7ofF+XK5TK+EijgxFE3eXRSURcjcGFRDBLvQ7ach5CKjOVcI0aXTVz9lsPierCqzjQ3meKgUYAn0rvno1bnOlN/i84V/9iChk
+# DEI4r/FiERM5sQZzZeT1D6wqkcPtKozUtuB3O0slEnz3YtAUf16m+weIA20Q5s+sdN5eMtyZCE7dX7sbI7N0XoGaWPmGQVgPk8f2pHl4lq9jdsa3Dcpo8Mwi
+# cKfvJLwEvZ7+qQ4DpmBg0hjxKGg2DE5HEJWKzkR+BUnorxeLjmfVabkpyVg/DF6ia0rwHXyTHQehLd5eZAtMxKNGPJGHt7hltU3ET4NxR53V4mnxFkpdfUQb
+# 7Tnx7CNq/+BDV3X7+jJp1I1J5Zwszl9+JyibYRhfkoY5KNau3Z2JvHI7YLMyq0fvXnU2mcjI6wqwve6BRdgwQlPZqfYQbta7fXBFkgPar/27z5+awqxr4urk
+# kufVGrk0T19g2Nnk8nMHxDL3bc8AS4AieWRqyrAa6YSS1QM/azzjESeuT5uydaxhDoMhZVQDUk2JHmuR1w1J6T4YGyfsWONSGteUm1L6RbBMzATOc6iFDooF
+# YiqHqRRa0VmdiZfE5E2EpdggRvfhO8Bk9/6PT8NXksJ6rET6K4VdoCNhiLQlgtkp2FYcwd0MAsX9FqnihhytiK3+rs0r2l1Utiao7hD+FNi6bJ9aCS5IALVn
+# u+Qo2KHUxX2J+XuxinHsOVL1fv42P6LXh55AJgFhZpuvRVD8A0jDzzOdknBzUrzoJPVeNdxzJLwHEmKy2oA9hL5ipDcvuLXwR7klcwyuS3hRhkZBVn0dYNf4
+# z6muMvtEb9qycWe7ZSRiZxX5uUNHzan0gQjXIy3X9+l0MD7+qBg8Cn7i2r0kJD2CY+a7rG62mGO4ytIX6z08UHb9nWRQ8Pta3lBCSA5dAouY7SMYVxfA3zHQ
+# ug/8MluCAFckVpasXE/BzCljf9n/Y+mmwbrSz9CCZlwTBKhugAfwbkmgtWrsXPpCFP71qTx+qAcq2GxRi6Db3+bE4pdEkqGxx4p7+ju4O5rCa82/hJx0+IRD
+# 8HZX0OIDzWPO7pp8wsmKYj+M6DwehBblfmaTGtNrKdmVFxRjeKCUyoSgYNTvQdyzyhINHLhemV+ZfMhdsFqL4mK1RtIgGs1klaYSGEQCw/q2F6g9x9IMNsOc
+# E8gKxQVux4ljsCYv9zwSYzitjiCTlOEqaynOvZAgQ93qGCSXnaLTKPavx0Ekg1VrJGifBahu2k6/kHM2Ve6QEMb3v9hmNO+NwinHmbhuce/pDTL3CnG9TCSA
+# 3fjKoemSRiwR0Xc9CbdbAofwkF+PZ/1coLqMoKv2A2Nbv3vTIofg3O70Nfynve5hzLVyB5UNGNMnJ9IYUi0x3zRRXlo8iqFSnzXmWYLQYSTiErvay5D559Nq
+# d5zRqZplqkk2oUUuoqmB01tyQkXmD4IaWIc2VIdXHlpk/dkp6gg11mN9XvFyHkuJ/ONvuSOS6lx7AzhJwWqguPd7/+/JFTItK01iRtGtYfkZ6j/NwADNBxQT
+# d5B9ex83dImng8TmJK1CR/acsfS8e/817skfmh/9WLG+2SjaZ3Rl7CkoLYVEqCxmjCjJ6dKhYxADQpPejbDkrqCBxYT3nVBu6KDZ2q1gaavAu7hTHmwWy4ha
+# IVq3kxym3iewJfmHOMsI9z4zNhnp1Wp6f6e9U/Q1x8WTwgJEzhPeFOkWEGhQCVJAmatOs5k+943XT6/N2WYUo/8dY69VRee06F/4naCQKYFq8Tu8AMStWBpG
+# kt3mh2DFH6d4EKhHIgKWBazh3kOerueWe+HlBjQ4C/SxAkLb/eY9eR4KEHvlbO3jw2DhtHTnYxNpmBFqm1wFiIwLYphCuBoCyIT9A2xVgJWj0aUOMg1+OEZZ
+# nOm/w9L8fK8bL8NvsHRnG6Z3EyMiMnZ9iABgoozgmTYbsIzHLiD9nOoQElES1JacdtGyADHg+6tpODhSavcn+ZF+Fu3H0KBCHclMTpVwG2DgaE807584jpQK
+# f9SLGeEUmRXUslTobf3sSPHgb5qkhD6TIeOugR7Xt1HoxTeiHpoDP8pO2Se/Nc4p/154fML8R4yMXAVti/wAmMfig66/HHxpBKLjnANVjWwrhxAkO6XoPcfO
+# bitf/auII2G7bqgJJgUq/sVOqI3e0X3ctqtKdIkduzB9lfZRQ4uIYnhoUI7GtASU4m7CmLiWgW5bXaS3+D5O0kKmAToeXPqxFepvzRsB0gReFd9e62A3qD54
+# VHpvW/Jq/2o1Khi5hAwSVm1YTMM79ny+xyExx+Sg5JS4BpOOsVqms+mW5BeKE1ZEc5EDSz5WtpWJp4mOy0S8vgzjVyNO7Wk8umnkOuwm3cQTf585rPqqWpql
+# yzitWrzNM1i8O3ITAhaq1VVj7cls1QuotMT0nVxzjPqfgt0YeA80+4o+RDUZSoobNIkyXoTVc6mSa4MqrUU3vkTamT0JX8sJMNRVOv4utEfuPn71WiOlJJQw
+# vm/FbkvebXFXJ3/lbOzPsQYAv+BK3c6v4IU15UFAVxbTxA/NHQ/jEq/AeXfbVSfK4jHHkMZCeP8SG9vTX+5ljmdI7awrqf9ct2skOjC1MWLydfm1Aqry4LQF
+# pMNGMQ1Ws1nC9mmlJAkfHY8C1FJBDIy+GzdCed/W/K4Zy1NjXqJhaQt0C4G08bsF3et0Fuv9cHQXueuYlb+9bzq7Mfc5D6mRr8jFXNJS5Nuun+rC9VA3Cx9Z
+# KzM6RGeylxlLZTPdap3CKizm1bvyHsEdL46AVjudD/k8lsz1Yade9FGRUDnZ93+nuYbZo4iOWnnyu1P/SuGAVRq6Ab/8VHnFMVeNDqwI0OX9GvepnTT1BbM0
+# 8iif7WTwDBQfmExausjbeHyz15e7U+DpLnrWYv4GBTRfvsYzUQkP6yWG9PNdGLHB7NLk5kbnydVVsxDpLgVJcmmbCdbxiqu1YHxe25ymYUbfXmktn3R1r3Ro
+# WbZXX3NEMHskQB6hA1oQhShs6w2rmVxv8nkYrWDMGLZUXjmnD8665+iK49+LKUVfCe3M7OWTdNW6+yZpgICehcDoQCgy5kxs4RrSzDtAWsimz+K5pt1sLB1W
+# gBJ0CmYAFK9bWXB1V1kV3HOoKkL4n5bQjiSUcLzxF9ot7CKDlc9kYZdZRr1di2xq5VgPtOzht5g5Xsw3rsR69qTz6nFIGmplEXch9g6LtceCP2jLi/eJ2Uzh
+# mSlOE0UtyfqSYbDyaoe0m+rJc2wGBZPHgHnPm7ja7CySMMoUO8qREB8U8be4BYRCuyYgAu1uZPb8iZ1CESRd+xHw1EBDGmln4uuKsHzSykHeshslOFhDud72
+# VPvunH0SAtqgD76Fb+oalugP0fCmz/UxXy9JoP80IQQ0oBLdbdTeWsSugahTrOttruhfM0NOb8c5SELIWWR7JZKcKRUEwPeQ5i35Q9Tur6ZFBP/tnVBfeUbO
+# Zy0HjxsknC7tTJMzO7kgbkiPfdpz0CWHUm3DOXbcJWeSpAHFTeNc2wdywZgxT/IUsaa+nmCP/5zTdPsH4IifXN9FvT7foDXlG3619ZJr6uUAGpQnHoPu8x84
+# t6E+hYQ0U3kCIe6JrZwp6mA1ljVRmEbc8Or/8GcH58BHiUucvj9bK6dVAhL8C+WgPxbuMf7583FB52i1sI+7ZeCdZ5PVSmI3eNPHS1aVJefVsM+UWg/L165T
+# LOfvMiqL2eKKr9K/MtArHYJg2P1SQW0nasJOB0NcVkGz8dNh6AGnm53xDWBFu36EqPgQZI3nOir5Mp9p+Vx8S4yd6+pTBv3NGSCtvdRF8wBJH5qCowio1T4U
+# oMdpoSOvFQznvGcZCbR4+fa7C3AHp9YR+SmL8rDXQQR/b+FGpS2mKlbxDB8oYBC7pB4yLDcJmSTusiwZckVe86epvbbVhhuMjkbH7IGgC9kWqCXH/vXJkJIx
+# HsmNcDPykffXtsIDogAPfkO+5lbEJtespV7yrGgdGhmpWe3xv5eFmrKSpDF/x1szDV0+t43X5d8SNvxe1x1b5fC7LdOir0Q3ExTtubPBJNo13Il/ySNgvU0M
+# vasMf/9jml9AWpFWjYPLaiBSMC7KAutLdbedB4GNFz9UpdIwKF8KpTTVvsw4OcJKtofm9HjkW3HDbcK38QPuvEX6ZUjhs4quX6NDFKo628HYZ1GJzpHeGuqS
+# gePM/AiS42oi/3n829jLxkzq12TfrIoOzOFvwrgBHZ0E3fV+HBG/a34U0Eirve4letRm9MjH7O8+nJ+X6vJZEK77xC3CMeL6nCa3ZhdnPJ1lbofL6NHPnDXj
+# SXAocr2yk5b+5Y+CvHi/fkqh7t9IXVk2Ui8Gvpnyk3kqMgNduNIhiWeWtSty8kA9PIpi7+fpCHnvtTrqHjyQ89dpywZ/QfANwiZiUGKrcI5HYpvZ8VkUlcXd
+# egc8FI1GMP198b28rK+JGap6m2B67wDiUxTAmtouQeVJJNq0LlyUkymMLjBzfcqOcCJG+sjqE+HpIeaBCXZvOuK2683DKRVjyQE+YjpcjoInUl64TW/WeKWu
+# yYwfLg4TtX8GzGW1jArsosETHjWa6WNFDp6v7cpaeDv5k6p4hyDAIt79kaCu3aZp68lBDaxfZOBGOGz2BrAgdKltvQMkoutkgKiPKNkV/EYeWmzTwqoJj2H6
+# njBbRMRG/ausAcJrpKJ15deyb4asLmnQkNbowWbv1jY9Mx9L9/RcA7auzgWcT3gRwuHoftYprf2E+AS4HNkLBQi72VMDDG4SwVPs8RgLAkSBfU2wUe6rJUXD
+# W0bCbL6En7sm3TE+Cj/Pm/tYAYrlGYHVcgA4lEJMGKlQy0PyrYNoLXAMT37sPJwsithOIPhogQaduBfrITZmIzkD363OW+CQiFb4y1dzsRz5VMtOYsTYev3s
+# 9dK4T32wb+wD3w4Bu+G3FtyZuoBJhWuqfehHlAAFPPdPJhU0xuM/FesZbZI2pmBVxJHslbyTRXJgYi6Q3Su0q6kiPPTj5g4RIJiotQlKj6sGfM84f82QPZA0
+# HPpni8Skr9krh3IWCp2xLIiENW+SE+/kT6tS5P+aOHaDd2/YcYAFtlPAqP4TmWD/rk0DkmJe11jdd3HHHPDxzV/cCelo3RBmsDNf5KHxBN5tq23YWkDQkyo8
+# 9JqQZZH16cw0RbiH6ySSH5U9zjpUXJSoMoXireSiXrgF3BexPNaYCmBxQD3mG1xShCN5q/WYBspaNNyy9jA3ZYD/8VNHMkrgnTSj8k/COQyG5VDA4Fdk+eU/
+# p/uWAGxJYykEHd8Wm7+sSgzCfS/2n3Xaeyi/GelM+4SOyiVAb4XSGCVQVPE/FSSPTGBN5Lgfqs/kYS98iLLvZPup9goD+mQ0DOvs4aeQvixAemNbiwtsOnxB
+# qE6vjdbflBsRoRQG0AWaw0tklM0UgkiFb/GsviiS3WATDdBNSUTsYacpeWesYDaXThDwsre7vxlwhwFNfPCtQrzgvWTzDJhya/g59xzJSdGXKcFe7GTYHTQ8
+# QFTR3H4bxriqRFYTKhaANsrAxQTEnIe0weXWR+sPKntJa+R6f3V9gjgagLbWhR0A0eX0SZs0azfCw4bt2eGMr39rWZ9sKT9CFzc+WFZcYhdysXiYMfpWLIFO
+# qKLHrSTDgWIBvN05aOr1qb90bcwWWUcCfPEzzwfqjAe978381YgBZ+i7qUlLN8XkunEYDgUTlLJR83Xm8bmUAfV7PYPmiDEGPMmO2s2z5my2/kYh1v5JvB+Q
+# atQdi7WNqJNwKSgsP9r637yl3KBPcduT71h04riTOwCK/9Ny0jGqhXcN4vLVs5VjDYbcn3re06BNnve6k4b0Ub7/GaYsXggEWbotfBAF/rUTF/fCkVeEa65f
+# 10WUDcB1a6LUhTEo5rv5DG25od/TG2jS++i/6X3ElndO92Iq8MHMI/ENsV25wMrKy+eH/cK1JS2gb8rqzV3Wte9GMzx2/wWITAn9z8IW6vxBtXL/hJdxdl41
+# SJ9+zMPz2YD7JvwpFl3hqSP/aFeLQ9bCgoUCUcBNI9zQY9HtEywNyyisMbF6l+rW7S4A5GnhtXHNtNtQFZswFjai23CMSDYA/1zPJZiBhRcIO+bXQuuto1Ai
+# 7UdG3He96/j+hxyph6Mk5bbg8gUczAmiVTlFDj7prVR6DVTqi2AvnNPGSkdRavHjY+Pq7Enws82FiknQzFiP3SOjYQ5XnCU3SKL+DBhacebmKdf4j7P6JIyU
+# ZkuOIn/WiCylyiW6bwQiNaYR/kYe4AhpJVAokjYW42WzEqTSDouVDsMnGtaSApjsTpvpGlKh/KWX6VhjnnTN0s6MZioJlAj/trdWlWjC6KyXGA0lo5H4CPbq
+# 9pDwp0jXNMszaAg8uzQcU3zO+L2E/fxAbkV3+a36MA+Risvr0OQ3tN8TowPLALQvbp6ohDy72us4p/ipMMKWdKko4AxBpa7OAEar6HTy+fTvIDSN6SoYgmYX
+# 0ZtvWh9PkYLVho1KgOVTH7gaY3fxT+Y9JQKgq3C1fV6aa6CQm0KOkz3w6M/oCMFoefA8vSFZ4b+70ysFi73ABdw/o9d/dxe9RhSI/+wf9VQnkwEG2H9wOQ7h
+# Ei+R5s9x1bgtagmWYfqE2awJ/vVyL6B71hmicHW1qq1LNZw2SzIpTCWNpq3j0rS8gOdkV7rNDbDAhRCJ/AVSTNlHwM+hE0orK9PRmlDSgEpgw2Uxn/Ui20uY
+# snxIQ5fdD/v9F3efBqnsAddjo8NBYmtIZ040nhT/8O9F6sDwwy/s1IHsW+xahRfXoBD35vMfWO2gJIH09EmMdLkP9tDqKHZhd4JArEWw9PQgiZlSBVQTwVBz
+# 0gt57ZeDQ15+M7pGi8HoOxchDj7rauyM6gOYw0csrfOmh4omHhXxyhVKv6b1F7qKhz96p2zYTWfthvVIJb14a4IKm42e+7y9e4lhCMw3Pc8E2N2tSj64eRkH
+# w+dCdiZ4/RhIezug+ivn0AiDt/SrgFPbLBLmltQvwPgEBsWCrzUjxi1NO0UAT+7flRFrQX/f+TQXFyBlhPWngVzYYNPE3oSwPP/VGY08O0kcKUBmH34thgLX
+# J0JhSPjyukEwzpWBDIuSJUeWFmIsiDtulzWUqwDBgc4cQhRDnWG9ApOda0vNA7CSN5wLbQ8WljAieNAtqnAxOddNRGM/SvAqA0s6lPvYE85UGAlUqtoj7cwn
+# gtEDzHDVkVXx000gQ2nkWykWLrLkzOAtzuE/eLQdY38izfythBi8ZCy1hznvc+nHPH3IA0Rkal0oAdIh4O1IvyUs31O+nSEaztXDe1sM0ogFCjWArGtiBLwb
+# FZrsMeZOfrajjICaoBc/8/Pi/plyzPWqtmeb/tVXIKaW5RGGjY7uheSgLaYtcDq9YpTnV/bPDRwMJfgmxsTolAehZOPP3G+0wXo4umVUy5euh3l2gwR0PP0H
+# fRSGGBR8n3u7Vjo+HrrKGdblrtFooXM9LOGha0/t7pkOm9onsiw89bewAVq34WYzaf8AcqnhVZWomxhHLSG4Ons6BmtT545+c9q5bHUeuKCPYBc5U2DR3WTu
+# EYClnYxOuhoaDaiu2zQTixfMaAeLgUwkfSp7eh8JHI0n+H3+IMHCc2jq4anqg21zhmSsCFvzvmdHylCpJyNW1noVlIMeiesQWNZJvtNlOuEFCmk+SLpRckOk
+# S5nfnqhfFJ7hlnqyL5px0/Al34snpCPdPd1m2XuS+q+w0xeuh1exTZKq/zkEgOHmMuScw1c8Km+GPabKsBaL/vJMNuC1oYedhUZCdOpbg1U3TbBpDQw/eD1S
+# e8oR7oU7Bqr2FhY741jE5EJmgQf5lG8q1uib/w/49pHGkt+jLYvw5B7uInhTmzzJ49Dv/nbMxhmw5XHPo0daUW8oHAe2TZwOe3kev+INCcQFOrSn3RNtesja
+# PmhlaxOv6dI1U2rencEC0RLEx2xKKu8qDz0P/dSi7m9SF4Kc385rEQC2wu7fRUX9g1DUXZyNIlLBqwNplzHrIdXnu0bYsvU+uzv/lY/3IIxVf2w2SS3TT2El
+# 7xvgz0p3W1BRIa1tNMZmm9/d9p/94qGkM6Jh29bECB33zJZ1lc2oDUDuzKYATitYKsFOtVD+8K+XhVKk5+fkSGxQcr2ItN68nH/HftFSRa2BjbgKG7pUzNJA
+# NaOgaEnHmCplZT/f2sGl6ey2yFP4KJ6Qd3Wq4T8lA90ilXJzXLNuMGRMeQyKiOcdyTfyvcbruP0FHx6OC/YViANjgbYGlm5aakVUDAv26TxpJzigt15PsPI6
+# PhYlcQfTPKOtk233a31/2zgfOl2jB/UnPUpUmrkcJx+5FLmJrsscss7CdwZv3SaE7uiKuxhjcKkkdNR4rr1oH7Id0uV23LbZwsqtD9GyCxHWeV9Z3UHVly9C
+# eTqTFq2om9KB6jt3OT6jsGM/0Alat0S9pqMo5XYdClyKdUjY16592XfF+ybLfRa5aXi/mvd5WkyFWvzJf+/GIQy3S/VKzJAU6Ni7N/MXVX9PWpVI0uF1C8VV
+# JzM/Wd2H5JHfb/OotymFyAq7Y1j+r2TRREkaUjwGo0w6RLWhreiz5UWbq/GWCwIXLrMl6PtAuvLc4a3hx7Ii93i99m9qqA9JmpP35EBdZUDWvymNxBOzk6uf
+# dOagCj1TpSNXkXovgqJkeRmssOE8anUnbDv7zVtbevR6JdRz7Wk8b4FRmtuUdBPwYmewf28LoQqT8lRvLEAxOGGss30hZZIH8t4MO3Ul2Br85yq/RwCITIou
+# PbXySnPiuzszS2gB2kW/0g+cgJNW4F9TIXgAjgYgCckkgEg4gRa/koBrKvGHOidkKkJ6hqYJIuT9bnrIni+Dda8vXCiRtLm5GI1aZ5KdQRwrx1NW1CQ7UXLa
+# fd8elNmlK8867cJUFrpQW4QxGx3Uo4hFvep5kPqfUeDddBDFcLHQfmv+2fmtmzP6aRBERih9Y93NN4P5KACvAKiQ4sr9HBTbzFu9N0o52wwSUGudbrw6d3uG
+# JhefXyDil2YeuvKe2lbb2I2A1OQMUKsbYhINOFgykRzgfe7zOUAEDbCDMO2UrjIuQWeK1Q03wJE4p9Ke6npdox3BxJwe9lRYyLuBf7chIPU02W+X4bZiP6Tr
+# oF1y8SYznJDgtS/zXEolxazEOilHahjg/tl6f7Etb2qmmBDAWJ+ueDbNvv+Z68whJ068k6Oy46ikj2Ei9uwqkrDEoG5lFQpamp8REXLpdatyuHJsGgbCjyf6
+# ktnVN/MTxInHXYno+I9LtiMuqkmpngUNAAUpFv2Rixkf5GcFZW3amvoBUnFWkqrhOsY3DsBqX8fbTbM9cw912tIne6H+yGd11IDzkBQ2JladQy0pZj5BEmbY
+# 4xG1BxMNywY1iwfqhJABKSTMqQPvh5O2bOlSn8RP6gblhXkPSfAF4R3G7WoEkyV2HEgCTAP1453LBHubGPRAOtJQAnlbl87WgWcAso3+YzmFTtJVpQWK08+q
+# aHaSO9zBdIddsTRj9J8mtwiKOsi/otO2xfA9jO4Jnxgg2JHeI70JNfiAMpIOr0l7qcHFKa6aUJBlRQnk1jf28cmQ/1D9/Lik3XgULHiI8ByiUY2eWlvTPAKI
+# H8YgT6i7Q6K53MadA6MofxFtOGa6xuLKLKAfD1YpzFL1hcNrgF5M6urrHwJyjKtVUioqU9kujo+XtZkHtbMqX5JhCKtli3gvHpGzJBqsqqiAzvfTE+q/D+Da
+# 6ADkpu2rxuX8lqcgsnsvm/mq7Uq3Ab4bbyAhVpbHQVp/bT6LeUfN8j6W8TLfw/BTuWBWoWD2N7XjZDZ0JED3X3BRKQIGLi3bQaMOM3zjWaiJSEDNrEKFKh45
+# 3BwJ0LFI2RdtyZ3rKa6lEbq+7pf9f/G0lUiTw9FcHchsnZaqOCIngBt9mZBNtAdxQmogX7CZh/m6STFfzaKpz5u5zKdTDqXFP0uykC4UyV/dfcLiUf7OCUY4
+# eL84e60+WEEc/esVUEUVeTZ7/624H9nV0FEKe9yBFS69WpjxfJPodIBDK3H78GzjMIt3O3svLp/Kkl6Y2ZFnxXT9nPkbM0UfaMI00V3hzmsiIVkWAsbrTD7r
+# Cdq7N5nIzj6zRRX4QiXJsQWUKkduaWNjyUlEw/hIp1713Ct6Gck7HQboMuFa7FPTjjvjwWHkXfdaeguMZMASH781blyZ1Kltqy5cSblbkHobTrVKAFdfy4YF
+# MlU3F4Wy0wGjQ4483YUvD4ZFKKO1cmSTYIcwq+Q+26hu9olOKisacUPBBHuxD5ZQ5aUejekBD1m5A6paSea8NwHzLj/G3sqnyFvWymVJBbzvGRHhNZuXq7rT
+# iKLJ8PVvWEBAWkXLn399EBfv6YC8x5ZXjKcfb3bNrgadbOP5tUYHcRBiLbcp0GMMROD7KBBp0BlxWXA5O4bIiQYHiYYWiGMATYS0Ue8KRJlVUEHG2Y1vFf+L
+# gFzKFh6gLupt7FAXjGHf3VDrf/0E7vSyBkgok5FFzsvhO0L3W8RHOAwbiKvk5lSfDVIbaVYJsLtqyDCIamTjwSCDlpqmdpEeQ7Zac+6AIYxiL4rrv3LnVkvk
+# Km7ED1ph54O7W6u0caoYLj2dVUU/+neJ+IBj/TPGgHCMfhTNIerk+4v3BAJkyvykiHuyK0W1nElS3kwGq4pQhcQ8zPrvmsto0Jckj3TUBu7R/g0YYWsWOZSH
+# vU3xvueWxrQlzMnU6IkV6qbr3EzR5Qo4WTMxNjrwGPTrHktrsbCgviXEInNI3ntEnbfcFwmlalDpJSxONx8VnU/BemnrkBDEcYydqiMcsYEqGEdgfw+UnTDm
+# v6ZpP4bHkbpXUHtp2OjUGCNq98taX1FMaYipsqUjWZbvim5NZgGHkcpWDY1FmvQSJUwAAHeFeWR1FNtVAAH/jAHUgAP6ETHDscRn+wIAAAAABFla
+# === EMDEDDED DEX END ===
