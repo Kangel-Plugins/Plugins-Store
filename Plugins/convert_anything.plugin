@@ -1,0 +1,953 @@
+from __future__ import annotations
+
+import csv
+import gzip
+import html
+import io
+import json
+import mimetypes
+import os
+import re
+import shutil
+import tarfile
+import threading
+import time
+import traceback
+import uuid
+import zipfile
+from html.parser import HTMLParser
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterable
+from xml.etree import ElementTree
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, send_document
+from file_utils import ensure_dir_exists, get_cache_dir
+from java import jclass
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+
+__id__ = "convert_anything"
+__name__ = "Convert Anything"
+__description__ = (
+    "Hold a message containing a file, tap Plugins, and select Convert Anything. "
+    "Then choose the output format and what to do with the converted file."
+)
+__author__ = "@MangoPlugins"
+__version__ = "1.0.0"
+__icon__ = "mangoplugins/0"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+IMAGE_EXTENSIONS = {
+    "jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "ico",
+}
+TEXT_EXTENSIONS = {
+    "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml",
+    "html", "htm", "yaml", "yml", "log", "ini", "cfg", "conf", "sql",
+    "py", "js", "ts", "css", "java", "kt", "c", "cpp", "h", "hpp", "sh",
+}
+WORD_EXTENSIONS = {"docx"}
+SHEET_EXTENSIONS = {"xlsx", "xlsm", "xltx", "xltm"}
+SLIDE_EXTENSIONS = {"pptx"}
+OPEN_DOCUMENT_EXTENSIONS = {"odt", "ods", "odp"}
+EBOOK_EXTENSIONS = {"epub"}
+PDF_EXTENSIONS: set[str] = set()
+ARCHIVE_EXTENSIONS = {"zip", "tar", "tgz", "gz", "cbz"}
+
+SUPPORTED_EXTENSIONS = tuple(sorted(
+    IMAGE_EXTENSIONS
+    | TEXT_EXTENSIONS
+    | WORD_EXTENSIONS
+    | SHEET_EXTENSIONS
+    | SLIDE_EXTENSIONS
+    | OPEN_DOCUMENT_EXTENSIONS
+    | EBOOK_EXTENSIONS
+    | PDF_EXTENSIONS
+    | ARCHIVE_EXTENSIONS
+))
+
+FORMAT_LABELS = {
+    "pdf": "PDF-документ (.pdf)",
+    "txt": "Обычный текст (.txt)",
+    "html": "HTML-документ (.html)",
+    "jpg": "Изображение JPEG (.jpg)",
+    "png": "Изображение PNG (.png)",
+    "webp": "Изображение WebP (.webp)",
+    "bmp": "Изображение BMP (.bmp)",
+    "gif": "Изображение GIF (.gif)",
+    "tiff": "Изображение TIFF (.tiff)",
+    "csv": "Таблица CSV (.csv)",
+    "json": "Данные JSON (.json)",
+    "zip": "Архив ZIP (.zip)",
+    "tar.gz": "Архив TAR.GZ (.tar.gz)",
+}
+
+
+class _HTMLTextExtractor(HTMLParser):
+    BLOCK_TAGS = {
+        "address", "article", "aside", "blockquote", "br", "div", "footer", "h1",
+        "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav",
+        "ol", "p", "pre", "section", "table", "tr", "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self.ignored_depth += 1
+        elif tag in self.BLOCK_TAGS and self.parts:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self.ignored_depth:
+            self.ignored_depth -= 1
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored_depth:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        value = "".join(self.parts).replace("\r", "")
+        value = re.sub(r"[ \t]+\n", "\n", value)
+        value = re.sub(r"\n{3,}", "\n\n", value)
+        return value.strip()
+
+
+def _read_text(path: str) -> str:
+    raw = Path(path).read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "cp1251", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _html_to_text(value: str) -> str:
+    parser = _HTMLTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return parser.text()
+
+
+def _safe_stem(file_name: str) -> str:
+    lower = file_name.lower()
+    if lower.endswith(".tar.gz"):
+        stem = file_name[:-7]
+    else:
+        stem = Path(file_name).stem
+    stem = re.sub(r"[^\w .()\-]+", "_", stem, flags=re.UNICODE).strip(" .")
+    return stem[:80] or "converted"
+
+
+def _source_extension(path: str, file_name: str = "") -> str:
+    name = (file_name or path).lower()
+    if name.endswith(".tar.gz"):
+        return "gz"
+    return Path(name).suffix.lower().lstrip(".")
+
+
+def _targets_for(extension: str) -> list[str]:
+    if extension in IMAGE_EXTENSIONS:
+        targets = ["pdf", "jpg", "png", "webp", "bmp", "gif", "tiff"]
+        normalized = "jpg" if extension == "jpeg" else "tiff" if extension in {"tif", "tiff"} else extension
+        return [target for target in targets if target != normalized]
+    if extension in TEXT_EXTENSIONS:
+        return ["pdf", "txt", "html"]
+    if extension in WORD_EXTENSIONS | SLIDE_EXTENSIONS | OPEN_DOCUMENT_EXTENSIONS | EBOOK_EXTENSIONS:
+        return ["pdf", "txt", "html"]
+    if extension in SHEET_EXTENSIONS:
+        return ["pdf", "csv", "json", "html", "txt"]
+    if extension in PDF_EXTENSIONS:
+        return ["txt"]
+    if extension == "cbz":
+        return ["pdf", "tar.gz"]
+    if extension in ARCHIVE_EXTENSIONS:
+        if extension in {"zip", "cbz"}:
+            return ["tar.gz"]
+        return ["zip"]
+    return []
+
+
+def _output_suffix(target: str) -> str:
+    return ".tar.gz" if target == "tar.gz" else f".{target}"
+
+
+def _flatten_image(image: Any) -> Any:
+    from PIL import Image
+
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return image.convert("RGB")
+
+
+def _convert_image(source: str, target: str, output: str) -> None:
+    from PIL import Image, ImageSequence
+
+    with Image.open(source) as image:
+        if target == "pdf":
+            pages = [_flatten_image(frame.copy()) for frame in ImageSequence.Iterator(image)]
+            if not pages:
+                raise ValueError("В изображении нет кадров")
+            pages[0].save(output, "PDF", save_all=True, append_images=pages[1:], resolution=150.0)
+            return
+
+        format_name = {"jpg": "JPEG", "tiff": "TIFF"}.get(target, target.upper())
+        converted = _flatten_image(image) if target in {"jpg", "bmp"} else image.copy()
+        save_options: dict[str, Any] = {}
+        if target == "jpg":
+            save_options.update(quality=92, optimize=True)
+        elif target == "webp":
+            save_options.update(quality=90, method=4)
+        elif target == "png":
+            save_options.update(optimize=True)
+        converted.save(output, format_name, **save_options)
+
+
+def _normalize_text_source(source: str, extension: str) -> str:
+    value = _read_text(source)
+    if extension in {"html", "htm"}:
+        return _html_to_text(value)
+    if extension == "json":
+        try:
+            return json.dumps(json.loads(value), ensure_ascii=False, indent=2)
+        except Exception:
+            return value
+    if extension == "jsonl":
+        rows = []
+        for line in value.splitlines():
+            try:
+                rows.append(json.dumps(json.loads(line), ensure_ascii=False, indent=2))
+            except Exception:
+                rows.append(line)
+        return "\n\n".join(rows)
+    if extension in {"yaml", "yml"}:
+        try:
+            import yaml
+            return yaml.safe_dump(yaml.safe_load(value), allow_unicode=True, sort_keys=False)
+        except Exception:
+            return value
+    if extension == "xml":
+        try:
+            root = ElementTree.fromstring(value)
+            if hasattr(ElementTree, "indent"):
+                ElementTree.indent(root)
+            return ElementTree.tostring(root, encoding="unicode")
+        except Exception:
+            return value
+    return value
+
+
+def _extract_docx(source: str) -> str:
+    with zipfile.ZipFile(source) as archive:
+        root = ElementTree.fromstring(archive.read("word/document.xml"))
+    blocks: list[str] = []
+    for node in root.iter():
+        if node.tag.rsplit("}", 1)[-1] != "p":
+            continue
+        value = "".join(
+            child.text or ""
+            for child in node.iter()
+            if child.tag.rsplit("}", 1)[-1] in {"t", "tab", "br"}
+        ).strip()
+        if value:
+            blocks.append(value)
+    return "\n".join(blocks)
+
+
+def _extract_pptx(source: str) -> str:
+    blocks: list[str] = []
+    with zipfile.ZipFile(source) as archive:
+        names = [
+            name for name in archive.namelist()
+            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+        ]
+        names.sort(key=lambda name: int(re.search(r"(\d+)", Path(name).stem).group(1)))
+        for number, name in enumerate(names, 1):
+            root = ElementTree.fromstring(archive.read(name))
+            blocks.append(f"Слайд {number}")
+            values = [
+                (node.text or "").strip()
+                for node in root.iter()
+                if node.tag.rsplit("}", 1)[-1] == "t" and (node.text or "").strip()
+            ]
+            blocks.extend(values)
+            blocks.append("")
+    return "\n".join(blocks).strip()
+
+
+def _extract_open_document(source: str) -> str:
+    with zipfile.ZipFile(source) as archive:
+        xml_data = archive.read("content.xml")
+    root = ElementTree.fromstring(xml_data)
+    blocks: list[str] = []
+    for node in root.iter():
+        local_name = node.tag.rsplit("}", 1)[-1]
+        if local_name in {"p", "h", "table-row"}:
+            value = " ".join("".join(node.itertext()).split())
+            if value:
+                blocks.append(value)
+    return "\n".join(blocks)
+
+
+def _extract_epub(source: str) -> str:
+    parts: list[str] = []
+    with zipfile.ZipFile(source) as archive:
+        names = sorted(
+            name for name in archive.namelist()
+            if name.lower().endswith((".xhtml", ".html", ".htm"))
+        )
+        for name in names:
+            raw = archive.read(name)
+            value = raw.decode("utf-8", errors="replace")
+            text = _html_to_text(value)
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _workbook_rows(source: str, extension: str) -> list[tuple[str, list[list[Any]]]]:
+    del extension
+    with zipfile.ZipFile(source) as archive:
+        names = set(archive.namelist())
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in shared_root:
+                shared_strings.append("".join(
+                    node.text or "" for node in item.iter()
+                    if node.tag.rsplit("}", 1)[-1] == "t"
+                ))
+
+        sheet_names: dict[str, str] = {}
+        if "xl/workbook.xml" in names and "xl/_rels/workbook.xml.rels" in names:
+            relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            targets = {
+                node.attrib.get("Id", ""): node.attrib.get("Target", "")
+                for node in relationships
+            }
+            workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+            for sheet in workbook.iter():
+                if sheet.tag.rsplit("}", 1)[-1] != "sheet":
+                    continue
+                relation_id = next(
+                    (value for key, value in sheet.attrib.items() if key.rsplit("}", 1)[-1] == "id"),
+                    "",
+                )
+                target = targets.get(relation_id, "")
+                if target:
+                    normalized = target.lstrip("/")
+                    if not normalized.startswith("xl/"):
+                        normalized = f"xl/{normalized}"
+                    sheet_names[normalized] = sheet.attrib.get("name", Path(normalized).stem)
+
+        worksheet_paths = sorted(
+            name for name in names
+            if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+        )
+        sheets: list[tuple[str, list[list[Any]]]] = []
+        for number, worksheet_path in enumerate(worksheet_paths, 1):
+            root = ElementTree.fromstring(archive.read(worksheet_path))
+            rows: list[list[Any]] = []
+            for row_node in root.iter():
+                if row_node.tag.rsplit("}", 1)[-1] != "row":
+                    continue
+                row: list[Any] = []
+                for cell in row_node:
+                    if cell.tag.rsplit("}", 1)[-1] != "c":
+                        continue
+                    cell_type = cell.attrib.get("t", "")
+                    value_node = next(
+                        (node for node in cell.iter() if node.tag.rsplit("}", 1)[-1] in {"v", "t"}),
+                        None,
+                    )
+                    value: Any = "" if value_node is None else (value_node.text or "")
+                    if cell_type == "s" and str(value).isdigit():
+                        index = int(value)
+                        value = shared_strings[index] if index < len(shared_strings) else value
+                    elif cell_type == "b":
+                        value = "TRUE" if value == "1" else "FALSE"
+                    row.append(value)
+                rows.append(row)
+            sheets.append((sheet_names.get(worksheet_path, f"Лист {number}"), rows))
+    return sheets
+
+
+def _cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _sheet_text(sheets: list[tuple[str, list[list[Any]]]]) -> str:
+    output: list[str] = []
+    for name, rows in sheets:
+        output.append(f"Лист: {name}")
+        output.extend("\t".join(_cell_text(value) for value in row) for row in rows)
+        output.append("")
+    return "\n".join(output).strip()
+
+
+def _write_csv(output: str, sheets: list[tuple[str, list[list[Any]]]]) -> None:
+    rows = sheets[0][1] if sheets else []
+    with open(output, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows([[_cell_text(value) for value in row] for row in rows])
+
+
+def _write_json(output: str, sheets: list[tuple[str, list[list[Any]]]]) -> None:
+    payload = {
+        name: [[value.isoformat() if hasattr(value, "isoformat") else value for value in row] for row in rows]
+        for name, rows in sheets
+    }
+    with open(output, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+
+def _write_html(output: str, title: str, text: str) -> None:
+    document = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{html.escape(title)}</title>"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<style>body{font:16px/1.5 sans-serif;max-width:960px;margin:32px auto;padding:0 20px}"
+        "pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body>"
+        f"<h1>{html.escape(title)}</h1><pre>{html.escape(text)}</pre></body></html>"
+    )
+    Path(output).write_text(document, encoding="utf-8")
+
+
+def _wrap_for_canvas(text: str, paint: Any, max_width: float) -> Iterable[str]:
+    for source_line in text.expandtabs(4).splitlines() or [""]:
+        remaining = source_line
+        if not remaining:
+            yield ""
+            continue
+        while remaining:
+            count = int(paint.breakText(remaining, True, max_width, None))
+            if count <= 0:
+                count = 1
+            if count < len(remaining):
+                whitespace = remaining.rfind(" ", 0, count + 1)
+                if whitespace > 0:
+                    count = whitespace
+            line = remaining[:count].rstrip()
+            yield line
+            remaining = remaining[count:].lstrip()
+
+
+def _write_pdf(output: str, title: str, text: str) -> None:
+    PdfDocument = jclass("android.graphics.pdf.PdfDocument")
+    PageInfoBuilder = jclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+    Paint = jclass("android.graphics.Paint")
+    Typeface = jclass("android.graphics.Typeface")
+    FileOutputStream = jclass("java.io.FileOutputStream")
+
+    width, height = 595, 842
+    margin, top, bottom = 42, 50, 46
+    body_size, title_size = 11.0, 18.0
+    line_height = 15
+    document = PdfDocument()
+    paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    paint.setColor(-15658735)
+    paint.setTextSize(body_size)
+
+    lines = list(_wrap_for_canvas(text, paint, width - margin * 2))
+    page_number = 0
+    index = 0
+    try:
+        while index < len(lines) or page_number == 0:
+            page_number += 1
+            info = PageInfoBuilder(width, height, page_number).create()
+            page = document.startPage(info)
+            canvas = page.getCanvas()
+            y = top
+            if page_number == 1:
+                paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD))
+                paint.setTextSize(title_size)
+                canvas.drawText(title[:70], float(margin), float(y), paint)
+                y += 30
+                paint.setTypeface(Typeface.DEFAULT)
+                paint.setTextSize(body_size)
+            while index < len(lines) and y <= height - bottom:
+                canvas.drawText(lines[index], float(margin), float(y), paint)
+                y += line_height
+                index += 1
+            document.finishPage(page)
+        stream = FileOutputStream(output)
+        try:
+            document.writeTo(stream)
+        finally:
+            stream.close()
+    finally:
+        document.close()
+
+
+def _archive_to_zip(source: str, output: str, extension: str) -> None:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as destination:
+        if zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source) as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    destination.writestr(member.filename, archive.read(member))
+            return
+        if tarfile.is_tarfile(source):
+            with tarfile.open(source, "r:*") as archive:
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    file_object = archive.extractfile(member)
+                    if file_object is not None:
+                        destination.writestr(member.name, file_object.read())
+            return
+        if extension == "gz":
+            inner_name = Path(source).stem or "content"
+            with gzip.open(source, "rb") as compressed:
+                destination.writestr(inner_name, compressed.read())
+            return
+        raise ValueError("Не удалось распознать тип архива")
+
+
+def _archive_to_tar_gz(source: str, output: str) -> None:
+    with tarfile.open(output, "w:gz") as destination:
+        if zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source) as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    data = archive.read(member)
+                    info = tarfile.TarInfo(member.filename)
+                    info.size = len(data)
+                    info.mtime = time.time()
+                    destination.addfile(info, io.BytesIO(data))
+            return
+        if tarfile.is_tarfile(source):
+            with tarfile.open(source, "r:*") as archive:
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    file_object = archive.extractfile(member)
+                    if file_object is not None:
+                        destination.addfile(member, file_object)
+            return
+        raise ValueError("Не удалось распознать тип архива")
+
+
+def _cbz_to_pdf(source: str, output: str) -> None:
+    from PIL import Image
+
+    pages: list[Any] = []
+    with zipfile.ZipFile(source) as archive:
+        names = sorted(
+            name for name in archive.namelist()
+            if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"))
+        )
+        for name in names:
+            with Image.open(io.BytesIO(archive.read(name))) as image:
+                pages.append(_flatten_image(image.copy()))
+    if not pages:
+        raise ValueError("В CBZ-архиве не найдено изображений")
+    pages[0].save(output, "PDF", save_all=True, append_images=pages[1:], resolution=150.0)
+
+
+def _extract_document_text(source: str, extension: str) -> str:
+    if extension in TEXT_EXTENSIONS:
+        return _normalize_text_source(source, extension)
+    if extension in WORD_EXTENSIONS:
+        return _extract_docx(source)
+    if extension in SLIDE_EXTENSIONS:
+        return _extract_pptx(source)
+    if extension in OPEN_DOCUMENT_EXTENSIONS:
+        return _extract_open_document(source)
+    if extension in EBOOK_EXTENSIONS:
+        return _extract_epub(source)
+    raise ValueError(f"Извлечение текста из .{extension} не поддерживается")
+
+
+def _convert_file(source: str, file_name: str, extension: str, target: str, output: str) -> None:
+    if extension in IMAGE_EXTENSIONS:
+        _convert_image(source, target, output)
+        return
+
+    if extension in SHEET_EXTENSIONS:
+        sheets = _workbook_rows(source, extension)
+        if target == "csv":
+            _write_csv(output, sheets)
+            return
+        if target == "json":
+            _write_json(output, sheets)
+            return
+        text = _sheet_text(sheets)
+    elif extension in ARCHIVE_EXTENSIONS:
+        if extension == "cbz" and target == "pdf":
+            _cbz_to_pdf(source, output)
+        elif target == "zip":
+            _archive_to_zip(source, output, extension)
+        elif target == "tar.gz":
+            _archive_to_tar_gz(source, output)
+        else:
+            raise ValueError("Неподдерживаемый формат архива")
+        return
+    else:
+        text = _extract_document_text(source, extension)
+
+    if target == "txt":
+        Path(output).write_text(text, encoding="utf-8")
+    elif target == "html":
+        _write_html(output, file_name, text)
+    elif target == "pdf":
+        _write_pdf(output, file_name, text)
+    else:
+        raise ValueError(f"Конвертация в {target} не поддерживается")
+
+
+class ConvertAnythingPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self._menu_item_id: str | None = None
+        self._busy_paths: set[str] = set()
+        self._busy_lock = threading.Lock()
+        self._output_dir = ""
+
+    def on_plugin_load(self) -> None:
+        self._output_dir = os.path.join(get_cache_dir(), "convert_anything")
+        ensure_dir_exists(self._output_dir)
+        self._cleanup_old_outputs()
+
+        self._menu_item_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Convert Anything",
+            on_click=self._on_message_menu,
+            item_id="convert_anything_message",
+            icon="msg_file",
+            subtext="Convert Anything",
+            priority=50,
+        ))
+        self.log("Convert Anything: пункт контекстного меню зарегистрирован")
+
+    def on_plugin_unload(self) -> None:
+        if self._menu_item_id:
+            try:
+                self.remove_menu_item(self._menu_item_id)
+            except Exception as error:
+                self.log(f"Не удалось удалить пункт меню: {error}")
+        self._menu_item_id = None
+
+    def _cleanup_old_outputs(self) -> None:
+        cutoff = time.time() - 7 * 24 * 60 * 60
+        try:
+            for entry in os.scandir(self._output_dir):
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    os.remove(entry.path)
+        except Exception as error:
+            self.log(f"Очистка старых файлов не выполнена: {error}")
+
+    def _on_message_menu(self, context: dict[str, Any]) -> None:
+        message = context.get("message")
+        fragment = context.get("fragment") or get_last_fragment()
+        activity = context.get("context")
+        if fragment is not None:
+            try:
+                activity = fragment.getParentActivity() or activity
+            except Exception:
+                pass
+        if message is None or activity is None:
+            BulletinHelper.show_error("Не удалось получить выбранное сообщение", fragment)
+            return
+
+        try:
+            account_value = context.get("account")
+            account = int(message.currentAccount if account_value is None else account_value)
+            file_object = self.client(account).get_file_loader().getPathToMessage(message.messageOwner)
+            file_name = str(message.getFileName() or file_object.getName())
+            args = SimpleNamespace(
+                file=file_object,
+                file_name=file_name,
+                message=message,
+                activity=activity,
+                parent_fragment=fragment,
+            )
+            self._show_conversion_dialog(args)
+        except Exception as error:
+            self.log(f"Не удалось получить файл сообщения: {error}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("В этом сообщении нет доступного файла", fragment)
+
+    def _show_conversion_dialog(self, args: Any) -> None:
+        source = str(args.file.getAbsolutePath())
+        file_name = str(args.file_name or os.path.basename(source))
+        extension = _source_extension(source, file_name)
+        targets = _targets_for(extension)
+
+        if not os.path.isfile(source):
+            self._show_error("Файл ещё не загружен. Скачайте его и повторите попытку.", args)
+            return
+        if not targets:
+            self._show_error(f"Для .{extension or '?'} пока нет доступных преобразований.", args)
+            return
+
+        labels = [FORMAT_LABELS[target] for target in targets]
+        builder = AlertDialogBuilder(args.activity)
+        builder.set_title("Convert Anything")
+        builder.set_message(f"{file_name}\n\nВыберите формат результата:")
+
+        def choose(dialog: AlertDialogBuilder, index: int) -> None:
+            dialog.dismiss()
+            if 0 <= index < len(targets):
+                self._start_conversion(args, source, file_name, extension, targets[index])
+
+        builder.set_items(labels, choose)
+        builder.set_negative_button("Отмена", lambda dialog, _which: dialog.dismiss())
+        builder.show()
+
+    def _start_conversion(
+        self,
+        args: Any,
+        source: str,
+        file_name: str,
+        extension: str,
+        target: str,
+    ) -> None:
+        with self._busy_lock:
+            if source in self._busy_paths:
+                BulletinHelper.show_info("Этот файл уже конвертируется", args.parent_fragment)
+                return
+            self._busy_paths.add(source)
+
+        loading = AlertDialogBuilder(args.activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        loading.set_title("Конвертация")
+        loading.set_message(f"{file_name}\n→ {FORMAT_LABELS[target]}")
+        loading.create().show()
+        loading.set_cancelable(False)
+
+        def worker() -> None:
+            suffix = _output_suffix(target)
+            output_name = f"{_safe_stem(file_name)}_{uuid.uuid4().hex[:6]}{suffix}"
+            output = os.path.join(self._output_dir, output_name)
+            try:
+                _convert_file(source, file_name, extension, target, output)
+                if not os.path.isfile(output) or os.path.getsize(output) == 0:
+                    raise ValueError("Конвертер создал пустой файл")
+                run_on_ui_thread(lambda: self._show_result(args, loading, output, output_name))
+            except Exception as error:
+                self.log(f"Ошибка конвертации {file_name}: {error}\n{traceback.format_exc()}")
+                try:
+                    if os.path.exists(output):
+                        os.remove(output)
+                except Exception:
+                    pass
+                message = self._friendly_error(error)
+                run_on_ui_thread(lambda: self._finish_with_error(args, loading, message))
+            finally:
+                with self._busy_lock:
+                    self._busy_paths.discard(source)
+
+        threading.Thread(target=worker, name="ConvertAnything", daemon=True).start()
+
+    def _friendly_error(self, error: Exception) -> str:
+        message = str(error).strip() or error.__class__.__name__
+        lower = message.lower()
+        if "encrypted" in lower or "password" in lower:
+            return "Файл защищён паролем. Такие файлы пока не поддерживаются."
+        if "cannot identify image" in lower:
+            return "Формат изображения не распознан или файл повреждён."
+        if "not a zip" in lower or "badzip" in lower:
+            return "Файл повреждён или имеет неверное расширение."
+        return f"Не удалось выполнить конвертацию: {message[:300]}"
+
+    def _finish_with_error(
+        self,
+        args: Any,
+        loading: AlertDialogBuilder,
+        message: str,
+    ) -> None:
+        try:
+            loading.dismiss()
+        except Exception:
+            pass
+        self._show_error(message, args)
+
+    def _show_result(
+        self,
+        args: Any,
+        loading: AlertDialogBuilder,
+        output: str,
+        output_name: str,
+    ) -> None:
+        try:
+            loading.dismiss()
+        except Exception:
+            pass
+
+        size = os.path.getsize(output)
+        dialog = AlertDialogBuilder(args.activity)
+        dialog.set_title("Готово")
+        dialog.set_message(f"{output_name}\n{self._format_size(size)}")
+
+        actions = [
+            ("Сохранить на устройство", lambda: self._save_to_device(args, output)),
+            ("В Избранное", lambda: self._send_to_saved_messages(args, output)),
+            ("Отправить в чат", lambda: self._send_to_chat(args, output)),
+            ("Поделиться", lambda: self._share_file(args, output)),
+        ]
+
+        def choose(builder: AlertDialogBuilder, index: int) -> None:
+            builder.dismiss()
+            if 0 <= index < len(actions):
+                actions[index][1]()
+
+        dialog.set_items([label for label, _action in actions], choose)
+        dialog.show()
+
+    def _save_to_device(self, args: Any, output: str) -> None:
+        def worker() -> None:
+            uri = None
+            resolver = None
+            try:
+                source_name = os.path.basename(output)
+                BuildVersion = jclass("android.os.Build$VERSION")
+                if int(BuildVersion.SDK_INT) >= 29:
+                    ContentValues = jclass("android.content.ContentValues")
+                    Environment = jclass("android.os.Environment")
+                    MediaColumns = jclass("android.provider.MediaStore$MediaColumns")
+                    Downloads = jclass("android.provider.MediaStore$Downloads")
+                    values = ContentValues()
+                    values.put(MediaColumns.DISPLAY_NAME, source_name)
+                    values.put(MediaColumns.MIME_TYPE, mimetypes.guess_type(output)[0] or "application/octet-stream")
+                    values.put(MediaColumns.RELATIVE_PATH, f"{Environment.DIRECTORY_DOWNLOADS}/Convert Anything")
+                    values.put(MediaColumns.IS_PENDING, 1)
+                    resolver = args.activity.getContentResolver()
+                    uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+                    if uri is None:
+                        raise IOError("Android не создал файл в папке загрузок")
+                    stream = resolver.openOutputStream(uri)
+                    if stream is None:
+                        raise IOError("Android не открыл файл для записи")
+                    try:
+                        with open(output, "rb") as source:
+                            while True:
+                                chunk = source.read(65536)
+                                if not chunk:
+                                    break
+                                stream.write(chunk)
+                        stream.flush()
+                    finally:
+                        stream.close()
+                    values.clear()
+                    values.put(MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, values, None, None)
+                else:
+                    Environment = jclass("android.os.Environment")
+                    downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    destination_dir = os.path.join(str(downloads.getAbsolutePath()), "Convert Anything")
+                    ensure_dir_exists(destination_dir)
+                    suffix = "".join(Path(source_name).suffixes)
+                    stem = source_name[:-len(suffix)] if suffix else source_name
+                    destination = os.path.join(destination_dir, source_name)
+                    number = 2
+                    while os.path.exists(destination):
+                        destination = os.path.join(destination_dir, f"{stem} ({number}){suffix}")
+                        number += 1
+                    shutil.copy2(output, destination)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(
+                    f"Сохранено в Загрузки/Convert Anything: {source_name}",
+                    args.parent_fragment,
+                ))
+            except Exception as error:
+                if uri is not None and resolver is not None:
+                    try:
+                        resolver.delete(uri, None, None)
+                    except Exception:
+                        pass
+                self.log(f"Не удалось сохранить файл: {error}\n{traceback.format_exc()}")
+                error_message = f"Не удалось сохранить файл: {error}"
+                run_on_ui_thread(lambda: self._show_error(error_message, args))
+
+        threading.Thread(target=worker, name="ConvertAnythingSave", daemon=True).start()
+
+    def _send_to_saved_messages(self, args: Any, output: str) -> None:
+        try:
+            message = args.message
+            try:
+                account = int(message.currentAccount)
+            except Exception:
+                UserConfig = jclass("org.telegram.messenger.UserConfig")
+                account = int(UserConfig.selectedAccount)
+            user_config = self.client(account).get_user_config()
+            peer = int(user_config.getClientUserId())
+            send_document(peer, output, account=account)
+            BulletinHelper.show_success("Файл отправляется в Избранное", args.parent_fragment)
+        except Exception as error:
+            self.log(f"Не удалось отправить в Избранное: {error}\n{traceback.format_exc()}")
+            self._show_error(f"Не удалось отправить в Избранное: {error}", args)
+
+    def _send_to_chat(self, args: Any, output: str) -> None:
+        try:
+            message = args.message
+            dialog_id = int(message.getDialogId())
+            try:
+                account = int(message.currentAccount)
+            except Exception:
+                UserConfig = jclass("org.telegram.messenger.UserConfig")
+                account = int(UserConfig.selectedAccount)
+            send_document(
+                dialog_id,
+                output,
+                account=account,
+            )
+            BulletinHelper.show_success("Файл отправляется", args.parent_fragment)
+        except Exception as error:
+            self.log(f"Не удалось отправить результат: {error}\n{traceback.format_exc()}")
+            self._show_error(f"Не удалось отправить файл: {error}", args)
+
+    def _share_file(self, args: Any, output: str) -> None:
+        try:
+            Intent = jclass("android.content.Intent")
+            File = jclass("java.io.File")
+            FileProvider = jclass("androidx.core.content.FileProvider")
+            ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+
+            authority = f"{ApplicationLoader.getApplicationId()}.provider"
+            uri = FileProvider.getUriForFile(args.activity, authority, File(output))
+            intent = Intent(Intent.ACTION_SEND)
+            intent.setType(mimetypes.guess_type(output)[0] or "application/octet-stream")
+            intent.putExtra(Intent.EXTRA_STREAM, uri)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            args.activity.startActivity(Intent.createChooser(intent, "Поделиться файлом"))
+        except Exception as error:
+            self.log(f"Не удалось открыть системное меню: {error}\n{traceback.format_exc()}")
+            self._show_error(f"Не удалось поделиться файлом: {error}", args)
+
+    def _show_error(self, message: str, args: Any) -> None:
+        try:
+            dialog = AlertDialogBuilder(args.activity)
+            dialog.set_title("Convert Anything")
+            dialog.set_message(message)
+            dialog.set_positive_button("ОК", lambda builder, _which: builder.dismiss())
+            dialog.show()
+        except Exception:
+            BulletinHelper.show_error(message, args.parent_fragment)
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        value = float(size)
+        for unit in ("Б", "КБ", "МБ", "ГБ"):
+            if value < 1024 or unit == "ГБ":
+                return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{size} Б"
