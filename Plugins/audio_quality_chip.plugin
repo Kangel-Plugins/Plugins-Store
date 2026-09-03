@@ -1,0 +1,293 @@
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from hook_utils import find_class, get_private_field
+
+from android.graphics.drawable import GradientDrawable
+from android.media import MediaMetadataRetriever
+from android.util import TypedValue
+from android.view import Gravity, View
+from android.widget import FrameLayout, TextView
+
+from org.telegram.messenger import AndroidUtilities, FileLoader, MediaController
+from org.telegram.ui.ActionBar import Theme
+
+
+__id__ = "audio_quality_chip"
+__name__ = "Audio Quality Chip"
+__description__ = "Shows the audio format and average bitrate below the progress bar in the music player."
+__author__ = "@TH157LECLAW"
+__version__ = "1.1.0"
+__icon__ = "MeijiPlugins/4"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+WRAP_CONTENT = -2
+CHIP_TAG = "audio_quality_chip"
+
+
+class _PlayerCreatedHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.install_chip(param.thisObject)
+
+
+class _PlayerUpdatedHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.refresh_chip(param.thisObject)
+
+
+class _PlayerProgressHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.center_existing_chip(param.thisObject)
+
+
+class AudioQualityChipPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._chips = {}
+
+        player_class = find_class("org.telegram.ui.Components.AudioPlayerAlert")
+        if player_class is None:
+            self.log("AudioPlayerAlert class not found; the plugin was not installed.")
+            return
+
+        # A player is built in its constructor, so attach the chip immediately
+        # after it has created playerLayout. updateTitle is also called on track
+        # changes and after a file has finished downloading.
+        self._constructor_hooks = self.hook_all_constructors(
+            player_class,
+            _PlayerCreatedHook(self),
+        )
+        self._title_hooks = self.hook_all_methods(
+            player_class,
+            "updateTitle",
+            _PlayerUpdatedHook(self),
+        )
+        # The seek bar has its real measured bounds only after the sheet is
+        # shown. updateProgress then keeps the chip centered on those bounds.
+        self._progress_hooks = self.hook_all_methods(
+            player_class,
+            "updateProgress",
+            _PlayerProgressHook(self),
+        )
+        self.log("Audio Quality Chip loaded")
+
+    def on_plugin_unload(self):
+        # The SDK removes hooks automatically. Drop Java view references too.
+        self._chips.clear()
+
+    def install_chip(self, alert):
+        try:
+            key = int(alert.hashCode())
+            if key in self._chips:
+                return
+
+            player_layout = get_private_field(alert, "playerLayout")
+            if player_layout is None:
+                self.log("playerLayout field not found")
+                return
+
+            context = player_layout.getContext()
+            chip = TextView(context)
+            chip.setTag(CHIP_TAG)
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11)
+            chip.setSingleLine(True)
+            chip.setIncludeFontPadding(False)
+            chip.setGravity(Gravity.CENTER)
+            chip.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+            chip.setPadding(
+                AndroidUtilities.dp(8),
+                AndroidUtilities.dp(3),
+                AndroidUtilities.dp(8),
+                AndroidUtilities.dp(3),
+            )
+
+            self.apply_chip_colors(alert, chip)
+
+            # The original progress line is at y=90dp. Keep the chip in the
+            # row beneath it without moving timers or playback controls.
+            params = FrameLayout.LayoutParams(
+                WRAP_CONTENT,
+                WRAP_CONTENT,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL,
+            )
+            params.topMargin = AndroidUtilities.dp(97)
+            player_layout.addView(chip, params)
+
+            self._chips[key] = chip
+            self.refresh_chip(alert)
+            # The player sheet is laid out after its constructor finishes.
+            # Schedule a few short retries so the first displayed frame is
+            # aligned too, not only later progress notifications.
+            for delay in (0, 80, 250):
+                run_on_ui_thread(
+                    lambda: self.refresh_chip(alert),
+                    delay,
+                )
+        except Exception as error:
+            self.log(f"Could not add audio-quality chip: {error}")
+
+    def refresh_chip(self, alert):
+        try:
+            key = int(alert.hashCode())
+            chip = self._chips.get(key)
+            if chip is None:
+                self.install_chip(alert)
+                chip = self._chips.get(key)
+            if chip is None:
+                return
+
+            message = MediaController.getInstance().getPlayingMessageObject()
+            if message is None or not message.isMusic():
+                chip.setVisibility(View.GONE)
+                return
+
+            document = message.getDocument()
+            if document is None:
+                chip.setVisibility(View.GONE)
+                return
+
+            audio_format = self.get_format(document)
+            bitrate_kbps = self.get_bitrate_kbps(message, document)
+            if bitrate_kbps is None:
+                chip.setText(audio_format)
+            else:
+                chip.setText(f"{audio_format} • {bitrate_kbps} kbps")
+
+            self.apply_chip_colors(alert, chip)
+            self.center_chip(alert, chip)
+            chip.setVisibility(View.VISIBLE)
+        except Exception as error:
+            self.log(f"Could not update audio-quality chip: {error}")
+
+    @staticmethod
+    def get_format(document):
+        try:
+            extension = str(FileLoader.getDocumentExtension(document)).strip()
+            if extension and extension != "APPLICATION/OCTET-STREAM":
+                return extension
+        except Exception:
+            pass
+
+        try:
+            mime_type = str(document.mime_type).strip()
+            if "/" in mime_type:
+                return mime_type.rsplit("/", 1)[-1].upper()
+            if mime_type:
+                return mime_type.upper()
+        except Exception:
+            pass
+        return "AUDIO"
+
+    def get_bitrate_kbps(self, message, document):
+        duration_seconds = int(message.getDuration())
+        if duration_seconds <= 0:
+            return None
+
+        try:
+            file = FileLoader.getInstance(message.currentAccount).getPathToMessage(
+                message.messageOwner
+            )
+            # Android reports the stream bitrate when the whole original file is
+            # available. Do not inspect an in-progress streaming cache.
+            if file is not None and file.exists() and file.length() >= document.size:
+                bitrate = self.read_embedded_bitrate_kbps(file.getAbsolutePath())
+                if bitrate is not None:
+                    return bitrate
+        except Exception:
+            pass
+
+        # Works before download as well: Telegram has the file size and audio
+        # duration in the message model. This is the average bitrate, which is
+        # the useful metric for VBR codecs and FLAC too.
+        try:
+            size_bytes = int(document.size)
+            if size_bytes > 0:
+                return int((size_bytes * 8 / duration_seconds + 500) // 1000)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def read_embedded_bitrate_kbps(path):
+        retriever = None
+        try:
+            retriever = MediaMetadataRetriever()
+            retriever.setDataSource(path)
+            raw_bitrate = retriever.extractMetadata(
+                MediaMetadataRetriever.METADATA_KEY_BITRATE
+            )
+            if raw_bitrate is None:
+                return None
+            bits_per_second = int(str(raw_bitrate))
+            if bits_per_second <= 0:
+                return None
+            return int((bits_per_second + 500) // 1000)
+        except Exception:
+            return None
+        finally:
+            if retriever is not None:
+                try:
+                    retriever.release()
+                except Exception:
+                    pass
+
+    def center_chip(self, alert, chip):
+        time_view = get_private_field(alert, "timeTextView")
+        duration_view = get_private_field(alert, "durationTextView")
+        if time_view is None or duration_view is None:
+            return
+
+        chip.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+        )
+        params = chip.getLayoutParams()
+        params.gravity = Gravity.TOP | Gravity.LEFT
+        # Use the visible timing row as the coordinate system. Its left edge is
+        # the current time and its right edge is the full duration, so this is
+        # the exact midpoint between the two labels.
+        timing_width = duration_view.getRight() - time_view.getLeft()
+        if timing_width <= 0:
+            return
+        params.leftMargin = time_view.getLeft() + max(
+            0,
+            (timing_width - chip.getMeasuredWidth()) // 2,
+        )
+        params.topMargin = AndroidUtilities.dp(97)
+        chip.setLayoutParams(params)
+
+    def center_existing_chip(self, alert):
+        try:
+            chip = self._chips.get(int(alert.hashCode()))
+            if chip is not None:
+                self.center_chip(alert, chip)
+        except Exception as error:
+            self.log(f"Could not center audio-quality chip: {error}")
+
+    @staticmethod
+    def apply_chip_colors(alert, chip):
+        # Keep the theme colors intact. Opacity is applied to the drawable as a
+        # separate property below, so it cannot erase or alter the RGB value.
+        try:
+            chip_color = alert.JA.getThemedColor(Theme.key_player_progress)
+            text_color = alert.JA.getThemedColor(Theme.key_player_actionBarTitle)
+        except Exception:
+            chip_color = Theme.getColor(Theme.key_player_progress)
+            text_color = Theme.getColor(Theme.key_player_actionBarTitle)
+
+        chip.setTextColor(text_color)
+
+        background = GradientDrawable()
+        background.setColor(chip_color)
+        background.setAlpha(64)  # 75% transparency (25% opacity)
+        background.setCornerRadius(AndroidUtilities.dp(9))
+        chip.setBackground(background)
