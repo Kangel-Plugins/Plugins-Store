@@ -1,0 +1,217 @@
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Switch, Selector
+from java import jclass
+from java.lang import Long, System
+from java.util import Date
+from org.telegram.messenger import LocaleController
+__id__ = 'local_time_shift'
+__name__ = 'Local Time Shift'
+__description__ = 'Локально сдвигает время сообщений, точное время последнего посещения и другие поддерживаемые подписи времени в Telegram.'
+__author__ = '@timesplinter'
+__version__ = '1.0.8'
+__icon__ = 'AnimatedEmojies/22'
+__app_version__ = '>=12.5.1'
+__sdk_version__ = '>=1.4.4.3'
+HOURS = tuple(range(-24, 25))
+DEFAULT_INDEX = 24
+DISPLAY_FIELDS = ('formatterDay', 'formatterDayWithSeconds')
+
+def reflection_class(name):
+    errors = []
+    for loader in (find_class, jclass):
+        try:
+            found = loader(name)
+            if found is None:
+                raise RuntimeError('Class not found')
+            resolved = found.getClass() if isinstance(found, type) else found
+            if str(resolved.getName()) != name:
+                raise RuntimeError('Resolved wrong class')
+            resolved.getDeclaredMethods()
+            return resolved
+        except Exception as error:
+            errors.append(str(error))
+    raise RuntimeError(name + ': ' + ' | '.join(errors))
+
+def read_formatter_attribute(controller, name, formatter_class):
+    member = getattr(controller, name)
+    if member is not None and formatter_class.isInstance(member):
+        return member
+    result = member()
+    if result is None or not formatter_class.isInstance(result):
+        raise RuntimeError('Несовместимый результат доступа: ' + name)
+    return result
+
+def offset_from_index(value):
+    try:
+        index = int(value)
+        if 0 <= index < len(HOURS):
+            return HOURS[index] * 3600000
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 0
+
+def shifted_millis(value, delta):
+    if hasattr(value, 'longValue'):
+        value = value.longValue()
+    result = int(value) + int(delta)
+    if not -(1 << 63) <= result < 1 << 63:
+        raise OverflowError('Timestamp exceeds Java long')
+    return result
+
+class DisplayTimeHook(MethodHook):
+
+    def __init__(self, plugin, argument_kind):
+        self.plugin = plugin
+        self.argument_kind = argument_kind
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        delta = plugin._delta_ms
+        if not plugin._active or not delta or param.thisObject is None:
+            return
+        try:
+            if not plugin._is_display_formatter(param.thisObject):
+                return
+            value = param.args[0]
+            if value is None:
+                return
+            kind = self.argument_kind
+            if kind == 'long':
+                param.args[0] = Long.valueOf(shifted_millis(value, delta))
+            elif kind == 'java.util.Date':
+                param.args[0] = Date(shifted_millis(value.getTime(), delta))
+            elif kind == 'java.util.Calendar':
+                copy = value.clone()
+                copy.setTimeInMillis(shifted_millis(value.getTimeInMillis(), delta))
+                param.args[0] = copy
+            elif kind == 'java.lang.Object':
+                if plugin._date_class.isInstance(value):
+                    param.args[0] = Date(shifted_millis(value.getTime(), delta))
+                elif plugin._calendar_class.isInstance(value):
+                    copy = value.clone()
+                    copy.setTimeInMillis(shifted_millis(value.getTimeInMillis(), delta))
+                    param.args[0] = copy
+                elif plugin._long_class.isInstance(value):
+                    param.args[0] = Long.valueOf(shifted_millis(value.longValue(), delta))
+        except Exception as error:
+            plugin._warn_once(error)
+
+class LocalTimeShiftPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._active = False
+        self._delta_ms = offset_from_index(self.get_setting('hour_index', DEFAULT_INDEX))
+        self._warned = False
+        self._accessors = []
+        self._handles = []
+        self._handlers = []
+        self._hook_count = 0
+        try:
+            self._date_class = reflection_class('java.util.Date')
+            self._calendar_class = reflection_class('java.util.Calendar')
+            self._long_class = reflection_class('java.lang.Long')
+            locale_class = reflection_class('org.telegram.messenger.LocaleController')
+            formatter_class = reflection_class('org.telegram.messenger.time.FastDateFormat')
+            self._discover_accessors(locale_class, formatter_class)
+            supported = {('long',), ('java.util.Date',), ('java.util.Calendar',), ('long', 'java.lang.StringBuffer'), ('java.util.Date', 'java.lang.StringBuffer'), ('java.util.Calendar', 'java.lang.StringBuffer'), ('java.lang.Object', 'java.lang.StringBuffer', 'java.text.FieldPosition')}
+            installed = set()
+            for method in formatter_class.getDeclaredMethods():
+                if str(method.getName()) != 'format':
+                    continue
+                signature = tuple((str(t.getName()) for t in method.getParameterTypes()))
+                if signature not in supported:
+                    continue
+                if str(method.getReturnType().getName()) not in ('java.lang.String', 'java.lang.StringBuffer'):
+                    continue
+                method.setAccessible(True)
+                handler = DisplayTimeHook(self, signature[0])
+                handle = self.hook_method(method, handler)
+                if handle is not None:
+                    self._handles.append(handle)
+                    self._handlers.append(handler)
+                    installed.add(signature)
+            self._hook_count = len(self._handles)
+            if ('long',) not in installed or ('java.util.Date',) not in installed:
+                raise RuntimeError('Не удалось подключить форматирование времени')
+            self._active = bool(self.get_setting('enabled', True))
+        except Exception:
+            self._active = False
+            self._remove_hooks()
+            raise
+
+    def _discover_accessors(self, locale_class, formatter_class):
+        controller = LocaleController.getInstance()
+        errors = []
+        for field_name in DISPLAY_FIELDS:
+            getter_name = 'get' + field_name[0].upper() + field_name[1:]
+            try:
+                reader = lambda n=getter_name, c=controller, fc=formatter_class: read_formatter_attribute(c, n, fc)
+                reader()
+                self._accessors.append(reader)
+                continue
+            except Exception as error:
+                errors.append(getter_name + ': ' + str(error))
+            try:
+                method = next((m for m in locale_class.getDeclaredMethods() if str(m.getName()) == getter_name and len(m.getParameterTypes()) == 0))
+                method.setAccessible(True)
+                reader = lambda m=method, c=controller: m.invoke(c)
+                current = reader()
+                if current is None or not formatter_class.isInstance(current):
+                    raise RuntimeError('Несовместимый результат Method.invoke')
+                self._accessors.append(reader)
+                continue
+            except Exception as error:
+                errors.append(getter_name + ': ' + str(error))
+            try:
+                field = locale_class.getDeclaredField(field_name)
+                field.setAccessible(True)
+                current = field.get(controller)
+                if current is not None and (not formatter_class.isInstance(current)):
+                    raise RuntimeError('Несовместимый тип поля')
+                if current is None and (not formatter_class.isAssignableFrom(field.getType())):
+                    raise RuntimeError('Неизвестный тип поля')
+                self._accessors.append(lambda f=field, c=controller: f.get(c))
+            except Exception as error:
+                errors.append(field_name + ': ' + str(error))
+        if not self._accessors:
+            raise RuntimeError('Не удалось получить форматтеры: ' + ' | '.join(errors))
+
+    def _is_display_formatter(self, formatter):
+        identity = System.identityHashCode(formatter)
+        for reader in self._accessors:
+            try:
+                current = reader()
+                if current is not None and System.identityHashCode(current) == identity and current.equals(formatter):
+                    return True
+            except Exception as error:
+                self._warn_once(error)
+        return False
+
+    def _warn_once(self, error):
+        if not self._warned:
+            self._warned = True
+            self.log(str(error))
+
+    def _remove_hooks(self):
+        for handle in getattr(self, '_handles', []):
+            try:
+                self.unhook_method(handle)
+            except Exception as error:
+                self.log(str(error))
+        self._handles = []
+        self._handlers = []
+        self._hook_count = 0
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._remove_hooks()
+
+    def _on_enabled(self, value):
+        self._active = bool(value) and getattr(self, '_hook_count', 0) > 0
+
+    def _on_hours(self, value):
+        self._delta_ms = offset_from_index(value)
+
+    def create_settings(self):
+        return [Switch(key='enabled', text='Включить сдвиг', default=True, on_change=self._on_enabled), Selector(key='hour_index', text='Сдвиг времени', default=DEFAULT_INDEX, items=['Без сдвига' if h == 0 else '%+d ч' % h for h in HOURS], on_change=self._on_hours)]
