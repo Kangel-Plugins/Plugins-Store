@@ -1,0 +1,2296 @@
+import base64
+import html
+import json
+import os
+import re
+import shutil
+import threading
+import time
+import traceback
+import urllib.parse
+import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List, Tuple, Optional, Dict
+
+import requests
+from hook_utils import find_class, get_private_field, set_private_field
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodReplacement, MethodHook, MenuItemData, MenuItemType
+
+try:
+    from client_utils import send_text, edit_message, get_last_fragment, send_audio, send_document, send_photo
+except ImportError:
+    from client_utils import send_text, edit_message, get_last_fragment
+    send_audio = send_document = send_photo = None
+
+from ui.settings import Header, Input, Selector, Switch, Divider, Text
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread, OnClickListener
+from file_utils import get_cache_dir
+from java import dynamic_proxy, jint
+from org.telegram.messenger import MessageObject, AndroidUtilities, FileLoader, ImageLocation, UserConfig, MessagesController, MediaDataController, NotificationCenter
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper, UItem, BackupImageView
+from org.telegram.ui.Components.Premium import StarParticlesView
+from org.telegram.ui.Gifts import GiftSheet
+from org.telegram.tgnet import TLRPC
+from android.content import Context, ClipData, Intent
+from android.net import Uri
+from android.widget import LinearLayout, TextView, ScrollView, FrameLayout
+from android.view import Gravity, View, MotionEvent
+from android.graphics import PorterDuff, PorterDuffColorFilter
+from android.graphics.drawable import GradientDrawable
+from android.util import TypedValue
+from java.io import File
+from java.lang import Long, Class, String
+from java.util import HashMap, Objects, ArrayList
+
+try:
+    from com.exteragram.messenger.plugins.models import HeaderSetting
+except ImportError:
+    HeaderSetting = None
+
+__id__ = "x_assist"
+__name__ = "X-Assist"
+__description__ = "Твой персональный AI в Telegram. Умные ответы с веб-поиском, расшифровка голосовых и кружочков, поиск музыки, генерация картинок и многое другое. Помощь с настройкой и команды - /help"
+__author__ = "@Somewhat_empty"
+__version__ = "1.1.0"
+__icon__ = "ForAiAssistant/0"
+__app_version__ = ">=12.8.1"
+__sdk_version__ = ">=1.4.4.3"
+__requirements__ = ["requests"]
+
+API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite"
+API_URL = f"{API_BASE_URL}:generateContent"
+GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_WHISPER_MODEL = "whisper-large-v3"
+GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_CLEANUP_MODEL = "openai/gpt-oss-20b"
+GROQ_FALLBACK_MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS = ["meta-llama/llama-3.3-70b-instruct:free", "google/gemma-2-27b-it:free"]
+SHAZAM_API_URL = "https://x-assist-sphs.onrender.com/api/recognize"
+HISTORY_MAXLEN = 100
+MAX_RESPONSE_LENGTH = 4096
+NETWORK_TIMEOUT = 45
+LANGUAGE_CODES = ["uk", "en", "ru", "pl", "de", "fr", "es", "auto"]
+LANGUAGE_LABELS = ["🇺🇦 Ukrainian", "🇬🇧 English", "🇷🇺 Russian", "🇵🇱 Polish", "🇩🇪 German", "🇫🇷 French", "🇪🇸 Spanish", "🌐 Auto-detect"]
+PLUGIN_LANGUAGES = ["🇷🇺 Русский", "🇬🇧 English"]
+AUTHOR_USER_ID = 7667805183
+AUTHOR_EMOJI_ID = 5382278695509574265
+AUTHOR_BADGE_TEXT_RU = "Создатель X-Assist"
+AUTHOR_BADGE_TEXT_EN = "Creator of X-Assist"
+TEXT_EXTENSIONS = {
+    ".txt", ".py", ".java", ".c", ".cpp", ".cs", ".js", ".ts", ".jsx", ".tsx",
+    ".html", ".css", ".json", ".xml", ".csv", ".md", ".log", ".sh", ".sql",
+    ".yaml", ".yml", ".ini", ".cfg", ".php", ".rb", ".go", ".rs", ".kt"
+}
+SYSTEM_PROMPT = """Ты — полезный AI-ассистент X-Assist. Отвечай на вопросы пользователя.
+Будь вежливым, информативным и лаконичным. Если не знаешь ответ — честно скажи об этом.
+Отвечай на том же языке, на котором задан вопрос.
+Если переданы контекст сообщения, изображение или документ — используй их для актуального и точного ответа."""
+OR_FALLBACK_HEADERS = {"HTTP-Referer": "https://t.me/Somewhat_empty", "X-Title": "X-Assist"}
+
+
+def _safe_iter(j_list):
+    if not j_list:
+        return
+    try:
+        if isinstance(j_list, (list, tuple)):
+            yield from j_list
+        else:
+            for i in range(j_list.size()):
+                yield j_list.get(i)
+    except Exception:
+        pass
+
+
+def _get_raw_id(entity_id):
+    if entity_id is None:
+        return None
+    try:
+        return int(getattr(entity_id, "longValue", lambda: int(entity_id))())
+    except Exception:
+        return None
+
+
+class CascadeLLM:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._session = plugin._session
+        self._log = plugin._log
+        self._clean_key = plugin._clean_key
+
+    def generate(self, sys_prompt: str, user_prompt: str, temp: float = 0.3, max_tokens: int = 1024, tools: list = None) -> str:
+        api_raw = str(self.plugin.get_setting("api_key", "") or "")
+        gemini_keys = [self._clean_key(k) for k in api_raw.replace(";", ",").split(",") if self._clean_key(k)]
+        groq_key = self._clean_key(self.plugin.get_setting("groq_api_key", "") or "")
+        openrouter_key = self._clean_key(self.plugin.get_setting("openrouter_api_key", "") or "")
+
+        if gemini_keys:
+            payload = {
+                "systemInstruction": {"parts": [{"text": sys_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": {"temperature": temp, "maxOutputTokens": max_tokens}
+            }
+            if tools:
+                payload["tools"] = tools
+            for idx, gk in enumerate(gemini_keys):
+                try:
+                    r = self._session.post(API_URL, headers={"x-goog-api-key": gk, "Content-Type": "application/json"}, json=payload, timeout=18)
+                    if r.status_code == 200:
+                        cand = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                        ans = "".join(p.get("text", "") for p in cand if p.get("text")).strip()
+                        if ans:
+                            return ans
+                    else:
+                        self._log(f"Gemini key {idx+1} API {r.status_code}: {r.text[:120]}")
+                except Exception as e:
+                    self._log(f"[AI] Gemini err: {e}")
+
+        msgs = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
+        if groq_key:
+            for m in GROQ_FALLBACK_MODELS:
+                ok, res = self._call_openai_compatible(GROQ_LLM_URL, groq_key, m, msgs)
+                if ok and res:
+                    return res
+        if openrouter_key:
+            for m in OPENROUTER_MODELS:
+                ok, res = self._call_openai_compatible(OPENROUTER_URL, openrouter_key, m, msgs, extra_headers=OR_FALLBACK_HEADERS)
+                if ok and res:
+                    return res
+        return ""
+
+    def _call_openai_compatible(self, url: str, token: str, model: str, msgs: list, extra_headers: dict = None) -> Tuple[bool, str]:
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+        try:
+            resp = self._session.post(url, headers=headers, json={"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 2048}, timeout=NETWORK_TIMEOUT)
+            if resp.status_code == 200:
+                choices = resp.json().get("choices") or []
+                if choices:
+                    txt = (choices[0].get("message", {}).get("content") or "").strip()
+                    if txt:
+                        return True, txt
+            self._log(f"API {url} status {resp.status_code}: {resp.text[:120]}")
+            return False, f"HTTP {resp.status_code}"
+        except Exception as e:
+            self._log(f"API {url} exception: {e}")
+            return False, str(e)
+
+
+class AISheetBuilder:
+    def __init__(self, act, icon=__icon__, dismissible=False):
+        self.act = act
+        self.sheet = BottomSheet(act, False)
+        self.sheet.setCanDismissWithSwipe(dismissible)
+        self.root = LinearLayout(act)
+        self.root.setOrientation(LinearLayout.VERTICAL)
+        self.root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(14))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        bg.setCornerRadii([AndroidUtilities.dp(20)] * 4 + [0] * 4)
+        self.root.setBackground(bg)
+        self.avatar_view = BackupImageView(act)
+        self.avatar_view.setRoundRadius(AndroidUtilities.dp(40))
+        self.root.addView(self.avatar_view, LayoutHelper.createLinear(85, 85, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 8))
+        self.title_view = TextView(act)
+        self.title_view.setTypeface(AndroidUtilities.bold())
+        self.title_view.setGravity(Gravity.CENTER)
+        self.title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+        self.title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        self.root.addView(self.title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 10))
+        self.scroll = ScrollView(act)
+        self.scroll.setVerticalScrollBarEnabled(False)
+        self.content_view = TextView(act)
+        self.content_view.setTextIsSelectable(True)
+        self.content_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        self.content_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        self.content_view.setLineSpacing(AndroidUtilities.dp(3), 1.15)
+        self.scroll.addView(self.content_view)
+        self.root.addView(self.scroll, LayoutHelper.createLinear(-1, 0, 1.0))
+        self.btns_container = LinearLayout(act)
+        self.btns_container.setOrientation(LinearLayout.VERTICAL)
+        self.root.addView(self.btns_container, LayoutHelper.createLinear(-1, -2))
+
+    def load_avatar(self, plugin, sticker_name=__icon__, size="85_85"):
+        plugin.load_sticker_with_fallback(self.avatar_view, sticker_name, 0, size)
+        return self
+
+    def title(self, text):
+        self.title_view.setText(text)
+        return self
+
+    def content(self, text, gravity=Gravity.NO_GRAVITY):
+        self.content_view.setText(text)
+        self.content_view.setGravity(gravity)
+        return self
+
+    def button(self, text, on_click, accent=False, top_margin=6, bottom_margin=0):
+        btn = FrameLayout(self.act)
+        col = Theme.getColor(Theme.key_featuredStickers_addButton if accent else Theme.key_chat_inLoader)
+        bg_col = col if accent else (col & 0x20FFFFFF | 0x14000000)
+        btn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(26), bg_col, bg_col))
+        btn.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12))
+        tv = TextView(self.act)
+        tv.setText(text)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        tv.setTypeface(AndroidUtilities.bold())
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText if accent else Theme.key_dialogTextBlack))
+        btn.addView(tv, FrameLayout.LayoutParams(-1, -2))
+        btn.setOnClickListener(OnClickListener(on_click))
+        self.btns_container.addView(btn, LayoutHelper.createLinear(-1, -2, 0, top_margin, 0, bottom_margin))
+        return self
+
+    def build(self):
+        self.sheet.setCustomView(self.root)
+        return self.sheet
+
+
+class _BadgeHook(MethodHook):
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args or param.args[0] is None:
+                return
+            entity_id = param.args[0]
+            raw_id = _get_raw_id(entity_id)
+            if raw_id and raw_id in self.manager.custom_badges:
+                param.setResult(self.manager.custom_badges[raw_id])
+            elif entity_id in self.manager.custom_badges:
+                param.setResult(self.manager.custom_badges[entity_id])
+        except Exception:
+            pass
+
+
+class BadgeManager:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.custom_badges = {}
+        self._hook_refs = []
+        self.api_badge_source = None
+
+    def setup(self):
+        try:
+            self._get_api_badge_source()
+            self._setup_hooks()
+            self._load_badges()
+        except Exception:
+            pass
+
+    def _get_api_badge_source(self):
+        try:
+            BadgesController = find_class("com.exteragram.messenger.badges.BadgesController")
+            if not BadgesController:
+                return
+            instance = getattr(BadgesController, "INSTANCE", None)
+            if not instance:
+                try:
+                    f = BadgesController.getClass().getDeclaredField("INSTANCE")
+                    f.setAccessible(True)
+                    instance = f.get(None)
+                except Exception:
+                    pass
+            if instance:
+                self.api_badge_source = get_private_field(instance, "apiBadgeSource")
+        except Exception:
+            pass
+
+    def _setup_hooks(self):
+        try:
+            if not self.api_badge_source:
+                return
+            ApiBadgeSource = find_class("com.exteragram.messenger.badges.source.ApiBadgeSource")
+            if not ApiBadgeSource:
+                return
+            methods = []
+            try:
+                if hasattr(ApiBadgeSource, "getDeclaredMethods"):
+                    methods = list(ApiBadgeSource.getDeclaredMethods())
+                elif hasattr(ApiBadgeSource, "getClass"):
+                    methods = list(ApiBadgeSource.getClass().getDeclaredMethods())
+            except Exception:
+                pass
+            for method_name, hook_cls in [
+                ("getBadge", _BadgeHook),
+            ]:
+                hook_inst = hook_cls(self)
+                for m in methods:
+                    try:
+                        if hasattr(m, "getName") and m.getName() == method_name:
+                            m.setAccessible(True)
+                            self._hook_refs.append(self.plugin.hook_method(m, hook_inst))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _load_badges(self):
+        try:
+            if not self.api_badge_source:
+                self._get_api_badge_source()
+            if not self.api_badge_source:
+                return
+            cache = get_private_field(self.api_badge_source, "cache")
+            if not cache:
+                return
+            BadgeDTO = find_class("com.exteragram.messenger.api.dto.BadgeDTO")
+            BadgeInfo = find_class("com.exteragram.messenger.badges.source.BadgeInfo")
+            ProfileStatus = find_class("com.exteragram.messenger.api.model.ProfileStatus")
+            if not all([BadgeDTO, BadgeInfo, ProfileStatus]):
+                return
+            text = AUTHOR_BADGE_TEXT_EN if self.plugin._is_en() else AUTHOR_BADGE_TEXT_RU
+            dto = None
+            try:
+                dto = BadgeDTO(AUTHOR_EMOJI_ID, text)
+            except Exception:
+                try:
+                    dto = BadgeDTO(Long.valueOf(AUTHOR_EMOJI_ID), String(text))
+                except Exception:
+                    pass
+            if not dto:
+                return
+            status = getattr(ProfileStatus, "NONE", None)
+            if not status:
+                status = getattr(ProfileStatus, "DEFAULT", None)
+            info = None
+            try:
+                info = BadgeInfo(dto, status, False)
+            except Exception:
+                try:
+                    info = BadgeInfo(dto, None, False)
+                except Exception:
+                    pass
+            j_uid = Long.valueOf(AUTHOR_USER_ID)
+            if info:
+                cache.put(j_uid, info)
+            self.custom_badges[AUTHOR_USER_ID] = self.custom_badges[j_uid] = dto
+        except Exception:
+            pass
+
+    def cleanup(self):
+        try:
+            for ref in self._hook_refs:
+                try:
+                    self.plugin.unhook_method(ref)
+                except Exception:
+                    pass
+            self._hook_refs.clear()
+            if self.api_badge_source and self.custom_badges:
+                try:
+                    cache = get_private_field(self.api_badge_source, "cache")
+                    if cache:
+                        cache.remove(Long.valueOf(AUTHOR_USER_ID))
+                except Exception:
+                    pass
+            self.custom_badges.clear()
+        except Exception:
+            pass
+
+
+_RequestDelegateCls = find_class("org.telegram.tgnet.RequestDelegate")
+
+
+class _GlobalReqDelegate(dynamic_proxy(_RequestDelegateCls)):
+    def __init__(self, callback, logger=None):
+        super().__init__()
+        self.callback = callback
+        self.logger = logger
+
+    def run(self, response, error):
+        try:
+            self.callback(response, error)
+        except Exception as e:
+            if self.logger:
+                self.logger(f"[ReqDelegate] Error: {e}\n{traceback.format_exc()}")
+
+
+class AIAssistantPlugin(BasePlugin):
+    def _is_en(self) -> bool:
+        return int(self.get_setting("plugin_lang", 0) or 0) == 1
+
+    def _clean_key(self, k: str) -> str:
+        if not k:
+            return ""
+        k = str(k).strip().strip("\"'`«»“”")
+        if k.lower().startswith("bearer "):
+            k = k[7:].strip().strip("\"'`«»“”")
+        return k
+
+    def on_plugin_load(self):
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ai_worker")
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "TelegramExtera/XAssist"})
+        self._llm = CascadeLLM(self)
+        self._log_lines = []
+        self._skip_next = set()
+        self._chat_history = {}
+        self._chat_settings = {}
+        self._processing = set()
+        self._settings_activity_hooks = []
+        self._original_messages = {}
+        self._cached_music_bots = {}
+        try:
+            self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            self._data_path = os.path.join(self._plugin_dir, "ai_data.json")
+        except Exception:
+            self._plugin_dir = self._data_path = None
+        self._log(f"=== X-Assist v{__version__} загружен ===")
+        self._cleanup_temp_dir(force_all=True)
+        self.add_on_send_message_hook()
+        TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
+        ChatMessageCell = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        if TranscribeButton and ChatMessageCell:
+            try:
+                on_tap = getattr(TranscribeButton, "getDeclaredMethod", TranscribeButton.getClass().getDeclaredMethod)("onTap")
+                update_wave = getattr(ChatMessageCell, "getDeclaredMethod", ChatMessageCell.getClass().getDeclaredMethod)("updateWaveform")
+                self.hook_method(on_tap, self.CreateTranscribeButtonHook(self))
+                self.hook_method(update_wave, self.CreateUpdateWaveformHook(self))
+                self._log("Хуки для распознавания аудио успешно подключены")
+            except Exception as e:
+                self._log(f"Ошибка подключения хуков TranscribeButton: {e}")
+        for m_id, title_ru, title_en, handler, icon in [
+            ("x_assist_tldr", "✨ Пересказать кратко", "✨ Summarize briefly", self._handle_tldr_click, "msg_viewreplies"),
+            ("x_assist_translate", "🌍 Перевести", "🌍 Translate", self._handle_translate_click, "msg_language"),
+            ("x_assist_factcheck", "🔍 Фактчек", "🔍 Fact Check", self._handle_factcheck_click, "msg_search"),
+        ]:
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text=title_en if self._is_en() else title_ru,
+                    on_click=handler,
+                    icon=icon,
+                    item_id=m_id
+                ))
+            except Exception as e:
+                self._log(f"Menu item {m_id} error: {e}")
+        self._setup_settings_header_hook()
+        self._setup_settings_activity_hook()
+        self._load_data()
+        self._force_load_stickers()
+        self._badge_manager = BadgeManager(self)
+        run_on_ui_thread(self._badge_manager.setup, 1500)
+        run_on_ui_thread(self._badge_manager.setup, 4000)
+        return super().on_plugin_load()
+
+    def on_plugin_unload(self):
+        if getattr(self, "_badge_manager", None):
+            self._badge_manager.cleanup()
+        self._save_data()
+        self._cleanup_temp_dir(force_all=True)
+        if getattr(self, "_executor", None):
+            self._executor.shutdown(wait=False)
+        for ref in getattr(self, "_settings_activity_hooks", []):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._settings_activity_hooks.clear()
+        if getattr(self, "_session", None):
+            self._session.close()
+        self._log("🤖 X-Assist выгружен")
+
+    def _extract_msg_and_cell(self, args):
+        msg_obj, cell = None, None
+        for arg in args:
+            if not arg:
+                continue
+            if hasattr(arg, "get") or isinstance(arg, dict):
+                for k in ("message", "messageObject", "message_object", "msg", "selectedMessage"):
+                    cand = arg.get(k)
+                    if cand and (hasattr(cand, "messageOwner") or hasattr(cand, "getId")):
+                        msg_obj = cand
+                        break
+                for k in ("view", "cell", "chatMessageCell"):
+                    c_cand = arg.get(k)
+                    if c_cand:
+                        cell = c_cand
+                        break
+            if not msg_obj and cell and hasattr(cell, "getMessageObject"):
+                msg_obj = cell.getMessageObject()
+            elif hasattr(arg, "messageOwner") or hasattr(arg, "getId"):
+                msg_obj = arg
+                break
+        return msg_obj, cell
+
+    def _handle_context_action(self, args, action_name, loading_text, task_fn):
+        en = self._is_en()
+        msg_obj, cell = self._extract_msg_and_cell(args)
+        if not msg_obj:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Error: message not found" if en else "Ошибка: сообщение не найдено"))
+            return
+        msg_id = getattr(msg_obj, "getId", lambda: getattr(getattr(msg_obj, "messageOwner", None), "id", None))()
+        if msg_id is None:
+            return
+        dialog_id = getattr(msg_obj, "getDialogId", lambda: getattr(getattr(msg_obj, "messageOwner", None), "dialog_id", 0))()
+        key = (dialog_id, msg_id)
+        account = getattr(msg_obj, "currentAccount", 0)
+        with self._lock:
+            if key in self._original_messages:
+                orig_text, orig_entities, prev_action = self._original_messages[key]
+                if prev_action == action_name:
+                    self._original_messages.pop(key, None)
+                    self._update_message_text_locally(msg_obj, cell, orig_text, account, entities=orig_entities)
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("Original restored" if en else "Оригинал восстановлен"))
+                    return
+                else:
+                    raw_text = orig_text
+                    self._original_messages[key] = (orig_text, orig_entities, action_name)
+            else:
+                raw_text = str(getattr(msg_obj, "messageText", None) or getattr(getattr(msg_obj, "messageOwner", None), "message", "") or "").strip()
+                if len(raw_text) < 5:
+                    return
+                self._original_messages[key] = (getattr(msg_obj, "messageText", raw_text), getattr(getattr(msg_obj, "messageOwner", None), "entities", None), action_name)
+        self._update_message_text_locally(msg_obj, cell, loading_text, account)
+
+        def runner():
+            try:
+                res = task_fn(raw_text)
+                if not res:
+                    raise Exception("Empty AI response")
+                run_on_ui_thread(lambda: self._update_message_text_locally(msg_obj, cell, res, account))
+            except Exception as ex:
+                self._log(f"[{action_name}] Error: {ex}")
+                with self._lock:
+                    entry = self._original_messages.pop(key, None)
+                    if entry:
+                        orig_t, orig_e = entry[0], entry[1]
+                    else:
+                        orig_t, orig_e = raw_text, None
+                run_on_ui_thread(lambda: self._update_message_text_locally(msg_obj, cell, orig_t, account, entities=orig_e))
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {ex}"))
+
+        self._submit(runner)
+
+    def _handle_tldr_click(self, *args, **kwargs):
+        en = self._is_en()
+        self._handle_context_action(
+            args, "TLDR",
+            "⏳ Summarizing via X-Assist..." if en else "⏳ Сжимаю текст через X-Assist...",
+            lambda text: f"✨ [Summary]:\n{self._fast_summarize(text)}\n\n(Click «Summarize briefly» again to restore)" if en
+            else f"✨ [Краткая выжимка]:\n{self._fast_summarize(text)}\n\n(Нажмите «Пересказать кратко» повторно для отмены)"
+        )
+
+    def _handle_translate_click(self, *args, **kwargs):
+        en = self._is_en()
+        self._handle_context_action(
+            args, "Translate",
+            "⏳ Translating via X-Assist..." if en else "⏳ Перевожу через X-Assist...",
+            lambda text: f"🌍 [Translation]:\n{self._fast_translate(text, 'English' if en else 'Russian')}\n\n(Click «Translate» again to restore)" if en
+            else f"🌍 [Перевод]:\n{self._fast_translate(text, 'English' if en else 'Russian')}\n\n(Нажмите «Перевести» повторно для отмены)"
+        )
+
+    def _handle_factcheck_click(self, *args, **kwargs):
+        en = self._is_en()
+        msg_obj, _ = self._extract_msg_and_cell(args)
+        raw_text = str(getattr(msg_obj, "messageText", None) or getattr(getattr(msg_obj, "messageOwner", None), "message", "") or "").strip()
+        if len(raw_text) < 10:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Text too short" if en else "Текст слишком короткий"))
+            return
+        run_on_ui_thread(lambda: BulletinHelper.show_info("🔍 Checking facts..." if en else "🔍 Анализирую источники и проверяю факты..."))
+
+        def runner():
+            try:
+                res = self._run_factcheck(raw_text)
+                if res:
+                    run_on_ui_thread(lambda: self._show_factcheck_sheet(res))
+                else:
+                    raise Exception("Check failed")
+            except Exception as e:
+                self._log(f"[FactCheck] Error: {e}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {e}"))
+
+        self._submit(runner)
+
+    def _create_sheet_button(self, act, text: str, is_accent: bool, on_click):
+        btn = FrameLayout(act)
+        col = Theme.getColor(Theme.key_featuredStickers_addButton if is_accent else Theme.key_chat_inLoader)
+        bg_col = col if is_accent else (col & 0x20FFFFFF | 0x14000000)
+        btn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(26), bg_col, bg_col))
+        btn.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12))
+        tv = TextView(act)
+        tv.setText(text)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        tv.setTypeface(AndroidUtilities.bold())
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText if is_accent else Theme.key_dialogTextBlack))
+        btn.addView(tv, FrameLayout.LayoutParams(-1, -2))
+        btn.setOnClickListener(OnClickListener(on_click))
+        self._apply_press_scale(btn)
+        return btn
+
+    def _show_factcheck_sheet(self, text: str):
+        act = getattr(get_last_fragment(), "getParentActivity", lambda: None)()
+        if not act:
+            return
+        en = self._is_en()
+        sheet = (AISheetBuilder(act, dismissible=False)
+                 .load_avatar(self)
+                 .title("🔍 X-Assist Fact Check" if en else "🔍 Фактчекинг X-Assist")
+                 .content(text)
+                 .button("📋 Copy Verdict" if en else "📋 Скопировать вердикт",
+                         lambda v: (act.getSystemService(Context.CLIPBOARD_SERVICE).setPrimaryClip(ClipData.newPlainText("factcheck", text)),
+                                    BulletinHelper.show_info("Copied to clipboard!" if en else "Скопировано в буфер!")),
+                         accent=True, top_margin=10, bottom_margin=6)
+                 .button("Close" if en else "Закрыть", lambda v: sheet.dismiss(), accent=False)
+                 .build())
+        sheet.show()
+
+    def _show_shazam_sheet(self, account: int, peer, track: dict):
+        act = getattr(get_last_fragment(), "getParentActivity", lambda: None)()
+        if not act:
+            return
+        en = self._is_en()
+        sheet = BottomSheet(act, False)
+        sheet.setCanDismissWithSwipe(True)
+        root = LinearLayout(act)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(14))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        bg.setCornerRadii([AndroidUtilities.dp(20)] * 4 + [0] * 4)
+        root.setBackground(bg)
+        title = track.get("title") or ("Unknown Track" if en else "Неизвестный трек")
+        artist = track.get("artist") or ("Unknown Artist" if en else "Неизвестный исполнитель")
+        album = track.get("album") or ""
+        genres = track.get("genres") or []
+        local_cover = track.get("local_cover_path")
+        avatar_view = BackupImageView(act)
+        avatar_view.setRoundRadius(AndroidUtilities.dp(16))
+        loaded = False
+        if local_cover and os.path.exists(local_cover):
+            try:
+                avatar_view.setImage(ImageLocation.getForPath(local_cover), "110_110", None, None, 0, 1)
+                avatar_view.setAlpha(1.0)
+                loaded = True
+            except Exception:
+                pass
+        if not loaded:
+            avatar_view.setRoundRadius(AndroidUtilities.dp(40))
+            self.load_sticker_with_fallback(avatar_view, __icon__, 0, "85_85")
+        root.addView(avatar_view, LayoutHelper.createLinear(95, 95, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 10))
+        tv_title = TextView(act)
+        tv_title.setTypeface(AndroidUtilities.bold())
+        tv_title.setGravity(Gravity.CENTER)
+        tv_title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19)
+        tv_title.setText(title)
+        tv_title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        root.addView(tv_title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 4))
+        tv_artist = TextView(act)
+        tv_artist.setGravity(Gravity.CENTER)
+        tv_artist.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        tv_artist.setText(artist)
+        tv_artist.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        root.addView(tv_artist, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 6))
+        info_parts = []
+        if album:
+            info_parts.append(f"💿 {album}")
+        if genres and genres[0]:
+            info_parts.append(f"🏷 {genres[0]}")
+        if info_parts:
+            tv_info = TextView(act)
+            tv_info.setGravity(Gravity.CENTER)
+            tv_info.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+            tv_info.setText(" • ".join(info_parts))
+            tv_info.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            root.addView(tv_info, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
+        search_query = f"{artist} - {title}".strip(" -")
+        send_btn = self._create_sheet_button(act, "🎵 Send to Chat" if en else "🎵 Отправить в чат", True, lambda v: (
+            sheet.dismiss(),
+            self._submit(self._fetch_inline_music, account, peer, search_query)
+        ))
+        close_btn = self._create_sheet_button(act, "Close" if en else "Закрыть", False, lambda v: sheet.dismiss())
+        btns = LinearLayout(act)
+        btns.setOrientation(LinearLayout.VERTICAL)
+        btns.addView(send_btn, LayoutHelper.createLinear(-1, -2, 0, 6, 0, 6))
+        btns.addView(close_btn, LayoutHelper.createLinear(-1, -2))
+        root.addView(btns, LayoutHelper.createLinear(-1, -2))
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _process_shazam(self, account: int, peer, reply_msg: MessageObject):
+        en = self._is_en()
+        doc = MessageObject.getDocument(reply_msg)
+        if not doc:
+            media = getattr(getattr(reply_msg, "messageOwner", None), "media", None)
+            doc = getattr(media, "document", None) if media else None
+        if not doc:
+            send_text(peer, "❌ Reply to a voice note, video note, video, or audio file!" if en else "❌ Ответьте на голосовое сообщение, кружочек, видео или аудиофайл!", account=account)
+            return
+        doc_sz = getattr(doc, "size", 0) or 0
+        if doc_sz > 35 * 1024 * 1024:
+            send_text(peer, "⚠️ File exceeds 35 MB." if en else "⚠️ Файл больше 35 МБ. Поддерживаются файлы до 35 МБ.", account=account)
+            return
+        run_on_ui_thread(lambda: BulletinHelper.show_info("🎵 Recognizing track via Shazam..." if en else "🎵 Распознаю трек через Shazam..."))
+        is_round = getattr(reply_msg, "isRoundVideo", lambda: False)()
+        is_voice = getattr(reply_msg, "isVoice", lambda: False)()
+        path = self._poll_download_file(reply_msg, doc, account, is_media=(is_round or is_voice))
+        if not path or not os.path.exists(path):
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Failed to load audio" if en else "Не удалось загрузить аудио"))
+            return
+        temp_cover_path = None
+        try:
+            fname = os.path.basename(path)
+            mime = getattr(doc, "mime_type", "application/octet-stream") or "application/octet-stream"
+            with open(path, "rb") as f:
+                r = self._session.post(
+                    SHAZAM_API_URL,
+                    files={"file": (fname, f, mime)},
+                    timeout=30
+                )
+            if r.status_code != 200:
+                self._log(f"[Shazam] HTTP {r.status_code}: {r.text[:120]}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Server error ({r.status_code})" if en else f"Ошибка сервера ({r.status_code})"))
+                return
+            res_json = r.json()
+            status = res_json.get("status")
+            if status == "not_found":
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Track not found" if en else "Трек не найден"))
+                return
+            elif status != "success" or not res_json.get("track"):
+                err_msg = res_json.get("message", "Recognition error")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {err_msg[:60]}" if en else f"Ошибка: {err_msg[:60]}"))
+                return
+            track = res_json.get("track", {})
+            cover_url = track.get("cover_url")
+            if cover_url:
+                try:
+                    shazam_temp = File(get_cache_dir(), "ai_shazam_temp")
+                    if not shazam_temp.exists():
+                        shazam_temp.mkdirs()
+                    temp_cover_path = File(shazam_temp, f"c_{uuid.uuid4().hex[:8]}.jpg").getAbsolutePath()
+                    c_resp = self._session.get(cover_url, timeout=10)
+                    if c_resp.status_code == 200 and len(c_resp.content) > 1000:
+                        with open(temp_cover_path, "wb") as cf:
+                            cf.write(c_resp.content)
+                        track["local_cover_path"] = temp_cover_path
+                except Exception as ce:
+                    self._log(f"[Shazam] Cover load err: {ce}")
+            run_on_ui_thread(lambda: self._show_shazam_sheet(account, peer, track))
+        except Exception as ex:
+            self._log(f"[Shazam] Error: {ex}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {str(ex)[:60]}"))
+        finally:
+            if path and os.path.exists(path) and "ai_voice_temp" in path:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+    def _generate_ai_text(self, sys_prompt: str, user_prompt: str, temp: float = 0.3, max_tokens: int = 1024, tools: list = None) -> str:
+        return self._llm.generate(sys_prompt, user_prompt, temp, max_tokens, tools)
+
+    def _fast_translate(self, text: str, target_lang: str) -> str:
+        sys_p = (
+            f"You are a professional translator. Translate accurately into {target_lang}. "
+            f"If already in {target_lang}, translate into the opposite (Russian <-> English). "
+            f"Preserve formatting, tone, nuances and emojis. Output ONLY direct translation."
+        )
+        return self._generate_ai_text(sys_p, text, temp=0.2, max_tokens=2048)
+
+    def _fast_summarize(self, text: str) -> str:
+        en = self._is_en()
+        sys_p = (
+            "Provide a concise, structured summary of the text (1-4 bullet points using •). Output bullet points directly without introductory phrases."
+            if en else
+            "Сделай емкую структурированную выжимку текста (1-4 тезиса с маркером •). Выводи сразу тезисы без вводных фраз."
+        )
+        return self._generate_ai_text(sys_p, text, temp=0.3, max_tokens=1024)
+
+    def _run_factcheck(self, text: str) -> str:
+        en = self._is_en()
+        sys_p = (
+            "Analyze the statement using fresh real-world information. Do NOT use ALL CAPS words.\n"
+            "Verdict: [🟢 True / 🔴 Fake / 🟡 Half-truth / ⚪️ Unconfirmed]\n"
+            "• Fact Analysis: [2-4 brief bullet points]\n• Context: [1-2 sentences]"
+        ) if en else (
+            "Проверь утверждение с опорой на реальные факты. НЕ используй слова капсом.\n"
+            "Вердикт: [🟢 Правда / 🔴 Фейк / 🟡 Полуправда / ⚪️ Не подтверждено]\n"
+            "• Анализ фактов: [2-4 тезиса]\n• Контекст: [1-2 коротких предложения]"
+        )
+        ans = self._generate_ai_text(sys_p, text, temp=0.2, max_tokens=1024, tools=[{"googleSearch": {}}])
+        if not ans:
+            snips = self._fetch_web_snippets(text[:120], max_results=4)
+            u_text = f"WEB SEARCH CONTEXT:\n{snips}\n\nCLAIM:\n{text}" if snips else text
+            ans = self._generate_ai_text(sys_p, u_text, temp=0.2, max_tokens=1024)
+        return ans
+
+    def _update_message_text_locally(self, msg_obj: Any, cell: Any, new_text: Any, account: int, entities: Any = None):
+        try:
+            j_text = String(str(new_text))
+            if hasattr(msg_obj, "messageOwner") and msg_obj.messageOwner:
+                msg_obj.messageOwner.message = j_text
+                msg_obj.messageOwner.entities = entities if entities is not None else ArrayList()
+                msg_obj.messageText = j_text
+                for m in ("createMessageText", "resetLayout"):
+                    if hasattr(msg_obj, m):
+                        try:
+                            getattr(msg_obj, m)()
+                        except Exception:
+                            pass
+
+            def refresh_ui():
+                try:
+                    if cell:
+                        if hasattr(cell, "setMessageObject"):
+                            cell.setMessageObject(msg_obj, None, False, False)
+                        if hasattr(cell, "invalidate"):
+                            cell.invalidate()
+                    frag = get_last_fragment()
+                    if frag:
+                        ca = getattr(frag, "chatAdapter", None) or get_private_field(frag, "chatAdapter")
+                        if ca and hasattr(ca, "notifyDataSetChanged"):
+                            ca.notifyDataSetChanged()
+                    NC = find_class("org.telegram.messenger.NotificationCenter") or NotificationCenter
+                    if NC:
+                        NC.getInstance(account).postNotificationName(NC.updateInterfaces, jint(1))
+                except Exception:
+                    pass
+
+            run_on_ui_thread(refresh_ui)
+        except Exception as e:
+            self._log(f"[UI] Update error: {e}")
+
+    def try_load_sticker(self, img, sticker_name, sticker_index=0, size="72_72"):
+        try:
+            set_name = sticker_name.split("/")[0] if isinstance(sticker_name, str) and "/" in sticker_name else sticker_name
+            idx = int(sticker_name.split("/")[1]) if isinstance(sticker_name, str) and "/" in sticker_name else sticker_index
+            acc = UserConfig.selectedAccount if UserConfig else 0
+            mdc = MediaDataController.getInstance(acc)
+            ss = mdc.getStickerSetByName(set_name) or mdc.getStickerSetByEmojiOrName(set_name)
+            if ss and ss.documents and ss.documents.size() > idx:
+                img.setImage(ImageLocation.getForDocument(ss.documents.get(idx)), size, None, None, 0, 1)
+                img.setAlpha(1.0)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def load_sticker_with_fallback(self, img, sticker_name, sticker_index=0, size="72_72", delay=800):
+        if self.try_load_sticker(img, sticker_name, sticker_index, size):
+            return
+        try:
+            set_name = sticker_name.split("/")[0] if isinstance(sticker_name, str) and "/" in sticker_name else sticker_name
+            acc = UserConfig.selectedAccount if UserConfig else 0
+            mdc = MediaDataController.getInstance(acc)
+            if mdc:
+                input_set = TLRPC.TL_inputStickerSetShortName()
+                input_set.short_name = set_name
+                mdc.getStickerSet(input_set, None, False, None)
+                run_on_ui_thread(lambda: self.try_load_sticker(img, sticker_name, sticker_index, size), delay)
+                run_on_ui_thread(lambda: self.try_load_sticker(img, sticker_name, sticker_index, size), delay + 1200)
+        except Exception:
+            pass
+
+    def _force_load_stickers(self):
+        try:
+            acc = UserConfig.selectedAccount if UserConfig else 0
+            mdc = MediaDataController.getInstance(acc)
+            if mdc:
+                input_set = TLRPC.TL_inputStickerSetShortName()
+                input_set.short_name = "ForAiAssistant"
+                mdc.getStickerSet(input_set, None, False, None)
+        except Exception:
+            pass
+
+    def _submit(self, fn, *args, **kwargs):
+        def runner():
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                self._log(f"Thread {fn.__name__} error:\n{traceback.format_exc()}")
+
+        executor = getattr(self, "_executor", None)
+        if executor and not getattr(executor, "_shutdown", False):
+            try:
+                return executor.submit(runner)
+            except Exception:
+                pass
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        return t
+
+    def _cleanup_temp_dir(self, force_all: bool = True, max_age: int = 3600):
+        now = time.time()
+        for sub in ("ai_voice_temp", "ai_music_temp", "ai_pic_temp", "ai_shazam_temp"):
+            try:
+                p = File(get_cache_dir(), sub).getAbsolutePath()
+                if os.path.exists(p):
+                    for fn in os.listdir(p):
+                        fp = os.path.join(p, fn)
+                        if os.path.isfile(fp) and (force_all or (now - os.path.getmtime(fp) > max_age)):
+                            try:
+                                os.remove(fp)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+    def _split_text_safely(self, text: str, max_chunk: int = 3900) -> List[str]:
+        if len(text) <= max_chunk:
+            return [text]
+        chunks = []
+        remaining = text
+        while len(remaining) > max_chunk:
+            cut_idx = -1
+            for sep in ("\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "):
+                pos = remaining.rfind(sep, 0, max_chunk)
+                if pos > max_chunk // 2:
+                    cut_idx = pos + len(sep)
+                    break
+            if cut_idx == -1:
+                cut_idx = max_chunk
+            chunk = remaining[:cut_idx]
+            remaining = remaining[cut_idx:]
+            code_fences = chunk.count("```")
+            if code_fences % 2 != 0:
+                last_fence = chunk.rfind("```")
+                fence_line = chunk[last_fence:].split("\n", 1)[0]
+                lang = fence_line.replace("```", "").strip()
+                chunk = chunk + "\n```"
+                remaining = f"```{lang}\n" + remaining
+            chunks.append(chunk)
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    def _send_split_message(self, peer, text: str, account: int):
+        chunks = self._split_text_safely(text, max_chunk=3900)
+        for idx, chunk in enumerate(chunks):
+            try:
+                send_text(peer, chunk, account=account)
+                if idx < len(chunks) - 1:
+                    time.sleep(0.2)
+            except Exception as e:
+                self._log(f"[Send] Chunk {idx+1} error: {e}")
+
+    def _log(self, text: str):
+        line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        with getattr(self, "_lock", threading.RLock()):
+            self._log_lines.append(line)
+            if len(self._log_lines) > 100:
+                self._log_lines = self._log_lines[-100:]
+        try:
+            self.log(line)
+        except Exception:
+            pass
+
+    def _format_api_error(self, code: int) -> str:
+        en = self._is_en()
+        err_map = {
+            429: "⚠️ **Rate limit exceeded**\n• Quotas exhausted. Wait 1-2 min." if en else "⚠️ **Превышен лимит запросов (Квота исчерпана)**\n• Подождите 1–2 минуты или проверьте актуальность ключей в /log.",
+            401: "⚠️ **API Authorization Error**\nCheck your keys." if en else "⚠️ **Ошибка авторизации API**\nПроверьте введенные API ключи в настройках плагина.",
+            403: "⚠️ **API Access Denied**" if en else "⚠️ **Доступ запрещен**\nПроверьте введенные API ключи в настройках плагина.",
+            400: "⚠️ **Bad Request (400)**" if en else "⚠️ **Некорректный запрос (400 Bad Request)**\nПопробуйте уменьшить прикрепленный файл или очистить историю.",
+        }
+        return err_map.get(code, f"❌ API Error ({code})" if en else f"❌ Ошибка API ({code})")
+
+    def _apply_press_scale(self, view):
+        try:
+            class _Touch(dynamic_proxy(View.OnTouchListener)):
+                def onTouch(self, v, ev):
+                    act = ev.getActionMasked()
+                    if act == MotionEvent.ACTION_DOWN:
+                        v.animate().scaleX(0.94).scaleY(0.94).setDuration(100).start()
+                    elif act in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                        v.animate().scaleX(1.0).scaleY(1.0).setDuration(200).start()
+                    return False
+
+            view.setOnTouchListener(_Touch())
+        except Exception:
+            pass
+
+    def _setup_settings_activity_hook(self):
+        try:
+            SA = find_class("org.telegram.ui.SettingsActivity")
+            if SA is None:
+                return
+            ArrayList_cls = find_class("java.util.ArrayList")
+            UniversalAdapter = find_class("org.telegram.ui.Components.UniversalAdapter")
+            if ArrayList_cls is None or UniversalAdapter is None:
+                return
+            _AI_SETTINGS_BTN_ID = 771122
+            plugin_ref = self
+
+            class FillItemsHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        if not plugin_ref.get_setting("show_settings_button", True):
+                            return
+                        items = param.args[0]
+                        if items is None or items.size() == 0:
+                            return
+                        for i in range(items.size()):
+                            item = items.get(i)
+                            try:
+                                if item is not None and int(item.id) == _AI_SETTINGS_BTN_ID:
+                                    return
+                            except Exception:
+                                pass
+                        extera_idx = -1
+                        for i in range(items.size()):
+                            item = items.get(i)
+                            try:
+                                if item is not None and int(item.id) == -1:
+                                    extera_idx = i
+                                    break
+                            except Exception:
+                                pass
+                        if extera_idx < 0:
+                            return
+                        SettingCellFactory = find_class("org.telegram.ui.SettingsActivity$SettingCell$Factory")
+                        if SettingCellFactory is None:
+                            return
+                        icon_id = 0
+                        try:
+                            R_tg = find_class("org.telegram.messenger.R")
+                            icon_id = int(getattr(R_tg.drawable, "msg_bot", getattr(R_tg.drawable, "msg_settings", 0)))
+                        except Exception:
+                            pass
+                        label = "X-Assist"
+                        of_method = None
+                        methods = list(SettingCellFactory.getDeclaredMethods()) if hasattr(SettingCellFactory, "getDeclaredMethods") else list(SettingCellFactory.getClass().getDeclaredMethods())
+                        for m in methods:
+                            try:
+                                if m.getName() == "of" and len(m.getParameterTypes()) == 5:
+                                    of_method = m
+                                    break
+                            except Exception:
+                                pass
+                        if of_method is None:
+                            return
+                        of_method.setAccessible(True)
+                        _AI_COLOR = -7711489
+                        item = of_method.invoke(None, [jint(_AI_SETTINGS_BTN_ID), jint(_AI_COLOR), jint(_AI_COLOR), jint(icon_id), String(label)])
+                        if item is None:
+                            return
+                        try:
+                            item_cls = item.getClass()
+                            for _fname in ("iconColor", "iconBgColor", "color", "bgColor"):
+                                try:
+                                    _f = item_cls.getDeclaredField(_fname)
+                                    _f.setAccessible(True)
+                                    _f.setInt(item, _AI_COLOR)
+                                    break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        items.add(extera_idx + 1, item)
+                    except Exception as e:
+                        plugin_ref._log(f"FillItemsHook error: {e}")
+
+            class OnClickHook(MethodHook):
+                def before_hooked_method(self, param):
+                    try:
+                        uItem = param.args[0]
+                        if uItem is None or int(uItem.id) != _AI_SETTINGS_BTN_ID:
+                            return
+                        param.setResult(None)
+
+                        def open_ai_settings():
+                            try:
+                                frag = get_last_fragment()
+                                PluginsController = find_class("com.exteragram.messenger.plugins.PluginsController")
+                                PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+                                if PluginsController and PluginSettingsActivity:
+                                    plugin_obj = PluginsController.getInstance().plugins.get(__id__)
+                                    if plugin_obj and frag:
+                                        frag.presentFragment(PluginSettingsActivity(plugin_obj))
+                            except Exception as e:
+                                plugin_ref._log(f"open_ai_settings error: {e}")
+
+                        run_on_ui_thread(open_ai_settings)
+                    except Exception as e:
+                        plugin_ref._log(f"OnClickHook error: {e}")
+
+            fill_method = getattr(SA, "getDeclaredMethod", SA.getClass().getDeclaredMethod)("fillItems", ArrayList_cls, UniversalAdapter)
+            fill_method.setAccessible(True)
+            self._settings_activity_hooks.append(self.hook_method(fill_method, FillItemsHook()))
+            methods = list(SA.getDeclaredMethods()) if hasattr(SA, "getDeclaredMethods") else list(SA.getClass().getDeclaredMethods())
+            click_method = next((m for m in methods if m.getName() == "onClick" and len(m.getParameterTypes()) == 5), None)
+            if click_method:
+                click_method.setAccessible(True)
+                self._settings_activity_hooks.append(self.hook_method(click_method, OnClickHook()))
+        except Exception as e:
+            self._log(f"SettingsActivity hook error: {e}")
+
+    def create_api_keys_submenu(self):
+        en = self._is_en()
+        gemini_ok = any(self._clean_key(k) for k in str(self.get_setting("api_key", "") or "").replace(";", ",").split(","))
+        groq_ok = bool(self._clean_key(self.get_setting("groq_api_key", "") or ""))
+        or_ok = bool(self._clean_key(self.get_setting("openrouter_api_key", "") or ""))
+        return [
+            Header(text="Main Key" if en else "Основной ключ"),
+            Input(key="api_key", text="Gemini API Key", default="", subtext="Main key. You can specify multiple separated by commas: key1, key2" if en else "Основной ключ. Можно указать несколько через запятую: key1, key2", icon="menu_privacy" if gemini_ok else "menu_unlock"),
+            Text(text="Get key at aistudio.google.com" if en else "Получить ключ на aistudio.google.com", icon="msg_openin", accent=True, on_click=lambda v: self._open_url("https://aistudio.google.com/app/apikey")),
+            Divider(),
+            Header(text="Backup Keys" if en else "Резервные ключи"),
+            Input(key="groq_api_key", text="Groq API Key", default="", subtext="Free key at console.groq.com (Fallback + STT + Rewrite)" if en else "Бесплатный ключ на console.groq.com (Резерв + STT + Рерайт)", icon="menu_privacy" if groq_ok else "menu_unlock"),
+            Text(text="Get key at console.groq.com" if en else "Получить ключ на console.groq.com", icon="msg_openin", accent=True, on_click=lambda v: self._open_url("https://console.groq.com")),
+            Input(key="openrouter_api_key", text="OpenRouter API Key", default="", subtext="Free key at openrouter.ai (Fallback text models)" if en else "Бесплатный ключ на openrouter.ai (Резерв текстовых моделей)", icon="menu_privacy" if or_ok else "menu_unlock"),
+            Text(text="Get key at openrouter.ai" if en else "Получить ключ на openrouter.ai", icon="msg_openin", accent=True, on_click=lambda v: self._open_url("https://openrouter.ai/settings/keys")),
+        ]
+
+    def create_generation_submenu(self):
+        en = self._is_en()
+        return [
+            Header(text="🌐 Internet Search" if en else "🌐 Поиск в интернете"),
+            Switch(key="enable_web_search", text="Enable web search" if en else "Включить поиск в сети", default=True, subtext="Google Grounding in Gemini + auto-fallback to backup networks" if en else "Google Grounding в Gemini + авто-перенаправление в резервные сети"),
+            Switch(key="search_always", text="Always search" if en else "Искать всегда", default=False, subtext="If disabled — search only via /search command" if en else "Если выключено — поиск только по команде /search"),
+        ]
+
+    def create_images_submenu(self):
+        en = self._is_en()
+        return [
+            Header(text="🎨 Image Generation" if en else "🎨 Генерация изображений"),
+            Switch(key="chatgpt_prompt_expander", text="ChatGPT prompt rewriter" if en else "ChatGPT рерайтер промптов", default=True, subtext="Expands short prompts into cinematic scenes for maximum quality" if en else "Разворачивает короткие фразы в кинематографичные сцены для максимального качества"),
+        ]
+
+    def create_stt_submenu(self):
+        en = self._is_en()
+        return [
+            Header(text="🎙 Audio Recognition" if en else "🎙 Распознавание аудио"),
+            Selector(key="language", text="Audio language" if en else "Язык аудио", default=2, items=LANGUAGE_LABELS, icon="menu_feature_voice"),
+            Switch(key="premium_stt", text="Transcription button on messages" if en else "Кнопка расшифровки у сообщений", default=True, subtext="Displays native transcribe button next to voice/video messages without Telegram Premium" if en else "Отображает нативную кнопку расшифровки рядом с голосовыми и видеосообщениями без Premium"),
+            Switch(key="llama_cleanup", text="Text improvement" if en else "Улучшение текста", default=False, subtext="Automatically fixes punctuation, capitalization, and minor speech inaccuracies" if en else "Автоматически расставляет знаки препинания, заглавные буквы и исправляет неточности речи"),
+        ]
+
+    def create_memory_submenu(self):
+        en = self._is_en()
+        items = ["Short (10)", "Medium (20)", "Deep (30)", "Maximum (50)"] if en else ["Короткая (10)", "Средняя (20)", "Глубокая (30)", "Максимум (50)"]
+        return [
+            Header(text="🧠 Memory & Context" if en else "🧠 Память и контекст"),
+            Selector(key="default_memory", text="Context depth" if en else "Глубина контекста", items=items, default=1),
+            Switch(key="auto_save", text="Save history between restarts" if en else "Сохранять историю между перезапусками", default=True),
+            Switch(key="show_stats", text="Show response speed" if en else "Показывать скорость ответа", default=False),
+        ]
+
+    def create_commands_submenu(self):
+        en = self._is_en()
+        return [
+            Header(text="Custom Commands" if en else "Кастомные команды"),
+            Input(key="cmd_ask", text="Ask command" if en else "Команда вопроса", default="/ask", subtext="Command for assistant requests (default: /ask)" if en else "Команда для обращения к AI (по умолчанию: /ask)", icon="msg_bot"),
+            Input(key="cmd_search", text="Search command" if en else "Команда поиска", default="/search", subtext="Command for web search (default: /search)" if en else "Команда для поиска в интернете (по умолчанию: /search)", icon="msg_search"),
+        ]
+
+    def create_settings(self) -> List[Any]:
+        en = self._is_en()
+        return [
+            Header(text="Settings" if en else "Настройки"),
+            Text(text="API Keys" if en else "API-Ключи", icon="menu_privacy", create_sub_fragment=self.create_api_keys_submenu),
+            Text(text="Generation & Search" if en else "Генерация ответов и поиск", icon="msg_search", create_sub_fragment=self.create_generation_submenu),
+            Text(text="Image Generation" if en else "Генерация изображений", icon="msg_media", create_sub_fragment=self.create_images_submenu),
+            Text(text="Audio Recognition" if en else "Распознавание аудио", icon="menu_feature_voice", create_sub_fragment=self.create_stt_submenu),
+            Text(text="Memory & Context" if en else "Память и контекст", icon="msg_data", create_sub_fragment=self.create_memory_submenu),
+            Text(text="Custom Commands" if en else "Кастомные команды", icon="msg_bot", create_sub_fragment=self.create_commands_submenu),
+            Divider(),
+            Header(text="Language" if en else "Язык"),
+            Selector(key="plugin_lang", text="Plugin language" if en else "Язык плагина", default=0, items=PLUGIN_LANGUAGES, icon="msg_language", on_change=lambda idx: (self.set_setting("plugin_lang", max(0, min(int(idx), 1))), getattr(self, "_badge_manager", None) and self._badge_manager._load_badges(), run_on_ui_thread(self.reload_settings))),
+            Divider(),
+            Header(text="Interface" if en else "Интерфейс"),
+            Switch(key="show_settings_button", text="Button in main settings" if en else "Кнопка в главных настройках", default=True, subtext="Displays «X-Assist» directly inside Telegram's main settings menu" if en else "Отображает «X-Assist» прямо в общем меню настроек Telegram"),
+            Divider(),
+            Header(text="About plugin" if en else "О плагине"),
+            Text(text="💬 Contact author" if en else "💬 Связь с автором", icon="msg_contacts", accent=True, on_click=lambda c: self._open_url("https://t.me/Somewhat_empty")),
+            Text(text="📢 Channel" if en else "📢 Канал", icon="msg_channel", accent=True, on_click=lambda c: self._open_url("https://t.me/XAssistOfficial")),
+            Text(text="⭐ Support project" if en else "⭐ Поддержать проект", icon="menu_feature_reactions", accent=True, on_click=lambda ctx: run_on_ui_thread(lambda: self._show_support_me_menu(ctx))),
+            Text(text="📌 About plugin" if en else "📌 О плагине", icon="msg_settings", accent=True, on_click=lambda ctx: run_on_ui_thread(lambda: self._show_version_dialog(ctx))),
+        ]
+
+    def _create_settings_header(self, context):
+        try:
+            container = FrameLayout(context)
+            try:
+                if StarParticlesView:
+                    particlesView = StarParticlesView(context)
+                    particlesView.doNotFling = True
+                    particlesView.setClipWithGradient()
+                    try:
+                        purple_key = None
+                        avatar_keys = getattr(Theme, "keys_avatar_name", None) or getattr(Theme, "keys_avatar_background", None)
+                        if avatar_keys and len(avatar_keys) > 2:
+                            purple_key = avatar_keys[2]
+                        if purple_key is not None:
+                            particlesView.drawable.colorKey = purple_key
+                        elif hasattr(Theme, "key_premiumGradient2"):
+                            particlesView.drawable.colorKey = Theme.key_premiumGradient2
+                        else:
+                            particlesView.drawable.colorKey = Theme.key_premiumGradient1
+                    except Exception:
+                        particlesView.drawable.colorKey = Theme.key_premiumGradient1
+                    particlesView.drawable.isCircle = False
+                    particlesView.drawable.roundEffect = False
+                    particlesView.drawable.useRotate = False
+                    particlesView.drawable.useBlur = True
+                    particlesView.drawable.checkBounds = True
+                    particlesView.drawable.useScale = True
+                    particlesView.drawable.startFromCenter = True
+                    particlesView.drawable.centerOffsetY = AndroidUtilities.dp(24)
+                    particlesView.drawable.size1 = 17
+                    particlesView.drawable.size2 = 18
+                    particlesView.drawable.size3 = 19
+                    particlesView.drawable.init()
+                    try:
+                        _INDIGO_COLOR = -10262799
+                        p = getattr(particlesView.drawable, "paint", None) or self._get_private_field(particlesView.drawable, "paint")
+                        if p:
+                            p.setColorFilter(PorterDuffColorFilter(jint(_INDIGO_COLOR), PorterDuff.Mode.SRC_IN))
+                    except Exception:
+                        pass
+                    container.addView(particlesView, LayoutHelper.createFrame(-1, 230, Gravity.CENTER_HORIZONTAL | Gravity.TOP, 0, -10, 0, 0))
+            except Exception:
+                pass
+            ml = LinearLayout(context)
+            ml.setOrientation(LinearLayout.VERTICAL)
+            ml.setGravity(Gravity.CENTER)
+            ml.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(16))
+            stk = BackupImageView(context)
+            stk.setRoundRadius(AndroidUtilities.dp(45))
+            if not self.try_load_sticker(stk, __icon__, 0, "130_130"):
+                self.load_sticker_with_fallback(stk, __icon__, 0, "130_130")
+            ml.addView(stk, LayoutHelper.createLinear(110, 110, Gravity.CENTER, 0, 0, 0, 12))
+            t = TextView(context)
+            t.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            t.setTypeface(AndroidUtilities.bold())
+            t.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+            t.setText("X-Assist")
+            t.setGravity(Gravity.CENTER)
+            ml.addView(t, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 4))
+            sub = TextView(context)
+            sub.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            sub.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            sub.setText(f"Version {__version__} • Your personal AI" if self._is_en() else f"Версия {__version__} • Твой персональный AI")
+            sub.setGravity(Gravity.CENTER)
+            ml.addView(sub, LayoutHelper.createLinear(-1, -2, Gravity.CENTER))
+            container.addView(ml, LayoutHelper.createFrame(-1, -2, Gravity.CENTER))
+            return container
+        except Exception:
+            return None
+
+    def _setup_settings_header_hook(self):
+        try:
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if not PSA:
+                return
+            methods = list(PSA.getDeclaredMethods()) if hasattr(PSA, "getDeclaredMethods") else list(PSA.getClass().getDeclaredMethods())
+            method = next((m for m in methods if m.getName() == "fillItems" and len(m.getParameterTypes()) == 2), None)
+            if not method:
+                return
+            method.setAccessible(True)
+            plugin = self
+
+            class HeaderHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        items = param.args[0]
+                        if not items or items.size() == 0:
+                            return
+                        for i in range(items.size()):
+                            it = items.get(i)
+                            if hasattr(it, "settingItem") and str(it.settingItem) == "x_assist_header":
+                                return
+                        act = param.thisObject
+                        p_obj = plugin._get_private_field(act, "plugin")
+                        if not p_obj or str(p_obj.getId()) != __id__ or plugin._get_private_field(act, "createSubFragmentCallback") or plugin._get_private_field(act, "searching"):
+                            return
+                        hdr = plugin._create_settings_header(act.getContext())
+                        if hdr:
+                            it = UItem.asCustom(hdr)
+                            it.settingItem = HeaderSetting("x_assist_header") if HeaderSetting else None
+                            try:
+                                it.setTransparent(True)
+                            except Exception:
+                                pass
+                            items.add(0, it)
+                            items.add(1, UItem.asShadow())
+                    except Exception:
+                        pass
+
+            self.hook_method(method, HeaderHook())
+        except Exception as e:
+            self._log(f"Header hook err: {e}")
+
+    def _open_url(self, url: str):
+        try:
+            frag = get_last_fragment()
+            if frag and frag.getParentActivity():
+                Browser.openUrl(frag.getParentActivity(), Uri.parse(url), True, True, True, None, None, False, False, False)
+        except Exception:
+            pass
+
+    def _fetch_web_snippets(self, query: str, max_results: int = 5) -> str:
+        try:
+            h = {"User-Agent": "Mozilla/5.0", "Accept-Language": "ru,uk,en;q=0.9"}
+            resp = self._session.post("https://html.duckduckgo.com/html/", data={"q": query}, headers=h, timeout=12)
+            if resp.status_code == 200:
+                snips = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', resp.text, re.DOTALL)
+                res = [f"• {html.unescape(re.sub(r'<[^>]+>', '', s)).strip()}" for s in snips[:max_results]]
+                return "\n".join(res)
+        except Exception:
+            pass
+        return ""
+
+    class CreateUpdateWaveformHook(MethodHook):
+        def __init__(self, plugin):
+            super().__init__()
+            self.plugin = plugin
+
+        def after_hooked_method(self, param):
+            if self.plugin.get_setting("premium_stt", True):
+                set_private_field(param.thisObject, "useTranscribeButton", True)
+
+    class CreateTranscribeButtonHook(MethodReplacement):
+        def __init__(self, plugin):
+            super().__init__()
+            self.plugin = plugin
+
+        def replace_hooked_method(self, param):
+            if self.plugin.get_setting("premium_stt", True):
+                self.plugin._submit(self.onTap, param)
+
+        def onTap(self, param):
+            this = param.thisObject
+            parent = get_private_field(this, "parent")
+            if not parent:
+                return
+            should_open = get_private_field(this, "shouldBeOpen")
+            loading = get_private_field(this, "loading")
+            to_open = not should_open
+            if not should_open:
+                if not loading:
+                    this.setLoading(True, True)
+                else:
+                    return
+            else:
+                this.setOpen(False, True)
+                this.setLoading(False, True)
+                set_private_field(this, "pressed", False)
+            self.transcribePressed(param, parent.getMessageObject(), to_open)
+
+        def transcribePressed(self, param, msg_obj, open_mode):
+            token = self.plugin._clean_key(self.plugin.get_setting("groq_api_key", "") or "")
+            this = param.thisObject
+            en = self.plugin._is_en()
+            if not token:
+                run_on_ui_thread(lambda: (this.setLoading(False, True), BulletinHelper.show_error("Specify Groq API key!" if en else "Укажите Groq API токен!")))
+                return
+            if not msg_obj or not msg_obj.messageOwner or not msg_obj.isSent():
+                run_on_ui_thread(lambda: this.setLoading(False, True))
+                return
+            TB = find_class("org.telegram.ui.Components.TranscribeButton")
+            MS = find_class("org.telegram.messenger.MessagesStorage")
+            DO = find_class("org.telegram.messenger.DialogObject")
+            MC = find_class("org.telegram.messenger.MessagesController")
+            NC = find_class("org.telegram.messenger.NotificationCenter")
+            acc, owner = msg_obj.currentAccount, msg_obj.messageOwner
+            peer = MC.getInstance(acc).getInputPeer(owner.peer_id)
+            dialog_id, msg_id = DO.getPeerDialogId(peer), owner.id
+            if open_mode:
+                if owner.voiceTranscription is not None and owner.voiceTranscriptionFinal:
+                    TB.openVideoTranscription(msg_obj)
+                    owner.voiceTranscriptionOpen = True
+                    MS.getInstance(acc).updateMessageVoiceTranscriptionOpen(dialog_id, msg_id, owner)
+                    run_on_ui_thread(lambda: NC.getInstance(acc).postNotificationName(NC.voiceTranscriptionUpdate, msg_obj, None, None, True, True))
+                    return
+                owner.voiceTranscriptionId = msg_id
+                doc = getattr(getattr(owner, "media", None), "document", None)
+                path = self.plugin._poll_download_file(msg_obj, doc, acc, is_media=True)
+                if not path:
+                    run_on_ui_thread(lambda: (this.setLoading(False, True), BulletinHelper.show_error("Failed to load audio" if en else "Не удалось скачать аудио")))
+                    return
+                try:
+                    text = self.plugin._transcribe_audio(path)
+                    if self.plugin.get_setting("llama_cleanup", False):
+                        cleaned = self.plugin._cleanup_llama(text, token)
+                        if cleaned:
+                            text = "✨ " + cleaned
+                    TB.openVideoTranscription(msg_obj)
+                    owner.voiceTranscriptionOpen = owner.voiceTranscriptionFinal = True
+                    MS.getInstance(acc).updateMessageVoiceTranscription(dialog_id, msg_id, text, owner)
+                    run_on_ui_thread(lambda: this.finishTranscription(msg_obj, msg_id, text))
+                except Exception as e:
+                    run_on_ui_thread(lambda: (this.setLoading(False, True), BulletinHelper.show_error(f"Error: {str(e)[:100]}")))
+                finally:
+                    if path and os.path.exists(path) and "ai_voice_temp" in path:
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+            else:
+                owner.voiceTranscriptionOpen = False
+                MS.getInstance(acc).updateMessageVoiceTranscriptionOpen(dialog_id, msg_id, owner)
+                run_on_ui_thread(lambda: NC.getInstance(acc).postNotificationName(NC.voiceTranscriptionUpdate, msg_obj, None, None, False, None))
+
+    def _cleanup_llama(self, text, api_key):
+        payload = {
+            "model": GROQ_CLEANUP_MODEL,
+            "max_tokens": 2048,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": "Correct punctuation, speech errors without altering meaning. Output ONLY text."},
+                {"role": "user", "content": text}
+            ]
+        }
+        r = self._session.post(GROQ_LLM_URL, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=25)
+        return r.json()["choices"][0]["message"]["content"].strip() if r.status_code == 200 else None
+
+    def _resolve_dialog_id(self, peer) -> int:
+        if isinstance(peer, int):
+            return peer
+        for attr in ("user_id", "chat_id", "channel_id", "peer_id"):
+            val = getattr(peer, attr, None)
+            if val is not None:
+                try:
+                    return int(val)
+                except Exception:
+                    pass
+        return 0
+
+    def _chat_key(self, peer) -> str:
+        d = self._resolve_dialog_id(peer)
+        return str(d) if d else f"peer:{str(peer)}"
+
+    def _get_private_field(self, obj, name):
+        cls = getattr(obj, "getClass", lambda: None)()
+        while cls is not None:
+            try:
+                f = cls.getDeclaredField(name)
+                f.setAccessible(True)
+                return f.get(obj)
+            except Exception:
+                cls = cls.getSuperclass()
+        return None
+
+    def _load_data(self):
+        try:
+            if self._data_path and os.path.exists(self._data_path):
+                with open(self._data_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                with self._lock:
+                    for p, msgs in data.get("history", {}).items():
+                        clean_msgs = [m for m in msgs if not str(m).startswith(("Собеседник:", "Собеседник :"))]
+                        self._chat_history[p] = deque(clean_msgs, maxlen=HISTORY_MAXLEN)
+                self._chat_settings = data.get("settings", {})
+        except Exception:
+            pass
+
+    def _save_data(self):
+        try:
+            if self._data_path and self.get_setting("auto_save", True):
+                with self._lock:
+                    data = {"history": {k: list(v) for k, v in self._chat_history.items()}, "settings": dict(self._chat_settings)}
+                with open(self._data_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _remember(self, key, who: str, text: str):
+        if key and text:
+            with self._lock:
+                self._chat_history.setdefault(str(key), deque(maxlen=HISTORY_MAXLEN)).append(f"{who}: {text}")
+
+    def _get_chat_memory(self, key) -> int:
+        with self._lock:
+            val = self._chat_settings.get(str(key), {}).get("memory", self.get_setting("default_memory", 1))
+            return [10, 20, 30, 50][val] if isinstance(val, int) and 0 <= val < 4 else 20
+
+    def _poll_download_file(self, msg_obj, doc, account: int, is_media: bool = False) -> str:
+        try:
+            fl = FileLoader.getInstance(account)
+            owner = msg_obj.messageOwner
+            attach = getattr(owner, "attachPath", None)
+            if attach and os.path.exists(attach) and os.path.getsize(attach) > 0:
+                return attach
+            if is_media:
+                temp_dir = File(get_cache_dir(), "ai_voice_temp")
+                if not temp_dir.exists():
+                    temp_dir.mkdirs()
+                ext = ".mp4" if getattr(msg_obj, "isRoundVideo", lambda: False)() else ".ogg"
+                target = File(temp_dir, f"m_{uuid.uuid4().hex[:8]}{ext}").getAbsolutePath()
+                if doc:
+                    try:
+                        if hasattr(doc, "mime_type"):
+                            fl.loadFile(doc, msg_obj, 1, 0)
+                    except Exception:
+                        pass
+                for _ in range(35):
+                    time.sleep(0.35)
+                    f_msg = fl.getPathToMessage(owner)
+                    if f_msg and f_msg.exists() and f_msg.length() > 0:
+                        if is_media:
+                            shutil.copyfile(f_msg.getAbsolutePath(), target)
+                            return target
+                        return str(f_msg.getAbsolutePath())
+                if doc:
+                    for force in (True, False):
+                        try:
+                            f_att = fl.getPathToAttach(doc, force)
+                            if f_att and f_att.exists() and f_att.length() > 0:
+                                return str(f_att.getAbsolutePath())
+                        except Exception:
+                            pass
+        except Exception as e:
+            self._log(f"[Download] Poll err: {e}")
+        return None
+
+    def _download_photo_sync(self, msg_obj: MessageObject, account: int):
+        try:
+            media = getattr(msg_obj.messageOwner, "media", None)
+            photo = getattr(media, "photo", None) if media else None
+            doc = MessageObject.getDocument(msg_obj)
+            if doc and getattr(doc, "mime_type", "").startswith("image/"):
+                return self._poll_download_file(msg_obj, doc, account), doc.mime_type
+            if photo and hasattr(photo, "sizes"):
+                valid = [s for s in _safe_iter(photo.sizes) if s and "Stripped" not in s.getClass().getSimpleName()]
+                if valid:
+                    best = max(valid, key=lambda s: getattr(s, "w", 0) * getattr(s, "h", 0))
+                    try:
+                        FileLoader.getInstance(account).loadFile(ImageLocation.getForPhoto(best, photo), msg_obj, "jpg", 1, 1)
+                    except Exception:
+                        pass
+                    return self._poll_download_file(msg_obj, best, account), "image/jpeg"
+        except Exception:
+            pass
+        return None, None
+
+    def _get_document_info(self, msg: MessageObject) -> Tuple[Any, str, str, int]:
+        doc = MessageObject.getDocument(msg)
+        if not doc:
+            return None, "", "", 0
+        name = "document"
+        for attr in _safe_iter(getattr(doc, "attributes", None)):
+            if attr and "DocumentAttributeFilename" in attr.getClass().getSimpleName():
+                name = getattr(attr, "file_name", "document") or "document"
+                break
+        return doc, name, getattr(doc, "mime_type", "application/octet-stream") or "application/octet-stream", getattr(doc, "size", 0)
+
+    def _transcribe_audio(self, path: str) -> str:
+        token = self._clean_key(self.get_setting("groq_api_key", "") or "")
+        lang_idx = max(0, min(int(self.get_setting("language", 2) or 2), len(LANGUAGE_CODES) - 1))
+        lang_code = LANGUAGE_CODES[lang_idx]
+        form = {"model": (None, GROQ_WHISPER_MODEL), "response_format": (None, "verbose_json"), "temperature": (None, "0")}
+        if lang_code != "auto":
+            form["language"] = (None, lang_code)
+        with open(path, "rb") as f:
+            form["file"] = (os.path.basename(path), f, "audio/ogg")
+        r = self._session.post(GROQ_WHISPER_URL, headers={"Authorization": f"Bearer {token}"}, files=form, timeout=90)
+        if r.status_code != 200:
+            raise Exception(f"Whisper error: {r.status_code}")
+        data = r.json()
+        segs = data.get("segments", [])
+        text = " ".join((s.get("text") or "").strip() for s in segs if s.get("no_speech_prob", 1.0) < 0.6).strip() if segs else (data.get("text") or "").strip()
+        if not text:
+            raise Exception("No speech recognized")
+        return text
+
+    def _expand_prompt(self, prompt: str) -> str:
+        en_prompt = self._fast_translate(prompt, "English") if not prompt.isascii() else prompt
+        if not self.get_setting("chatgpt_prompt_expander", True):
+            return en_prompt
+        sys_p = "You are an expert prompt engineer. Expand the prompt into a vivid, photorealistic scene description in English under 50 words. Output ONLY the scene."
+        res = self._generate_ai_text(sys_p, f"Concept: {en_prompt}", temp=0.7, max_tokens=160)
+        return res if res and len(res) > len(en_prompt) else en_prompt
+
+    def _process_image_gen(self, account: int, peer, prompt: str):
+        out_path = None
+        en = self._is_en()
+        try:
+            self._cleanup_temp_dir(force_all=False)
+            run_on_ui_thread(lambda: BulletinHelper.show_info("🎨 Generating image..." if en else "🎨 Генерация изображения..."))
+            temp_dir = File(get_cache_dir(), "ai_pic_temp")
+            if not temp_dir.exists():
+                temp_dir.mkdirs()
+            out_path = File(temp_dir, f"p_{uuid.uuid4().hex[:8]}.jpg").getAbsolutePath()
+            enhanced = self._expand_prompt(prompt)
+            seed = uuid.uuid4().int % 10000000
+            enc = urllib.parse.quote(enhanced)
+            url = f"https://image.pollinations.ai/prompt/{enc}?width=1024&height=1024&nologo=true&seed={seed}&model=flux"
+            r = self._session.get(url, timeout=50)
+            if r.status_code != 200 or len(r.content) < 5000:
+                r = self._session.get(f"https://image.pollinations.ai/prompt/{enc}?width=1024&height=1024&nologo=true&seed={seed}", timeout=40)
+            if r.status_code == 200 and len(r.content) > 5000:
+                with open(out_path, "wb") as f:
+                    f.write(r.content)
+            else:
+                raise Exception(f"Server error ({r.status_code})")
+            caption = f"🎨 **[AI Generation]**\n📝 **Prompt:** {prompt[:250]}\n\nBy @xassistofficial" if en else f"🎨 **[AI Генерация]**\n📝 **Промпт:** {prompt[:250]}\n\nBy @xassistofficial"
+            if send_photo is not None:
+                try:
+                    send_photo(peer, out_path, caption=caption, account=account)
+                except Exception:
+                    send_text(peer, "⚠️ Failed to send image", account=account)
+        except Exception as e:
+            self._log(f"[Image] Err: {e}")
+            send_text(peer, f"❌ Error: {e}", account=account)
+        finally:
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+
+    def _fetch_inline_music(self, account: int, peer, query: str):
+        en = self._is_en()
+        run_on_ui_thread(lambda: BulletinHelper.show_info("🔍 Searching tracks..." if en else "🔍 Ищу треки..."))
+        try:
+            cm = find_class("org.telegram.tgnet.ConnectionsManager").getInstance(account)
+            mc = find_class("org.telegram.messenger.MessagesController").getInstance(account)
+            bots = ["vkmusic_bot", "lybot"]
+
+            def try_bot(idx: int):
+                if idx >= len(bots):
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Tracks not found" if en else "Треки не найдены"))
+                    send_text(peer, "❌ Tracks not found" if en else "❌ Не удалось найти треки.", account=account)
+                    return
+                bot_name = bots[idx]
+
+                def send_query(target_bot):
+                    req = TLRPC.TL_messages_getInlineBotResults()
+                    req.bot = mc.getInputUser(target_bot)
+                    req.query = String(query)
+                    req.offset = String("")
+                    req.peer = mc.getInputPeer(peer)
+
+                    def on_res(in_resp, in_err):
+                        if in_err or not in_resp or not getattr(in_resp, "results", None) or in_resp.results.size() == 0:
+                            try_bot(idx + 1)
+                            return
+                        tracks = []
+                        qid = getattr(in_resp, "query_id", 0)
+                        for i in range(in_resp.results.size()):
+                            r = in_resp.results.get(i)
+                            if not r:
+                                continue
+                            t_title = str(getattr(r, "title", "") or "")
+                            t_desc = str(getattr(r, "description", "") or "")
+                            t_dur = "MP3"
+                            doc = getattr(r, "document", None)
+                            if doc and hasattr(doc, "attributes"):
+                                for attr in _safe_iter(doc.attributes):
+                                    if attr and "DocumentAttributeAudio" in attr.getClass().getSimpleName():
+                                        d_sec = getattr(attr, "duration", 0)
+                                        if d_sec > 0:
+                                            m, s = divmod(d_sec, 60)
+                                            t_dur = f"{m}:{s:02d}"
+                                        t_title = t_title or str(getattr(attr, "title", "") or "")
+                                        t_desc = t_desc or str(getattr(attr, "performer", "") or "")
+                            tracks.append({"title": html.unescape(t_title or query).strip(), "author": html.unescape(t_desc or "Music").strip(), "duration": t_dur, "bot_result": r, "query_id": qid})
+                        run_on_ui_thread(lambda: self._show_music_picker_sheet(account, peer, tracks, query))
+
+                    cm.sendRequest(req, _GlobalReqDelegate(on_res, self._log))
+
+                cached = self._cached_music_bots.get(bot_name)
+                if cached:
+                    send_query(cached)
+                    return
+
+                def on_resolved(resp, err):
+                    if err or not resp or not getattr(resp, "users", None) or resp.users.size() == 0:
+                        try_bot(idx + 1)
+                        return
+                    u = resp.users.get(0)
+                    mc.putUser(u, False)
+                    self._cached_music_bots[bot_name] = u
+                    send_query(u)
+
+                resolve_req = TLRPC.TL_contacts_resolveUsername()
+                resolve_req.username = String(bot_name)
+                cm.sendRequest(resolve_req, _GlobalReqDelegate(on_resolved, self._log))
+
+            try_bot(0)
+        except Exception as e:
+            self._log(f"[Music] Err: {e}")
+
+    def _show_music_picker_sheet(self, account: int, peer, tracks: List[dict], query: str):
+        act = getattr(get_last_fragment(), "getParentActivity", lambda: None)()
+        if not act:
+            return
+        en = self._is_en()
+        sheet = BottomSheet(act, False)
+        sheet.setCanDismissWithSwipe(True)
+        root = LinearLayout(act)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(14), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        bg.setCornerRadii([AndroidUtilities.dp(20)] * 4 + [0] * 4)
+        root.setBackground(bg)
+        avatar_view = BackupImageView(act)
+        avatar_view.setRoundRadius(AndroidUtilities.dp(35))
+        self.load_sticker_with_fallback(avatar_view, __icon__, 0, "70_70")
+        root.addView(avatar_view, LayoutHelper.createLinear(70, 70, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 8))
+        tv_title = TextView(act)
+        tv_title.setTypeface(AndroidUtilities.bold())
+        tv_title.setGravity(Gravity.CENTER)
+        tv_title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+        tv_title.setText("🎵 Select Track" if en else "🎵 Выберите трек")
+        tv_title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        root.addView(tv_title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 4))
+        tv_sub = TextView(act)
+        tv_sub.setGravity(Gravity.CENTER)
+        tv_sub.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        tv_sub.setText(f"Results for: «{query[:30]}»" if en else f"Результаты по запросу: «{query[:30]}»")
+        tv_sub.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        root.addView(tv_sub, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 10))
+        scroll = ScrollView(act)
+        scroll.setVerticalScrollBarEnabled(False)
+        list_l = LinearLayout(act)
+        list_l.setOrientation(LinearLayout.VERTICAL)
+        btn_bg = (Theme.getColor(Theme.key_chat_inLoader) & 0x20FFFFFF) | 0x18000000
+        for item in tracks:
+            ib = LinearLayout(act)
+            ib.setOrientation(LinearLayout.VERTICAL)
+            ib.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+            ib.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(12), btn_bg, btn_bg))
+            tv1 = TextView(act)
+            tv1.setTypeface(AndroidUtilities.bold())
+            tv1.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            tv1.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            tv1.setText(f"• {item.get('duration', 'MP3')} • {item.get('title', '')}")
+            ib.addView(tv1, LayoutHelper.createLinear(-1, -2))
+            tv2 = TextView(act)
+            tv2.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+            tv2.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            tv2.setText(item.get("author", "Artist"))
+            ib.addView(tv2, LayoutHelper.createLinear(-1, -2, 0, 2, 0, 0))
+            it_ref = item
+            ib.setOnClickListener(OnClickListener(lambda v, it=it_ref: (
+                sheet.dismiss(),
+                run_on_ui_thread(lambda: BulletinHelper.show_info("⏳ Bot is loading track, please wait..." if en else "⏳ Бот загружает трек, подождите...")),
+                self._submit(self._send_chosen_inline_track, account, peer, it)
+            )))
+            self._apply_press_scale(ib)
+            list_l.addView(ib, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 6))
+        scroll.addView(list_l)
+        root.addView(scroll, LayoutHelper.createLinear(-1, 0, 1.0))
+        close_btn = self._create_sheet_button(act, "Cancel" if en else "Отмена", False, lambda v: sheet.dismiss())
+        root.addView(close_btn, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0))
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _send_chosen_inline_track(self, account: int, peer, item: dict):
+        bot_result, qid = item.get("bot_result"), item.get("query_id", 0)
+        en = self._is_en()
+        cm = find_class("org.telegram.tgnet.ConnectionsManager").getInstance(account)
+        mc = find_class("org.telegram.messenger.MessagesController").getInstance(account)
+        u_cfg = find_class("org.telegram.messenger.UserConfig").getInstance(account)
+        if not all([cm, mc, u_cfg, u_cfg.getCurrentUser()]):
+            return
+        try:
+            my_peer = mc.getInputPeer(u_cfg.getCurrentUser())
+            tgt_peer = mc.getInputPeer(peer)
+            transit = TLRPC.TL_messages_sendInlineBotResult()
+            transit.silent = transit.background = True
+            transit.hide_via = False
+            transit.peer = my_peer
+            transit.random_id = int(uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
+            transit.query_id = int(qid)
+            res_id = getattr(bot_result, "id", None)
+            transit.id = String(str(res_id) if res_id is not None else "")
+
+            def on_transit(resp, err):
+                if err or not resp:
+                    self._send_direct_fallback(cm, tgt_peer, bot_result, qid)
+                    return
+                msg_id = None
+                if hasattr(resp, "updates") and resp.updates:
+                    for u in _safe_iter(resp.updates):
+                        m = getattr(u, "message", None)
+                        if m and getattr(m, "id", 0):
+                            msg_id = int(m.id)
+                            break
+                if not msg_id and hasattr(resp, "id"):
+                    msg_id = int(resp.id)
+                if not msg_id:
+                    self._send_direct_fallback(cm, tgt_peer, bot_result, qid)
+                    return
+                run_on_ui_thread(lambda: BulletinHelper.show_info("🎵 Sending track to chat..." if en else "🎵 Отправляю трек в чат..."))
+                fwd = TLRPC.TL_messages_forwardMessages()
+                fwd.drop_author = True
+                fwd.drop_media_captions = True
+                fwd.silent = False
+                fwd.background = False
+                fwd.with_my_score = False
+                fwd.from_peer, fwd.to_peer = my_peer, tgt_peer
+                ids, r_ids = ArrayList(), ArrayList()
+                ids.add(jint(msg_id))
+                r_ids.add(Long.valueOf(int(uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)))
+                fwd.id, fwd.random_id = ids, r_ids
+
+                def on_fwd(f_resp, f_err):
+                    if f_err:
+                        self._send_direct_fallback(cm, tgt_peer, bot_result, qid)
+                    try:
+                        del_req = TLRPC.TL_messages_deleteMessages()
+                        del_req.revoke = True
+                        del_ids = ArrayList()
+                        del_ids.add(jint(msg_id))
+                        del_req.id = del_ids
+                        cm.sendRequest(del_req, _GlobalReqDelegate(lambda r, e: None))
+                    except Exception:
+                        pass
+
+                cm.sendRequest(fwd, _GlobalReqDelegate(on_fwd, self._log))
+
+            cm.sendRequest(transit, _GlobalReqDelegate(on_transit, self._log))
+        except Exception as e:
+            self._log(f"[Music] Transit err: {e}")
+            self._send_direct_fallback(cm, mc.getInputPeer(peer), bot_result, qid)
+
+    def _send_direct_fallback(self, cm, target_peer, bot_result, qid):
+        try:
+            req = TLRPC.TL_messages_sendInlineBotResult()
+            req.peer = target_peer
+            req.random_id = int(uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
+            req.query_id = int(qid)
+            res_id = getattr(bot_result, "id", None)
+            req.id = String(str(res_id) if res_id is not None else "")
+            cm.sendRequest(req, _GlobalReqDelegate(lambda r, e: None, self._log))
+        except Exception:
+            pass
+
+    def _show_custom_sheet(self, title: str, text: str):
+        act = getattr(get_last_fragment(), "getParentActivity", lambda: None)()
+        if not act:
+            return
+        sheet = (AISheetBuilder(act, dismissible=False)
+                 .load_avatar(self, size="90_90")
+                 .title(title)
+                 .content(text, gravity=Gravity.CENTER)
+                 .button("Close" if self._is_en() else "Закрыть", lambda v: sheet.dismiss(), accent=True, top_margin=10)
+                 .build())
+        sheet.show()
+
+    def _show_support_me_menu(self, ctx):
+        act = getattr(get_last_fragment(), "getParentActivity", lambda: None)()
+        if not act:
+            return
+        en = self._is_en()
+        sheet = BottomSheet(act, False)
+        sheet.setCanDismissWithSwipe(False)
+        root = LinearLayout(act)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(12))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        bg.setCornerRadii([AndroidUtilities.dp(20)] * 4 + [0] * 4)
+        root.setBackground(bg)
+        avatar_view = BackupImageView(act)
+        avatar_view.setRoundRadius(AndroidUtilities.dp(45))
+        root.addView(avatar_view, LayoutHelper.createLinear(110, 110, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
+        self.load_sticker_with_fallback(avatar_view, __icon__, 0, "110_110")
+        title = TextView(act)
+        title.setTypeface(AndroidUtilities.bold())
+        title.setGravity(Gravity.CENTER)
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+        title.setText("⭐ Support Project" if en else "⭐ Поддержать проект")
+        title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        root.addView(title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
+        tv = TextView(act)
+        tv.setText("If you enjoy X-Assist, you can support the author with a Telegram gift or write in private messages ❤️" if en else "Если вам нравится X-Assist, вы можете поддержать автора подарком в Telegram или написать в личные сообщения ❤️")
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        tv.setLineSpacing(AndroidUtilities.dp(3), 1.15)
+        root.addView(tv, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 4, 0, 4, 16))
+
+        def on_gift_click(v):
+            sheet.dismiss()
+            try:
+                if GiftSheet:
+                    GiftSheet(act, UserConfig.selectedAccount if UserConfig else 0, int(AUTHOR_USER_ID), None, None).show()
+                    return
+            except Exception:
+                pass
+            self._open_url("https://t.me/Somewhat_empty")
+
+        gift_btn = self._create_sheet_button(act, "🎁 Send a Gift in Telegram" if en else "🎁 Отправить подарок в Telegram", True, on_gift_click)
+        close_btn = self._create_sheet_button(act, "Close" if en else "Закрыть", False, lambda v: sheet.dismiss())
+        root.addView(gift_btn, LayoutHelper.createLinear(-1, -2, 0, 4, 0, 8))
+        root.addView(close_btn, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0))
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _show_version_dialog(self, ctx):
+        en = self._is_en()
+        text = (
+            f"Hello! Welcome to X-Assist v{__version__} 👋\n\n"
+            "This plugin turns your Telegram into a personal smart Swiss Army knife powered by modern neural networks.\n\n"
+            "✨ Key Features:\n"
+            "• Smart AI chat analyzing text, documents, code, and images\n"
+            "• Automatic real-time internet search\n"
+            "• High-quality image generation using ChatGPT prompting algorithms\n"
+            "• In-chat voice and video message transcription right inside message bubbles\n"
+            "• Instant music search, download, and playback without third-party bots\n"
+            "• Cascading backup system across multiple AI providers\n\n"
+            "Thank you for using X-Assist! ❤️"
+        ) if en else (
+            f"Привет! Добро пожаловать в X-Assist v{__version__} 👋\n\n"
+            "Этот плагин превращает ваш Telegram в персональный умный комбайн на базе передовых нейросетей.\n\n"
+            "✨ Основные возможности:\n"
+            "• Умный чат с поддержкой анализа текста, документов, кода и изображений\n"
+            "• Автоматический поиск актуальной информации в интернете\n"
+            "• Генерация высококачественных картинок по алгоритмам промптинга ChatGPT\n"
+            "• Распознавание голосовых и видеосообщений прямо в чате\n"
+            "• Поиск, скачивание и отправка музыки без сторонних ботов\n"
+            "• Надёжная система с каскадным переключением между моделями\n\n"
+            "Спасибо, что пользуетесь X-Assist! ❤️"
+        )
+        self._show_custom_sheet("📌 About plugin" if en else "📌 О плагине", text)
+
+    def on_update_hook(self, name: str, account: int, update: Any) -> HookResult:
+        return HookResult()
+
+    def _get_custom_command(self, key: str, default: str) -> str:
+        cmd = str(self.get_setting(key, default) or default).strip().lower()
+        if not cmd:
+            cmd = default.lower()
+        words = cmd.split()
+        if words:
+            cmd = words[0]
+        if not cmd.startswith("/"):
+            cmd = "/" + cmd
+        return cmd
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        peer = getattr(params, "peer", None)
+        raw_msg = getattr(params, "message", None)
+        if not peer or raw_msg is None:
+            return HookResult()
+        text = str(raw_msg).strip()
+        peer_key = self._chat_key(peer)
+        if peer in self._skip_next or peer_key in self._skip_next:
+            self._skip_next.discard(peer)
+            self._skip_next.discard(peer_key)
+            return HookResult()
+        reply_msg = getattr(params, "replyToMsg", None)
+        if text == "/help" or text.startswith("/help"):
+            en = self._is_en()
+            cmd_ask_label = self._get_custom_command("cmd_ask", "/ask")
+            cmd_search_label = self._get_custom_command("cmd_search", "/search")
+            if en:
+                help_text = (
+                    "👋 Welcome to X-Assist!\n\n"
+                    "Your personal smart AI assistant directly in Telegram.\n\n"
+                    "🔑 How to configure API keys (free):\n\n"
+                    "1️⃣ Gemini API Key (Primary brain):\n"
+                    "• Visit: https://aistudio.google.com/app/apikey\n"
+                    "• Sign in with your Google account and click «Create API key»\n"
+                    "• Copy your key and paste into Settings ➔ API Keys ➔ Gemini API Key\n"
+                    "(You can specify multiple keys separated by commas as backup)\n\n"
+                    "2️⃣ Groq API Key (Voice transcription + fallback):\n"
+                    "• Visit: https://console.groq.com/keys\n"
+                    "• Sign up, click «Create API Key» and copy the key\n"
+                    "• Paste into Settings ➔ API Keys ➔ Groq API Key\n"
+                    "(Used for fast transcription of voice messages and video notes)\n\n"
+                    "3️⃣ OpenRouter API Key (Backup text models):\n"
+                    "• Visit: https://openrouter.ai/settings/keys\n"
+                    "• Create a key and paste into OpenRouter API Key\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "📋 Commands & features:\n\n"
+                    f"💬 {cmd_ask_label} [question] — Ask assistant (image and document recognition works only in reply to a message containing them).\n"
+                    f"🌐 {cmd_search_label} [query] — Real-time internet search via Google.\n"
+                    "🎨 /pic [prompt] — High quality image generation.\n"
+                    "🎵 /ms [title] — Search, select and send music tracks.\n"
+                    "🎵 /shazam — Recognize music from voice notes, video notes, video or audio (reply to message).\n"
+                    "✨ Context Menu — Tap on a message, then tap «Plugins», and those three buttons («Summarize briefly», «Translate», «Fact Check») will be there.\n"
+                    "🧹 /clear_history — Clear dialogue memory in this chat.\n"
+                    "📝 /log — Show recent system logs.\n"
+                    "❓ /help — Show this help message.\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "💡 Encountered an error or bug?\n"
+                    "If you are sure everything is set up correctly, but something is not working — contact the author in private messages (using «Contact author» button in settings), describe the problem in detail and attach the output of /log."
+                )
+            else:
+                help_text = (
+                    "👋 Добро пожаловать в X-Assist!\n\n"
+                    "Ваш персональный умный AI-помощник прямо в Telegram.\n\n"
+                    "🔑 Как настроить API-ключи (это бесплатно):\n\n"
+                    "1️⃣ Gemini API Key (Основной ум):\n"
+                    "• Перейдите на сайт: https://aistudio.google.com/app/apikey\n"
+                    "• Войдите через Google-аккаунт и нажмите «Create API key»\n"
+                    "• Скопируйте ключ и вставьте в Настройки ➔ API-Ключи ➔ Gemini API Key\n"
+                    "(Можно вставить несколько ключей через запятую для запаса)\n\n"
+                    "2️⃣ Groq API Key (Распознавание речи + резерв):\n"
+                    "• Перейдите на сайт: https://console.groq.com/keys\n"
+                    "• Зарегистрируйтесь, нажмите «Create API Key» и скопируйте ключ\n"
+                    "• Вставьте в Настройки ➔ API-Ключи ➔ Groq API Key\n"
+                    "(Нужен для быстрой расшифровки голосовых сообщений и кружочков)\n\n"
+                    "3️⃣ OpenRouter API Key (Запасной резерв текстовых моделей):\n"
+                    "• Зайдите на: https://openrouter.ai/settings/keys\n"
+                    "• Создайте ключ и вставьте в OpenRouter API Key\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "📋 Команды и возможности:\n\n"
+                    f"💬 {cmd_ask_label} [вопрос] — Задать вопрос ассистенту (распознавание изображений и документов работает только в ответ на сообщение с ними).\n"
+                    f"🌐 {cmd_search_label} [запрос] — Поиск актуальной информации в интернете через Google.\n"
+                    "🎨 /pic [описание] — Генерация картинок в высоком качестве.\n"
+                    "🎵 /ms [название] — Поиск, выбор и отправка музыки.\n"
+                    "🎵 /shazam — Распознать трек по голосовому, кружочку, видео или аудио (в ответ на сообщение).\n"
+                    "✨ Контекстное меню — Нажмите на сообщение, затем на «Плагины», и эти три кнопки («Пересказать кратко», «Перевести», «Фактчек») будут там.\n"
+                    "🧹 /clear_history — Очистить память диалога в этом чате.\n"
+                    "📝 /log — Показать последние системные логи.\n"
+                    "❓ /help — Вызвать эту справку.\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "💡 Возникла ошибка или баг?\n"
+                    "Если вы уверены, что настроили всё правильно, но что-то работает не так — напишите автору в личные сообщения (кнопка «Связь с автором» в настройках плагина), подробно описав проблему и приложив результат команды /log."
+                )
+            send_text(peer, help_text, account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        parts = text.split(maxsplit=1)
+        first_word = parts[0].lower() if parts else ""
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+        if first_word in ("/pic", "/img"):
+            p = remainder or (getattr(getattr(reply_msg, "messageOwner", None), "message", "").strip() if reply_msg else "")
+            if p:
+                self._submit(self._process_image_gen, account, peer, p)
+            else:
+                send_text(peer, "❌ Please specify an image description!" if self._is_en() else "❌ Укажите описание картинки!", account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if first_word in ("/ms", "/music"):
+            q = remainder
+            if q:
+                self._submit(self._fetch_inline_music, account, peer, q)
+            else:
+                send_text(peer, "❌ Please specify a song name!" if self._is_en() else "❌ Укажите название песни!", account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if first_word == "/shazam":
+            if not reply_msg:
+                send_text(peer, "❌ Reply with /shazam to a voice note, video note, video, or audio file!" if self._is_en() else "❌ Ответьте командой /shazam на голосовое сообщение, кружочек, видео или аудиофайл!", account=account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self._submit(self._process_shazam, account, peer, reply_msg)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if first_word == "/log":
+            with self._lock:
+                log_txt = "\n".join(self._log_lines[-40:]) or ("Logs are empty" if self._is_en() else "Лог пуст")
+            hdr = "📝 **Logs:**\n" if self._is_en() else "📝 **Логи:**\n"
+            self._send_split_message(peer, f"{hdr}{log_txt}", account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if first_word == "/clear_history":
+            with self._lock:
+                if peer_key in self._chat_history:
+                    self._chat_history[peer_key].clear()
+                    self._save_data()
+            send_text(peer, "🧹 History cleared!" if self._is_en() else "🧹 История очищена!", account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        custom_ask = self._get_custom_command("cmd_ask", "/ask")
+        custom_search = self._get_custom_command("cmd_search", "/search")
+        is_search = False
+        is_ask = False
+        q = ""
+        if first_word in (custom_search, "/search"):
+            is_search = True
+            q = remainder
+        elif first_word in (custom_ask, "/ask"):
+            is_ask = True
+            q = remainder
+        if not (is_search or is_ask):
+            return HookResult()
+        api_raw = str(self.get_setting("api_key", "") or "")
+        has_gemini = any(self._clean_key(k) for k in api_raw.replace(";", ",").split(","))
+        has_groq = bool(self._clean_key(self.get_setting("groq_api_key", "") or ""))
+        has_or = bool(self._clean_key(self.get_setting("openrouter_api_key", "") or ""))
+        if not (has_gemini or has_groq or has_or):
+            err_msg = (
+                "❌ Specify at least one API key (Gemini, Groq, or OpenRouter) in plugin settings!\nType `/help` for instructions."
+                if self._is_en() else
+                "❌ Укажите хотя бы один API-ключ (Gemini, Groq или OpenRouter) в настройках плагина!\nНапишите `/help` для инструкции."
+            )
+            send_text(peer, err_msg, account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if not q and reply_msg:
+            if self._is_photo_message(reply_msg):
+                q = "Describe and analyze this image in detail." if self._is_en() else "Подробно опиши и проанализируй это изображение."
+            elif MessageObject.getDocument(reply_msg):
+                q = "Thoroughly examine this document, summarize it and highlight key points." if self._is_en() else "Подробно изучи этот документ, сделай краткую выжимку и выдели главное."
+            elif getattr(getattr(reply_msg, "messageOwner", None), "message", "").strip():
+                q = "Analyze and explain this message." if self._is_en() else "Проанализируй и объясни это сообщение."
+        if not q:
+            send_text(peer, "❌ Enter your question after the command." if self._is_en() else "❌ Введите вопрос после команды.", account=account)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        with self._lock:
+            if peer_key in self._processing:
+                send_text(peer, "⏳ Request is already being processed..." if self._is_en() else "⏳ Запрос уже обрабатывается...", account=account)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self._processing.add(peer_key)
+        self._remember(peer_key, "User" if self._is_en() else "Я", q)
+        self._submit(self._ask_gemini, account, peer, peer_key, q, is_search, reply_msg)
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _is_photo_message(self, msg: MessageObject) -> bool:
+        media = getattr(getattr(msg, "messageOwner", None), "media", None)
+        return bool(media and (getattr(media, "photo", None) or (MessageObject.getDocument(msg) and getattr(MessageObject.getDocument(msg), "mime_type", "").startswith("image/"))))
+
+    def _ask_gemini(self, account: int, peer, peer_key: str, question: str, is_search: bool = False, reply_msg: MessageObject = None):
+        en = self._is_en()
+        try:
+            api_raw = str(self.get_setting("api_key", "") or "")
+            gemini_keys = [self._clean_key(k) for k in api_raw.replace(";", ",").split(",") if self._clean_key(k)]
+            groq_key = self._clean_key(self.get_setting("groq_api_key", "") or "")
+            openrouter_key = self._clean_key(self.get_setting("openrouter_api_key", "") or "")
+            use_web = (self.get_setting("search_always", False) or is_search) and self.get_setting("enable_web_search", True)
+            if use_web:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("🔍 Searching the web..." if en else "🔍 Поиск в интернете..."))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("💭 Generating response..." if en else "💭 Генерирую ответ..."))
+            image_data = doc_data = None
+            doc_text_content = doc_file_name = replied_text = ""
+            if reply_msg and getattr(reply_msg, "messageOwner", None):
+                if self._is_photo_message(reply_msg):
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("🖼 Loading photo..." if en else "🖼 Загружаю фото..."))
+                    p, mime = self._download_photo_sync(reply_msg, account)
+                    if p and os.path.exists(p):
+                        with open(p, "rb") as f:
+                            image_data = (mime, base64.b64encode(f.read()).decode("utf-8"))
+                elif MessageObject.getDocument(reply_msg):
+                    doc, doc_file_name, mime, sz = self._get_document_info(reply_msg)
+                    if sz <= 15 * 1024 * 1024:
+                        run_on_ui_thread(lambda: BulletinHelper.show_info(f"📄 Loading {doc_file_name}..." if en else f"📄 Загружаю {doc_file_name}..."))
+                        dp = self._poll_download_file(reply_msg, doc, account)
+                        if dp and os.path.exists(dp):
+                            ext = os.path.splitext(doc_file_name.lower())[1]
+                            if ext == ".pdf" or mime == "application/pdf":
+                                with open(dp, "rb") as f:
+                                    doc_data = ("application/pdf", base64.b64encode(f.read()).decode("utf-8"))
+                            else:
+                                try:
+                                    with open(dp, "r", encoding="utf-8", errors="ignore") as f:
+                                        doc_text_content = f.read(150000 if ext in TEXT_EXTENSIONS or mime.startswith("text/") else 100000)
+                                except Exception:
+                                    pass
+                    else:
+                        send_text(peer, "⚠️ File exceeds 15 MB. Supported document size is up to 15 MB." if en else "⚠️ Файл больше 15 МБ. Поддерживаются документы до 15 МБ.", account=account)
+                        return
+                else:
+                    raw_m = getattr(reply_msg.messageOwner, "message", "")
+                    if raw_m and not raw_m.startswith("/"):
+                        replied_text = raw_m.strip()
+            memory_lim = self._get_chat_memory(peer_key)
+            with self._lock:
+                raw_history = list(self._chat_history.get(peer_key, []))
+            history = [h for h in raw_history if not str(h).startswith(("Собеседник:", "Собеседник :"))][-memory_lim:]
+            gemini_contents = []
+            for h in history[:-1]:
+                if ":" in h:
+                    s, m = h.split(":", 1)
+                    r = "model" if s.strip() in ("Assistant", "Ассистент") else "user"
+                    txt = f"{s.strip()}: {m.strip()}"
+                    if gemini_contents and gemini_contents[-1]["role"] == r:
+                        gemini_contents[-1]["parts"][0]["text"] += f"\n{txt}"
+                    else:
+                        gemini_contents.append({"role": r, "parts": [{"text": txt}]})
+            while gemini_contents and gemini_contents[0]["role"] == "model":
+                gemini_contents.pop(0)
+            cur_prompt = question
+            if replied_text:
+                cur_prompt = f"MESSAGE CONTEXT:\n«««\n{replied_text}\n»»»\nTASK:\n{question}" if en else f"КОНТЕКСТ СООБЩЕНИЯ:\n«««\n{replied_text}\n»»»\nЗАДАЧА:\n{question}"
+            if doc_text_content:
+                cur_prompt = f"DOCUMENT CONTENT «{doc_file_name}»:\n```\n{doc_text_content}\n```\nTASK:\n{cur_prompt}" if en else f"СОДЕРЖИМОЕ ДОКУМЕНТА «{doc_file_name}»:\n```\n{doc_text_content}\n```\nЗАДАЧА:\n{cur_prompt}"
+            u_parts = []
+            if image_data:
+                u_parts.append({"inline_data": {"mime_type": image_data[0], "data": image_data[1]}})
+            elif doc_data:
+                u_parts.append({"inline_data": {"mime_type": doc_data[0], "data": doc_data[1]}})
+            u_parts.append({"text": cur_prompt})
+            if gemini_contents and gemini_contents[-1]["role"] == "user":
+                gemini_contents[-1]["parts"].extend(u_parts)
+            else:
+                gemini_contents.append({"role": "user", "parts": u_parts})
+            openai_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + [
+                {"role": "assistant" if "Assistant" in h.split(":", 1)[0] else "user", "content": h.split(":", 1)[1].strip()}
+                for h in history[:-1] if ":" in h
+            ] + [{"role": "user", "content": cur_prompt}]
+            start_t = time.time()
+            header_badge = (f"📄 **[File: {doc_file_name}]**\n" if en else f"📄 **[Файл: {doc_file_name}]**\n") if doc_file_name else ((("🖼 **[Image Analysis]**\n" if en else "🖼 **[Анализ изображения]**\n") if image_data else (("🌐 **[Google Search]**\n" if en else "🌐 **[Google Поиск]**\n") if use_web else "")))
+            new_text, used_badge = None, ""
+
+            def parse_gemini(resp):
+                cand = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                ans = "".join(p.get("text", "") for p in cand if p.get("text")).strip()
+                return ans if ans else None
+
+            def try_fallbacks(msgs, badge):
+                if groq_key:
+                    for m in GROQ_FALLBACK_MODELS:
+                        ok, res = self._llm._call_openai_compatible(GROQ_LLM_URL, groq_key, m, msgs)
+                        if ok and res:
+                            return res, badge
+                if openrouter_key:
+                    for m in OPENROUTER_MODELS:
+                        ok, res = self._llm._call_openai_compatible(OPENROUTER_URL, openrouter_key, m, msgs, extra_headers=OR_FALLBACK_HEADERS)
+                        if ok and res:
+                            return res, badge
+                return None, ""
+
+            def call_gemini(k, payload):
+                return self._session.post(API_URL, headers={"x-goog-api-key": k, "Content-Type": "application/json"}, json=payload, timeout=NETWORK_TIMEOUT)
+
+            if use_web:
+                payload = {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]}, "contents": gemini_contents, "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}, "tools": [{"googleSearch": {}}]}
+                for idx, gk in enumerate(gemini_keys):
+                    try:
+                        r = call_gemini(gk, payload)
+                        if r.status_code == 200:
+                            ans = parse_gemini(r)
+                            if ans:
+                                new_text, used_badge = ans, header_badge
+                                break
+                        else:
+                            self._log(f"Gemini key {idx+1} err ({r.status_code}): {r.text[:120]}")
+                    except Exception as e:
+                        self._log(f"Gemini key {idx+1} error: {e}")
+                if not new_text:
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("🌐 Searching via backup networks..." if en else "🌐 Поиск через резервные сети..."))
+                    snips = self._fetch_web_snippets(question)
+                    target_msgs = openai_msgs
+                    if snips:
+                        snippet_prompt = f"FRESH WEB DATA:\n{snips}\n\nUSER PROMPT:\n{cur_prompt}\n\nAnswer using the web data above." if en else f"АКТУАЛЬНЫЕ ДАННЫЕ ИЗ СЕТИ (ПОИСК):\n{snips}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{cur_prompt}\n\nОтветь на запрос пользователя, используя свежие данные из поиска выше."
+                        target_msgs = list(openai_msgs[:-1]) + [{"role": "user", "content": snippet_prompt}]
+                    res, b = try_fallbacks(target_msgs, "🌐 **[Fallback: Web Search]**\n" if en else "🌐 **[Резерв: Web Поиск]**\n")
+                    if res:
+                        new_text, used_badge = res, b
+            if not new_text:
+                base_badge = (("⚠️ **[Web search failed: answering from Gemini knowledge base]**\n" if en else "⚠️ **[Поиск в сети не удался: ответ из базы Gemini]**\n") if use_web else "")
+                fb_badge = (("⚠️ **[Web search failed: answering from backup knowledge base]**\n" if en else "⚠️ **[Поиск в сети не удался: ответ из резервной базы]**\n") if use_web else ("⚡️ **[Fallback]**\n" if en else "⚡️ **[Резерв]**\n"))
+                payload = {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]}, "contents": gemini_contents, "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}}
+                for idx, gk in enumerate(gemini_keys):
+                    try:
+                        r = call_gemini(gk, payload)
+                        if r.status_code == 200:
+                            ans = parse_gemini(r)
+                            if ans:
+                                new_text, used_badge = ans, base_badge
+                                break
+                        else:
+                            self._log(f"Gemini fallback key {idx+1} err ({r.status_code}): {r.text[:120]}")
+                    except Exception as e:
+                        self._log(f"Gemini fallback key {idx+1}: {e}")
+                if not new_text:
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("⚡️ Answering via backup model..." if en else "⚡️ Ответ через резервную модель..."))
+                    res, b = try_fallbacks(openai_msgs, fb_badge)
+                    if res:
+                        new_text, used_badge = res, b
+            if not new_text:
+                new_text = self._format_api_error(429)
+            run_on_ui_thread(lambda: BulletinHelper.show_info("✍️ Sending response..." if en else "✍️ Отправляю ответ..."))
+            new_text = re.sub(r"^###\s+", "▫️ ", new_text, flags=re.MULTILINE)
+            act_badge = used_badge or header_badge
+            stats = (f"\n📊 ⏱ {round(time.time() - start_t, 1)}s | 💾 Context: {len(history)} msgs." if en else f"\n📊 ⏱ {round(time.time() - start_t, 1)}с | 💾 Контекст: {len(history)} сообщ.") if self.get_setting("show_stats", False) else ""
+            footer = "\n\nBy @xassistofficial"
+            final_msg = f"{act_badge}{new_text}{stats}{footer}"
+            if not new_text.startswith(("❌", "⚠️")):
+                self._remember(peer_key, "Assistant" if en else "Ассистент", new_text)
+            self._send_split_message(peer, final_msg, account=account)
+        except Exception as e:
+            self._log(f"[Ask] Err: {e}")
+            send_text(peer, f"❌ Error: {e}" if en else f"❌ Ошибка: {e}", account=account)
+        finally:
+            with self._lock:
+                self._processing.discard(peer_key)
