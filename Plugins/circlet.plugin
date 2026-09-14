@@ -24,23 +24,29 @@ from ui.bulletin import BulletinHelper
 __id__ = "circlet"
 __name__ = "Circlet"
 __author__ = "@zxtoichi"
-__version__ = "1.1"
+__version__ = "1.2"
 __min_version__ = "12.5.1"
 __icon__ = "UtyaDuckFull/49"
 __description__ = """Отправка видео кружком с превью обрезки.
 
-Выбираете видео, видите живое превью круга на весь экран. Один палец двигает круг, два пальца меняют его размер. Только потом отправка."""
+Выбираете видео, видите живое превью круга на весь экран. Один палец двигает круг, два пальца меняют его размер. Если видео длиннее минуты, отправится выбранный кусок, а без обрезки — первая минута. Только потом отправка."""
 
 
 ACTIVE = {"sheet": None}
 
 ROUND_SIZE = 384
+ROUND_SAFE_MS = 59990
+ROUND_START_SHIFT_MS = 100
 PREVIEW_DP = 240
 MIN_ZOOM = 1.0
 MAX_ZOOM = 4.0
 
 _CLASS_CACHE = {}
 _METHOD_CACHE = {}
+
+
+def slog(message):
+    return
 
 
 def resolve_class(name):
@@ -179,6 +185,7 @@ class VideoProbe:
         self.rotation = 0
         self.duration_ms = 0
         self.frame = None
+        self.frame_time_us = 0
         self.ok = False
 
     def run(self):
@@ -192,10 +199,7 @@ class VideoProbe:
             self.duration_ms = self._meta(retriever, MediaMetadataRetriever.METADATA_KEY_DURATION)
             if self.rotation in (90, 270):
                 self.width, self.height = self.height, self.width
-            try:
-                self.frame = retriever.getFrameAtTime(0)
-            except Exception:
-                self.frame = None
+            self._fetch_frame(retriever, 0)
             self.ok = self.width > 0 and self.height > 0
         except Exception:
             pass
@@ -206,6 +210,33 @@ class VideoProbe:
                 except Exception:
                     pass
         return self.ok
+
+    def _fetch_frame(self, retriever, time_us):
+        try:
+            self.frame = retriever.getFrameAtTime(int(time_us), MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+        except Exception:
+            self.frame = None
+        if self.frame is None:
+            try:
+                self.frame = retriever.getFrameAtTime(int(time_us), MediaMetadataRetriever.OPTION_CLOSEST)
+            except Exception:
+                self.frame = None
+        self.frame_time_us = int(time_us)
+
+    def fetch_frame_at(self, time_us):
+        retriever = None
+        try:
+            retriever = MediaMetadataRetriever()
+            retriever.setDataSource(self.path)
+            self._fetch_frame(retriever, time_us)
+        except Exception:
+            pass
+        finally:
+            if retriever is not None:
+                try:
+                    retriever.release()
+                except Exception:
+                    pass
 
     @staticmethod
     def _meta(retriever, key):
@@ -623,12 +654,10 @@ def native_edited_info(path):
 
     try:
         info = method.invoke(None, args)
-        if info is None:
-            pass
-        else:
-            pass
+        slog(f"createCompressionSettings -> {'ok' if info is not None else 'None'}")
         return info
     except Exception:
+        slog("createCompressionSettings invoke failed")
         return None
 
 
@@ -668,7 +697,67 @@ def round_estimated_size(info, duration_ms):
     return bitrate, encoder, int(seconds * encoder / 8.0 + audio) + 1
 
 
+def viewer_trim_window_ms(total_ms, expected_path):
+    cls = resolve_class(PHOTO_VIEWER)
+    if cls is None:
+        return -1, -1
+    try:
+        has = find_method(cls, "hasInstance", 0)
+        if has is not None and not bool(has.invoke(None, None)):
+            return -1, -1
+    except Exception:
+        return -1, -1
+    getter = find_method(cls, "getInstance", 0)
+    if getter is None:
+        return -1, -1
+    try:
+        viewer = getter.invoke(None, None)
+    except Exception:
+        return -1, -1
+    if viewer is None:
+        return -1, -1
+    current = get_field(viewer, "currentPathObject")
+    if current is None:
+        slog("viewer closed (currentPathObject=None) -> no trim window")
+        return -1, -1
+    if expected_path is not None:
+        try:
+            if str(current) != str(expected_path):
+                slog(f"viewer path mismatch: viewer={current} probe={expected_path}")
+                return -1, -1
+        except Exception:
+            slog("viewer path compare failed")
+            return -1, -1
+    vis = get_field(viewer, "isVisible")
+    if vis is not None and not bool(vis):
+        slog("viewer not visible -> no trim window")
+        return -1, -1
+    start_raw = get_field(viewer, "startTime")
+    end_raw = get_field(viewer, "endTime")
+    try:
+        start_us = int(start_raw)
+    except Exception:
+        start_us = -1
+    try:
+        end_us = int(end_raw)
+    except Exception:
+        end_us = -1
+    if start_us < 0 and end_us <= 0:
+        slog(f"viewer trim raw: start_us={start_us} end_us={end_us} -> no trim in viewer")
+        return -1, -1
+    start_ms = 0 if start_us < 0 else start_us // 1000
+    end_ms = int(total_ms) if end_us <= 0 else end_us // 1000
+    if end_ms > int(total_ms) + 500:
+        return -1, -1
+    return start_ms, end_ms
+
+
 def build_edited_info(probe, crop_state):
+    try:
+        total = int(probe.duration_ms)
+    except Exception:
+        total = 0
+    slog(f"build_edited_info: total={total} ms path={probe.path}")
     info = native_edited_info(probe.path)
     if info is None:
         cls = resolve_class("org.telegram.messenger.VideoEditedInfo")
@@ -692,20 +781,67 @@ def build_edited_info(probe, crop_state):
         ):
             set_typed_field(info, name, value)
 
-    duration = get_field(info, "estimatedDuration") or int(probe.duration_ms)
+    total_ms = int(probe.duration_ms)
+    start_ms, end_ms = viewer_trim_window_ms(total_ms, probe.path)
+    if end_ms <= 0:
+        if total_ms > ROUND_SAFE_MS:
+            start_ms, end_ms = 0, int(total_ms)
+        else:
+            start_ms, end_ms = -1, -1
+    if end_ms > 0:
+        if end_ms - start_ms > ROUND_SAFE_MS:
+            end_ms = start_ms + ROUND_SAFE_MS
+        start_ms = max(0, int(start_ms))
+        end_ms = min(int(end_ms), int(total_ms))
+        if end_ms - start_ms < 1000:
+            start_ms = max(0, end_ms - ROUND_SAFE_MS)
+        if start_ms < ROUND_START_SHIFT_MS:
+            start_ms = ROUND_START_SHIFT_MS
+            if end_ms <= start_ms:
+                end_ms = min(int(total_ms), start_ms + ROUND_SAFE_MS)
+        start_us = start_ms * 1000
+        end_us = end_ms * 1000
+        written_start = set_typed_field(info, "startTime", start_us)
+        written_end = set_typed_field(info, "endTime", end_us)
+        try:
+            ok_start = written_start is not None and int(written_start) == start_us
+            ok_end = written_end is not None and int(written_end) == end_us
+        except Exception:
+            ok_start = ok_end = False
+        if not (ok_start and ok_end):
+            slog(f"trim window write failed: start={written_start} end={written_end}")
+            return None
+        set_typed_field(info, "estimatedDuration", int(end_ms - start_ms))
+        duration = int(end_ms - start_ms)
+        slog(f"trim window: {start_ms}-{end_ms} ms")
+    else:
+        duration = int(get_field(info, "estimatedDuration") or 0) or int(probe.duration_ms)
     bitrate, encoder, estimated = round_estimated_size(info, duration)
+
+    max_est_size = 8388608
+    if estimated > max_est_size:
+        seconds = max(0.1, duration / 1000.0)
+        audio_bytes = seconds * 16000.0
+        cap = int(max(200000, (max_est_size - audio_bytes) * 8.0 / seconds))
+        bitrate = min(bitrate, cap)
+        encoder = min(encoder, cap)
+        estimated = int(seconds * encoder / 8.0 + audio_bytes) + 1
+        slog(f"size cap: est={estimated} bitrate={bitrate} encoder={encoder}")
 
     written = {}
     for name, value in (
         ("resultWidth", ROUND_SIZE),
         ("resultHeight", ROUND_SIZE),
         ("roundVideo", True),
+        ("muted", False),
         ("bitrate", bitrate),
         ("estimatedSize", estimated),
     ):
         written[name] = set_typed_field(info, name, value)
 
     written["cropState"] = set_typed_field(info, "cropState", crop_state)
+
+    slog(f"info fields: start={get_field(info, 'startTime')} end={get_field(info, 'endTime')} estDur={get_field(info, 'estimatedDuration')} round={written.get('roundVideo')} muted={written.get('muted')} estSize={written.get('estimatedSize')} crop={written.get('cropState') is not None}")
 
 
     if not bool(written.get("roundVideo")):
@@ -1219,6 +1355,7 @@ def send_round(probe, crop_state, rect=None):
     if method is None:
         BulletinHelper.show_error("Метод отправки не найден")
         return False
+    slog(f"prepareSendingVideo: params={count}")
 
 
     account = UserConfig.selectedAccount
@@ -1274,10 +1411,10 @@ def send_round(probe, crop_state, rect=None):
     def fire():
         try:
             method.invoke(None, args)
+            slog("prepareSendingVideo invoked ok")
             run_on_ui_thread(close_hosts, 60)
-            BulletinHelper.show_success("Кружок отправляется")
         except Exception:
-            BulletinHelper.show_error("Отправить не удалось")
+            slog("prepareSendingVideo invoke failed")
 
     try:
         run_on_ui_thread(fire, 0)
@@ -1855,6 +1992,14 @@ class CircletPlugin(BasePlugin):
         if not probe.run():
             BulletinHelper.show_error("Не удалось прочитать размеры видео")
             return False
+        slog(f"probe ok: {probe.width}x{probe.height} dur={probe.duration_ms} ms")
+        try:
+            vw_start, vw_end = viewer_trim_window_ms(int(probe.duration_ms), path)
+        except Exception:
+            vw_start, vw_end = -1, -1
+        if vw_end > 0 and vw_start > 0:
+            probe.fetch_frame_at(vw_start * 1000)
+            slog(f"preview frame re-fetched at {vw_start} ms")
 
         sheet = CropSheet(probe, send_round)
         self._pending = sheet
