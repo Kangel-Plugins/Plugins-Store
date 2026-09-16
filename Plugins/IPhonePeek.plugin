@@ -1,0 +1,580 @@
+from typing import Any, Dict, List, Optional, Tuple
+
+from base_plugin import BasePlugin, MethodHook
+from extera_utils.classes import Base, joverload
+from hook_utils import find_class, get_private_field, set_private_field
+from java import jclass
+from ui.settings import Switch
+
+
+__id__ = "IPhonePeek"
+__name__ = "IPhonePeek"
+__description__ = "Предпросмотр медиа как на iPhone. Выделить фото или видео, затем зажать медиа."
+__author__ = "@lunaref"
+__version__ = "1.0.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+RECYCLER_LIST_VIEW = "org.telegram.ui.Components.RecyclerListView"
+LONG_CLICK_INTERFACE = (
+    "org.telegram.ui.Components.RecyclerListView$OnItemLongClickListenerExtended"
+)
+BASIC_LONG_CLICK_INTERFACE = (
+    "org.telegram.ui.Components.RecyclerListView$OnItemLongClickListener"
+)
+SHARED_MEDIA_LAYOUT = "org.telegram.ui.Components.SharedMediaLayout"
+SHARED_MEDIA_LIST_VIEW = (
+    "org.telegram.ui.Components.SharedMediaLayout$SharedMediaListView"
+)
+SHARED_MEDIA_CELLS = (
+    "org.telegram.ui.Cells.SharedPhotoVideoCell2",
+    "org.telegram.ui.Cells.SharedPhotoVideoCell",
+)
+ACTION_MODE_FIELDS = ("isActionModeShowed", "actionModeShowed")
+
+JAVA_OBJECT_CLASS = jclass("java.lang.Object")
+LONG_CLICK_JCLASS = jclass(LONG_CLICK_INTERFACE)
+BASIC_LONG_CLICK_JCLASS = jclass(BASIC_LONG_CLICK_INTERFACE)
+
+PEEK_SCALE = 1.035
+PEEK_IN_MS = 90
+PEEK_OUT_MS = 120
+
+_PROXIES_BOUND = False
+
+
+class _LongPressProxy(Base):
+    def __init__(self, plugin, list_view, original):
+        self.plugin = plugin
+        self.list_view = list_view
+        self.original = original
+        self.peek_active = False
+        self.peek_cell = None
+
+    @joverload(
+        "onItemClick",
+        ["android.view.View", "int", "float", "float"],
+    )
+    def on_item_click(self, view, position, x, y):
+        return self.plugin._on_long_press(
+            self,
+            self.list_view,
+            self.original,
+            view,
+            position,
+            x,
+            y,
+        )
+
+    @joverload("onMove", ["float", "float"])
+    def on_move(self, dx, dy):
+        if not self.peek_active:
+            self.plugin._delegate_move(self.original, dx, dy)
+
+    @joverload("onLongClickRelease", [])
+    def on_long_click_release(self):
+        if self.peek_active:
+            self.plugin._finish_peek(self)
+        else:
+            self.plugin._delegate_release(self.original)
+
+
+class _BasicLongPressProxy(Base):
+    def __init__(self, plugin, list_view, original):
+        self.plugin = plugin
+        self.list_view = list_view
+        self.original = original
+        self.peek_active = False
+        self.peek_cell = None
+
+    @joverload("onItemClick", ["android.view.View", "int"])
+    def on_item_click(self, view, position):
+        return self.plugin._on_long_press(
+            self,
+            self.list_view,
+            self.original,
+            view,
+            position,
+            0.0,
+            0.0,
+        )
+
+
+class _SetLongClickListenerHook(MethodHook):
+    def __init__(self, plugin: "MediaPeekPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin._wrap_listener(param)
+        except Exception as exc:
+            self.plugin.log(f"Не удалось обернуть long-press: {exc}")
+
+
+class _CellAttachedHook(MethodHook):
+    def __init__(self, plugin: "MediaPeekPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._retrofit_from_cell(param.thisObject)
+        except Exception as exc:
+            self.plugin.log(f"Резервная привязка не удалась: {exc}")
+
+
+class _TouchReleaseHook(MethodHook):
+    def __init__(self, plugin: "MediaPeekPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if param.args is None or len(param.args) < 1:
+                return
+            event = param.args[0]
+            action = int(event.getActionMasked())
+            if action == 1 or action == 3:
+                self.plugin._finish_basic_peek(param.thisObject)
+        except Exception:
+            pass
+
+
+class MediaPeekPlugin(BasePlugin):
+    def on_plugin_load(self):
+        global _PROXIES_BOUND
+
+        self._hook_count = 0
+        self._setter_hook_count = 0
+        self._cell_hook_count = 0
+        self._touch_hook_count = 0
+        self._retrofit_checked = set()
+        self._basic_active: Dict[int, _BasicLongPressProxy] = {}
+        self._unloading = False
+        self._bindings: Dict[int, Tuple[Any, Any, Any, str]] = {}
+
+        recycler_class = find_class(RECYCLER_LIST_VIEW)
+        interface_class = find_class(LONG_CLICK_INTERFACE)
+        basic_interface_class = find_class(BASIC_LONG_CLICK_INTERFACE)
+        object_class = find_class("java.lang.Object")
+        layout_class = find_class(SHARED_MEDIA_LAYOUT)
+        cell_class = find_class(SHARED_MEDIA_CELLS[0])
+        self._long_click_interface = interface_class
+        self._basic_long_click_interface = basic_interface_class
+
+        required = (
+            (recycler_class, "RecyclerListView"),
+            (interface_class, "OnItemLongClickListenerExtended"),
+            (basic_interface_class, "OnItemLongClickListener"),
+            (object_class, "java.lang.Object"),
+            (layout_class, "SharedMediaLayout"),
+            (cell_class, "SharedPhotoVideoCell2"),
+        )
+        missing = [label for clazz, label in required if clazz is None]
+        if missing:
+            self.log("Не найдены классы: " + ", ".join(missing))
+            return
+
+        try:
+            if not _PROXIES_BOUND:
+                _LongPressProxy.bind(
+                    JAVA_OBJECT_CLASS,
+                    LONG_CLICK_JCLASS,
+                    custom_name="MediaPeekLongPress",
+                )
+                _BasicLongPressProxy.bind(
+                    JAVA_OBJECT_CLASS,
+                    BASIC_LONG_CLICK_JCLASS,
+                    custom_name="MediaPeekBasicLongPress",
+                )
+                _PROXIES_BOUND = True
+        except Exception as exc:
+            self.log(f"Не удалось создать Java listener: {exc}")
+            return
+
+        try:
+            unhooks = self.hook_all_methods(
+                recycler_class,
+                "setOnItemLongClickListener",
+                _SetLongClickListenerHook(self),
+            )
+            self._setter_hook_count = len(unhooks or [])
+            self._hook_count += self._setter_hook_count
+            cell_unhooks = self.hook_all_methods(
+                cell_class,
+                "onAttachedToWindow",
+                _CellAttachedHook(self),
+            )
+            self._cell_hook_count = len(cell_unhooks or [])
+            self._hook_count += self._cell_hook_count
+            touch_unhooks = self.hook_all_methods(
+                recycler_class,
+                "dispatchTouchEvent",
+                _TouchReleaseHook(self),
+            )
+            self._touch_hook_count = len(touch_unhooks or [])
+            self._hook_count += self._touch_hook_count
+        except Exception as exc:
+            self.log(f"Не удалось подключить listener hook: {exc}")
+            return
+
+        if not self._hook_count:
+            self.log("Метод setOnItemLongClickListener не найден")
+
+    def on_plugin_unload(self):
+        self._unloading = True
+        for list_view, original, _proxy, field_name in list(
+            getattr(self, "_bindings", {}).values()
+        ):
+            try:
+                set_private_field(list_view, field_name, original)
+            except Exception:
+                pass
+        getattr(self, "_bindings", {}).clear()
+        self._basic_active.clear()
+        self._close_native_viewer()
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Switch(
+                key="close_on_release",
+                text="Закрывать после отпускания",
+                subtext=(
+                    "Выключите, если хотите оставаться в полном просмотре "
+                    "после долгого нажатия."
+                ),
+                default=True,
+                icon="msg_close",
+            ),
+        ]
+
+    def _wrap_listener(self, param: Any) -> None:
+        if self._unloading or param.args is None or len(param.args) < 1:
+            return
+        list_view = param.thisObject
+        original = param.args[0]
+        if list_view is None or original is None:
+            return
+        original_name = self._class_name(original)
+        if (
+            "MediaPeekLongPress" in original_name
+            or "MediaPeekBasicLongPress" in original_name
+        ):
+            return
+        listener_kind = self._listener_kind(original)
+        if listener_kind is None:
+            return
+
+        layout = self._find_shared_media_layout(list_view, original)
+        if not self._is_shared_media_list(list_view) and layout is None:
+            return
+
+        proxy = self._install_proxy(list_view, original, listener_kind)
+        param.args[0] = proxy.java
+
+    def _install_proxy(
+        self,
+        list_view: Any,
+        original: Any,
+        listener_kind: str,
+    ) -> Any:
+        key = self._object_key(list_view)
+        previous = self._bindings.get(key)
+        if previous is not None:
+            previous_proxy = previous[2]
+            if previous[1] is original:
+                return previous_proxy
+
+        proxy_class = (
+            _LongPressProxy
+            if listener_kind == "extended"
+            else _BasicLongPressProxy
+        )
+        proxy = proxy_class.new_instance(
+            init_args=[self, list_view, original]
+        )
+        field_name = (
+            "onItemLongClickListenerExtended"
+            if listener_kind == "extended"
+            else "onItemLongClickListener"
+        )
+        self._bindings[key] = (list_view, original, proxy, field_name)
+        return proxy
+
+    def _retrofit_from_cell(self, cell: Any) -> None:
+        if self._unloading or cell is None:
+            return
+        list_view = self._find_recycler_parent(cell)
+        if list_view is None:
+            return
+        key = self._object_key(list_view)
+        if key in self._bindings or key in self._retrofit_checked:
+            return
+
+        extended = get_private_field(
+            list_view,
+            "onItemLongClickListenerExtended",
+        )
+        basic = get_private_field(list_view, "onItemLongClickListener")
+        self._retrofit_checked.add(key)
+
+        if bool(extended):
+            original = extended
+            listener_kind = "extended"
+            field_name = "onItemLongClickListenerExtended"
+        elif bool(basic):
+            original = basic
+            listener_kind = "basic"
+            field_name = "onItemLongClickListener"
+        else:
+            original = None
+            listener_kind = None
+            field_name = ""
+
+        if original is None or listener_kind is None:
+            return
+        original_name = self._class_name(original)
+        if (
+            "MediaPeekLongPress" in original_name
+            or "MediaPeekBasicLongPress" in original_name
+        ):
+            return
+        proxy = self._install_proxy(list_view, original, listener_kind)
+        if not bool(set_private_field(list_view, field_name, proxy.java)):
+            self._bindings.pop(key, None)
+            self.log(f"Не удалось заменить приватное поле {field_name}")
+
+    def _listener_kind(self, original: Any) -> Optional[str]:
+        try:
+            if bool(self._long_click_interface.isInstance(original)):
+                return "extended"
+        except Exception:
+            pass
+        try:
+            if bool(self._basic_long_click_interface.isInstance(original)):
+                return "basic"
+        except Exception:
+            pass
+        return None
+
+    def _find_recycler_parent(self, view: Any) -> Any:
+        current = view
+        for _ in range(8):
+            try:
+                current = current.getParent()
+            except Exception:
+                return None
+            if current is None:
+                return None
+            if (
+                self._class_in_hierarchy(current, RECYCLER_LIST_VIEW)
+                or self._is_shared_media_list(current)
+            ):
+                return current
+        return None
+
+    def _on_long_press(
+        self,
+        proxy: _LongPressProxy,
+        list_view: Any,
+        original: Any,
+        view: Any,
+        position: int,
+        x: float,
+        y: float,
+    ) -> bool:
+        if self._class_name(view) not in SHARED_MEDIA_CELLS:
+            return self._delegate_long_press(
+                original, view, position, x, y
+            )
+
+        layout = self._find_shared_media_layout(list_view, original)
+        if layout is None:
+            self.log("Long-press получен, SharedMediaLayout не найден")
+            return self._delegate_long_press(
+                original, view, position, x, y
+            )
+
+        action_context = self._suspend_action_mode(layout)
+        if action_context is None:
+            return self._delegate_long_press(
+                original, view, position, x, y
+            )
+
+        field_name, old_value = action_context
+        self._animate_in(view)
+        opened = False
+        try:
+            list_view.clickItem(view, position)
+            opened = True
+        except Exception as exc:
+            self.log(f"Не удалось открыть PhotoViewer: {exc}")
+        finally:
+            set_private_field(layout, field_name, old_value)
+
+        if not opened:
+            self._animate_out(view)
+            return self._delegate_long_press(
+                original, view, position, x, y
+            )
+
+        proxy.peek_active = True
+        proxy.peek_cell = view
+        if isinstance(proxy, _BasicLongPressProxy):
+            self._basic_active[self._object_key(list_view)] = proxy
+        return True
+
+    def _finish_peek(self, proxy: _LongPressProxy) -> None:
+        try:
+            if bool(self.get_setting("close_on_release", True)):
+                self._close_native_viewer()
+        finally:
+            self._animate_out(proxy.peek_cell)
+            proxy.peek_active = False
+            proxy.peek_cell = None
+
+    def _finish_basic_peek(self, list_view: Any) -> None:
+        key = self._object_key(list_view)
+        proxy = self._basic_active.pop(key, None)
+        if proxy is not None and proxy.peek_active:
+            self._finish_peek(proxy)
+
+    def _close_native_viewer(self) -> None:
+        try:
+            from org.telegram.ui import PhotoViewer
+
+            viewer = PhotoViewer.getInstance()
+            if viewer is not None and bool(viewer.isVisibleOrAnimating()):
+                viewer.closePhoto(True, False)
+        except Exception as exc:
+            if not getattr(self, "_unloading", False):
+                self.log(f"Не удалось закрыть PhotoViewer: {exc}")
+
+    def _suspend_action_mode(self, layout: Any) -> Optional[Tuple[str, Any]]:
+        for field_name in ACTION_MODE_FIELDS:
+            old_value = get_private_field(layout, field_name)
+            if not bool(old_value):
+                continue
+            if bool(set_private_field(layout, field_name, False)):
+                return field_name, old_value
+        return None
+
+    def _find_shared_media_layout(self, view: Any, listener: Any = None) -> Any:
+        current = view
+        for _ in range(10):
+            if current is None:
+                break
+            if self._class_in_hierarchy(current, SHARED_MEDIA_LAYOUT):
+                return current
+            try:
+                current = current.getParent()
+            except Exception:
+                break
+
+        if listener is not None:
+            try:
+                outer = get_private_field(listener, "this$0")
+                if self._class_in_hierarchy(outer, SHARED_MEDIA_LAYOUT):
+                    return outer
+            except Exception:
+                pass
+        return None
+
+    def _is_shared_media_list(self, obj: Any) -> bool:
+        return self._class_in_hierarchy(obj, SHARED_MEDIA_LIST_VIEW)
+
+    @staticmethod
+    def _class_in_hierarchy(obj: Any, wanted_name: str) -> bool:
+        clazz = None
+        try:
+            clazz = obj.getClass()
+        except Exception:
+            return False
+        for _ in range(10):
+            if clazz is None:
+                break
+            try:
+                if str(clazz.getName()) == wanted_name:
+                    return True
+                clazz = clazz.getSuperclass()
+            except Exception:
+                break
+        return False
+
+    @staticmethod
+    def _delegate_long_press(
+        original: Any,
+        view: Any,
+        position: int,
+        x: float,
+        y: float,
+    ) -> bool:
+        try:
+            return bool(original.onItemClick(view, position, x, y))
+        except Exception:
+            try:
+                return bool(original.onItemClick(view, position))
+            except Exception:
+                return False
+
+    @staticmethod
+    def _delegate_move(original: Any, dx: float, dy: float) -> None:
+        try:
+            original.onMove(dx, dy)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _delegate_release(original: Any) -> None:
+        try:
+            original.onLongClickRelease()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _class_name(obj: Any) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.getClass().getName())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _object_key(obj: Any) -> int:
+        try:
+            return int(obj.hashCode())
+        except Exception:
+            return id(obj)
+
+    def _animate_in(self, view: Any) -> None:
+        try:
+            view.animate().cancel()
+            view.setPivotX(view.getWidth() / 2.0)
+            view.setPivotY(view.getHeight() / 2.0)
+            (
+                view.animate()
+                .scaleX(PEEK_SCALE)
+                .scaleY(PEEK_SCALE)
+                .setDuration(PEEK_IN_MS)
+                .start()
+            )
+        except Exception:
+            pass
+
+    def _animate_out(self, view: Any) -> None:
+        if view is None:
+            return
+        try:
+            (
+                view.animate()
+                .scaleX(1.0)
+                .scaleY(1.0)
+                .setDuration(PEEK_OUT_MS)
+                .start()
+            )
+        except Exception:
+            try:
+                view.setScaleX(1.0)
+                view.setScaleY(1.0)
+            except Exception:
+                pass
