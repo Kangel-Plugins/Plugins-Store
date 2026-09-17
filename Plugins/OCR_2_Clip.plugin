@@ -1,0 +1,361 @@
+__id__ = "OCR_2_Clip"
+__name__ = "OCR2Clip"
+__author__ = "@Iorela"
+__version__ = "1.2.0"
+__min_version__ = "12.5.1"
+__icon__ = "sillyplugins/0"
+__description__ = "Extract text from images directly to your clipboard, can crop and translate. Use ocr.space or Gemini"
+__app_version__ = ">=12.10.1"
+__sdk_version__ = ">=1.4.4.3"
+
+import base64, json, threading, urllib.request, urllib.error
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Input, Divider
+from org.telegram.messenger import FileLoader, AndroidUtilities
+from android import R
+from android.app import Dialog
+from android.content.res import Configuration
+from android.graphics import Bitmap, BitmapFactory, Color, PorterDuff
+from android.graphics.drawable import GradientDrawable
+from android.view import View, MotionEvent, Gravity
+from android.widget import FrameLayout, ImageView, LinearLayout, TextView
+from android.util import TypedValue
+from java.io import File, FileOutputStream
+from java import dynamic_proxy
+from org.telegram.ui import LaunchActivity
+from android_utils import run_on_ui_thread
+
+SystemClock = __import__("java").jclass("android.os.SystemClock")
+
+class ViewClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, cb): super().__init__(); self.cb = cb
+    def onClick(self, v): self.cb(v) if callable(self.cb) else None
+
+class CropTouchListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, orig, scale, on_crop, views, sw, sh, auto_confirm, on_sel_change):
+        super().__init__()
+        self.orig, self.scale, self.on_crop = orig, scale, on_crop
+        self.views, self.sw, self.sh = views, sw, sh
+        self.auto_confirm, self.on_sel_change = auto_confirm, on_sel_change
+        self.sx = self.sy = -1.0
+        self.last_crop = None
+        self._update_ui(0, 0, 0, 0, False)
+
+    def _move(self, v, x, y, w, h):
+        if w <= 0 or h <= 0: v.setScaleX(0.0); v.setScaleY(0.0)
+        else:
+            v.setTranslationX(float(x)); v.setTranslationY(float(y))
+            v.setScaleX(float(w)); v.setScaleY(float(h))
+
+    def _update_ui(self, l, t, r, b, drawing):
+        if not drawing:
+            for k in ['bt', 'bb', 'bl', 'br', 'sb', 'sl', 'sr']: self._move(self.views[k], 0, 0, 0, 0)
+            self._move(self.views['st'], 0, 0, self.sw, self.sh)
+            return
+            
+        il, it, ir, ib = int(l), int(t), int(r), int(b)
+        w, h, th = max(0, ir - il), max(0, ib - it), int(AndroidUtilities.dp(2))
+        
+        self._move(self.views['st'], 0, 0, self.sw, it)
+        self._move(self.views['sb'], 0, ib, self.sw, self.sh - ib)
+        self._move(self.views['sl'], 0, it, il, h)
+        self._move(self.views['sr'], ir, it, self.sw - ir, h)
+        self._move(self.views['bt'], il, it, w, th)
+        self._move(self.views['bb'], il, max(it, ib - th), w, th)
+        ih = max(0, h - 2 * th)
+        self._move(self.views['bl'], il, it + th, th, ih)
+        self._move(self.views['br'], max(il, ir - th), it + th, th, ih)
+
+    def onTouch(self, v, e):
+        act, x, y = e.getAction(), float(e.getX()), float(e.getY())
+        if act == MotionEvent.ACTION_DOWN:
+            self.sx, self.sy = x, y
+            return True
+        elif act == MotionEvent.ACTION_MOVE:
+            l, t = max(0.0, min(self.sx, x)), max(0.0, min(self.sy, y))
+            r, b = min(float(self.sw), max(self.sx, x)), min(float(self.sh), max(self.sy, y))
+            self._update_ui(l, t, r, b, True)
+            return True
+        elif act == MotionEvent.ACTION_UP:
+            l, t = max(0.0, min(self.sx, x) / self.scale), max(0.0, min(self.sy, y) / self.scale)
+            r, b = max(0.0, max(self.sx, x) / self.scale), max(0.0, max(self.sy, y) / self.scale)
+            w, h, xc, yc = max(1, int(r - l)), max(1, int(b - t)), int(l), int(t)
+            ow, oh = self.orig.getWidth(), self.orig.getHeight()
+            
+            if w + xc > ow: w = ow - xc
+            if h + yc > oh: h = oh - yc
+
+            if w > 20 and h > 20:
+                self.last_crop = (xc, yc, w, h)
+                self.execute_crop() if self.auto_confirm else self.on_sel_change(True)
+            else:
+                self.last_crop = None
+                self._update_ui(0, 0, 0, 0, False)
+                self.on_sel_change(False)
+            return True
+        return False
+
+    def execute_crop(self):
+        if not self.last_crop: return
+        xc, yc, w, h = self.last_crop
+        crop = Bitmap.createBitmap(self.orig, xc, yc, w, h)
+        tf = File.createTempFile("crop_", ".jpg")
+        out = FileOutputStream(tf)
+        crop.compress(Bitmap.CompressFormat.JPEG, 100, out)
+        out.flush(); out.close()
+        self.on_crop(tf.getAbsolutePath())
+
+class ImageOCRPlugin(BasePlugin):
+    def _is_gemini(self, key):
+        return key.startswith("AIza") or key.startswith("AQ.")
+
+    def create_settings(self):
+        k = self.get_setting("api_key", "").strip()
+        prv = "Gemini Flash-Lite" if self._is_gemini(k) else ("Default ocr.space" if not k else "Custom ocr.space")
+        
+        sets = [
+            Header(text="OCR2Clip Preferences"),
+            Switch(key="auto_full_extract", text="Instant Full Extract", subtext="Instantly extract the entire image when tapping OCR2Clip, bypassing the crop screen.", default=False, on_change=lambda v: self.set_setting("auto_full_extract", v, reload_settings=True))
+        ]
+        if self.get_setting("auto_full_extract", False):
+            sets.append(Switch(key="auto_translate_full", text="Auto-Translate Full Extract", subtext="Automatically translate to your target language when instantly extracting (Gemini Only).", default=False))
+
+        sets.extend([
+            Switch(key="auto_confirm_crop", text="Auto-Confirm Crop", subtext="Extract text immediately upon releasing your finger.", default=False),
+            Header(text="Auto-Translate (Gemini)"),
+            Switch(key="auto_translate_default", text="Translate by Default", subtext="Enable translation by default in the crop UI.", default=False),
+            Input(key="target_language", text="Target Language", subtext="The language to translate extracted text into (e.g., English, Spanish).", default="English"),
+            Header(text="OCR Provider"),
+            Input(key="api_key", text=f"API Key | {prv}", subtext="Starts with 'AQ.' or 'AIza' -> Gemini. Any other -> ocr.space. Leave blank -> Default.", default="")
+        ])
+        
+        if not k:
+            sets.append(Divider(text="Default Key Limit: 3 requests / 15 mins.\nAdd your Gemini or ocr.space free API key for better performance and limits"))
+            
+        return sets
+
+    def on_plugin_load(self):
+        self.item_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU, 
+            text="OCR2Clip", 
+            icon="msg_gallery", 
+            on_click=self.handle_req, 
+            priority=20,
+            condition="message != null && (message.isPhoto() || message.isSticker())"
+        ))
+
+    def on_plugin_unload(self):
+        if hasattr(self, "item_id") and self.item_id: self.remove_menu_item(self.item_id)
+
+    def handle_req(self, ctx: dict):
+        msg = ctx.get("message")
+        if not msg or not getattr(msg, "messageOwner", None) or not getattr(msg.messageOwner, "media", None): return
+        path = FileLoader.getInstance(msg.currentAccount).getPathToMessage(msg.messageOwner)
+        if not path or not path.exists(): return BulletinHelper.show_info("Please open or download the image first.")
+
+        if self.get_setting("auto_full_extract", False):
+            tr = self.get_setting("auto_translate_full", False)
+            prv = "Gemini Flash-Lite" if self._is_gemini(self.get_setting("api_key", "").strip()) else "ocr.space"
+            BulletinHelper.show_info(f"{prv} | Extracting{' & Translating' if tr else ' full text'}...")
+            threading.Thread(target=self._process_ocr, args=(str(path.getAbsolutePath()), tr), daemon=True).start()
+        else:
+            self._show_crop_ui(str(path.getAbsolutePath()))
+
+    def _show_crop_ui(self, img_path: str):
+        auto_conf = self.get_setting("auto_confirm_crop", False)
+        def ui_act():
+            try:
+                act = LaunchActivity.instance
+                if not act: return
+                dlg = Dialog(act, R.style.Theme_Black_NoTitleBar_Fullscreen)
+                bmp = BitmapFactory.decodeFile(img_path)
+                
+                res, ori = act.getResources(), act.getResources().getConfiguration().orientation
+                dm = res.getDisplayMetrics()
+                w_px, h_px = dm.widthPixels, dm.heightPixels
+                sw, sh = (max(w_px, h_px), min(w_px, h_px)) if ori == Configuration.ORIENTATION_LANDSCAPE else (min(w_px, h_px), max(w_px, h_px))
+                
+                scale = min(sw / bmp.getWidth(), sh / bmp.getHeight())
+                sc_w, sc_h = int(bmp.getWidth() * scale), int(bmp.getHeight() * scale)
+
+                rf = FrameLayout(act); rf.setBackgroundColor(Color.BLACK)
+                ic = FrameLayout(act); iv = ImageView(act); iv.setImageBitmap(bmp)
+                ic.addView(iv, FrameLayout.LayoutParams(-1, -1))
+                oc = FrameLayout(act); ic.addView(oc, FrameLayout.LayoutParams(-1, -1))
+
+                vw = {}
+                for c, ks in [(153, ['st', 'sb', 'sl', 'sr']), (128, ['bt', 'bb', 'bl', 'br'])]:
+                    for k in ks:
+                        v = View(act); v.setBackgroundColor(Color.argb(c, 0 if c==153 else 255, 0 if c==153 else 255, 0 if c==153 else 255))
+                        v.setPivotX(0.0); v.setPivotY(0.0)
+                        oc.addView(v, FrameLayout.LayoutParams(1, 1)); vw[k] = v
+
+                tv = View(act); oc.addView(tv, FrameLayout.LayoutParams(-1, -1))
+                lp = FrameLayout.LayoutParams(sc_w, sc_h); lp.gravity = Gravity.CENTER
+                rf.addView(ic, lp)
+
+                cc = LinearLayout(act); cc.setOrientation(LinearLayout.HORIZONTAL); cc.setGravity(Gravity.CENTER)
+                lpc = FrameLayout.LayoutParams(-1, -2); lpc.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+                lpc.bottomMargin = AndroidUtilities.dp(16) if ori == Configuration.ORIENTATION_LANDSCAPE else AndroidUtilities.dp(36)
+                rf.addView(cc, lpc)
+
+                is_gemini = self._is_gemini(self.get_setting("api_key", "").strip())
+                default_tr = is_gemini and bool(self.get_setting("auto_translate_default", False))
+                tr_act = [default_tr]
+
+                def on_crop(cp):
+                    dlg.dismiss()
+                    prv = "Gemini Flash-Lite" if is_gemini else "ocr.space"
+                    BulletinHelper.show_info(f"{prv} | Extracting{' & Translating' if tr_act[0] else ' cropped area'}...")
+                    threading.Thread(target=self._process_ocr, args=(cp, tr_act[0]), daemon=True).start()
+
+                bsz = min(AndroidUtilities.dp(58), int(sw * 0.20))
+                isz, spc = int(bsz * 0.44), int(bsz * 0.6)
+                pkg = act.getPackageName()
+                
+                def mk_btn(icons, txt, col, alph, cb, mr=0):
+                    c = FrameLayout(act)
+                    bg = GradientDrawable(); bg.setShape(GradientDrawable.OVAL); bg.setColor(Color.argb(107, 28, 28, 28))
+                    c.setBackground(bg); c.setAlpha(alph)
+                    rid = next((res.getIdentifier(n, "drawable", pkg) for n in icons if res.getIdentifier(n, "drawable", pkg) != 0), 0)
+                    
+                    if rid:
+                        iv = ImageView(act); iv.setImageResource(rid); iv.setColorFilter(col, PorterDuff.Mode.SRC_IN)
+                        c.addView(iv, FrameLayout.LayoutParams(isz, isz, Gravity.CENTER))
+                    else:
+                        tv = TextView(act); tv.setText(txt); tv.setTextColor(col); tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, float(isz)); tv.setGravity(Gravity.CENTER); tv.setTypeface(AndroidUtilities.bold())
+                        c.addView(tv, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                    
+                    c.setOnClickListener(ViewClickListener(cb))
+                    lp = LinearLayout.LayoutParams(bsz, bsz); lp.rightMargin = mr; cc.addView(c, lp)
+                    return c
+
+                def on_full(v):
+                    dlg.dismiss()
+                    prv = "Gemini Flash-Lite" if is_gemini else "ocr.space"
+                    BulletinHelper.show_info(f"{prv} | Extracting{' & Translating' if tr_act[0] else ' full text'}...")
+                    threading.Thread(target=self._process_ocr, args=(img_path, tr_act[0]), daemon=True).start()
+
+                spc_full = spc if (is_gemini or not auto_conf) else 0
+                mk_btn(["ic_video_fullscreen", "ic_fullscreen_white", "msg_fullscreen"], "⛶", Color.parseColor("#B8B8B8"), 1.0, on_full, spc_full)
+
+                if is_gemini:
+                    def on_tr(v):
+                        tr_act[0] = not tr_act[0]
+                        active = tr_act[0]
+                        col = Color.parseColor("#3390EC") if active else Color.parseColor("#B8B8B8")
+                        v.setAlpha(1.0 if active else 0.35)
+                        child = v.getChildAt(0)
+                        if isinstance(child, ImageView):
+                            child.setColorFilter(col, PorterDuff.Mode.SRC_IN)
+                        elif isinstance(child, TextView):
+                            child.setTextColor(col)
+
+                    init_col = Color.parseColor("#3390EC") if default_tr else Color.parseColor("#B8B8B8")
+                    init_alpha = 1.0 if default_tr else 0.35
+                    mk_btn(["msg_translate", "msg_language", "ic_translate"], "文A", init_col, init_alpha, on_tr, 0 if auto_conf else spc)
+
+                holder = [None]
+                b_conf = mk_btn(["ic_ab_done", "ic_done", "msg_check"], "✓", Color.parseColor("#B8B8B8"), 0.35, lambda v: holder[0].execute_crop() if holder[0] else None, 0)
+
+                if auto_conf: b_conf.setVisibility(View.GONE)
+                else: b_conf.setEnabled(False)
+
+                def upd_conf(has_sel):
+                    if not auto_conf:
+                        b_conf.setEnabled(has_sel); b_conf.setAlpha(1.0 if has_sel else 0.35)
+                        c = Color.parseColor("#4FE064") if has_sel else Color.parseColor("#B8B8B8")
+                        ch = b_conf.getChildAt(0)
+                        if isinstance(ch, ImageView):
+                            ch.setColorFilter(c, PorterDuff.Mode.SRC_IN)
+                        elif isinstance(ch, TextView):
+                            ch.setTextColor(c)
+
+                touch = CropTouchListener(bmp, scale, on_crop, vw, sc_w, sc_h, auto_conf, upd_conf)
+                holder[0] = touch; tv.setOnTouchListener(touch); tv.setClickable(True)
+                dlg.setContentView(rf); dlg.show()
+
+            except Exception as e:
+                self.log(f"UI Error: {e}"); BulletinHelper.show_error("Failed to open crop view.")
+
+        run_on_ui_thread(ui_act)
+
+    def _process_ocr(self, img_path: str, translate: bool = False):
+        def show_msg(m, err=False): run_on_ui_thread(lambda: BulletinHelper.show_error(m) if err else BulletinHelper.show_info(m))
+            
+        try:
+            with open(img_path, "rb") as f: img_bytes = f.read()
+            if "crop_" in img_path:
+                try: File(img_path).delete()
+                except: pass
+
+            key = self.get_setting("api_key", "").strip()
+
+            if self._is_gemini(key):
+                pmt = "Extract all text from this image exactly as written. If there are distinct speech bubbles, comic panels, or separate text blocks, you must clearly separate each of them with a blank line (double newline). Preserve reading order, formatting, and spacing."
+                if translate: pmt += f"\n\nIMPORTANT: After extracting, perfectly translate all the text into {self.get_setting('target_language', 'English').strip() or 'English'}. You must return ONLY the final translated text. Maintain the exact same paragraph structure, double newlines, and block separations as the original layout. Do not output the original text. Do not add conversational filler."
+                else: pmt += " Do not add any conversational text, commentary, or markdown code blocks around the response, just return the raw text."
+                
+                req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={key}",
+                    data=json.dumps({"contents": [{"parts": [{"text": pmt}, {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(img_bytes).decode('utf-8')}}]}], "generationConfig": {"temperature": 0.0}}).encode('utf-8'),
+                    headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp: res = json.loads(resp.read().decode("utf-8"))
+                try: text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except KeyError: return show_msg("Gemini failed to extract text.", True)
+
+            else:
+                if translate: return show_msg("Translation requires a Gemini API key in settings.", True)
+                    
+                if not key:
+                    now = SystemClock.elapsedRealtime() / 1000.0
+                    try: u = json.loads(self.get_setting("def_api_u", '{"st": 0, "c": 0}'))
+                    except: u = {"st": 0, "c": 0}
+                    
+                    if now - u.get("st", 0) >= 900: u = {"st": now, "c": 0}
+                    if u["c"] >= 3: return show_msg("Default API limit reached (3 per 15m). Add your own API key in settings.", True)
+                    
+                    u["c"] += 1
+                    self.set_setting("def_api_u", json.dumps(u))
+                
+                bndry = "----WKB7MA4YW"; body = bytearray()
+                for k, v in {"language":"auto", "isTable":"false", "OCREngine":"2", "scale":"true", "isOverlayRequired":"true"}.items():
+                    body.extend(f"--{bndry}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+
+                body.extend(f"--{bndry}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"in.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".encode())
+                body.extend(img_bytes)
+                body.extend(f"\r\n--{bndry}--\r\n".encode())
+
+                req = urllib.request.Request("https://api.ocr.space/parse/image", data=bytes(body), headers={"apikey": key or "helloworld", "Content-Type": f"multipart/form-data; boundary={bndry}", "User-Agent": "exteraGram-OCR"}, method="POST")
+                with urllib.request.urlopen(req, timeout=60) as resp: res = json.loads(resp.read().decode("utf-8"))
+                if res.get("IsErroredOnProcessing"): return show_msg(res.get("ErrorMessage", ["API Rate Limit/Error"])[0], True)
+
+                parsed = res.get("ParsedResults", [])
+                if not parsed: return show_msg("No text detected.")
+
+                overlay = parsed[0].get("TextOverlay")
+                if overlay and overlay.get("Lines"):
+                    text, pb, pt = "", -1, -1
+                    for ln in overlay.get("Lines"):
+                        txt = ln.get("LineText", "").strip()
+                        if not txt: continue
+                        mt, mh = ln.get("MinTop", 0), ln.get("MaxHeight", 0)
+                        if pb != -1: text += "\n\n" if mt < (pt - mh * 0.5) or (mt - pb) > mh else "\n"
+                        text += txt; pb, pt = mt + mh, mt
+                    text = text.strip()
+                else: text = parsed[0].get("ParsedText", "").strip()
+
+            if not text: return show_msg("No text found in image.")
+            run_on_ui_thread(lambda: (AndroidUtilities.addToClipboard(text), BulletinHelper.show_copied_to_clipboard("Text extracted and copied!")))
+
+        except urllib.error.HTTPError as e:
+            m = "Check your API key."
+            try: m = json.loads(e.read().decode('utf-8')).get("error", {}).get("message", m)
+            except: pass
+            show_msg(f"API {e.code}: {m}", True)
+        except urllib.error.URLError as e:
+            show_msg("Network Timeout: Google servers took longer than 60s." if "timeout" in str(e.reason).lower() else f"Connection Error: {e.reason}", True)
+        except Exception as e:
+            show_msg(f"Internal Plugin Error: {str(e)}", True)
