@@ -1,0 +1,1120 @@
+# -*- coding: utf-8 -*-
+"""
+Google Фото в меню вложений exteraGram.
+
+Добавляет отдельный пункт «Google Фото» сразу после «Галереи» в существующее
+меню скрепки (штатные Галерея/Файл/... не трогаются) и открывает системный
+выбор медиа Android с поддержкой фото и видео, множественного выбора и
+облачных фото Google Фото. Выбранное отправляется одним блоком (альбомом),
+как в обычном медиапикере Telegram.
+
+Ключевые моменты реализации:
+  * Пункт меню добавляется сдвигом индексов в ChatAttachAlert$ButtonsAdapter
+    сразу после notifyDataSetChanged(): Telegram сам считает раскладку, поэтому
+    getItemCount/getItemViewType/onBindViewHolder остаются штатными и меню
+    не «съезжает». Оригинальные пункты не трогаются.
+  * Интент системного выбора: MediaStore.ACTION_PICK_IMAGES БЕЗ setType()
+    (по документации Android отсутствие type = и фото, и видео) плюс
+    MediaStore.EXTRA_PICK_IMAGES_MAX для множественного выбора.
+  * Клик: штатный путь Telegram по тегу кнопки. Наш id лежит в теге вкладки,
+    поэтому нажатие уходит в ChatActivity.didPressedButton и дальше в наши хуки
+    на dismissWithButtonClick / processSelectedAttach. Свой OnClickListener не
+    ставим: кликабельный ребёнок заставляет RecyclerListView.onInterceptTouchEvent
+    вернуть false, после чего нажатия по ОСТАЛЬНЫМ кнопкам перестают работать.
+  * Запуск системного выбора откладывается на LAUNCH_DELAY_MS. Если стартовать
+    поверх ещё не закрытого BottomSheet, окно picker'а остаётся позади окна
+    Telegram: активность поднимается, а на экране ничего не появляется.
+  * Отправка: SendMessagesHelper.SendingMediaInfo -> ChatActivity.didSelectSearchPhotos
+    (это тот же путь, что у поиска медиа в Telegram: forceDocument=false,
+    groupMedia=true, то есть один альбом).
+"""
+
+import time
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, get_last_fragment
+
+from java import jarray, jclass
+from java.lang import Boolean, Integer, Long, String
+from java.util import ArrayList
+
+from android.app import Activity
+from android.content import Intent
+from android.os import Build, Bundle
+
+__id__ = "google_photo_picker"
+__name__ = "Google Фото picker"
+__description__ = (
+    "Добавляет пункт «Google Фото» после «Галереи» в меню вложений и открывает "
+    "системный выбор Android: фото и видео, несколько сразу, отправка одним блоком.\n\n"
+    "Штатное меню вложений Telegram не заменяется."
+)
+__author__ = "@varwqxddd"
+__version__ = "3.7.1"
+__icon__ = "pixelcamera/15"
+__app_version__ = ">=12.5.1"
+
+# ─── константы плагина ────────────────────────────────────────────────────────
+
+# Позиция новой кнопки в ленте меню: сразу после «Галереи» (она всегда 0).
+MY_INDEX = 1
+
+# Свой id кнопки. Не должен совпадать с id кнопок Telegram (1, 3, 4, 5, 6, 9,
+# 11, 12, 13, 14, 15, 16, 7, 8) — по нему мы перехватываем клик.
+MY_TAG = 1000
+
+# requestCode для startActivityForResult. Свободные у Telegram: 0, 1, 2, 19, 21.
+MY_REQUEST_CODE = 0x6F11  # 28433
+# Пауза перед запуском: даём меню вложений закрыться.
+LAUNCH_DELAY_MS = 400
+
+# Предел системного picker'а: при большем значении он отвергает
+# конфигурацию целиком и не открывается.
+MAX_PICK_ITEMS = 100
+
+TAG = "[GooglePhotoPicker] "
+
+
+def int_class():
+    """
+    Класс примитива int для рефлексии.
+
+    jint из Chaquopy — это аннотация типа, а не java.lang.Class, поэтому
+    getDeclaredMethod("...", jint) не находит метод. Нужен именно
+    Integer.TYPE (он же int.class).
+    """
+    try:
+        return Integer.TYPE
+    except Exception:
+        pass
+    try:
+        return jclass("int")
+    except Exception:
+        return None
+
+
+# ─── 1. кнопка в меню вложений ────────────────────────────────────────────────
+
+# ButtonsAdapter хранит позиции кнопок в int-полях: galleryButton,
+# documentButton, ... , attachBotsStartRow/attachBotsEndRow и buttonsCount.
+_INDEX_FIELD_SUFFIXES = ("Button", "Row")
+_INDEX_FIELD_NAMES = ("buttonsCount",)
+
+
+class AdapterRowsHook(MethodHook):
+    """
+    notifyDataSetChanged() заново раскладывает кнопки меню.
+
+    Сразу после этого сдвигаем все индексы на +1 и освобождаем слот MY_INDEX
+    под «Google Фото». Раскладка остаётся штатной: getItemCount(),
+    getItemViewType() и onBindViewHolder() продолжают считать позиции сами,
+    поэтому меню не «съезжает» — в отличие от подмены аргументов bind.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    ADAPTER_CLASS = "org.telegram.ui.Components.ChatAttachAlert$ButtonsAdapter"
+
+    def before_hooked_method(self, param):
+        # Начался новый пересчёт раскладки — сдвиг ещё не применён.
+        if not self._is_buttons_adapter(param.thisObject):
+            return
+        self.plugin._rows_shifted = False
+
+    def after_hooked_method(self, param):
+        adapter = param.thisObject
+        if not self._is_buttons_adapter(adapter):
+            return
+        # Флаг на самом плагине: если хук встал не точечно, а через
+        # hook_all_methods, он зацепит и RecyclerView.Adapter — тогда сдвиг
+        # всё равно применится ровно один раз за пересчёт.
+        if self.plugin._rows_shifted:
+            return
+        self.plugin._rows_shifted = True
+        try:
+            self._shift(adapter)
+        except Exception as exc:
+            log(TAG + "row shift failed: " + str(exc))
+
+    @classmethod
+    def _is_buttons_adapter(cls, obj):
+        """Чужой адаптер (другая RecyclerView) сдвигать нельзя."""
+        try:
+            return str(obj.getClass().getName()) == cls.ADAPTER_CLASS
+        except Exception:
+            return False
+
+    def _shift(self, adapter):
+        """Все индексы после «Галереи» уезжают на +1."""
+        shifted = 0
+        for field in adapter.getClass().getDeclaredFields():
+            if not self._is_index_field(field):
+                continue
+            field.setAccessible(True)
+            value = int(field.get(adapter))
+            if value >= MY_INDEX:
+                field.set(adapter, Integer(value + 1))
+                shifted += 1
+        if shifted == 0:
+            log(TAG + "warning: no row indices shifted")
+
+    @staticmethod
+    def _is_index_field(field):
+        try:
+            if str(field.getType().getName()) != "int":
+                return False
+            name = str(field.getName())
+            return name in _INDEX_FIELD_NAMES or name.endswith(_INDEX_FIELD_SUFFIXES)
+        except Exception:
+            return False
+
+
+class AdapterBindHook(MethodHook):
+    """
+    onBindViewHolder(holder, position): оформляем нашу вкладку.
+
+    Позиции НЕ подменяются — слот уже освобождён AdapterRowsHook, поэтому
+    оригинальный bind сам решает, что рисовать. Наш слот не совпадает ни с
+    одним индексом Telegram, значит остаётся пустым: его и оформляем —
+    тот же значок, что у «Галереи», своя подпись и свой id для клика.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._ours = False
+
+    def before_hooked_method(self, param):
+        self._ours = False
+        try:
+            self._ours = int(param.args[1]) == MY_INDEX
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        ours = self._ours
+        self._ours = False
+        try:
+            view = self._item_view(param.args[0])
+            if view is None:
+                return
+            if not ours:
+                # Вьюха ушла под другую кнопку. Если её отдали боту, штатный
+                # bind тег не ставит — и на нём остался бы наш id, из-за чего
+                # клик по боту открывал бы Google Фото.
+                self.plugin.clear_stale_tag(view)
+                return
+            # Штатный обработчик Telegram читает id кнопки из тега — именно
+            # по нему нажатие доходит до наших хуков.
+            view.setTag(Integer(MY_TAG))
+            self.plugin.style_button(view)
+        except Exception as exc:
+            log(TAG + "bind our tab failed: " + str(exc))
+
+    def _item_view(self, holder):
+        try:
+            return holder.itemView
+        except Exception:
+            return get_private_field(holder, "itemView")
+
+
+class AlertButtonHook(MethodHook):
+    """
+    Путь A: ChatAttachAlert.dismissWithButtonClick(MY_TAG).
+
+    Именно сюда приходит наш тег из штатного OnItemClickListener: он видит
+    неизвестный id и передаёт его в delegate.didPressedButton, а тот вызывает
+    dismissWithButtonClick.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._alert = None
+
+    def before_hooked_method(self, param):
+        """
+        Оригинал НЕ блокируем: BottomSheet.dismissWithButtonClick закрывает
+        меню принудительно, тогда как dismiss() уважает delegate.canDismiss()
+        и может ничего не сделать. Поэтому даём Telegram закрыть меню штатно,
+        а пикер открываем уже после этого — в after-хуке.
+        """
+        self._alert = None
+        try:
+            button = int(param.args[0])
+        except Exception:
+            return
+        if button != MY_TAG:
+            return
+        self._alert = getattr(param, "thisObject", None)
+
+    def after_hooked_method(self, param):
+        alert = self._alert
+        self._alert = None
+        if alert is None:
+            return
+        log(TAG + "click path A")
+        self.plugin.on_menu_item_selected(alert, None)
+
+
+class ProcessSelectedAttachHook(MethodHook):
+    """
+    Путь B: ChatActivity.processSelectedAttach(MY_TAG) — независимый резерв.
+
+    Telegram вызывает его сразу после dismissWithButtonClick, поэтому если
+    путь A не встал, этот сработает. Запуск защищён от дублирования.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            which = int(param.args[0])
+        except Exception:
+            return
+        if which != MY_TAG:
+            return
+        log(TAG + "click path B")
+        param.setResult(None)
+        self.plugin.on_menu_item_selected(None, getattr(param, "thisObject", None))
+
+
+# ─── 2. результат системного выбора ───────────────────────────────────────────
+
+class PickerResultHook(MethodHook):
+    """ChatActivity.onActivityResultFragment — забираем выбранные uri."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            request_code = int(param.args[0])
+        except Exception:
+            return
+        if request_code != MY_REQUEST_CODE:
+            return
+        param.setResult(None)
+        try:
+            result_code = int(param.args[1])
+            data = param.args[2]
+            if result_code != Activity.RESULT_OK or data is None:
+                return
+            self.plugin.on_picked(param.thisObject, data)
+        except Exception as exc:
+            log(TAG + "result handling failed: " + str(exc))
+
+
+# ─── сам плагин ───────────────────────────────────────────────────────────────
+
+class GooglePhotoPickerPlugin(BasePlugin):
+
+    # Состояние держим в атрибутах класса: __init__ у BasePlugin не трогаем,
+    # чтобы не сломать инициализацию плагина движком.
+    _icon = None
+    _label_cache = None
+    _hooks = None
+    _gallery_animation = None
+    _rows_shifted = False
+    _last_launch = 0.0
+
+    # ---- жизненный цикл ----
+
+    def on_plugin_load(self):
+        self._icon = None
+        self._label_cache = None
+        self._hooks = []
+        self._gallery_animation = None
+        self._rows_shifted = False
+        self._last_launch = 0.0
+
+        try:
+            self._hook_attach_menu()
+        except Exception as exc:
+            self.log(TAG + "attach menu init failed: " + str(exc))
+        try:
+            self._hook_chat_activity()
+        except Exception as exc:
+            self.log(TAG + "chat activity init failed: " + str(exc))
+
+        # Версия и фактический лимит выбора — в лог: по ним сразу видно,
+        # какая сборка запущена и что именно уходит в системный picker.
+        self.log(
+            TAG + "v" + __version__
+            + " loaded, hooks: " + str(len(self._hooks))
+            + ", max: " + str(self.max_items())
+        )
+
+    def on_plugin_unload(self):
+        self._hooks = []
+        self._icon = None
+
+    # ---- установка хуков ----
+
+    def _hook_attach_menu(self):
+        adapter = self._safe_find(
+            "org.telegram.ui.Components.ChatAttachAlert$ButtonsAdapter"
+        )
+        if adapter is None:
+            self.log(TAG + "ButtonsAdapter не найден — кнопка не добавлена")
+            return
+
+        # 1) Раскладка: освобождаем слот MY_INDEX под нашу кнопку. Без этого
+        #    хука кнопки нет вообще, поэтому дальше не идём.
+        if not self._install(
+            adapter, "notifyDataSetChanged", (), AdapterRowsHook(self)
+        ):
+            self.log(TAG + "notifyDataSetChanged не подключён — кнопка не добавлена")
+            return
+
+        # 2) Оформление вкладки. Здесь же ставится основной обработчик клика,
+        #    поэтому дальше идём, даже если шаг 3 не встанет.
+        self._install(adapter, "onBindViewHolder", None, AdapterBindHook(self))
+
+        # 3) Клик по штатному тегу: dismissWithButtonClick объявлен в
+        #    BottomSheet, а в ChatAttachAlert только переопределён.
+        int_type = int_class()
+        types = (int_type,) if int_type is not None else None
+        for class_name in (
+            "org.telegram.ui.Components.ChatAttachAlert",
+            "org.telegram.ui.ActionBar.BottomSheet",
+        ):
+            alert = self._safe_find(class_name)
+            if alert is None:
+                continue
+            self._install(alert, "dismissWithButtonClick", types, AlertButtonHook(self))
+
+        self.log(TAG + "attach menu hooked, hooks: " + str(len(self._hooks)))
+
+    def _hook_chat_activity(self):
+        chat_activity = self._safe_find("org.telegram.ui.ChatActivity")
+        if chat_activity is None:
+            self.log(TAG + "ChatActivity не найден")
+            return
+
+        int_type = int_class()
+        types = (int_type,) if int_type is not None else None
+
+        # Резервный путь клика — по штатному тегу кнопки.
+        self._install(
+            chat_activity, "processSelectedAttach", types,
+            ProcessSelectedAttachHook(self),
+        )
+
+        # Приём результата системного выбора.
+        self._install(
+            chat_activity, "onActivityResultFragment", None, PickerResultHook(self)
+        )
+
+    def _install(self, clazz, name, param_types, hook):
+        """
+        Ставит хук так, чтобы одна неудача не сломала остальные.
+
+        param_types=None означает «точный хук не нужен» — сразу по имени.
+        """
+        if param_types is not None:
+            try:
+                if self._hook_declared(clazz, name, param_types, hook):
+                    return True
+            except Exception as exc:
+                log(TAG + "precise hook " + name + " failed: " + str(exc))
+        try:
+            return self._hook_all(clazz, name, hook)
+        except Exception as exc:
+            log(TAG + "named hook " + name + " failed: " + str(exc))
+            return False
+
+    def _safe_find(self, class_name):
+        """find_class, который не роняет установку остальных хуков."""
+        try:
+            return find_class(class_name)
+        except Exception as exc:
+            log(TAG + "find_class(" + class_name + ") failed: " + str(exc))
+            return None
+
+    def _hook_declared(self, clazz, name, param_types, hook):
+        """Хук на метод, объявленный именно в этом классе (без фоллбэков)."""
+        try:
+            method = clazz.getDeclaredMethod(name, *param_types)
+            method.setAccessible(True)
+            unhook = self.hook_method(method, hook, priority=1000)
+            if unhook:
+                self._hooks.append(unhook)
+                return True
+        except Exception as exc:
+            log(TAG + "declared hook " + name + " failed: " + str(exc))
+        return False
+
+    def _hook_all(self, clazz, name, hook):
+        """
+        Хук по имени метода. priority передаём только если SDK его принимает:
+        в документации hook_all_methods вызывается без него.
+        """
+        for with_priority in (False, True):
+            try:
+                if with_priority:
+                    unhooks = self.hook_all_methods(clazz, name, hook, priority=1000)
+                else:
+                    unhooks = self.hook_all_methods(clazz, name, hook)
+            except TypeError as exc:
+                log(TAG + "hook_all_methods(" + name + ") signature: " + str(exc))
+                continue
+            except Exception as exc:
+                log(TAG + "hook_all_methods(" + name + ") failed: " + str(exc))
+                continue
+            if unhooks:
+                self._hooks.extend(list(unhooks))
+                return True
+        log(TAG + "HOOK FAILED: " + name)
+        return False
+
+    # ---- оформление кнопки ----
+
+    def style_button(self, button):
+        """
+        Оформляем нашу вкладку: тот же значок, что у «Галереи», но своя
+        подпись и свой id, чтобы вкладка не подсвечивалась как выбранная.
+        """
+        glass = get_private_field(button, "glassTabView")
+        if glass is None:
+            # Старый Telegram: обычная AttachButton без GlassTabView.
+            log(TAG + "glassTabView not found, legacy styling")
+            self._set_text_and_icon(button)
+            return
+
+        animation = self.gallery_animation()
+        if animation is not None:
+            try:
+                glass.setTabAnimation(animation)
+            except Exception as exc:
+                log(TAG + "setTabAnimation failed: " + str(exc))
+
+        try:
+            self._apply_label(glass)
+        except Exception as exc:
+            log(TAG + "label update failed: " + str(exc))
+
+        try:
+            # currentId штатной «Галереи» = 1, и он же выбран по умолчанию
+            # (selectedId = 1). Свой id не даёт нашей вкладке выглядеть
+            # выбранной вместо галереи.
+            set_private_field(button, "currentId", Integer(MY_TAG))
+        except Exception as exc:
+            log(TAG + "currentId update failed: " + str(exc))
+
+    def clear_stale_tag(self, view):
+        """Снимаем наш id с вьюхи, отданной другой кнопке."""
+        try:
+            tag = view.getTag()
+            if tag is not None and int(tag) == MY_TAG:
+                view.setTag(None)
+        except Exception as exc:
+            log(TAG + "clear stale tag failed: " + str(exc))
+
+    def gallery_animation(self):
+        """
+        Константа GlassTabView.TabAnimation.GALLERY — подходящий значок
+        вкладки выбора медиа. Имя класса перебираем строками, чтобы плагин
+        не падал на сборках с другим пакетом.
+        """
+        if self._gallery_animation is not None:
+            return self._gallery_animation
+        for class_name in (
+            "org.telegram.ui.Components.glass.GlassTabView$TabAnimation",
+            "org.telegram.ui.Components.GlassTabView$TabAnimation",
+        ):
+            try:
+                enum_class = jclass(class_name)
+            except Exception:
+                continue
+            constant = self._enum_constant(enum_class, ("GALLERY", "PHOTOS", "IMAGES"))
+            if constant is not None:
+                self._gallery_animation = constant
+                return constant
+        log(TAG + "TabAnimation.GALLERY not found")
+        return None
+
+    def _set_text_and_icon(self, button):
+        """
+        У новых версий Telegram подпись ставится через
+        setTextAndIcon(int, CharSequence, GlassTabView.TabAnimation),
+        у старых — через setTextAndIcon(int, CharSequence, RLottieDrawable, int, int).
+        Тип третьего аргумента берём прямо из найденного метода, чтобы не
+        угадывать имена классов.
+        """
+        label = self.label()
+        target = None
+        for method in button.getClass().getDeclaredMethods():
+            try:
+                if method.getName() != "setTextAndIcon":
+                    continue
+                if len(method.getParameterTypes()) in (3, 5):
+                    target = method
+                    break
+            except Exception:
+                continue
+        if target is None:
+            return self._set_label_only(button, label)
+
+        param_types = target.getParameterTypes()
+        if len(param_types) == 3:
+            third = param_types[2]
+            try:
+                is_enum = bool(third.isEnum())
+            except Exception:
+                is_enum = False
+            if is_enum:
+                animation = self._enum_constant(
+                    third, ("GALLERY", "PHOTOS", "CLOUD", "FILES", "ARTICLE")
+                )
+                if animation is not None:
+                    target.invoke(button, Integer(MY_TAG), label, animation)
+                    return True
+            return self._set_label_only(button, label)
+
+        # старая версия: отдаём лотти-иконку галереи и её цвета
+        try:
+            theme = jclass("org.telegram.ui.ActionBar.Theme")
+            drawables = theme.chat_attachButtonDrawables
+            if drawables is None:
+                return self._set_label_only(button, label)
+            target.invoke(
+                button,
+                Integer(MY_TAG),
+                label,
+                drawables[0],
+                Integer(int(theme.key_chat_attachGalleryBackground)),
+                Integer(int(theme.key_chat_attachGalleryText)),
+            )
+            return True
+        except Exception as exc:
+            log(TAG + "legacy setTextAndIcon failed: " + str(exc))
+            return self._set_label_only(button, label)
+
+    def _enum_constant(self, enum_class, preferred_names):
+        """Первая существующая enum-константа из списка предпочтений."""
+        for name in preferred_names:
+            try:
+                return enum_class.getField(name).get(None)
+            except Exception:
+                pass
+            try:
+                return jclass("java.lang.Enum").valueOf(enum_class, name)
+            except Exception:
+                pass
+        try:
+            constants = enum_class.getEnumConstants()
+            if constants is not None and len(constants) > 0:
+                return constants[0]
+        except Exception:
+            pass
+        return None
+
+    def _set_label_only(self, button, label):
+        """Аварийный вариант: пишем хотя бы подпись, иконка остаётся штатной."""
+        try:
+            text_view = None
+            glass = get_private_field(button, "glassTabView")
+            if glass is not None:
+                text_view = get_private_field(glass, "textView")
+            if text_view is None:
+                text_view = get_private_field(button, "textView")
+            if text_view is not None:
+                text_view.setText(label)
+                return True
+        except Exception as exc:
+            log(TAG + "label fallback failed: " + str(exc))
+        return False
+
+    def _apply_label(self, glass):
+        """
+        Подбираем самую длинную подпись, которая влезает во вкладку.
+
+        Ширина вкладки в Telegram ограничена константой dp(84)
+        (GlassTabView.measureAttachTabWidth), а текст с ellipsize=END
+        обрезается. «Google Фото» в этот лимит не входит, поэтому при
+        переполнении берём укороченный вариант.
+        """
+        for candidate in self.label_candidates():
+            glass.setText(candidate)
+            try:
+                if glass.measureAttachTabWidth() < self.tab_width_limit() - 0.5:
+                    return  # не упёрлись в лимит — текст не обрежется
+            except Exception:
+                return  # измерить не смогли, оставляем как есть
+        log(TAG + "label truncated to shortest variant")
+
+    def tab_width_limit(self):
+        """Лимит ширины вкладки: min(dp(84), ...) в measureAttachTabWidth."""
+        try:
+            return float(jclass("org.telegram.messenger.AndroidUtilities").dp(84))
+        except Exception:
+            return 84.0
+
+    def label_candidates(self):
+        """От длинного к короткому: первым идёт желаемый вариант."""
+        if self._label_cache is None:
+            self._label_cache = self._build_labels()
+        return self._label_cache
+
+    def _build_labels(self):
+        ru = True
+        try:
+            language = jclass("java.util.Locale").getDefault().getLanguage()
+            if language is not None:
+                ru = str(language).lower().startswith("ru")
+        except Exception:
+            ru = True  # интерфейс плагина русский
+        if ru:
+            return ["Google Фото", "Гугл Фото", "Фото"]
+        return ["Google Photos", "Google", "Photos"]
+
+    def label(self):
+        """Короткая подпись — для старого AttachButton без GlassTabView."""
+        candidates = self.label_candidates()
+        return candidates[-1]
+
+    # ---- запуск системного выбора ----
+
+    def on_menu_item_selected(self, alert=None, activity=None):
+        """
+        Единая точка входа для всех путей клика.
+
+        Пути могут сработать почти одновременно, поэтому запуск защищён
+        тайм-штампом: иначе системный выбор откроется дважды.
+        """
+        now = time.monotonic()
+        if now - self._last_launch < 1.0:
+            log(TAG + "duplicate click ignored")
+            return
+        self._last_launch = now
+        log(TAG + "click handled")
+
+        fragment = self._resolve_fragment(alert, activity)
+
+        # Меню закрываем сами: при клике по нашей вкладке штатный
+        # dismissWithButtonClick может вообще не вызываться.
+        if alert is None and fragment is not None:
+            alert = self._alert_of(fragment)
+        if alert is not None:
+            try:
+                alert.dismiss()
+            except Exception as exc:
+                log(TAG + "alert dismiss failed: " + str(exc))
+
+        if fragment is None:
+            log(TAG + "chat fragment not found")
+            self._bulletin("Не удалось определить чат для отправки")
+            return
+
+        # Запускаем выбор ПОСЛЕ того, как меню вложений закроется. Если
+        # стартовать поверх ещё не закрытого BottomSheet, окно picker'а
+        # остаётся за окном Telegram — активность поднялась, а на экране
+        # ничего не появилось.
+        run_on_ui_thread(lambda: self.launch_picker(fragment), LAUNCH_DELAY_MS)
+
+    def _alert_of(self, fragment):
+        """ChatAttachAlert текущего чата — чтобы закрыть меню вложений."""
+        try:
+            return get_private_field(fragment, "chatAttachAlert")
+        except Exception as exc:
+            log(TAG + "chatAttachAlert lookup failed: " + str(exc))
+            return None
+
+    def _resolve_fragment(self, alert, activity):
+        """
+        Ищем фрагмент чата — от самого надёжного источника к общему.
+
+        baseFragment у меню вложений — ровно то, что использует сам Telegram
+        при клике. Дальше идёт последний фрагмент LaunchActivity и хелпер SDK.
+        """
+        if alert is not None:
+            fragment = self._safe_field(alert, "baseFragment")
+            if fragment is not None:
+                return fragment
+        if activity is not None:
+            return activity
+        for getter in (self.launch_fragment, self.last_fragment):
+            fragment = getter()
+            if fragment is not None:
+                return fragment
+        return None
+
+    def _safe_field(self, obj, name):
+        try:
+            return get_private_field(obj, name)
+        except Exception as exc:
+            log(TAG + name + " lookup failed: " + str(exc))
+            return None
+
+    def launch_fragment(self):
+        """Последний фрагмент LaunchActivity — то же, что видит Telegram."""
+        try:
+            return jclass("org.telegram.ui.LaunchActivity").getLastFragment()
+        except Exception as exc:
+            log(TAG + "LaunchActivity.getLastFragment failed: " + str(exc))
+            return None
+
+    def last_fragment(self):
+        try:
+            return get_last_fragment()
+        except Exception as exc:
+            log(TAG + "get_last_fragment failed: " + str(exc))
+            return None
+
+    def _class_name(self, obj):
+        try:
+            return str(obj.getClass().getName())
+        except Exception:
+            return "?"
+
+    def launch_picker(self, fragment):
+        """
+        Открываем системный выбор.
+
+        Сначала ACTION_PICK_IMAGES (фото + видео, множественный выбор), затем
+        ACTION_GET_CONTENT с обоими mime-типами. Запускаем с Activity чата,
+        а если её нет — с самого фрагмента.
+
+        startActivityForResult зовём напрямую: отсутствие обработчика
+        (ActivityNotFoundException) приходит именно синхронно, и только так мы
+        успеваем уйти на запасной intent.
+        """
+        if fragment is None:
+            log(TAG + "launch_picker without fragment")
+            self._bulletin("Не удалось определить чат для отправки")
+            return
+
+        log(TAG + "target fragment: " + self._class_name(fragment))
+
+        # Activity идёт первой: BaseFragment.startActivityForResult уходит в
+        # неё же, но при пустом parentLayout просто ничего не делает и не
+        # бросает исключение — по фрагменту мы бы отчитались об успехе зря.
+        targets = []
+        try:
+            activity = fragment.getParentActivity()
+            if activity is not None:
+                targets.append(activity)
+        except Exception as exc:
+            log(TAG + "getParentActivity failed: " + str(exc))
+        targets.append(fragment)
+
+        last_error = None
+        for build in (self.picker_intent, self.fallback_intent):
+            try:
+                intent = build()
+            except Exception as exc:
+                last_error = exc
+                log(TAG + "intent build failed: " + str(exc))
+                continue
+            for target in targets:
+                try:
+                    target.startActivityForResult(intent, MY_REQUEST_CODE)
+                except Exception as exc:
+                    last_error = exc
+                    log(
+                        TAG + "startActivityForResult via "
+                        + self._class_name(target) + " failed: " + str(exc)
+                    )
+                    continue
+                log(TAG + "picker launched via " + self._class_name(target))
+                return
+
+        log(TAG + "picker not launched: " + str(last_error))
+        self._bulletin("Не удалось открыть системный выбор фото и видео")
+
+    def picker_intent(self):
+        """
+        Android 13+ (и Android 11/12 с модулем фото-выбора): ACTION_PICK_IMAGES.
+
+        type намеренно НЕ выставляется: по документации Android пустой type
+        означает «фото и видео». EXTRA_PICK_IMAGES_MAX включает множественный
+        выбор (без него системный выбор одиночный).
+        """
+        if self.system_picker_available():
+            media_store = jclass("android.provider.MediaStore")
+            intent = Intent(media_store.ACTION_PICK_IMAGES)
+            limit = self.max_items()
+            key = str(media_store.EXTRA_PICK_IMAGES_MAX)
+
+            # Bundle.putInt — единственная перегрузка с таким именем, поэтому
+            # значение гарантированно уходит как int. У Intent.putExtra
+            # перегрузок больше десятка (int/long/char/byte/String/...), и
+            # выбор между ними неочевиден.
+            extras = Bundle()
+            extras.putInt(key, limit)
+            intent.putExtras(extras)
+
+            # Читаем значение обратно: если picker'у приходит не то число,
+            # это будет видно здесь, а не только в его логе.
+            try:
+                readback = int(intent.getIntExtra(key, -1))
+            except Exception as exc:
+                readback = "error: " + str(exc)
+            log(
+                TAG + "extra " + key + "=" + str(limit)
+                + " readback=" + str(readback)
+            )
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            return intent
+        return self.fallback_intent()
+
+    def fallback_intent(self):
+        intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent.setType("*/*")
+        intent.putExtra(
+            Intent.EXTRA_MIME_TYPES, jarray(String)(["image/*", "video/*"])
+        )
+
+        # putBoolean вместо putExtra: у putExtra несколько десятков перегрузок,
+        # и Chaquopy может выбрать не ту (см. комментарий в picker_intent).
+        extras = Bundle()
+        extras.putBoolean(str(Intent.EXTRA_ALLOW_MULTIPLE), True)
+        intent.putExtras(extras)
+
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        return intent
+
+    def system_picker_available(self):
+        try:
+            sdk = int(Build.VERSION.SDK_INT)
+        except Exception:
+            return False
+        if sdk >= 33:
+            return True
+        if sdk >= 30:
+            # фото-выбор приезжает на Android 11/12 как расширение SDK
+            try:
+                extensions = jclass("android.os.ext.SdkExtensions")
+                return int(extensions.getExtensionVersion(30)) >= 2
+            except Exception:
+                return False
+        return False
+
+    def max_items(self):
+        """
+        Лимит выбора для системного picker'а.
+
+        У самого picker'а предел — 100. При большем значении он не просто
+        занижает лимит, а отвергает конфигурацию целиком
+        (IllegalIntentExtraException) и закрывается: активность поднимается,
+        а окна нет. MediaStore.getPickImagesMaxLimit() на новых Android
+        возвращает больше 100, поэтому берём меньшее из двух значений.
+        """
+        limit = MAX_PICK_ITEMS
+        try:
+            system_limit = int(
+                jclass("android.provider.MediaStore").getPickImagesMaxLimit()
+            )
+            if 1 <= system_limit < limit:
+                limit = system_limit
+        except Exception as exc:
+            log(TAG + "getPickImagesMaxLimit failed: " + str(exc))
+        return limit
+
+    # ---- полученные файлы ----
+
+    def on_picked(self, fragment, data):
+        uris = []
+
+        try:
+            clip = data.getClipData()
+        except Exception:
+            clip = None
+        if clip is not None:
+            try:
+                count = int(clip.getItemCount())
+            except Exception:
+                count = 0
+            for index in range(count):
+                try:
+                    item = clip.getItemAt(index)
+                    uri = item.getUri() if item is not None else None
+                    if uri is not None:
+                        uris.append(uri)
+                except Exception:
+                    continue
+
+        if not uris:
+            try:
+                uri = data.getData()
+                if uri is not None:
+                    uris.append(uri)
+            except Exception:
+                pass
+
+        if not uris:
+            return
+
+        limit = self.max_items()
+        if len(uris) > limit:
+            uris = uris[:limit]
+
+        log(TAG + "picked " + str(len(uris)) + " item(s)")
+        # Копирование облачных видео в кеш — блокирующая операция, только не в UI.
+        run_on_queue(lambda: self.prepare_media(fragment, uris))
+
+    def prepare_media(self, fragment, uris):
+        """Собираем SendingMediaInfo: фото — по uri, видео — через локальный файл."""
+        sending_info_class = None
+        for name in (
+            "org.telegram.messenger.SendMessagesHelper$SendingMediaInfo",
+            "org.telegram.messenger.SendMessagesHelper.SendingMediaInfo",
+        ):
+            try:
+                sending_info_class = jclass(name)
+                break
+            except Exception:
+                continue
+        if sending_info_class is None:
+            log(TAG + "SendingMediaInfo not found")
+            return
+
+        resolver = None
+        try:
+            activity = fragment.getParentActivity()
+            if activity is not None:
+                resolver = activity.getContentResolver()
+        except Exception:
+            resolver = None
+
+        infos = ArrayList()
+        skipped = 0
+
+        for uri in uris:
+            mime = None
+            if resolver is not None:
+                try:
+                    mime = resolver.getType(uri)
+                except Exception:
+                    mime = None
+
+            info = sending_info_class()
+            info.uri = uri
+            info.isVideo = False
+
+            if mime is not None and str(mime).startswith("video"):
+                # Ветке видео в Telegram нужен реальный путь к файлу: с одним
+                # uri она падает. Поэтому копируем в кеш (для облачных видео
+                # Google Фото это ещё и скачивание).
+                if self._needs_download(uri):
+                    self._bulletin("Скачиваю видео из облака…", fragment)
+                path = self._video_path(uri, mime)
+                if path is None:
+                    # Отправить такое видео нельзя — лучше пропустить один
+                    # файл, чем уронить отправку всего блока.
+                    skipped += 1
+                    continue
+                info.isVideo = True
+                info.path = path
+            infos.add(info)
+
+        if skipped:
+            self._bulletin(
+                "Не удалось подготовить файлов: " + str(skipped), fragment
+            )
+
+        if infos.isEmpty():
+            return
+        run_on_ui_thread(lambda: self.send_media(fragment, infos))
+
+    def _video_path(self, uri, mime):
+        """Путь к видеофайлу: копия в кеше или реальный путь в хранилище."""
+        try:
+            path = jclass("org.telegram.messenger.MediaController").copyFileToCache(
+                uri, self.extension_for(mime)
+            )
+            if path is not None:
+                return path
+        except Exception as exc:
+            log(TAG + "copyFileToCache failed: " + str(exc))
+        try:
+            path = jclass("org.telegram.messenger.AndroidUtilities").getPath(uri)
+            if path is not None and jclass("java.io.File")(path).exists():
+                return path
+        except Exception as exc:
+            log(TAG + "getPath failed: " + str(exc))
+        return None
+
+    def _needs_download(self, uri):
+        """True, если файла нет на устройстве (облачное видео Google Фото)."""
+        try:
+            path = jclass("org.telegram.messenger.AndroidUtilities").getPath(uri)
+            if path is None:
+                return True
+            return not jclass("java.io.File")(path).exists()
+        except Exception:
+            return False
+
+    def _bulletin(self, message, fragment=None):
+        try:
+            from ui.bulletin import BulletinHelper
+
+            BulletinHelper.show_info(message, fragment)
+        except Exception as exc:
+            log(TAG + "bulletin failed: " + str(exc))
+
+    def send_media(self, fragment, infos):
+        if infos.isEmpty():
+            return
+        # Фрагмент мог умереть, пока открыт системный выбор.
+        try:
+            if fragment.getParentActivity() is None:
+                log(TAG + "fragment detached, send skipped")
+                return
+        except Exception:
+            pass
+
+        # didSelectSearchPhotos — публичный путь Telegram для отправки уже
+        # готовых SendingMediaInfo: внутри prepareSendingMedia с
+        # forceDocument=false и groupMedia=true, то есть одним альбомом.
+        try:
+            fragment.didSelectSearchPhotos(infos, True, 0)
+            log(TAG + "sent via didSelectSearchPhotos")
+            return
+        except Exception as exc:
+            log(TAG + "didSelectSearchPhotos failed: " + str(exc))
+
+        # Резерв: didSelectPhotos — в новых сборках у него 5 параметров.
+        if self._call_did_select_photos(fragment, infos):
+            return
+
+        self._bulletin("Не удалось отправить выбранные файлы", fragment)
+
+    def _call_did_select_photos(self, fragment, infos):
+        """Вызов didSelectPhotos с любым числом параметров (3 или 5)."""
+        try:
+            methods = fragment.getClass().getMethods()
+        except Exception:
+            return False
+        for method in methods:
+            try:
+                if method.getName() != "didSelectPhotos":
+                    continue
+                types = method.getParameterTypes()
+                if len(types) == 3:
+                    method.invoke(fragment, infos, Boolean(True), Integer(0))
+                elif len(types) == 5:
+                    method.invoke(
+                        fragment, infos, Boolean(True), Integer(0), Integer(0), Long(0)
+                    )
+                else:
+                    continue
+                log(TAG + "sent via didSelectPhotos/" + str(len(types)))
+                return True
+            except Exception as exc:
+                log(TAG + "didSelectPhotos invoke failed: " + str(exc))
+        return False
+
+    def extension_for(self, mime):
+        try:
+            mime_type_map = jclass("android.webkit.MimeTypeMap").getSingleton()
+            extension = mime_type_map.getExtensionFromMimeType(mime)
+            if extension:
+                return str(extension)
+        except Exception:
+            pass
+        return "mp4"
