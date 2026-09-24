@@ -5,15 +5,16 @@ from ui.alert import AlertDialogBuilder
 from client_utils import get_last_fragment
 from java import jclass
 from java.lang import String as jString
-from java.io import File
-from android.os import Process, Environment
+from java.io import File, FileOutputStream
+from android.content import Intent
+from android.os import Process
 import threading
 import time
 import re
 
 __id__ = "panic_passcode_pro"
 __name__ = "Panic Passcode Pro"
-__version__ = "1.0.67"
+__version__ = "1.0.70"
 __description__ = "✅ Universal panic passcode for all Telegram forks"
 __icon__ = "msg_lock"
 __min_version__ = "12.2.3"
@@ -31,6 +32,7 @@ STRINGS = {
         'cant_match_main': "Can't match passcode!",
         'panic_full_desc': 'FULL data wipe on panic',
         'sharedconfig_error': '🔒 SharedConfig unavailable',
+        'protection_inactive': '⚠️ Protection inactive: hook failed to install',
         'panic_management': 'Panic Code Management',
         'enable_in_settings': 'Settings → Privacy → Passcode',
         'enable_panic_switch': 'Enable Panic Code',
@@ -52,6 +54,7 @@ STRINGS = {
         'cant_match_main': 'Не может совпадать с код-паролем!',
         'panic_full_desc': 'ПОЛНАЯ очистка данных',
         'sharedconfig_error': '🔒 SharedConfig недоступен',
+        'protection_inactive': '⚠️ Защита не активна: перехват не установлен',
         'panic_management': 'Управление Panic Code',
         'enable_in_settings': 'Настройки → Конфиденциальность → Код-пароль',
         'enable_panic_switch': 'Включить Panic Code',
@@ -74,11 +77,9 @@ except Exception:
 def _init_jclasses():
     cls_map = {
         "UserConfig": "org.telegram.messenger.UserConfig",
-        "MessagesController": "org.telegram.messenger.MessagesController",
         "Utilities": "org.telegram.messenger.Utilities",
         "ApplicationLoader": "org.telegram.messenger.ApplicationLoader",
         "SharedConfig": "org.telegram.messenger.SharedConfig",
-        "NotificationCenter": "org.telegram.messenger.NotificationCenter",
         "AccountInstance": "org.telegram.messenger.AccountInstance",
         "MessagesStorage": "org.telegram.messenger.MessagesStorage",
     }
@@ -108,10 +109,12 @@ class SharedConfigCheckHook(MethodHook):
     def before_hooked_method(self, param):
         with self.check_lock:
             try:
+                p = self.plugin
+                if getattr(p, "ignore_hook", False):
+                    return
                 entered = str(param.args[0]) if param.args and param.args[0] else None
                 if not entered:
                     return
-                p = self.plugin
                 panic_hash = p.get_setting("panic_hash", "")
                 panic_enabled = p.get_setting("panic_enabled", False)
                 if not (panic_enabled and panic_hash):
@@ -127,9 +130,27 @@ class SharedConfigCheckHook(MethodHook):
 
 def get_passcode_state():
     SharedConfig = globals().get("SharedConfig")
-    h = getattr(SharedConfig, "passcodeHash", "") if SharedConfig else ""
-    h_str = str(h) if h else ""
-    return bool(h_str.strip()), h_str
+    if not SharedConfig:
+        return False, ""
+    # passcodeHash may be a String or a Java byte[] depending on the fork.
+    # str() of a byte[] yields an address repr like "[B@7b2a3c", which must
+    # never be treated as "passcode set". Rely on real length instead.
+    try:
+        h = getattr(SharedConfig, "passcodeHash", None)
+    except Exception:
+        h = None
+    if h is None:
+        return False, ""
+    try:
+        if not isinstance(h, str):
+            length = len(h)
+            return length > 0, (str(h) if length > 0 else "")
+    except Exception:
+        pass
+    h_str = str(h).strip()
+    if h_str.startswith("[B@"):
+        return False, ""
+    return bool(h_str), h_str
 
 def get_panic_state(plugin):
     return plugin.get_setting("panic_hash", ""), plugin.get_setting("panic_enabled", False)
@@ -139,6 +160,8 @@ class PanicPasscodePlugin(BasePlugin):
         super().__init__()
         self.unhook_objects = []
         self.initialized = False
+        self.hook_installed = False
+        self.ignore_hook = False
         self.logout_in_progress = False
         self.logout_lock = threading.Lock()
 
@@ -179,6 +202,7 @@ class PanicPasscodePlugin(BasePlugin):
             unhook = self.hook_method(method, hook)
             if unhook:
                 self.unhook_objects.append(unhook)
+                self.hook_installed = True
         except Exception:
             pass
 
@@ -203,6 +227,8 @@ class PanicPasscodePlugin(BasePlugin):
             if not SharedConfig:
                 s.append(Text(self._('sharedconfig_error'), icon="msg_warning"))
             else:
+                if not self.hook_installed:
+                    s.append(Text(self._('protection_inactive'), icon="msg_warning"))
                 s.append(Text(self._('panic_management'), icon="msg_settings", create_sub_fragment=self._create_management_subpage))
         except Exception:
             s = [Header("Error"), Text("Error loading settings", icon="msg_info")]
@@ -300,10 +326,16 @@ class PanicPasscodePlugin(BasePlugin):
                 SharedConfig = globals().get("SharedConfig")
                 if SharedConfig and hasattr(SharedConfig, 'checkPasscode'):
                     try:
-                        if SharedConfig.checkPasscode(jString(c1)):
+                        self.ignore_hook = True
+                        try:
+                            matches_main = SharedConfig.checkPasscode(jString(c1))
+                        finally:
+                            self.ignore_hook = False
+                        if matches_main:
                             BulletinHelper.show_error(self._('cant_match_main'), f)
                             return
                     except Exception:
+                        self.ignore_hook = False
                         pass
 
                 h = compute_simple_hash(c1)
@@ -320,29 +352,52 @@ class PanicPasscodePlugin(BasePlugin):
         except Exception:
             BulletinHelper.show_error(self._('hash_error'), f)
 
+    def _erase_file(self, path, filter_fn):
+        try:
+            name = path.getName()
+            if filter_fn and not filter_fn(name):
+                return 0
+            if re.search(r'\.(db|xml)(\.|$)', name, re.IGNORECASE) or re.search(r'-(wal|shm|journal)$', name, re.IGNORECASE):
+                try:
+                    fos = FileOutputStream(path, False)
+                    fos.write(bytearray())
+                    fos.close()
+                except Exception:
+                    pass
+            return 1 if path.delete() else 0
+        except Exception:
+            return 0
+
     def _safe_delete(self, path, filter_fn=None):
-        if not path or not path.exists():
+        if not path:
             return 0
         try:
-            if path.isDirectory():
-                children = path.listFiles() or []
-                total = sum(self._safe_delete(child, filter_fn) for child in children)
-                return total + (1 if path.delete() else 0)
-            else:
-                name = path.getName()
-                if not filter_fn or filter_fn(name):
-                    if re.search(r'\.(db|xml)(\.|$)', name, re.IGNORECASE):
-                        try:
-                            from java.io import FileOutputStream
-                            fos = FileOutputStream(path, False)
-                            fos.write(bytearray())
-                            fos.close()
-                        except Exception:
-                            pass
-                    return 1 if path.delete() else 0
+            if not path.exists():
+                return 0
         except Exception:
-            pass
-        return 0
+            return 0
+        deleted = 0
+        dir_list = []
+        stack = [path]
+        while stack:
+            node = stack.pop()
+            try:
+                if node.isDirectory():
+                    dir_list.append(node)
+                    children = node.listFiles() or []
+                    for child in children:
+                        stack.append(child)
+                else:
+                    deleted += self._erase_file(node, filter_fn)
+            except Exception:
+                pass
+        for d in reversed(dir_list):
+            try:
+                if d.delete():
+                    deleted += 1
+            except Exception:
+                pass
+        return deleted
 
     def _cleanup_databases(self):
         try:
@@ -362,82 +417,81 @@ class PanicPasscodePlugin(BasePlugin):
             pass
 
     def _wipe_all_data(self, ctx):
+        # Collect deletion targets defensively. A failure in any single
+        # Android API call must never abort the whole wipe, and the deletion
+        # loop must always run regardless of collection errors.
         try:
             self._cleanup_databases()
-            package_name = ctx.getPackageName()
-            targets = []
-
-            internal_base = ctx.getFilesDir().getParentFile()
-            targets.extend([
-                ctx.getCacheDir(),
-                ctx.getFilesDir(),
-                File(internal_base, "databases"),
-                File(internal_base, "shared_prefs"),
-                File(internal_base, "code_cache"),
-                File(internal_base, "no_backup"),
-            ])
-
-            for name in ["Telegram", "stickers", "wallpapers", "tmp", "Cache", "downloads"]:
-                d = File(ctx.getFilesDir(), name)
-                if d.exists():
-                    targets.append(d)
-
-            ext_files = ctx.getExternalFilesDir(None)
-            if ext_files and ext_files.exists():
-                targets.append(ext_files)
-            ext_cache = ctx.getExternalCacheDir()
-            if ext_cache and ext_cache.exists():
-                targets.append(ext_cache)
-
-            try:
-                sdcard = Environment.getExternalStorageDirectory()
-                if sdcard:
-                    for subdir in [
-                        f"Android/data/{package_name}",
-                        f"Android/media/{package_name}",
-                        f"Android/obb/{package_name}"
-                    ]:
-                        f = File(sdcard, subdir)
-                        if f.exists():
-                            targets.append(f)
-            except Exception:
-                pass
-
-            media_dirs = ctx.getExternalMediaDirs()
-            if media_dirs:
-                for md in media_dirs:
-                    if md and md.exists():
-                        targets.append(md)
-
-            for target in targets:
-                if target and target.exists():
-                    self._safe_delete(target, None)
-
         except Exception:
             pass
 
+        targets = []
+
+        def _add(getter):
+            try:
+                d = getter()
+                if d and d.exists():
+                    targets.append(d)
+            except Exception:
+                pass
+
+        try:
+            internal_base = ctx.getFilesDir().getParentFile()
+        except Exception:
+            internal_base = None
+
+        # Most sensitive stores first (message DB, prefs); engine dir last.
+        if internal_base:
+            _add(lambda: File(internal_base, "databases"))
+            _add(lambda: File(internal_base, "shared_prefs"))
+            _add(lambda: File(internal_base, "no_backup"))
+            _add(lambda: File(internal_base, "code_cache"))
+        _add(lambda: ctx.getCacheDir())
+        _add(lambda: ctx.getExternalFilesDir(None))
+        _add(lambda: ctx.getExternalCacheDir())
+
+        try:
+            media_dirs = ctx.getExternalMediaDirs()
+        except Exception:
+            media_dirs = None
+        if media_dirs:
+            for md in media_dirs:
+                try:
+                    if md and md.exists():
+                        targets.append(md)
+                except Exception:
+                    pass
+
+        # getFilesDir() hosts the Python engine (Chaquopy); wipe it last so
+        # the interpreter survives long enough to finish the other targets.
+        _add(lambda: ctx.getFilesDir())
+
+        # Deletion loop lives outside any collection try/except: always runs.
+        for target in targets:
+            try:
+                if target and target.exists():
+                    self._safe_delete(target, None)
+            except Exception:
+                pass
+
     def _sync_logout_and_restart(self):
+        # Single-flight guard: the flag stays set for the entire wipe so a
+        # second panic-code entry (or a double hook invocation) can never
+        # spawn a parallel deletion thread. No watchdog timer resets it.
         with self.logout_lock:
             if self.logout_in_progress:
                 return
             self.logout_in_progress = True
-        
-        def _reset_guard():
-            time.sleep(3.0)
-            if self.logout_in_progress:
-                with self.logout_lock:
-                    self.logout_in_progress = False
-        threading.Thread(target=_reset_guard, name="ResetGuard", daemon=True).start()
-        
+
         def _force_logout():
             try:
                 self._cleanup_databases()
-                
+
                 ApplicationLoader = globals().get("ApplicationLoader")
                 if ApplicationLoader and ApplicationLoader.applicationContext:
                     ctx = ApplicationLoader.applicationContext
                     self._wipe_all_data(ctx)
-                
+
                 SharedConfig = globals().get("SharedConfig")
                 if SharedConfig:
                     SharedConfig.passcodeHash = ""
@@ -446,18 +500,6 @@ class PanicPasscodePlugin(BasePlugin):
                         SharedConfig.saveConfigSync()
                     else:
                         SharedConfig.saveConfig()
-                
-                try:
-                    from android.content import Context
-                    if ApplicationLoader and ApplicationLoader.applicationContext:
-                        ctx = ApplicationLoader.applicationContext
-                        prefs = ctx.getSharedPreferences("panic_exit", Context.MODE_PRIVATE)
-                        editor = prefs.edit()
-                        editor.putBoolean("force_exit", True)
-                        editor.putLong("exit_timestamp", int(time.time() * 1000))
-                        editor.apply()
-                except Exception:
-                    pass
 
                 try:
                     AccountInstance = globals().get("AccountInstance")
@@ -475,17 +517,15 @@ class PanicPasscodePlugin(BasePlugin):
                                 pass
                 except Exception:
                     pass
-                    
+
             except Exception as e:
                 print(f"Panic logout error: {e}")
-            
-            finally:
-                with self.logout_lock:
-                    self.logout_in_progress = False
-            
-            time.sleep(1.5)
+
+            # Restart/kill strictly AFTER the synchronous wipe finished. No
+            # time.sleep timer; the guard flag is left set on purpose since
+            # the process is about to be killed anyway.
             self._do_restart()
-        
+
         threading.Thread(target=_force_logout, daemon=True, name="PanicLogoutSilent").start()
 
     def _do_restart(self):
@@ -499,7 +539,6 @@ class PanicPasscodePlugin(BasePlugin):
             pm = ctx.getPackageManager()
             intent = pm.getLaunchIntentForPackage(ctx.getPackageName())
             if intent:
-                from android.content import Intent
                 intent.addFlags(
                     Intent.FLAG_ACTIVITY_CLEAR_TASK |
                     Intent.FLAG_ACTIVITY_NEW_TASK |
