@@ -1,0 +1,1004 @@
+__id__ = "gradient_mini_player"
+__name__ = "Gradient Mini Player"
+__description__ = "Динамический градиент из цветов обложки: штатный Mini Player, полноэкранный плеер и цвет уведомления. Плавная смена цветов, лёгкая анимация, настройка прозрачности."
+__author__ = "@thelevikane"
+__version__ = "3.4.0"
+__icon__ = "qwertysticks3/0"
+__app_version__ = ">=12.5.1"
+
+import time
+import math
+import threading
+import colorsys
+import traceback
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodHook, AppEvent
+from hook_utils import find_class
+from android_utils import run_on_ui_thread, R
+from ui.settings import Header, Switch, Selector, Divider, Text
+from ui.bulletin import BulletinHelper
+
+from java import jarray, jint
+from java.lang import System, Class
+from android.graphics import Bitmap, BitmapFactory
+from android.graphics.drawable import GradientDrawable, ColorDrawable, LayerDrawable, Drawable
+from org.telegram.messenger import AndroidUtilities, MediaController, NotificationCenter
+
+try:
+    from org.telegram.messenger import FileLoader, ImageLoader, ImageLocation
+except Exception:
+    FileLoader = None
+    ImageLoader = None
+    ImageLocation = None
+
+try:
+    from org.telegram.ui.ActionBar import Theme
+except Exception:
+    Theme = None
+
+FCV_CLASS = "org.telegram.ui.Components.FragmentContextView"
+FULL_CLASS = "org.telegram.ui.Components.AudioPlayerAlert"
+FULL_METHODS = ["updateTitle", "show", "didReceivedNotification"]
+
+DEFAULT_BLUE = [(41, 98, 255), (86, 160, 255), (22, 62, 170)]
+TRANSITION_MS = 1000.0
+SHIMMER_PERIOD_S = 14.0
+ALPHAS = [0.25, 0.40, 0.55, 0.70, 0.85]
+ALPHA_LABELS = ["25%", "40%", "55%", "70%", "85%"]
+
+HOOKED_METHODS = [
+    "checkPlayer",
+    "updateStyle",
+    "updateColors",
+    "onAttachedToWindow",
+    "didReceivedNotification",
+]
+
+
+def _s32(v):
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v & 0x80000000 else v
+
+
+def _mix(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t)
+
+
+def _ease(t):
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _dist(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _hex(c):
+    return "#%02x%02x%02x" % (int(c[0]), int(c[1]), int(c[2]))
+
+
+def _extract_palette(pixels):
+    buckets = {}
+    for p in pixels:
+        p &= 0xFFFFFFFF
+        if (p >> 24) < 128:
+            continue
+        r = (p >> 16) & 255
+        g = (p >> 8) & 255
+        b = p & 255
+        mx = max(r, g, b)
+        mn = min(r, g, b)
+        lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        if lum < 0.10 or lum > 0.94:
+            continue
+        sat = (mx - mn) / float(mx) if mx else 0.0
+        k = (r >> 4, g >> 4, b >> 4)
+        e = buckets.get(k)
+        if e is None:
+            buckets[k] = [1, r, g, b, sat]
+        else:
+            e[0] += 1
+            e[1] += r
+            e[2] += g
+            e[3] += b
+            e[4] += sat
+    if not buckets:
+        return None
+
+    cands = []
+    for e in buckets.values():
+        n = e[0]
+        avg = (e[1] / float(n), e[2] / float(n), e[3] / float(n))
+        sat = e[4] / float(n)
+        cands.append((n * (0.25 + sat * 1.75), avg))
+    cands.sort(key=lambda x: x[0], reverse=True)
+
+    top = cands[0][0]
+    picked = []
+    for score, c in cands:
+        if score < top * 0.10 and picked:
+            break
+        if all(_dist(c, q) > 70 for q in picked):
+            picked.append(c)
+        if len(picked) >= 4:
+            break
+
+    if len(picked) == 1:
+        r, g, b = picked[0]
+        h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        r2, g2, b2 = colorsys.hsv_to_rgb((h + 0.08) % 1.0, s, min(1.0, v * 0.72 + 0.16))
+        picked.append((r2 * 255, g2 * 255, b2 * 255))
+    return picked
+
+
+def _to_stops(palette):
+    p = list(palette)
+    n = len(p)
+    if n == 1:
+        p = [p[0], p[0]]
+        n = 2
+    if n == 2:
+        return [p[0], _mix(p[0], p[1], 0.33), _mix(p[0], p[1], 0.66), p[1]]
+    if n == 3:
+        return [p[0], p[1], p[2], _mix(p[2], p[0], 0.4)]
+    return [p[0], p[1], p[2], p[3]]
+
+
+def _adapt(rgb, dark):
+    h, s, v = colorsys.rgb_to_hsv(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+    if dark:
+        v = min(v, 0.72)
+        s = max(s, 0.25) if s > 0.05 else s
+    else:
+        v = max(v, 0.60)
+        s = min(s, 0.85)
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return (r * 255.0, g * 255.0, b * 255.0)
+
+
+def _count(res):
+    if res is None:
+        return 0
+    try:
+        return len(res)
+    except Exception:
+        pass
+    try:
+        return int(res.size())
+    except Exception:
+        return 1
+
+
+_FIELD_CACHE = {}
+
+
+def _get_field(obj, name):
+    try:
+        c = obj.getClass()
+        cname = str(c.getName())
+        key = (cname, name)
+        if key in _FIELD_CACHE:
+            return _FIELD_CACHE[key]
+        while c is not None:
+            try:
+                f = c.getDeclaredField(name)
+                f.setAccessible(True)
+                _FIELD_CACHE[key] = f
+                return f
+            except Exception:
+                c = c.getSuperclass()
+    except Exception:
+        pass
+    return None
+
+
+class _AfterHook(MethodHook):
+    def __init__(self, plugin, name, kind):
+        self.plugin = plugin
+        self.name = name
+        self.kind = kind
+
+    def after_hooked_method(self, param):
+        try:
+            if self.name == "didReceivedNotification":
+                if int(param.args[0]) not in self.plugin._nc_ids:
+                    return
+            self.plugin._on_hook(param.thisObject, self.name, self.kind)
+        except Exception as e:
+            self.plugin._note_error("hook " + self.name, e)
+
+
+class _NotifHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._on_notif_style(param.thisObject, param.args[0])
+        except Exception as e:
+            self.plugin._note_error("notif hook", e)
+
+
+class GradientMiniPlayerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._entries = {}
+        self._cache = {}
+        self._cache_order = []
+        self._cur_key = None
+        self._load_gen = 0
+        self._from = None
+        self._to = None
+        self._disp = None
+        self._t0 = 0.0
+        self._dirty = True
+        self._paused = False
+        self._scheduled = False
+        self._due = 0.0
+        self._last_argb = None
+        self._last_argbs = {}
+        self._theme_cache = {}
+        self._cls = None
+        self._style_f = None
+        self._frame_f = None
+        self._full_f = None
+        self._last_bases = {}
+        self._audio_style = 0
+        self._runnable = R(self._tick)
+        self._nc_ids = set()
+        for n in ("messagePlayingDidStart", "messagePlayingDidReset", "messagePlayingPlayStateChanged"):
+            try:
+                self._nc_ids.add(int(getattr(NotificationCenter, n)))
+            except Exception:
+                pass
+        self._stats = {
+            "class": False, "hooks": {}, "fired": 0, "applied": 0,
+            "cover": "-", "error": "-", "palette": "-", "track": "-",
+        }
+        try:
+            self._install_hooks()
+        except Exception as e:
+            self._note_error("install_hooks", e)
+        try:
+            self._install_full_hooks()
+        except Exception as e:
+            self._note_error("install_full_hooks", e)
+        self._install_notif_hook()
+        self._kick(300)
+        self.log("Gradient Mini Player loaded")
+
+    def on_plugin_unload(self):
+        try:
+            self._load_gen += 1
+            try:
+                AndroidUtilities.cancelRunOnUIThread(self._runnable)
+            except Exception:
+                pass
+            entries = list(self._entries.values())
+            self._entries = {}
+
+            def restore_all():
+                for e in entries:
+                    self._restore(e)
+            run_on_ui_thread(restore_all)
+        except Exception as e:
+            self._note_error("unload", e)
+
+    def on_app_event(self, event_type: AppEvent):
+        if event_type == AppEvent.PAUSE:
+            self._paused = True
+        elif event_type == AppEvent.RESUME:
+            self._paused = False
+            self._dirty = True
+            self._kick(50)
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Gradient Mini Player"),
+            Switch(
+                key="gradient_bg",
+                text="Динамический фон",
+                default=True,
+                subtext="Градиент из цветов обложки в штатном Mini Player",
+                on_change=self._on_setting_changed,
+            ),
+            Switch(
+                key="animation",
+                text="Анимация",
+                default=True,
+                subtext="Очень медленное переливание градиента",
+                on_change=self._on_setting_changed,
+            ),
+            Switch(
+                key="full_player",
+                text="Фон полного плеера",
+                default=True,
+                subtext="Градиент в развёрнутом плеере (панель управления)",
+                on_change=self._on_setting_changed,
+            ),
+            Switch(
+                key="notif_color",
+                text="Цвет уведомления",
+                default=False,
+                subtext="Окрашивать уведомление плеера в цвет обложки (градиент там невозможен)",
+                on_change=self._on_setting_changed,
+            ),
+            Selector(
+                key="transparency",
+                text="Прозрачность",
+                default=2,
+                items=ALPHA_LABELS,
+                on_change=self._on_setting_changed,
+            ),
+            Divider(text="Прозрачность = насколько заметен градиент поверх обычного фона."),
+            Text(
+                text="Диагностика",
+                icon="msg_info",
+                on_click=self._show_diag,
+            ),
+        ]
+
+    def _on_setting_changed(self, *args):
+        self._dirty = True
+        self._kick(150)
+
+    def _gradient_enabled(self):
+        try:
+            return bool(self.get_setting("gradient_bg", True))
+        except Exception:
+            return True
+
+    def _full_enabled(self):
+        try:
+            return bool(self.get_setting("full_player", True))
+        except Exception:
+            return True
+
+    def _notif_enabled(self):
+        try:
+            return bool(self.get_setting("notif_color", False))
+        except Exception:
+            return True
+
+    def _anim_enabled(self):
+        try:
+            return bool(self.get_setting("animation", True))
+        except Exception:
+            return True
+
+    def _alpha(self):
+        try:
+            i = int(self.get_setting("transparency", 2))
+        except Exception:
+            i = 2
+        i = max(0, min(len(ALPHAS) - 1, i))
+        return ALPHAS[i]
+
+    def _real_class(self, name):
+        try:
+            loader = MediaController.getInstance().getClass().getClassLoader()
+            return Class.forName(name, True, loader)
+        except Exception:
+            return None
+
+    def _hook_methods(self, real, jcls, method, handler):
+        for target in (real, jcls):
+            if target is None:
+                continue
+            try:
+                return _count(self.hook_all_methods(target, method, handler))
+            except Exception as e:
+                self._note_error("hook_all_methods " + method, e)
+        return -1
+
+    def _hook_ctors(self, real, jcls, handler):
+        for target in (real, jcls):
+            if target is None:
+                continue
+            try:
+                return _count(self.hook_all_constructors(target, handler))
+            except Exception as e:
+                self._note_error("hook_all_constructors", e)
+        return -1
+
+    def _install_hooks(self):
+        cls = find_class(FCV_CLASS)
+        if not cls:
+            self.log("FragmentContextView not found")
+            return
+        self._cls = cls
+        self._stats["class"] = True
+        real = self._real_class(FCV_CLASS)
+        for name in HOOKED_METHODS:
+            self._stats["hooks"][name] = self._hook_methods(real, cls, name, _AfterHook(self, name, "mini"))
+        self._stats["hooks"]["<init>"] = self._hook_ctors(real, cls, _AfterHook(self, "<init>", "mini"))
+
+    def _install_full_hooks(self):
+        cls = find_class(FULL_CLASS)
+        if not cls:
+            self.log("AudioPlayerAlert not found")
+            self._stats["full"] = "NOT FOUND"
+            return
+        self._stats["full"] = {}
+        real = self._real_class(FULL_CLASS)
+        for name in FULL_METHODS:
+            self._stats["full"][name] = self._hook_methods(real, cls, name, _AfterHook(self, name, "full"))
+        self._stats["full"]["<init>"] = self._hook_ctors(real, cls, _AfterHook(self, "<init>", "full"))
+
+    def _install_notif_hook(self):
+        try:
+            b = Class.forName("android.app.Notification$Builder")
+            st = Class.forName("android.app.Notification$Style")
+            m = b.getDeclaredMethod("setStyle", st)
+            m.setAccessible(True)
+            self.hook_method(m, _NotifHook(self))
+            self._stats["notif"] = "hooked"
+        except Exception as e:
+            self._stats["notif"] = "FAILED"
+            self._note_error("notif install", e)
+
+    def _on_hook(self, view, name, kind="mini"):
+        if view is None:
+            return
+        self._stats["fired"] += 1
+        if kind == "full":
+            self._stats["full_fired"] = self._stats.get("full_fired", 0) + 1
+        if kind == "full" and not self._full_enabled():
+            return
+        e = self._entry_for(view, kind)
+        if name == "didReceivedNotification":
+            self._kick(30)
+            return
+        if e is not None and self._gradient_enabled() and self._last_argbs.get(kind) is not None:
+            self._apply_entry(e, self._last_argbs[kind], self._last_bases.get(kind, self._theme_base(kind)))
+        if name in ("checkPlayer", "updateStyle", "onAttachedToWindow", "show", "<init>"):
+            self._kick(40)
+
+    def _on_notif_style(self, builder, style):
+        if builder is None or style is None or not self._notif_enabled() or not self._gradient_enabled():
+            return
+        ms = Class.forName("android.app.Notification$MediaStyle")
+        if not ms.isInstance(style):
+            return
+        mo = self._playing()
+        if mo is None:
+            return
+        palette = self._palette_for(mo)
+        if not palette:
+            return
+        c = _adapt(palette[0], True)
+        c = (c[0] * 0.8, c[1] * 0.8, c[2] * 0.8)
+        color = _s32(0xFF000000 | (int(c[0]) << 16) | (int(c[1]) << 8) | int(c[2]))
+        builder.setColorized(True)
+        builder.setColor(color)
+        self._stats["notif"] = "colored " + _hex(c)
+
+    def _palette_for(self, mo):
+        key = self._track_key(mo)
+        if key is None:
+            return None
+        pal = self._cache.get(key)
+        if pal is not None:
+            return pal
+        try:
+            account = int(mo.currentAccount)
+        except Exception:
+            account = 0
+        bmp, source, owned, pending = self._fetch_cover(mo, account, True)
+        pal = self._bitmap_palette(bmp, owned) if bmp is not None else None
+        if pal is None:
+            pal = list(DEFAULT_BLUE)
+        self._cache[key] = pal
+        self._cache_order.append(key)
+        return pal
+
+    def _entry_for(self, view, kind="mini"):
+        try:
+            key = int(System.identityHashCode(view))
+            e = self._entries.get(key)
+            if e is None:
+                frame = self._resolve_frame(view, kind)
+                orig_bg = None
+                if frame is not None:
+                    try:
+                        orig_bg = frame.getBackground()
+                    except Exception:
+                        orig_bg = None
+                e = {"view": view, "kind": kind, "t": time.time(),
+                     "frame": frame, "orig_bg": orig_bg,
+                     "grad": None, "layer": None, "bd": None, "base_c": None}
+                self._entries[key] = e
+                self._stats.setdefault("frames", {})[kind] = "ok" if e["frame"] is not None else "NONE"
+            return e
+        except Exception as ex:
+            self._note_error("entry_for", ex)
+            return None
+
+    def _resolve_frame(self, view, kind="mini"):
+        if kind == "full":
+            try:
+                fld = _get_field(view, "playerLayout")
+                f = fld.get(view) if fld is not None else None
+                if f is not None:
+                    return f
+            except Exception as ex:
+                self._note_error("playerLayout", ex)
+            return None
+        fld = _get_field(view, "frameLayout")
+        if fld is not None:
+            try:
+                f = fld.get(view)
+                if f is not None:
+                    return f
+            except Exception:
+                pass
+        try:
+            fl = find_class("android.widget.FrameLayout")
+            for i in range(view.getChildCount()):
+                c = view.getChildAt(i)
+                if fl.isInstance(c):
+                    return c
+        except Exception:
+            pass
+        return view
+
+    def _is_audio(self, view, kind="mini"):
+        if kind == "full":
+            return True
+        fld = _get_field(view, "currentStyle")
+        if fld is not None:
+            try:
+                return int(fld.getInt(view)) == self._audio_style
+            except Exception:
+                pass
+        return self._playing() is not None
+
+    def _apply_entry(self, e, argb, base):
+        try:
+            view = e["view"]
+            kind = e.get("kind", "mini")
+            frame = e["frame"]
+            if frame is None:
+                return
+            if not self._is_audio(view, kind) or (kind == "full" and not self._full_enabled()):
+                self._restore(e)
+                return
+            arr = jarray(jint)(argb) if (e["grad"] is None or e.get("argb") != argb) else None
+            if e["grad"] is None:
+                grad = GradientDrawable()
+                grad.setColors(arr)
+                grad.setOrientation(GradientDrawable.Orientation.TL_BR if kind == "full" else GradientDrawable.Orientation.LEFT_RIGHT)
+                bd = ColorDrawable(base)
+                layer = LayerDrawable(jarray(Drawable)([bd, grad]))
+                e["grad"] = grad
+                e["bd"] = bd
+                e["layer"] = layer
+                e["base_c"] = base
+                e["argb"] = list(argb)
+            else:
+                if e.get("argb") != argb:
+                    e["grad"].setColors(arr)
+                e["argb"] = list(argb)
+                if e["base_c"] != base:
+                    e["bd"].setColor(base)
+                    e["base_c"] = base
+            if not e["layer"].equals(frame.getBackground()):
+                frame.setBackground(e["layer"])
+                self._stats["applied"] += 1
+                ak = self._stats.setdefault("applied_kind", {})
+                ak[kind] = ak.get(kind, 0) + 1
+        except Exception as ex:
+            self._note_error("apply_entry", ex)
+
+    def _restore(self, e):
+        lay = e.get("layer")
+        if lay is None:
+            return
+        try:
+            fr = e["frame"]
+            if lay.equals(fr.getBackground()):
+                orig = e.get("orig_bg")
+                if orig is not None:
+                    fr.setBackground(orig)
+                else:
+                    fr.setBackgroundColor(self._theme_base(e.get("kind", "mini")))
+        except Exception:
+            pass
+        e["layer"] = None
+        e["grad"] = None
+        e["bd"] = None
+        e["base_c"] = None
+
+    def _prune(self):
+        dead = []
+        for k, e in self._entries.items():
+            try:
+                fr = e["frame"] if e["frame"] is not None else e["view"]
+                if not fr.isAttachedToWindow() and time.time() - e["t"] > 6.0:
+                    dead.append(k)
+            except Exception:
+                dead.append(k)
+        for k in dead:
+            self._entries.pop(k, None)
+
+    def _theme_base(self, kind="mini"):
+        now = time.time()
+        c = self._theme_cache.get(kind)
+        if c is not None and now - c[0] < 1.5:
+            return c[1]
+        v = self._theme_base_raw(kind)
+        self._theme_cache[kind] = (now, v)
+        return v
+
+    def _theme_base_raw(self, kind="mini"):
+        if Theme is None:
+            return _s32(0xFF1F2A36)
+        if kind == "full":
+            try:
+                return _s32(int(Theme.getColor(Theme.key_player_background)) | 0xFF000000)
+            except Exception:
+                pass
+        try:
+            return _s32(int(Theme.getColor(Theme.key_inappPlayerBackground)) | 0xFF000000)
+        except Exception:
+            pass
+        try:
+            return _s32(int(Theme.getColor(Theme.key_windowBackgroundWhite)) | 0xFF000000)
+        except Exception:
+            pass
+        return _s32(0xFF1F2A36)
+
+    def _kick(self, delay=0):
+        run_on_ui_thread(lambda: self._schedule(delay))
+
+    def _schedule(self, delay):
+        try:
+            due = time.time() * 1000.0 + delay
+            if self._scheduled:
+                if self._due <= due + 5:
+                    return
+                try:
+                    AndroidUtilities.cancelRunOnUIThread(self._runnable)
+                except Exception:
+                    pass
+            self._scheduled = True
+            self._due = due
+            AndroidUtilities.runOnUIThread(self._runnable, int(delay))
+        except Exception as e:
+            self._note_error("schedule", e)
+
+    def _playing(self):
+        try:
+            return MediaController.getInstance().getPlayingMessageObject()
+        except Exception:
+            return None
+
+    def _is_paused(self):
+        try:
+            return bool(MediaController.getInstance().isMessagePaused())
+        except Exception:
+            return False
+
+    def _track_key(self, mo):
+        if mo is None:
+            return None
+        try:
+            return str(mo.getDialogId()) + ":" + str(mo.getId())
+        except Exception:
+            return None
+
+    def _tick(self):
+        self._scheduled = False
+        delay = 1500
+        try:
+            self._prune()
+            if not self._entries:
+                return
+
+            if not self._gradient_enabled():
+                for e in list(self._entries.values()):
+                    self._restore(e)
+                self._schedule(1500)
+                return
+
+            mo = self._playing()
+            key = self._track_key(mo)
+            if key != self._cur_key:
+                self._cur_key = key
+                self._stats["track"] = key or "-"
+                if mo is not None:
+                    self._on_new_track(mo, key)
+
+            now = time.time()
+            transitioning = self._to is not None and (now - self._t0) * 1000.0 < TRANSITION_MS
+            animating = (mo is not None and self._anim_enabled()
+                         and not self._paused and not self._is_paused())
+
+            visible = False
+            for e in self._entries.values():
+                try:
+                    fr = e["frame"] if e["frame"] is not None else e["view"]
+                    if fr.isShown():
+                        visible = True
+                        break
+                except Exception:
+                    pass
+            if not visible:
+                animating = False
+                transitioning = False
+                self._dirty = True
+                self._schedule(500)
+                return
+
+            if self._to is not None and (transitioning or animating or self._dirty):
+                self._render(now, animating)
+                self._dirty = False
+
+            if transitioning:
+                delay = 33
+            elif animating and self._to is not None:
+                delay = 250
+            elif mo is not None:
+                delay = 600
+        except Exception as e:
+            self._note_error("tick", e)
+        self._schedule(delay)
+
+    def _render(self, now, animating):
+        k = _ease((now - self._t0) * 1000.0 / TRANSITION_MS)
+        if self._from is None or k >= 1.0:
+            stops = list(self._to)
+        else:
+            stops = [_mix(self._from[i], self._to[i], k) for i in range(4)]
+        self._disp = stops
+
+        if animating:
+            phase = 2.0 * math.pi * (now % SHIMMER_PERIOD_S) / SHIMMER_PERIOD_S
+            shimmered = []
+            for i in range(4):
+                w = 0.5 * (1.0 + math.sin(phase + i * 1.7))
+                shimmered.append(_mix(stops[i], stops[(i + 1) % 4], 0.38 * w))
+            stops = shimmered
+
+        a = int(self._alpha() * 255)
+        by_kind = {}
+        for e in list(self._entries.values()):
+            kind = e.get("kind", "mini")
+            if kind not in by_kind:
+                base = self._theme_base(kind)
+                dark = (0.299 * ((base >> 16) & 255) + 0.587 * ((base >> 8) & 255)
+                        + 0.114 * (base & 255)) < 128.0
+                argb = []
+                for c in stops:
+                    c = _adapt(c, dark)
+                    argb.append(_s32((a << 24) | (int(c[0]) << 16) | (int(c[1]) << 8) | int(c[2])))
+                by_kind[kind] = (argb, base)
+                self._last_bases[kind] = base
+                self._last_argbs[kind] = argb
+            argb, base = by_kind[kind]
+            self._apply_entry(e, argb, base)
+
+    def _on_new_track(self, mo, key):
+        self._load_gen += 1
+        gen = self._load_gen
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._set_target(cached, gen)
+            return
+        try:
+            account = int(mo.currentAccount)
+        except Exception:
+            account = 0
+        t = threading.Thread(target=self._load_worker, args=(mo, key, gen, account))
+        t.daemon = True
+        t.start()
+
+    def _load_worker(self, mo, key, gen, account):
+        palette = None
+        source = "none"
+        try:
+            asked = False
+            for attempt in range(8):
+                if gen != self._load_gen:
+                    return
+                bmp, source, owned, pending = self._fetch_cover(mo, account, not asked)
+                asked = True
+                if bmp is not None:
+                    palette = self._bitmap_palette(bmp, owned)
+                    break
+                if not pending and attempt >= 2:
+                    break
+                time.sleep(0.7)
+        except Exception as e:
+            self._note_error("load_worker", e)
+        if gen != self._load_gen:
+            return
+        if palette is None:
+            palette = list(DEFAULT_BLUE)
+            if source in ("none", "-"):
+                source = "no cover → blue"
+        self._stats["cover"] = source
+
+        def done():
+            if gen != self._load_gen:
+                return
+            self._cache[key] = palette
+            self._cache_order.append(key)
+            if len(self._cache_order) > 24:
+                self._cache.pop(self._cache_order.pop(0), None)
+            self._set_target(palette, gen)
+        run_on_ui_thread(done)
+
+    def _set_target(self, palette, gen):
+        if gen != self._load_gen:
+            return
+        stops = _to_stops(palette)
+        self._from = list(self._disp) if self._disp is not None else None
+        self._to = stops
+        self._t0 = time.time()
+        self._dirty = True
+        self._stats["palette"] = " ".join(_hex(c) for c in palette)
+        self._kick(0)
+
+    def _fetch_cover(self, mo, account, first):
+        pending = False
+        doc = None
+        try:
+            doc = mo.getDocument()
+        except Exception:
+            doc = None
+
+        if doc is not None:
+            try:
+                thumbs = doc.thumbs
+                if thumbs is not None and thumbs.size() > 0:
+                    cands, stripped, cached = [], None, None
+                    for i in range(thumbs.size()):
+                        s = thumbs.get(i)
+                        nm = str(s.getClass().getSimpleName())
+                        if "Empty" in nm:
+                            continue
+                        if "Stripped" in nm:
+                            stripped = s
+                        elif "Cached" in nm:
+                            cached = s
+                        else:
+                            cands.append(s)
+                    if cands:
+                        cands.sort(key=lambda s: abs(max(int(s.w), int(s.h)) - 160))
+                        s = cands[0]
+                        path = None
+                        if FileLoader is not None:
+                            try:
+                                path = FileLoader.getInstance(account).getPathToAttach(s, True)
+                            except Exception as e:
+                                self._note_error("getPathToAttach", e)
+                        if path is not None and path.exists():
+                            bmp = self._decode_file(path.getAbsolutePath())
+                            if bmp is not None:
+                                return bmp, "thumb-file", True, False
+                        elif first:
+                            self._request_thumb(s, doc, mo, account)
+                        pending = True
+                    if cached is not None:
+                        try:
+                            data = cached.bytes
+                            if data is not None and len(data) > 0:
+                                bmp = BitmapFactory.decodeByteArray(data, 0, len(data))
+                                if bmp is not None:
+                                    return bmp, "thumb-cached", True, False
+                        except Exception as e:
+                            self._note_error("cached thumb", e)
+                    if stripped is not None and ImageLoader is not None:
+                        try:
+                            bmp = ImageLoader.getStrippedPhotoBitmap(stripped.bytes, "b")
+                            if bmp is not None:
+                                return bmp, "thumb-stripped", True, False
+                        except Exception as e:
+                            self._note_error("stripped thumb", e)
+            except Exception as e:
+                self._note_error("thumbs", e)
+
+        try:
+            ai = MediaController.getInstance().getAudioInfo()
+            if ai is not None:
+                bmp = ai.getSmallCover()
+                if bmp is None:
+                    bmp = ai.getCover()
+                if bmp is not None:
+                    return bmp, "embedded", False, False
+        except Exception:
+            pass
+
+        return None, ("thumb-pending" if pending else "none"), False, pending
+
+    def _request_thumb(self, size, doc, mo, account):
+        if FileLoader is None or ImageLocation is None:
+            return
+        try:
+            loc = ImageLocation.getForDocument(size, doc)
+            FileLoader.getInstance(account).loadFile(loc, mo, None, 1, 1)
+        except Exception as e:
+            self._note_error("request_thumb", e)
+
+    def _decode_file(self, path):
+        try:
+            opts = BitmapFactory.Options()
+            opts.inJustDecodeBounds = True
+            BitmapFactory.decodeFile(path, opts)
+            side = min(int(opts.outWidth), int(opts.outHeight))
+            opts = BitmapFactory.Options()
+            opts.inSampleSize = max(1, side // 96)
+            return BitmapFactory.decodeFile(path, opts)
+        except Exception as e:
+            self._note_error("decode_file", e)
+            return None
+
+    def _bitmap_palette(self, bmp, owned):
+        tmp = None
+        try:
+            if bmp.getWidth() <= 0 or bmp.getHeight() <= 0:
+                return None
+            tmp = Bitmap.createScaledBitmap(bmp, 32, 32, True)
+            arr = jarray(jint)(1024)
+            tmp.getPixels(arr, 0, 32, 0, 0, 32, 32)
+            return _extract_palette(list(arr))
+        except Exception as e:
+            self._note_error("bitmap_palette", e)
+            return None
+        finally:
+            try:
+                if tmp is not None and not tmp.equals(bmp):
+                    tmp.recycle()
+                if owned:
+                    bmp.recycle()
+            except Exception:
+                pass
+
+    def _note_error(self, where, e):
+        try:
+            msg = where + ": " + str(e)
+            self._stats["error"] = msg
+            errs = self._stats.setdefault("errors", {})
+            if msg in errs or len(errs) < 12:
+                errs[msg] = errs.get(msg, 0) + 1
+            self.log("[GMP] " + where + ": " + traceback.format_exc())
+        except Exception:
+            pass
+
+    def _diag_text(self):
+        s = self._stats
+        hooks = ", ".join("%s=%s" % (k, v) for k, v in s["hooks"].items()) or "-"
+        return (
+            "Gradient Mini Player " + __version__ + "\n"
+            "FragmentContextView: " + ("found" if s["class"] else "NOT FOUND") + "\n"
+            "Hooks: " + hooks + "\n"
+            "Full player hooks: " + str(s.get("full", "-")) + "\n"
+            "Notification: " + str(s.get("notif", "-")) + "\n"
+            "Views tracked: " + str(len(self._entries)) + "\n"
+            "Hook calls: " + str(s["fired"]) + ", background applied: " + str(s["applied"]) + "\n"
+            "Track: " + str(s["track"]) + "\n"
+            "Cover: " + str(s["cover"]) + "\n"
+            "Palette: " + str(s["palette"]) + "\n"
+            "Frames: " + str(s.get("frames", "-")) + "\n"
+            "Full hook calls: " + str(s.get("full_fired", 0)) + "\n"
+            "Applied by kind: " + str(s.get("applied_kind", "-")) + "\n"
+            "Errors: " + (" | ".join("%sx %s" % (v, k) for k, v in s.get("errors", {}).items()) or "-")
+        )
+
+    def _show_diag(self, view=None):
+        text = self._diag_text()
+        self.log(text)
+        try:
+            AndroidUtilities.addToClipboard(text)
+            BulletinHelper.show_info("Диагностика скопирована в буфер обмена")
+        except Exception:
+            try:
+                BulletinHelper.show_info(text)
+            except Exception:
+                pass
