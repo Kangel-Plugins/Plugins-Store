@@ -1,0 +1,281 @@
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, get_static_private_field
+from android_utils import OnClickListener
+
+from android.view import View
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader, LocaleController, NotificationCenter
+from org.telegram.ui.Components.voip import VoIPHelper
+
+__id__ = "header_call_button"
+__name__ = "Header Call Button"
+__description__ = "Кнопка звонка в шапке личного чата, как в официальном Telegram"
+__author__ = "@l_limon_l"
+__version__ = "1.2.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+# Свой id кнопки в шапке, чтобы не пересекаться с id ChatActivity.
+CALL_ITEM_ID = 0x0C411B7
+# Значение ChatActivity.call в исходниках Telegram, если поле не удастся прочитать.
+FALLBACK_MENU_CALL_ID = 32
+ICON_CANDIDATES = ("call", "ic_call", "profile_call", "msg_calls")
+
+
+class _Hook(MethodHook):
+    def __init__(self, before=None, after=None):
+        self.before = before
+        self.after = after
+
+    def before_hooked_method(self, param):
+        if self.before:
+            self.before(param)
+
+    def after_hooked_method(self, param):
+        if self.after:
+            self.after(param)
+
+
+class HeaderCallButtonPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._unhooks = []
+        self._icon_res = None
+        self._call_title = None
+        self._static_call_id = None
+        # hashCode кнопки в шапке -> нужно ли её показывать
+        self._wanted = {}
+        # hashCode headerItem (⋮) -> набор id пункта «Позвонить» в его меню
+        self._headers = {}
+
+        chat_activity = find_class("org.telegram.ui.ChatActivity")
+        action_bar = find_class("org.telegram.ui.ActionBar.ActionBar")
+        menu_item = find_class("org.telegram.ui.ActionBar.ActionBarMenuItem")
+        if chat_activity is None or action_bar is None or menu_item is None:
+            self.log("ChatActivity/ActionBar/ActionBarMenuItem not found")
+            return
+
+        self._hook_all(chat_activity, "createView", after=lambda p: self._refresh(p.thisObject))
+        self._hook_all(chat_activity, "setInPreviewMode", after=lambda p: self._refresh(p.thisObject))
+        self._hook_all(chat_activity, "didReceivedNotification", after=self._on_notification)
+        self._hook_all(action_bar, "onSearchFieldVisibilityChanged", after=self._on_search_visibility)
+        # ChatActivity сама возвращает «Позвонить» в меню (например, в onMeasure),
+        # поэтому блокируем показ этого пункта и прячем его перед открытием меню.
+        self._hook_all(menu_item, "showSubItem", before=self._on_show_sub_item)
+        self._hook_all(menu_item, "toggleSubMenu", before=self._on_toggle_sub_menu)
+        self.log(f"Header Call Button loaded, hooks: {len(self._unhooks)}")
+
+    def on_plugin_unload(self):
+        for unhook in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    # ---------- hooks ----------
+
+    def _hook_all(self, clazz, name, before=None, after=None):
+        try:
+            hook = _Hook(self._safe(before) if before else None, self._safe(after) if after else None)
+            result = self.hook_all_methods(clazz, name, hook)
+            if result:
+                self._unhooks.extend(list(result))
+            else:
+                self.log(f"No methods hooked: {name}")
+        except Exception as e:
+            self.log(f"Failed to hook {name}: {e}")
+
+    def _safe(self, callback):
+        def wrapper(param):
+            try:
+                callback(param)
+            except Exception as e:
+                self.log(f"Hook error: {e}")
+        return wrapper
+
+    def _on_notification(self, param):
+        if param.args[0] == NotificationCenter.userInfoDidLoad:
+            self._refresh(param.thisObject)
+
+    def _on_search_visibility(self, param):
+        menu = get_private_field(param.thisObject, "menu")
+        if menu is None:
+            return
+        item = menu.getItem(CALL_ITEM_ID)
+        if item is None:
+            return
+        # При открытом поиске прячем кнопку, при закрытии возвращаем, если она нужна.
+        if param.args[0]:
+            item.setVisibility(View.GONE)
+        else:
+            item.setVisibility(View.VISIBLE if self._wanted.get(item.hashCode(), False) else View.GONE)
+
+    def _on_show_sub_item(self, param):
+        call_ids = self._headers.get(param.thisObject.hashCode())
+        if call_ids and param.args[0] in call_ids:
+            param.setResult(None)
+
+    def _on_toggle_sub_menu(self, param):
+        header = param.thisObject
+        if header.hashCode() in self._headers:
+            self._hide_menu_call(header)
+
+    # ---------- core ----------
+
+    def _refresh(self, fragment):
+        action_bar = fragment.getActionBar()
+        if action_bar is None:
+            return
+        menu = action_bar.createMenu()
+        item = menu.getItem(CALL_ITEM_ID)
+
+        wanted = self._should_show(fragment)
+        if item is None and not wanted:
+            return
+        if item is None:
+            item = self._create_item(fragment, menu)
+            if item is None:
+                return
+
+        self._wanted[item.hashCode()] = wanted
+        visible = wanted and not action_bar.isSearchFieldVisible()
+        item.setVisibility(View.VISIBLE if visible else View.GONE)
+
+        header = get_private_field(fragment, "headerItem")
+        if header is None:
+            return
+        if wanted:
+            self._fix_title_margin(fragment)
+            self._hide_menu_call(header)
+        else:
+            self._headers.pop(header.hashCode(), None)
+
+    def _hide_menu_call(self, header):
+        call_ids = self._find_menu_call_ids(header)
+        self._headers[header.hashCode()] = call_ids
+        for call_id in call_ids:
+            header.hideSubItem(call_id)
+
+    def _find_menu_call_ids(self, header) -> set:
+        """Ищем пункт «Позвонить» по тексту: id в форке может не совпадать с оффтг."""
+        title = self._get_call_title()
+        ids = set()
+
+        lazy_map = get_private_field(header, "lazyMap")
+        if lazy_map is not None:
+            for lazy in lazy_map.values().toArray():
+                text = get_private_field(lazy, "text")
+                if text is not None and str(text) == title:
+                    ids.add(int(get_private_field(lazy, "id")))
+
+        popup = get_private_field(header, "popupLayout")
+        if popup is not None:
+            for i in range(popup.getItemsCount()):
+                view = popup.getItemAt(i)
+                text_view = getattr(view, "getTextView", None)
+                tag = view.getTag()
+                if text_view is None or tag is None:
+                    continue
+                text = text_view().getText()
+                if text is not None and str(text) == title:
+                    ids.add(int(tag))
+
+        if not ids:
+            ids.add(self._get_static_call_id())
+        return ids
+
+    def _should_show(self, fragment) -> bool:
+        user = get_private_field(fragment, "currentUser")
+        if user is None or user.self:
+            return False
+        if fragment.isInPreviewMode():
+            return False
+        chat_mode = get_private_field(fragment, "chatMode")
+        if chat_mode is not None and chat_mode != 0:
+            return False
+        # Если форк сам показывает свою кнопку — не дублируем.
+        native = get_private_field(fragment, "audioCallIconItem")
+        if native is not None and native.getVisibility() == View.VISIBLE:
+            return False
+        user_full = fragment.getMessagesController().getUserFull(user.id)
+        return user_full is not None and bool(user_full.phone_calls_available)
+
+    def _create_item(self, fragment, menu):
+        icon = self._get_icon_res()
+        if not icon:
+            self.log("Call icon resource not found")
+            return None
+
+        theme = get_private_field(fragment, "themeDelegate")
+        item = menu.addItem(CALL_ITEM_ID, icon, theme) if theme is not None else menu.addItem(CALL_ITEM_ID, icon)
+
+        # Ставим кнопку перед «три точки», как в официальном клиенте.
+        header = get_private_field(fragment, "headerItem")
+        index = menu.indexOfChild(header) if header is not None else -1
+        if index >= 0:
+            menu.removeView(item)
+            menu.addView(item, index)
+
+        item.setContentDescription(self._get_call_title())
+        item.setOnClickListener(OnClickListener(lambda v: self._start_call(fragment)))
+        return item
+
+    def _start_call(self, fragment):
+        try:
+            user = get_private_field(fragment, "currentUser")
+            activity = fragment.getParentActivity()
+            if user is None or activity is None:
+                return
+            user_full = fragment.getMessagesController().getUserFull(user.id)
+            can_video = user_full is not None and bool(user_full.video_calls_available)
+            VoIPHelper.startCall(user, False, can_video, activity, user_full, fragment.getAccountInstance())
+        except Exception as e:
+            self.log(f"Failed to start call: {e}")
+
+    def _fix_title_margin(self, fragment):
+        # Официальный клиент увеличивает правый отступ заголовка, когда видна кнопка звонка.
+        avatar = get_private_field(fragment, "avatarContainer")
+        if avatar is None:
+            return
+        lp = avatar.getLayoutParams()
+        target = AndroidUtilities.dp(92)
+        if lp is not None and hasattr(lp, "rightMargin") and lp.rightMargin < target:
+            lp.rightMargin = target
+            avatar.setLayoutParams(lp)
+
+    # ---------- helpers ----------
+
+    def _get_icon_res(self) -> int:
+        if self._icon_res:
+            return self._icon_res
+        context = ApplicationLoader.applicationContext
+        resources = context.getResources()
+        package = context.getPackageName()
+        for name in ICON_CANDIDATES:
+            res = resources.getIdentifier(name, "drawable", package)
+            if res:
+                self._icon_res = res
+                return res
+        return 0
+
+    def _get_call_title(self) -> str:
+        if self._call_title is None:
+            self._call_title = "Call"
+            try:
+                context = ApplicationLoader.applicationContext
+                res = context.getResources().getIdentifier("Call", "string", context.getPackageName())
+                if res:
+                    self._call_title = str(LocaleController.getString(res))
+            except Exception:
+                pass
+        return self._call_title
+
+    def _get_static_call_id(self) -> int:
+        if self._static_call_id is None:
+            value = None
+            try:
+                value = get_static_private_field(find_class("org.telegram.ui.ChatActivity"), "call")
+            except Exception:
+                pass
+            self._static_call_id = int(value) if value is not None else FALLBACK_MENU_CALL_ID
+        return self._static_call_id
