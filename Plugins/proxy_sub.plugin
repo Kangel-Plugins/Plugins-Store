@@ -1,164 +1,242 @@
+import hashlib
 import ipaddress
+import json
+import os
+import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
+
+from android.content import Intent
+from android.net import Uri
 from android_utils import log, run_on_ui_thread
-from base_plugin import BasePlugin, MethodHook
-from client_utils import PLUGINS_QUEUE, get_user_config, run_on_queue, send_message
-from hook_utils import get_private_field
-from ui.bulletin import BulletinHelper
-from java import dynamic_proxy, jclass
-from java.lang import Integer
+from base_plugin import BasePlugin
+from client_utils import PLUGINS_QUEUE, get_user_config, run_on_queue, send_document, send_message
+from java import jclass
 from org.telegram.tgnet import TLRPC
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector, Switch, Text
 
 __id__ = "proxy_sub"
 __name__ = "Proxy Sub"
-__description__ = "Добавляет кнопку получения свежих прокси в соответствующем меню, а также их экспорт в избранное.\nВАЖНО: после обновления списка необходимо перезапустить клиент."
+__description__ = "Загружает список прокси MTProto и WebProxy из удалённого источника и добавляет их в ваш клиент.\n\nВозможности:\n • Выбор источника (GitVerse / GitHub) с автофоллбэком\n • Фильтрация типов прокси через настройки плагина\n • Экспорт текущего списка прокси в Избранное (сообщением или файлом, если список большой)"
 __author__ = "@akresik"
-__version__ = "1.0.1"
-__min_version__ = "12.1.1"
+__version__ = "2.0.0"
+__min_version__ = "12.10.5"
 __icon__ = "OliverEmoji/21"
 
-def _shared_config():
-    return jclass("org.telegram.messenger.SharedConfig")
+def _parse_entry(entry):
+    server = entry.get("server")
+    if not server:
+        return None
+    secret = entry.get("secret", "")
+    via = entry.get("via")
+    if via:
+        return {"type": "web", "via": via, "server": server, "secret": secret}
+    port = entry.get("port")
+    if not port:
+        return None
+    subtype = "faketls" if secret.lower().startswith("ee") else "padding"
+    return {"type": "mtproto", "subtype": subtype, "server": server, "port": int(port), "secret": secret}
 
-def _parse_proxy(line):
-    if not (line := line.strip()) or not line.startswith("tg://proxy"): return None
-    try:
-        p = parse_qs(urlparse(line).query)
-        host, port = p.get("server", [None])[0], p.get("port", [None])[0]
-        if host and port: return {"host": host, "port": int(port), "secret": p.get("secret", [""])[0]}
-    except Exception: pass
-    return None
+def _proxy_key(p):
+    if p["type"] == "web":
+        return f"web:{p['server']}:{p['secret']}"
+    return f"mtproto:{p['server']}:{p['port']}:{p['secret']}"
 
-def _apply_icon(cell, tv_name, icon_name):
+def _build_uri(p):
+    if p["type"] == "web":
+        return f"tg://webproxy?server={p['server']}&secret={p['secret']}"
+    return f"tg://proxy?server={p['server']}&port={p['port']}&secret={p['secret']}"
+
+def _mtp_sort_key(e):
     try:
-        tv = get_private_field(cell, tv_name)
-        ctx = cell.getContext()
-        res_id = ctx.getResources().getIdentifier(icon_name, "drawable", ctx.getPackageName())
-        if not tv or not res_id: return
-        Theme = jclass("org.telegram.ui.ActionBar.Theme")
-        drawable = ctx.getResources().getDrawable(res_id).mutate()
-        drawable.setColorFilter(jclass("android.graphics.PorterDuffColorFilter")(
-            Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon), 
-            jclass("android.graphics.PorterDuff").Mode.MULTIPLY
-        ))
-        is_rtl = jclass("org.telegram.messenger.LocaleController").isRTL
-        tv.setCompoundDrawablesWithIntrinsicBounds(None, None, drawable, None) if is_rtl else tv.setCompoundDrawablesWithIntrinsicBounds(drawable, None, None, None)
-        tv.setCompoundDrawablePadding(jclass("org.telegram.messenger.AndroidUtilities").dp(16))
-    except: pass
+        ip_key = (0, int(ipaddress.ip_address(e["addr"])))
+    except Exception:
+        ip_key = (1, e["addr"])
+    return (ip_key, e["port"], len(e["secret"]), e["secret"])
+
+def _web_sort_key(line):
+    p = parse_qs(urlparse(line).query)
+    return (p.get("server", [""])[0], p.get("secret", [""])[0])
 
 class ProxyManagerPlugin(BasePlugin):
-    def on_plugin_load(self):
+    def create_settings(self):
+        return [
+            Header(text="Действия"),
+            Text(text="Получить новый список", icon="msg_download", on_click=lambda v: self._fetch_proxies()),
+            Text(text="Экспортировать прокси", icon="msg_share", on_click=lambda v: self._export_proxies()),
+            Divider(text="Выберите ниже типы прокси, которые хотите получать. Подробную информацию о получаемых прокси и протоколах можно просмотреть на [сайте](https://proxy.akres.xyz), если не открывается — попробуйте [зеркало](https://akres.gitverse.site/proxy)"),
+            Header(text="MTProto"),
+            Switch(key="mtproto_faketls", text="FakeTLS", default=True),
+            Switch(key="mtproto_padding", text="Padding", default=True),
+            Header(text="WebProxy"),
+            Switch(key="web_websocket", text="WebSocket", default=True),
+            Switch(key="web_websocket_lanes", text="WebSocket-Lanes", default=True),
+            Switch(key="web_https", text="HTTPS", default=True),
+            Switch(key="web_https_lanes", text="HTTPS-Lanes", default=True),
+            Header(text="Источник"),
+            Selector(key="proxy_source", text="Источник прокси", icon="msg_link", default=0, items=["GitVerse", "GitHub"]),
+        ]
+
+    def _open_url(self, url):
         try:
-            ActivityCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxyListActivity")
-            AdapterCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxyListActivity$ListAdapter")
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
         except Exception as e:
-            return log(f"[PS] class not found: {e}")
-        plugin = self
-        def _get_orig_count(param):
-            act = get_private_field(param.thisObject, "this$0")
-            return int(get_private_field(act, "rowCount")) if act else None
+            log(f"[PS] open_url error: {e}")
 
-        class CountHook(MethodHook):
-            def after_hooked_method(self, param):
-                param.setResult(Integer(int(param.getResult()) + 3))
-
-        class ViewTypeHook(MethodHook):
-            def before_hooked_method(self, param):
-                if (orig := _get_orig_count(param)) is not None and (pos := int(param.args[0])) >= orig:
-                    param.setResult(Integer(0 if pos - orig == 0 else 1))
-
-        class BindHook(MethodHook):
-            def before_hooked_method(self, param):
-                if (orig := _get_orig_count(param)) is not None and int(param.args[1]) >= orig:
-                    param.setResult(None)
-            def after_hooked_method(self, param):
-                if (orig := _get_orig_count(param)) is None or (pos := int(param.args[1])) < orig: return
-                cell, cpos = param.args[0].itemView, pos - orig
-                try:
-                    if cpos == 1:
-                        cell.setText("Получить новый список", True)
-                        _apply_icon(cell, "textView", "msg_download")
-                    elif cpos == 2:
-                        cell.setText("Экспортировать прокси", False)
-                        _apply_icon(cell, "textView", "msg_share")
-                except Exception: pass
-
-        class ClickHook(MethodHook):
-            def after_hooked_method(self, param):
-                act = param.thisObject
-                try:
-                    lv = get_private_field(act, "listView")
-                    old_l = get_private_field(lv, "onItemClickListener")
-                    if old_l and "PMClickListener" in str(old_l.getClass().getName()): return
-                    class PMClickListener(dynamic_proxy(jclass("org.telegram.ui.Components.RecyclerListView$OnItemClickListener"))):
-                        def __init__(self): super().__init__()
-                        def onItemClick(self, view, pos):
-                            orig = int(get_private_field(act, "rowCount"))
-                            if pos < orig: return old_l.onItemClick(view, pos) if old_l else None
-                            if pos - orig == 1: plugin._fetch_proxies()
-                            elif pos - orig == 2: plugin._export_proxies()
-                    lv.setOnItemClickListener(PMClickListener())
-                except Exception: pass
-
-        for m in ActivityCls.getDeclaredMethods():
-            if m.getName() == "createView": self.hook_method(m, ClickHook())
-        for m in AdapterCls.getDeclaredMethods():
-            if m.getName() == "getItemCount": self.hook_method(m, CountHook())
-            elif m.getName() == "getItemViewType": self.hook_method(m, ViewTypeHook())
-            elif m.getName() == "onBindViewHolder" and len(m.getParameterTypes()) == 2: self.hook_method(m, BindHook())
+    def _is_allowed(self, p):
+        if p["type"] == "mtproto":
+            if p["subtype"] == "faketls": return self.get_setting("mtproto_faketls", True)
+            if p["subtype"] == "padding": return self.get_setting("mtproto_padding", True)
+        if p["type"] == "web":
+            via = p["via"]
+            if via == "websocket": return self.get_setting("web_websocket", True)
+            if via == "websocket-lanes": return self.get_setting("web_websocket_lanes", True)
+            if via == "https": return self.get_setting("web_https", True)
+            if via == "https-lanes": return self.get_setting("web_https_lanes", True)
+        return True
 
     def _fetch_proxies(self):
         BulletinHelper.show_info("Загружаем список прокси…")
         run_on_queue(self._do_fetch, PLUGINS_QUEUE)
 
     def _do_fetch(self):
+        source_idx = self.get_setting("proxy_source", 0)
+        urls = [
+            "https://gitverse.ru/api/repos/Akres/Proxy/raw/branch/master/proxies.json",
+            "https://github.com/theakres/Proxy/raw/main/proxies.json",
+        ]
+        raw = None
+        for idx in [source_idx, 1 - source_idx]:
+            try:
+                with urllib.request.urlopen(urls[idx], timeout=8) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                break
+            except Exception as e:
+                log(f"[PS] source {idx} failed: {e}")
+        if raw is None:
+            return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить прокси из всех источников"))
         try:
-            with urllib.request.urlopen("https://gitverse.ru/api/repos/Akres/Proxy/raw/branch/master/proxies.txt", timeout=15) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
+            entries = json.loads(raw)
         except Exception as e:
-            return run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка загрузки: {e}"))
-        parsed = {f"{p['host']}:{p['port']}:{p.get('secret', '')}": p for l in raw.splitlines() if (p := _parse_proxy(l))}
-        SC = _shared_config()
-        try: existing = {f"{p.address}:{p.port}:{p.secret or ''}" for i in range(SC.proxyList.size()) if (p := SC.proxyList.get(i))}
-        except Exception: existing = set()
-        added = duplicates = 0
+            return run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка парсинга JSON: {e}"))
+        parsed = {}
+        for entry in entries:
+            p = _parse_entry(entry)
+            if p and self._is_allowed(p):
+                parsed[_proxy_key(p)] = p
+        SC = jclass("org.telegram.messenger.SharedConfig")
+        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+        SC.loadProxyList()
+        existing = set()
+        try:
+            for i in range(PC.getProxyList().size()):
+                try:
+                    s = PC.getProxyList().get(i).settings
+                    addr = str(s.getAddress())
+                    port = int(s.getPort())
+                    secret = str(s.getSecret()) if s.getSecret() else ""
+                    if str(s.getType()) == "WEB":
+                        existing.add(f"web:{addr}:{secret}")
+                    else:
+                        existing.add(f"mtproto:{addr}:{port}:{secret}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+        Uri = jclass("android.net.Uri")
+        PS = jclass("org.telegram.utils.proxy.ProxySettings")
+        added = duplicates = skipped = 0
         for key, p in parsed.items():
-            if key in existing:
+            chk = f"web:{p['server']}:{p['secret']}" if p["type"] == "web" else f"mtproto:{p['server']}:{p['port']}:{p['secret']}"
+            if chk in existing:
                 duplicates += 1
                 continue
             try:
-                SC.addProxy(ProxyInfo(p["host"], p["port"], "", "", p.get("secret", "")))
-                existing.add(key)
+                ps = PS.fromUri(Uri.parse(_build_uri(p)))
+                if ps is None:
+                    skipped += 1
+                    continue
+                PC.addProxy(ProxyInfo(ps))
+                existing.add(chk)
                 added += 1
-            except Exception as e: log(f"[PS] addProxy error: {e}")
-        run_on_ui_thread(lambda: BulletinHelper.show_success(f"Добавлено: {added}. Уже было: {duplicates}."))
+            except Exception as e:
+                log(f"[PS] addProxy error ({p['server']}): {e}")
+                skipped += 1
+        msg = f"Добавлено: {added}. Уже было: {duplicates}."
+        if skipped:
+            msg += f" Пропущено: {skipped}."
+        run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
 
     def _export_proxies(self):
         run_on_queue(self._do_export, PLUGINS_QUEUE)
 
     def _do_export(self):
         try:
-            SC = _shared_config()
+            SC = jclass("org.telegram.messenger.SharedConfig")
+            PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
             SC.loadProxyList()
-            if not SC.proxyList or SC.proxyList.size() == 0:
+            pl = PC.getProxyList()
+            if not pl or pl.size() == 0:
                 return run_on_ui_thread(lambda: BulletinHelper.show_info("Нет прокси для экспорта."))
-            proxies = []
-            for i in range(SC.proxyList.size()):
-                p = SC.proxyList.get(i)
-                proxies.append({"host": str(p.address), "port": int(p.port), "secret": str(p.secret) if p.secret else ""})
-            def sort_key(p):
-                try: h_val = (0, ipaddress.ip_address(p['host']).version, ipaddress.ip_address(p['host']))
-                except ValueError: h_val = (1, 0, p['host'])
-                return (h_val, p['port'], len(p['secret']), p['secret'])
-            lines = [f"tg://proxy?server={p['host']}&port={p['port']}&secret={p['secret']}" for p in sorted(proxies, key=sort_key)]
-            if not lines: return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сформировать список."))
-            txt = "\n".join(lines)
+            faketls, padding, web = [], [], []
+            for i in range(pl.size()):
+                try:
+                    s = pl.get(i).settings
+                    addr = str(s.getAddress())
+                    port = int(s.getPort())
+                    secret = str(s.getSecret()) if s.getSecret() else ""
+                    if str(s.getType()) == "WEB":
+                        web.append(f"tg://webproxy?server={addr}&secret={secret}")
+                    else:
+                        e = {"addr": addr, "port": port, "secret": secret,
+                             "line": f"tg://proxy?server={addr}&port={port}&secret={secret}"}
+                        (faketls if secret.startswith("ee") else padding).append(e)
+                except Exception:
+                    pass
+            faketls.sort(key=_mtp_sort_key)
+            padding.sort(key=_mtp_sort_key)
+            web.sort(key=_web_sort_key)
+            sections = []
+            if faketls: sections.append("FakeTLS (MTP):\n" + "\n".join(e["line"] for e in faketls))
+            if padding: sections.append("Padding (MTP):\n" + "\n".join(e["line"] for e in padding))
+            if web: sections.append("WebProxy:\n" + "\n".join(web))
+            if not sections:
+                return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сформировать список."))
+            txt = "\n\n".join(sections)
+            total = len(faketls) + len(padding) + len(web)
+            entities = []
+            offset = 0
+            for section in sections:
+                bold = TLRPC.TL_messageEntityBold()
+                bold.offset = offset
+                bold.length = section.index("\n")
+                entities.append(bold)
+                offset += len(section.encode("utf-16-le")) // 2 + 2
             q = TLRPC.TL_messageEntityBlockquote()
-            q.collapsed, q.offset, q.length = True, 0, len(txt.encode("utf-16-le")) // 2
-            send_message({"peer": get_user_config().getClientUserId(), "message": txt, "entities": [q]})
-            run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {len(lines)} прокси в Избранное."))
+            q.collapsed = True
+            q.offset = 0
+            q.length = len(txt.encode("utf-16-le")) // 2
+            entities.append(q)
+            peer = get_user_config().getClientUserId()
+            if len(txt.encode("utf-16-le")) // 2 <= 4096:
+                send_message({"peer": peer, "message": txt, "entities": entities})
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {total} прокси в Избранное."))
+            else:
+                suffix = hashlib.sha1(str(time.time()).encode()).hexdigest()[:7]
+                fname = f"proxy-{suffix}.txt"
+                fpath = os.path.join(
+                    jclass("org.telegram.messenger.ApplicationLoader").applicationContext.getCacheDir().getAbsolutePath(),
+                    fname
+                )
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                send_document(peer, fpath)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {total} прокси файлом в Избранное."))
         except Exception as e:
             log(f"[PS] export error: {e}")
             run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка экспорта: {e}"))
