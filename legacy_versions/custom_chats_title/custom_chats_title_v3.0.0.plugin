@@ -1,0 +1,421 @@
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from android_utils import copy_to_clipboard, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from ui.settings import Divider, Header, Input, Text
+
+__id__ = "custom_chats_title"
+__name__ = "Custom Header"
+__description__ = "Replaces the exteraGram / AyuGram title above the chat list with your own text. A separate title can be set for every account."
+__author__ = "@l_limon_l"
+__version__ = "3.0.0"
+__icon__ = "limPlugIc/0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+# Account 0 keeps the key used by 1.x/2.x so existing titles survive the update.
+SETTING_KEY = "custom_chats_title"
+
+# Stock chat-list titles, compared case-insensitively. Titles produced by
+# exteraGram's own LocaleUtils.getActionBarTitle() are learned at runtime.
+STOCK_TITLES = {"exteragram", "ayugram", "telegram"}
+
+DIALOGS_ACTIVITY = "org.telegram.ui.DialogsActivity"
+STORIES_CELL = "org.telegram.ui.Stories.DialogStoriesCell"
+ACTION_BAR = "org.telegram.ui.ActionBar.ActionBar"
+ANIMATED_TEXT_VIEW = "org.telegram.ui.Components.AnimatedTextView"
+LOCALE_UTILS = "com.exteragram.messenger.utils.LocaleUtils"
+
+# 2.x allowed emoji markup in the title; saved values keep only the fallback text.
+LEGACY_EMOJI_TAG = re.compile(r'<emoji\s+(?:document_)?id="\d+"\s*>(.*?)</emoji>|<e:\d+:(.*?)>', re.IGNORECASE | re.DOTALL)
+
+LINKS = {
+    "tg": "https://t.me/l_limon_l",
+    "fakecrime": "https://fakecrime.bio/l_limon_l",
+    "ezbio": "https://e-z.bio/l_limon_l",
+}
+
+STRINGS: Dict[str, Dict[str, str]] = {
+    "en": {
+        "header": "Chats header",
+        "input": "Header text",
+        "input_sub": "Leave empty to keep the standard title",
+        "hint": "Changes apply instantly. The premium star, emoji status or gift next to the title stays in place.",
+        "account": "Account {n}",
+        "about": "Author & feedback",
+        "tg": "Ideas and suggestions — write on TG",
+        "fakecrime": "Socials & contacts (FakeCrime)",
+        "ezbio": "Socials & contacts (E-Z Bio)",
+    },
+    "ru": {
+        "header": "Заголовок списка чатов",
+        "input": "Текст в шапке",
+        "input_sub": "Оставьте пустым, чтобы вернуть стандартный заголовок",
+        "hint": "Изменения применяются сразу. Звезда премиума, эмодзи-статус или подарок рядом с заголовком остаются на месте.",
+        "account": "Аккаунт {n}",
+        "about": "Автор и обратная связь",
+        "tg": "Идеи и предложения — пишите в ТГ",
+        "fakecrime": "Соцсети и контакты (FakeCrime)",
+        "ezbio": "Соцсети и контакты (E-Z Bio)",
+    },
+}
+
+
+def _field(obj: Any, name: str) -> Any:
+    if obj is None:
+        return None
+    try:
+        return get_private_field(obj, name)
+    except Exception:
+        return None
+
+
+def _text(value: Any) -> str:
+    return str(value) if value is not None else ""
+
+
+def _java_list(items: Any) -> List[Any]:
+    """Java List -> Python list; Chaquopy here does not make ArrayList iterable."""
+    if items is None:
+        return []
+    return [items.get(i) for i in range(items.size())]
+
+
+def _class_name(obj: Any) -> str:
+    try:
+        return obj.getClass().getName()
+    except Exception:
+        return type(obj).__name__
+
+
+def _is_a(obj: Any, class_name: str) -> bool:
+    """instanceof by name, walking superclasses; the app often uses anonymous subclasses."""
+    if obj is None:
+        return False
+    try:
+        cls = obj.getClass()
+        while cls is not None:
+            if cls.getName() == class_name:
+                return True
+            cls = cls.getSuperclass()
+    except Exception:
+        pass
+    return False
+
+
+class TitleArgHook(MethodHook):
+    """Swaps the title argument (args[0]) for whatever the resolver returns."""
+
+    def __init__(self, plugin: "CustomHeaderPlugin", resolve, label: str):
+        self.plugin = plugin
+        self.resolve = resolve
+        self.label = label
+
+    def before_hooked_method(self, param):
+        try:
+            replacement = self.resolve(param.thisObject, param.args[0])
+        except Exception as e:
+            self.plugin.log_error(self.label, e)
+            return
+        if replacement is not None:
+            param.args[0] = replacement
+
+
+class LocaleTitleHook(MethodHook):
+    """exteraGram builds the chat-list title here; swap the result at the source."""
+
+    def __init__(self, plugin: "CustomHeaderPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            account = next((a for a in param.args if isinstance(a, int)), None)
+            replacement = self.plugin.resolve_locale_title(account, param.getResult())
+        except Exception as e:
+            self.plugin.log_error("LocaleUtils.getActionBarTitle", e)
+            return
+        if replacement is not None:
+            param.setResult(replacement)
+
+
+class CustomHeaderPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.active = True
+        self.unhooks: List[Any] = []
+        self.logged_errors: Set[str] = set()
+        self.stock_titles: Set[str] = set()         # lowercase stock titles seen at runtime
+        self.stock_by_account: Dict[int, Any] = {}  # original title each account had before replacement
+        self.applied: Set[str] = set()              # every custom title shown
+        self.stories_parents: Dict[str, bool] = {}  # class name -> is a DialogStoriesCell
+
+        locale_utils = find_class(LOCALE_UTILS)
+        if locale_utils:
+            self.hook_all(locale_utils, "getActionBarTitle", LocaleTitleHook(self))
+
+        action_bar = find_class(ACTION_BAR)
+        if action_bar:
+            hook = TitleArgHook(self, self.resolve_action_bar_title, "ActionBar.setTitle")
+            self.hook_all(action_bar, "setTitle", hook)
+            self.hook_all(action_bar, "setTitleAnimated", hook)
+
+        text_view = find_class(ANIMATED_TEXT_VIEW)
+        if text_view:
+            self.hook_stories_title(text_view)
+
+        self.refresh()
+
+    def on_plugin_unload(self):
+        self.active = False
+        for unhook in self.unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self.unhooks = []
+        self.refresh()
+
+    def log_error(self, where: str, error: Exception):
+        key = f"{where}: {error!r}"
+        if key not in self.logged_errors:
+            self.logged_errors.add(key)
+            self.log(key)
+
+    # region Hooks
+
+    def hook_all(self, cls: Any, method: str, handler: MethodHook):
+        try:
+            self.unhooks.extend(self.hook_all_methods(cls, method, handler) or [])
+        except Exception as e:
+            self.log_error(f"hook {method}", e)
+
+    def hook_stories_title(self, text_view: Any):
+        hook = TitleArgHook(self, self.resolve_stories_title, "AnimatedTextView.setText")
+        try:
+            # Every setText overload funnels into setText(CharSequence, boolean, boolean).
+            from java.lang import Boolean
+            method = text_view.getDeclaredMethod("setText", find_class("java.lang.CharSequence"), Boolean.TYPE, Boolean.TYPE)
+            unhook = self.hook_method(method, hook)
+            if unhook:
+                self.unhooks.append(unhook)
+                return
+        except Exception:
+            pass
+        self.hook_all(text_view, "setText", hook)
+
+    def resolve_locale_title(self, account: Optional[int], title: Any) -> Optional[str]:
+        self.remember_stock(title)
+        if account is None:
+            account = self.selected_account()
+        custom = self.custom_title(account)
+        if custom is not None:
+            self.stock_by_account[account] = title
+        return custom
+
+    def resolve_action_bar_title(self, action_bar: Any, title: Any) -> Optional[str]:
+        fragment = _field(action_bar, "parentFragment")
+        if not _is_a(fragment, DIALOGS_ACTIVITY) or not self.is_stock(title):
+            return None
+        account = fragment.getCurrentAccount()
+        custom = self.custom_title(account)
+        if custom is not None:
+            self.stock_by_account[account] = title
+        return custom
+
+    def resolve_stories_title(self, view: Any, title: Any) -> Optional[str]:
+        # With bottom tabs the visible title is the stories cell's titleView, not the action bar.
+        cell = view.getParent()
+        if cell is None:
+            return None
+        name = _class_name(cell)
+        is_cell = self.stories_parents.get(name)
+        if is_cell is None:
+            is_cell = self.stories_parents[name] = _is_a(cell, STORIES_CELL)
+        if not is_cell or not self.is_stock(title):
+            return None
+        return self.custom_title(self.account_of(cell))
+
+    # endregion
+
+    # region Titles
+
+    def setting_key(self, account: int) -> str:
+        return SETTING_KEY if account == 0 else f"{SETTING_KEY}_{account}"
+
+    @staticmethod
+    def selected_account() -> int:
+        from org.telegram.messenger import UserConfig
+        return UserConfig.selectedAccount
+
+    def account_of(self, obj: Any) -> int:
+        account = _field(obj, "currentAccount")
+        return int(account) if account is not None else self.selected_account()
+
+    def remember_stock(self, title: Any):
+        text = _text(title).strip()
+        if text and text not in self.applied:
+            self.stock_titles.add(text.lower())
+
+    def is_stock(self, title: Any) -> bool:
+        text = _text(title).strip().lower()
+        return bool(text) and (text in STOCK_TITLES or text in self.stock_titles)
+
+    def custom_title(self, account: int) -> Optional[str]:
+        """Custom title for the account, or None to keep the stock one."""
+        if not self.active:
+            return None
+        raw = _text(self.get_setting(self.setting_key(account), ""))
+        title = LEGACY_EMOJI_TAG.sub(lambda m: m.group(1) or m.group(2) or "", raw).strip()
+        if not title:
+            return None
+        self.applied.add(title)
+        return title
+
+    # endregion
+
+    # region Live refresh
+
+    def refresh(self):
+        run_on_ui_thread(self.refresh_now)
+
+    def refresh_now(self):
+        try:
+            fragments = self.dialogs_fragments()
+        except Exception as e:
+            self.log_error("refresh", e)
+            return
+        for fragment in fragments:
+            try:
+                self.refresh_action_bar(fragment)
+                self.refresh_stories(fragment)
+            except Exception as e:
+                self.log_error("refresh", e)
+
+    def dialogs_fragments(self) -> List[Any]:
+        from org.telegram.ui import LaunchActivity
+        launch = LaunchActivity.instance
+        if launch is None:
+            return []
+        found = []
+        for layout in (launch.getActionBarLayout(), launch.getRightActionBarLayout(), launch.getLayersActionBarLayout()):
+            if layout is None:
+                continue
+            for fragment in _java_list(layout.getFragmentStack()):
+                if not _is_a(fragment, DIALOGS_ACTIVITY):
+                    # With bottom tabs the chat list lives inside MainTabsActivity.
+                    try:
+                        fragment = fragment.getDialogsActivity()
+                    except Exception:
+                        continue
+                if fragment is not None and fragment not in found:
+                    found.append(fragment)
+        return found
+
+    def base_title(self, account: int, current: Any) -> Optional[Any]:
+        """Stock title to rebuild from, or None if the current title is not ours to touch."""
+        if _text(current) in self.applied:
+            return self.stock_by_account.get(account)
+        if not self.is_stock(current):
+            return None
+        self.stock_by_account[account] = current
+        return current
+
+    def refresh_action_bar(self, fragment: Any):
+        action_bar = fragment.getActionBar()
+        if action_bar is None:
+            return
+        account = fragment.getCurrentAccount()
+        base = self.base_title(account, _field(action_bar, "lastTitle"))
+        if base is None:
+            return
+        if _field(action_bar, "titleOverlayShown"):
+            # "Connecting…" is on screen: only swap the title it restores to.
+            set_private_field(action_bar, "lastTitle", self.custom_title(account) or base)
+        else:
+            # Goes through our hook; the right drawable (premium star, status, gift) is passed back untouched.
+            action_bar.setTitle(base, _field(action_bar, "lastRightDrawable"))
+
+    def refresh_stories(self, fragment: Any):
+        cell = _field(fragment, "dialogStoriesCell")
+        title_view = _field(cell, "titleView")
+        if title_view is None:
+            return
+        current = _field(cell, "currentTitle")
+        base = self.base_title(self.account_of(cell), current)
+        if base is None:
+            return
+        if base is not current:
+            set_private_field(cell, "currentTitle", base)
+        if not _field(cell, "hasOverlayText"):
+            title_view.setText(base, False)
+
+    # endregion
+
+    # region Settings
+
+    def tr(self, key: str, **kwargs: Any) -> str:
+        lang = "en"
+        try:
+            from org.telegram.messenger import LocaleController
+            if LocaleController.getInstance().getCurrentLocale().getLanguage().lower().startswith("ru"):
+                lang = "ru"
+        except Exception:
+            pass
+        return STRINGS[lang][key].format(**kwargs)
+
+    def accounts(self) -> List[Tuple[int, str]]:
+        result = []
+        try:
+            from org.telegram.messenger import UserConfig, UserObject
+            for account in range(UserConfig.MAX_ACCOUNT_COUNT):
+                config = UserConfig.getInstance(account)
+                if not config.isClientActivated():
+                    continue
+                user = config.getCurrentUser()
+                name = UserObject.getUserName(user) if user else ""
+                result.append((account, name or self.tr("account", n=account + 1)))
+        except Exception as e:
+            self.log_error("accounts", e)
+        return result or [(0, self.tr("account", n=1))]
+
+    def on_title_change(self, account: int, value: Any):
+        self.set_setting(self.setting_key(account), _text(value).strip())
+        self.refresh()
+
+    def open_link(self, name: str, view: Any = None):
+        url = LINKS[name]
+        try:
+            from org.telegram.messenger.browser import Browser
+            Browser.openUrl(view.getContext(), url)
+        except Exception:
+            copy_to_clipboard(url)
+
+    def create_settings(self) -> List[Any]:
+        accounts = self.accounts()
+        several = len(accounts) > 1
+        items: List[Any] = [Header(text=self.tr("header"))]
+        for account, name in accounts:
+            items.append(Input(
+                key=self.setting_key(account),
+                text=name if several else self.tr("input"),
+                subtext=self.tr("input_sub"),
+                default="",
+                icon="msg_text",
+                on_change=lambda value, account=account: self.on_title_change(account, value),
+            ))
+        items.append(Divider(text=self.tr("hint")))
+
+        items.append(Header(text=self.tr("about")))
+        for name, icon, accent in (("tg", "msg_discuss", True), ("fakecrime", "msg_info", False), ("ezbio", "msg_info", False)):
+            items.append(Text(
+                text=self.tr(name),
+                subtext=LINKS[name].split("://", 1)[1],
+                icon=icon,
+                accent=accent,
+                on_click=lambda view, name=name: self.open_link(name, view),
+            ))
+        items.append(Divider())
+        return items
+
+    # endregion
