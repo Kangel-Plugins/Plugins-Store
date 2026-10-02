@@ -1,0 +1,590 @@
+import json
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Divider, Switch, Text
+
+__id__ = "local_contact_override"
+__name__ = "Local Contact Override"
+__description__ = (
+    "Локальные имена для людей, ботов, групп и каналов. Меняется только отображение "
+    "на вашем устройстве. Редактор открывается из меню профиля или чата, "
+    "все правки собраны в настройках плагина, есть экспорт и импорт."
+)
+__author__ = "@daxo_os"
+__version__ = "7.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+
+USER_KEY = "overrides"
+CHAT_KEY = "chat_overrides"
+
+USER_FIELDS = ("first_name", "last_name", "username")
+CHAT_FIELDS = ("title", "username")
+META_FIELDS = ("was",)
+
+CHANNEL_OFFSET = 1000000000000
+MAX_SERVER_RELOADS = 20
+
+
+def _dialog_to_chat_id(dialog_id: int) -> int:
+    if dialog_id <= -CHANNEL_OFFSET:
+        return -CHANNEL_OFFSET - dialog_id
+    return -dialog_id
+
+
+class _CacheHook(MethodHook):
+    def __init__(self, plugin: "LocalContactOverridePlugin", kind: str, many: bool):
+        self.plugin = plugin
+        self.kind = kind
+        self.many = many
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if not plugin._on:
+            return
+        index = plugin._index[self.kind]
+        if not index:
+            return
+        try:
+            arg = param.args[0]
+            if arg is None:
+                return
+            if self.many:
+                for obj in arg:
+                    plugin.apply(self.kind, obj)
+            else:
+                plugin.apply(self.kind, arg)
+        except Exception as e:
+            plugin.log(f"cache hook ({self.kind}) failed: {e}")
+
+
+class LocalContactOverridePlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._users: Dict[str, Dict[str, str]] = self._read(USER_KEY)
+        self._chats: Dict[str, Dict[str, str]] = self._read(CHAT_KEY)
+        self._index: Dict[str, Dict[int, Dict[str, str]]] = {"user": {}, "chat": {}}
+        self._originals: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
+        self._on = bool(self.get_setting("enabled", True))
+        self._hooked = 0
+        self._reindex()
+        self._install_hooks()
+        self._install_menu()
+
+    # ---------- storage ----------
+
+    def _read(self, key: str) -> Dict[str, Dict[str, str]]:
+        try:
+            data = json.loads(self.get_setting(key, "{}"))
+            if isinstance(data, dict):
+                return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)}
+        except Exception as e:
+            self.log(f"failed to parse {key}: {e}")
+        return {}
+
+    def _store(self, kind: str) -> Dict[str, Dict[str, str]]:
+        return self._users if kind == "user" else self._chats
+
+    def _reindex(self):
+        for kind in ("user", "chat"):
+            self._index[kind] = {int(k): v for k, v in self._store(kind).items() if k.isdigit()}
+
+    def _flush(self, kind: str):
+        self._reindex()
+        key = USER_KEY if kind == "user" else CHAT_KEY
+        self.set_setting(key, json.dumps(self._store(kind), ensure_ascii=False), reload_settings=True)
+
+    # ---------- hooks ----------
+
+    def _install_hooks(self):
+        try:
+            raw = find_class("org.telegram.messenger.MessagesController")
+            if raw is None:
+                raise RuntimeError("MessagesController не найден")
+            table = (
+                ("putUser", "user", False),
+                ("putUsers", "user", True),
+                ("putChat", "chat", False),
+                ("putChats", "chat", True),
+            )
+            for method in raw.getClass().getDeclaredMethods():
+                for name, kind, many in table:
+                    if method.getName() == name:
+                        method.setAccessible(True)
+                        self.hook_method(method, _CacheHook(self, kind, many))
+                        self._hooked += 1
+            if self._hooked == 0:
+                raise RuntimeError("не найдено ни одной подходящей перегрузки")
+        except Exception:
+            self.log("hook install failed:\n" + traceback.format_exc())
+            BulletinHelper.show_error("Local Contact Override: не удалось поставить хуки, подробности в логе плагина")
+
+    def apply(self, kind: str, obj: Any):
+        override = self._index[kind].get(getattr(obj, "id", None))
+        if not override:
+            return
+        fields = USER_FIELDS if kind == "user" else CHAT_FIELDS
+        saved = None
+        for field in fields:
+            value = override.get(field)
+            if not value:
+                continue
+            current = getattr(obj, field, None)
+            if current != value:
+                if saved is None:
+                    saved = self._originals.setdefault((kind, str(obj.id)), {})
+                saved[field] = current
+                setattr(obj, field, value)
+
+    def _restore(self, kind: str, obj_id: str, account: int) -> bool:
+        saved = self._originals.pop((kind, obj_id), None)
+        if not saved:
+            return False
+        obj = self._cached(kind, obj_id, account)
+        if obj is None:
+            return False
+        for field, value in saved.items():
+            try:
+                setattr(obj, field, value)
+            except Exception as e:
+                self.log(f"restore {field} failed: {e}")
+        return True
+
+    # ---------- telegram helpers ----------
+
+    def _account(self) -> int:
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                return fragment.getCurrentAccount()
+        except Exception:
+            pass
+        try:
+            from org.telegram.messenger import UserConfig
+            return UserConfig.selectedAccount
+        except Exception:
+            return 0
+
+    def _cached(self, kind: str, obj_id: str, account: int):
+        try:
+            from org.telegram.messenger import MessagesController
+            controller = MessagesController.getInstance(account)
+            if kind == "user":
+                return controller.getUser(int(obj_id))
+            return controller.getChat(int(obj_id))
+        except Exception as e:
+            self.log(f"cache lookup failed: {e}")
+            return None
+
+    def _refresh_ui(self, account: int):
+        def run():
+            try:
+                from org.telegram.messenger import MessagesController, NotificationCenter
+                try:
+                    from java import jint
+                except Exception:
+                    jint = int
+
+                mask = (
+                    getattr(MessagesController, "UPDATE_MASK_NAME", 1)
+                    | getattr(MessagesController, "UPDATE_MASK_CHAT_NAME", 16)
+                    | getattr(MessagesController, "UPDATE_MASK_CHAT", 8192)
+                )
+                center = NotificationCenter.getInstance(account)
+                center.postNotificationName(NotificationCenter.updateInterfaces, jint(mask))
+                center.postNotificationName(NotificationCenter.dialogsNeedReload)
+            except Exception as e:
+                self.log(f"notification refresh failed: {e}")
+            self._rebind_open_chat()
+
+        run_on_ui_thread(run)
+
+    def _rebind_open_chat(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            getter = getattr(fragment, "getChatListView", None)
+            if getter is None:
+                return
+            view = getter()
+            adapter = view.getAdapter() if view is not None else None
+            if adapter is not None:
+                adapter.notifyDataSetChanged()
+        except Exception as e:
+            self.log(f"chat rebind failed: {e}")
+
+    def _reload_from_server(self, kind: str, obj_id: str, account: int):
+        try:
+            from org.telegram.messenger import MessagesController
+            controller = MessagesController.getInstance(account)
+            fragment = get_last_fragment()
+            guid = fragment.getClassGuid() if fragment is not None else 0
+            if kind == "user":
+                user = controller.getUser(int(obj_id))
+                if user is not None:
+                    controller.loadFullUser(user, guid, True)
+            else:
+                controller.loadFullChat(int(obj_id), guid, True)
+        except Exception as e:
+            self.log(f"server reload failed: {e}")
+
+    def _current_display(self, kind: str, obj_id: str, account: int) -> str:
+        saved = self._originals.get((kind, obj_id), {})
+        obj = self._cached(kind, obj_id, account)
+        if obj is None:
+            return ""
+
+        def pick(field):
+            return saved.get(field, getattr(obj, field, None)) or ""
+
+        if kind == "user":
+            return " ".join(x for x in (pick("first_name"), pick("last_name")) if x)
+        return pick("title")
+
+    def _display_name(self, kind: str, obj_id: str) -> str:
+        override = self._store(kind).get(obj_id, {})
+        if kind == "user":
+            name = " ".join(x for x in (override.get("first_name"), override.get("last_name")) if x)
+        else:
+            name = override.get("title", "")
+        if not name and override.get("username"):
+            name = "@" + override["username"]
+        return name or f"id {obj_id}"
+
+    # ---------- menu ----------
+
+    def _install_menu(self):
+        try:
+            from base_plugin import MenuItemData, MenuItemType
+        except Exception as e:
+            self.log(f"menu api unavailable: {e}")
+            return
+        for type_name in ("PROFILE_ACTION_MENU", "CHAT_ACTION_MENU"):
+            menu_type = getattr(MenuItemType, type_name, None)
+            if menu_type is None:
+                continue
+            try:
+                self.add_menu_item(
+                    MenuItemData(
+                        menu_type=menu_type,
+                        text="Локальное имя",
+                        icon="msg_edit",
+                        on_click=self._on_menu_click,
+                    )
+                )
+            except Exception as e:
+                self.log(f"menu item {type_name} failed: {e}")
+
+    def _on_menu_click(self, context: Any):
+        try:
+            target = self._resolve_target(context)
+            if target is None:
+                BulletinHelper.show_error("Не удалось определить собеседника")
+                return
+            kind, obj_id, account = target
+            self._show_editor(kind, obj_id, account)
+        except Exception:
+            self.log("menu click failed:\n" + traceback.format_exc())
+            BulletinHelper.show_error("Ошибка открытия редактора")
+
+    def _resolve_target(self, context: Any) -> Optional[Tuple[str, str, int]]:
+        def get(key):
+            if isinstance(context, dict):
+                return context.get(key)
+            return getattr(context, key, None)
+
+        account = get("account")
+        if not isinstance(account, int):
+            account = self._account()
+
+        user_id, chat_id, dialog_id = get("user_id"), get("chat_id"), get("dialog_id")
+        if user_id:
+            return "user", str(abs(int(user_id))), account
+        if chat_id:
+            return "chat", str(abs(int(chat_id))), account
+        if not dialog_id:
+            try:
+                dialog_id = get_last_fragment().getDialogId()
+            except Exception:
+                dialog_id = None
+        if dialog_id:
+            dialog_id = int(dialog_id)
+            if dialog_id > 0:
+                return "user", str(dialog_id), account
+            return "chat", str(_dialog_to_chat_id(dialog_id)), account
+        return None
+
+    # ---------- editor ----------
+
+    def _show_editor(self, kind: str, obj_id: str, account: int):
+        def build():
+            try:
+                from android.widget import EditText, LinearLayout, TextView
+                from android.text import InputType
+                from org.telegram.messenger import AndroidUtilities
+
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None:
+                    return
+
+                fields = USER_FIELDS if kind == "user" else CHAT_FIELDS
+                hints = {
+                    "first_name": "Имя",
+                    "last_name": "Фамилия",
+                    "title": "Название",
+                    "username": "username без @",
+                }
+                override = self._store(kind).get(obj_id, {})
+                cached = self._cached(kind, obj_id, account)
+                original = self._originals.get((kind, obj_id), {})
+                was = override.get("was") or self._current_display(kind, obj_id, account)
+
+                layout = LinearLayout(activity)
+                layout.setOrientation(LinearLayout.VERTICAL)
+                pad = AndroidUtilities.dp(20)
+                layout.setPadding(pad, AndroidUtilities.dp(8), pad, 0)
+
+                if was:
+                    info = TextView(activity)
+                    info.setText(f"Оригинал: {was}")
+                    info.setTextSize(14.0)
+                    layout.addView(info)
+
+                inputs: Dict[str, Any] = {}
+                for field in fields:
+                    edit = EditText(activity)
+                    edit.setHint(hints[field])
+                    edit.setSingleLine(True)
+                    edit.setInputType(InputType.TYPE_CLASS_TEXT)
+                    prefill = override.get(field)
+                    if not prefill and cached is not None:
+                        prefill = original.get(field, getattr(cached, field, None))
+                    if prefill:
+                        edit.setText(str(prefill))
+                    layout.addView(edit)
+                    inputs[field] = edit
+
+                def on_save(bld, which):
+                    values = {}
+                    for field, edit in inputs.items():
+                        text = str(edit.getText().toString()).strip()
+                        if field == "username":
+                            text = text.lstrip("@")
+                        if text:
+                            values[field] = text
+                    if values and was:
+                        values["was"] = was
+                    self._save_override(kind, obj_id, values, account)
+
+                def on_reset(bld, which):
+                    self._reset_override(kind, obj_id, account)
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("Локальное имя")
+                builder.set_view(layout)
+                builder.set_positive_button("Сохранить", on_save)
+                if obj_id in self._store(kind):
+                    builder.set_neutral_button("Сбросить", on_reset)
+                builder.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+                builder.show()
+            except Exception:
+                self.log("editor failed:\n" + traceback.format_exc())
+                BulletinHelper.show_error("Не удалось открыть редактор")
+
+        run_on_ui_thread(build)
+
+    def _save_override(self, kind: str, obj_id: str, values: Dict[str, str], account: int):
+        if not any(values.get(f) for f in (USER_FIELDS if kind == "user" else CHAT_FIELDS)):
+            self._reset_override(kind, obj_id, account)
+            return
+        store = self._store(kind)
+        previous = store.get(obj_id, {})
+        obj = self._cached(kind, obj_id, account)
+        saved = self._originals.get((kind, obj_id), {})
+        if obj is not None:
+            for field in list(previous):
+                if field not in values and field in saved:
+                    setattr(obj, field, saved.pop(field))
+        store[obj_id] = values
+        self._flush(kind)
+        if obj is not None and self._on:
+            self.apply(kind, obj)
+        self._refresh_ui(account)
+        BulletinHelper.show_success("Сохранено")
+
+    def _reset_override(self, kind: str, obj_id: str, account: int):
+        store = self._store(kind)
+        if obj_id not in store:
+            BulletinHelper.show_info("Для этого чата нет правок")
+            return
+        restored = self._restore(kind, obj_id, account)
+        del store[obj_id]
+        self._flush(kind)
+        self._refresh_ui(account)
+        if not restored:
+            self._reload_from_server(kind, obj_id, account)
+        BulletinHelper.show_success("Правка снята")
+
+    # ---------- settings ----------
+
+    def create_settings(self) -> List[Any]:
+        rows: List[Any] = [
+            Header(text="Local Contact Override"),
+            Switch(
+                key="enabled",
+                text="Применять правки",
+                default=True,
+                icon="msg_customize",
+                on_change=lambda value: self._on_toggle(bool(value)),
+            ),
+            Divider(text="Редактор открывается из меню профиля или чата, пункт «Локальное имя»."),
+            Header(text=f"Люди: {len(self._users)}"),
+        ]
+        for obj_id in self._users:
+            rows.append(self._entry_row("user", obj_id))
+        rows.append(Header(text=f"Группы и каналы: {len(self._chats)}"))
+        for obj_id in self._chats:
+            rows.append(self._entry_row("chat", obj_id))
+
+        rows.append(Divider())
+        rows.append(Text(text="Экспорт в буфер обмена", icon="msg_copy", on_click=lambda v: self._export()))
+        rows.append(Text(text="Импорт из буфера обмена", icon="msg_paste", on_click=lambda v: self._import()))
+        if self._users or self._chats:
+            rows.append(Text(text="Удалить все правки", icon="msg_delete", red=True, on_click=lambda v: self._confirm_clear()))
+        return rows
+
+    def _entry_row(self, kind: str, obj_id: str):
+        override = self._store(kind).get(obj_id, {})
+        was = override.get("was")
+        label = self._display_name(kind, obj_id)
+        text = f"{label} (было: {was})" if was else f"{label} ({obj_id})"
+        return Text(
+            text=text,
+            icon="msg_edit",
+            on_click=lambda v, k=kind, i=obj_id: self._show_editor(k, i, self._account()),
+        )
+
+    def _on_toggle(self, enabled: bool):
+        self._on = enabled
+        account = self._account()
+        reloads = 0
+        for kind in ("user", "chat"):
+            for obj_id in list(self._store(kind)):
+                if enabled:
+                    obj = self._cached(kind, obj_id, account)
+                    if obj is not None:
+                        self.apply(kind, obj)
+                elif not self._restore(kind, obj_id, account) and reloads < MAX_SERVER_RELOADS:
+                    reloads += 1
+                    self._reload_from_server(kind, obj_id, account)
+        self._refresh_ui(account)
+
+    def _confirm_clear(self):
+        def build():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None:
+                    return
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("Удалить все правки?")
+                builder.set_message("Все локальные имена будут сброшены.")
+                builder.set_positive_button("Удалить", lambda bld, which: self._clear_all())
+                builder.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+                builder.show()
+            except Exception as e:
+                self.log(f"confirm dialog failed: {e}")
+
+        run_on_ui_thread(build)
+
+    def _clear_all(self):
+        account = self._account()
+        reloads = 0
+        for kind in ("user", "chat"):
+            store = self._store(kind)
+            for obj_id in list(store):
+                if not self._restore(kind, obj_id, account) and reloads < MAX_SERVER_RELOADS:
+                    reloads += 1
+                    self._reload_from_server(kind, obj_id, account)
+            store.clear()
+            self._flush(kind)
+        self._refresh_ui(account)
+        BulletinHelper.show_success("Все правки удалены")
+
+    # ---------- export / import ----------
+
+    def _export(self):
+        payload = json.dumps({"users": self._users, "chats": self._chats}, ensure_ascii=False)
+
+        def run():
+            try:
+                from org.telegram.messenger import ApplicationLoader
+                from android.content import Context, ClipData
+
+                manager = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                manager.setPrimaryClip(ClipData.newPlainText("local_contact_override", payload))
+                BulletinHelper.show_success("Скопировано в буфер обмена")
+            except Exception as e:
+                self.log(f"export failed: {e}")
+                BulletinHelper.show_error("Не удалось скопировать")
+
+        run_on_ui_thread(run)
+
+    def _import(self):
+        def run():
+            try:
+                from org.telegram.messenger import ApplicationLoader
+                from android.content import Context
+
+                manager = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                clip = manager.getPrimaryClip()
+                if clip is None or clip.getItemCount() == 0:
+                    BulletinHelper.show_error("Буфер обмена пуст")
+                    return
+                text = str(clip.getItemAt(0).coerceToText(ApplicationLoader.applicationContext))
+                data = json.loads(text)
+                users = self._sanitize(data.get("users"), USER_FIELDS)
+                chats = self._sanitize(data.get("chats"), CHAT_FIELDS)
+                self._users.update(users)
+                self._chats.update(chats)
+                self._flush("user")
+                self._flush("chat")
+                account = self._account()
+                if self._on:
+                    for kind, store in (("user", users), ("chat", chats)):
+                        for obj_id in store:
+                            obj = self._cached(kind, obj_id, account)
+                            if obj is not None:
+                                self.apply(kind, obj)
+                self._refresh_ui(account)
+                BulletinHelper.show_success(f"Импортировано: {len(users) + len(chats)}")
+            except Exception as e:
+                self.log(f"import failed: {e}")
+                BulletinHelper.show_error("В буфере обмена нет корректных данных")
+
+        run_on_ui_thread(run)
+
+    @staticmethod
+    def _sanitize(raw: Any, allowed: Tuple[str, ...]) -> Dict[str, Dict[str, str]]:
+        result: Dict[str, Dict[str, str]] = {}
+        if not isinstance(raw, dict):
+            return result
+        for obj_id, entry in raw.items():
+            if not isinstance(entry, dict) or not str(obj_id).lstrip("-").isdigit():
+                continue
+            clean = {
+                f: str(entry[f]).strip()
+                for f in allowed + META_FIELDS
+                if entry.get(f) and str(entry[f]).strip()
+            }
+            if any(f in clean for f in allowed):
+                result[str(abs(int(obj_id)))] = clean
+        return result
