@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import traceback
@@ -5,25 +6,27 @@ from typing import Any, Callable, List
 
 from android.content import ContentValues
 from android.provider import MediaStore
-from android.widget import LinearLayout
+from android.webkit import MimeTypeMap
+from android.view import Gravity, ViewGroup
+from android.widget import FrameLayout, LinearLayout
 from android_utils import OnClickListener, log
 from base_plugin import BasePlugin, MethodHook
 from client_utils import run_on_queue
 from hook_utils import find_class, get_private_field
 from java.nio.file import Files
 from java.util import ArrayList
-from org.telegram.messenger import FileLoader
+from org.telegram.messenger import FileLoader, ImageLocation
 from org.telegram.messenger import R as R_tg
-from org.telegram.ui.ActionBar import ActionBarMenuItem, Theme
+from org.telegram.ui.ActionBar import ActionBar, ActionBarMenuItem, Theme
 from ui.bulletin import BulletinHelper
 
 __id__ = "save_selected_files"
 __name__ = "Save Selected Files"
-__description__ = "Добавляет кнопку сохранения в панель действий при выделении файлов в медиа-профиле (вкладка «Файлы») и в результатах поиска. Нажимаете её, и все выбранные файлы сохраняются в «Загрузки» в один клик. Если файл ещё не загружен, плагин докачает его сам."
-__author__ = "@akresik" # ну я то на деле ниче кроме метаданных сам не писал, все делал клодик. причем новый соннет 5.5 реально прикольный
-__version__ = "1.0.0"
+__description__ = "Добавляет кнопку сохранения в панель действий при выделении файлов в медиа-профиле (вкладки «Медиа» и «Файлы») в результатах поиска и в управлении кэшем (Настройки → Данные и память → Использование памяти). Нажимаете её, и все выбранные файлы сохраняются в «Загрузки» в один клик. Если файл ещё не загружен, плагин докачает его сам."
+__author__ = "@akresik"
+__version__ = "1.2.0"
 __icon__ = "Catz5Emoji/35"
-__min_version__ = "12.1.1"
+__min_version__ = "12.9.0"
 
 class AfterHook(MethodHook):
     def __init__(self, callback: Callable[[Any], None]):
@@ -43,6 +46,124 @@ class SaveSelectedFilesPlugin(BasePlugin):
         pager_class = find_class("org.telegram.ui.Components.SearchViewPager")
         if pager_class:
             self.hook_all_methods(pager_class, "showActionMode", AfterHook(self.inject_into_search))
+        cache_class = find_class("org.telegram.ui.CacheControlActivity")
+        if cache_class:
+            self.hook_all_methods(cache_class, "createView", AfterHook(self.inject_into_cache))
+
+    def inject_into_cache(self, fragment: Any):
+        clear = get_private_field(fragment, "actionModeClearButton")
+        if clear is None:
+            return
+        container = clear.getParent()
+        if container is None or container.findViewWithTag("save_selected_files_button") is not None:
+            return
+        context = clear.getContext()
+        button = ActionBarMenuItem(
+            context,
+            None,
+            Theme.getColor(Theme.key_listSelector),
+            Theme.getColor(Theme.key_windowBackgroundWhiteBlackText),
+            False,
+        )
+        button.setTag("save_selected_files_button")
+        button.setIcon(R_tg.drawable.msg_download)
+        button.setOnClickListener(OnClickListener(lambda v: self.save_from_cache(fragment, context)))
+        clear_params = clear.getLayoutParams()
+        wrapper = LinearLayout(context)
+        wrapper.setOrientation(LinearLayout.HORIZONTAL)
+        wrapper_params = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        wrapper_params.gravity = clear_params.gravity
+        wrapper_params.setMargins(
+            clear_params.leftMargin, clear_params.topMargin, clear_params.rightMargin, clear_params.bottomMargin
+        )
+        index = container.indexOfChild(clear)
+        container.removeView(clear)
+        container.addView(wrapper, index, wrapper_params)
+        size = ActionBar.getCurrentActionBarHeight()
+        button_params = LinearLayout.LayoutParams(size, size)
+        button_params.gravity = Gravity.CENTER_VERTICAL
+        wrapper.addView(button, button_params)
+        inner_params = LinearLayout.LayoutParams(clear_params.width, clear_params.height)
+        inner_params.gravity = Gravity.CENTER_VERTICAL
+        wrapper.addView(clear, inner_params)
+
+    def collect_cache_files(self, fragment: Any) -> List[Any]:
+        files, seen = [], set()
+
+        def add(info):
+            file = get_private_field(info, "file")
+            if file is None:
+                return
+            path = str(file.getAbsolutePath())
+            if path not in seen:
+                seen.add(path)
+                files.append(file)
+        model = get_private_field(fragment, "cacheModel")
+        if model is None:
+            return files
+        selected = get_private_field(model, "selectedFiles")
+        if selected is not None:
+            it = selected.iterator()
+            while it.hasNext():
+                add(it.next())
+        dialogs = get_private_field(model, "selectedDialogs")
+        entities = get_private_field(model, "entities")
+        if dialogs is not None and entities is not None and not dialogs.isEmpty():
+            chosen = set()
+            it = dialogs.iterator()
+            while it.hasNext():
+                chosen.add(int(it.next()))
+            for i in range(entities.size()):
+                entity = entities.get(i)
+                if int(get_private_field(entity, "dialogId")) not in chosen:
+                    continue
+                by_type = get_private_field(entity, "entitiesByType")
+                for j in range(by_type.size()):
+                    group = by_type.valueAt(j)
+                    group_files = get_private_field(group, "files")
+                    for k in range(group_files.size()):
+                        add(group_files.get(k))
+        return files
+
+    def save_from_cache(self, fragment: Any, context: Any):
+        files = self.collect_cache_files(fragment)
+        if not files:
+            BulletinHelper.show_error("Не удалось получить выбранные файлы")
+            return
+        self.clear_cache_selection(fragment)
+        run_on_queue(lambda: self.save_files(files, context))
+
+    def clear_cache_selection(self, fragment: Any):
+        try:
+            model = get_private_field(fragment, "cacheModel")
+            layout = get_private_field(fragment, "cachedMediaLayout")
+            if model is not None:
+                model.clearSelection()
+            if layout is not None:
+                layout.showActionMode(False)
+                layout.updateVisibleRows()
+        except Exception:
+            log(traceback.format_exc())
+
+    def save_files(self, files: List[Any], context: Any):
+        saved = 0
+        for file in files:
+            try:
+                if not file.exists():
+                    continue
+                name = str(file.getName())
+                ext = os.path.splitext(name)[1].lstrip(".").lower()
+                mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) if ext else None
+                self.copy_to_downloads(file, context, name, mime)
+                saved += 1
+            except Exception:
+                log(traceback.format_exc())
+        if saved > 0:
+            BulletinHelper.show_file_saved_to_downloads("UNKNOWN", amount=saved)
+        else:
+            BulletinHelper.show_error("Не удалось сохранить файлы")
 
     def add_button(self, anchor: Any, on_click: Callable[[], None]):
         container = anchor.getParent()
@@ -96,36 +217,83 @@ class SaveSelectedFilesPlugin(BasePlugin):
 
     def save_all(self, messages: List[Any], context: Any):
         saved = 0
+        log("[SSF] saving %d message(s)" % len(messages))
         for message in messages:
             try:
                 if self.save_one(message, context):
                     saved += 1
             except Exception:
-                log(traceback.format_exc())
+                log("[SSF] error on message %s:\n%s" % (self.msg_id(message), traceback.format_exc()))
+        log("[SSF] saved %d of %d" % (saved, len(messages)))
         if saved > 0:
             BulletinHelper.show_file_saved_to_downloads("UNKNOWN", amount=saved)
         else:
             BulletinHelper.show_error("Не удалось сохранить файлы")
 
-    def save_one(self, message: Any, context: Any) -> bool:
-        document = message.getDocument()
-        if document is None:
-            return False
-        loader = FileLoader.getInstance(message.currentAccount)
-        name = str(FileLoader.getDocumentFileName(document) or "")
+    def msg_id(self, message: Any) -> str:
+        try:
+            return str(message.getId())
+        except Exception:
+            return "?"
+
+    def get_photo(self, message: Any):
+        try:
+            media = message.messageOwner.media
+            photo = getattr(media, "photo", None)
+            if photo is None:
+                web = getattr(media, "webpage", None)
+                photo = getattr(web, "photo", None) if web is not None else None
+            return photo
+        except Exception:
+            return None
+
+    def wait_for_file(self, loader: Any, message: Any, start_load: Callable[[], None]):
         file = loader.getPathToMessage(message.messageOwner)
-        if file is None or not file.exists():
-            loader.loadFile(document, message, FileLoader.PRIORITY_NORMAL, 0)
-            deadline = time.time() + 900
-            while time.time() < deadline:
-                time.sleep(0.5)
-                file = loader.getPathToMessage(message.messageOwner)
-                if file is not None and file.exists():
-                    break
-            else:
+        if file is not None and file.exists():
+            return file
+        start_load()
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            time.sleep(0.5)
+            file = loader.getPathToMessage(message.messageOwner)
+            if file is not None and file.exists():
+                return file
+        return None
+
+    def save_one(self, message: Any, context: Any) -> bool:
+        loader = FileLoader.getInstance(message.currentAccount)
+        document = message.getDocument()
+        if document is not None:
+            name = str(FileLoader.getDocumentFileName(document) or "")
+            file = self.wait_for_file(
+                loader, message,
+                lambda: loader.loadFile(document, message, FileLoader.PRIORITY_NORMAL, 0),
+            )
+            if file is None:
+                log("[SSF] document not loaded, msg %s" % self.msg_id(message))
                 return False
-        self.copy_to_downloads(file, context, name or str(file.getName()), document.mime_type)
-        return True
+            self.copy_to_downloads(file, context, name or str(file.getName()), document.mime_type)
+            return True
+        photo = self.get_photo(message)
+        if photo is not None:
+            size = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, 5000)
+            if size is None:
+                log("[SSF] no photo size, msg %s" % self.msg_id(message))
+                return False
+            file = self.wait_for_file(
+                loader, message,
+                lambda: loader.loadFile(
+                    ImageLocation.getForPhoto(size, photo), message, "jpg", FileLoader.PRIORITY_NORMAL, 0
+                ),
+            )
+            if file is None:
+                log("[SSF] photo not loaded, msg %s" % self.msg_id(message))
+                return False
+            name = "photo_%s_%s.jpg" % (photo.id, self.msg_id(message))
+            self.copy_to_downloads(file, context, name, "image/jpeg")
+            return True
+        log("[SSF] unsupported message type, msg %s" % self.msg_id(message))
+        return False
 
     def app_folder(self, context: Any) -> str:
         label = str(context.getApplicationInfo().loadLabel(context.getPackageManager()))

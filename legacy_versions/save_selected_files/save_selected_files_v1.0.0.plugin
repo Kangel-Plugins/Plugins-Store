@@ -1,0 +1,149 @@
+import re
+import time
+import traceback
+from typing import Any, Callable, List
+
+from android.content import ContentValues
+from android.provider import MediaStore
+from android.widget import LinearLayout
+from android_utils import OnClickListener, log
+from base_plugin import BasePlugin, MethodHook
+from client_utils import run_on_queue
+from hook_utils import find_class, get_private_field
+from java.nio.file import Files
+from java.util import ArrayList
+from org.telegram.messenger import FileLoader
+from org.telegram.messenger import R as R_tg
+from org.telegram.ui.ActionBar import ActionBarMenuItem, Theme
+from ui.bulletin import BulletinHelper
+
+__id__ = "save_selected_files"
+__name__ = "Save Selected Files"
+__description__ = "Добавляет кнопку сохранения в панель действий при выделении файлов в медиа-профиле (вкладка «Файлы») и в результатах поиска. Нажимаете её, и все выбранные файлы сохраняются в «Загрузки» в один клик. Если файл ещё не загружен, плагин докачает его сам."
+__author__ = "@akresik" # ну я то на деле ниче кроме метаданных сам не писал, все делал клодик. причем новый соннет 5.5 реально прикольный
+__version__ = "1.0.0"
+__icon__ = "Catz5Emoji/35"
+__min_version__ = "12.1.1"
+
+class AfterHook(MethodHook):
+    def __init__(self, callback: Callable[[Any], None]):
+        self.callback = callback
+
+    def after_hooked_method(self, param):
+        try:
+            self.callback(param.thisObject)
+        except Exception:
+            log(traceback.format_exc())
+
+class SaveSelectedFilesPlugin(BasePlugin):
+    def on_plugin_load(self):
+        layout_class = find_class("org.telegram.ui.Components.SharedMediaLayout")
+        if layout_class:
+            self.hook_all_constructors(layout_class, AfterHook(self.inject_into_profile))
+        pager_class = find_class("org.telegram.ui.Components.SearchViewPager")
+        if pager_class:
+            self.hook_all_methods(pager_class, "showActionMode", AfterHook(self.inject_into_search))
+
+    def add_button(self, anchor: Any, on_click: Callable[[], None]):
+        container = anchor.getParent()
+        if container is None or container.findViewWithTag("save_selected_files_button") is not None:
+            return
+        button = ActionBarMenuItem(
+            anchor.getContext(),
+            None,
+            Theme.getColor(Theme.key_actionBarActionModeDefaultSelector),
+            Theme.getColor(Theme.key_actionBarActionModeDefaultIcon),
+            False,
+        )
+        button.setTag("save_selected_files_button")
+        button.setIcon(R_tg.drawable.msg_download)
+        button.setOnClickListener(OnClickListener(lambda v: on_click()))
+        container.addView(
+            button,
+            container.indexOfChild(anchor),
+            LinearLayout.LayoutParams(anchor.getLayoutParams()),
+        )
+
+    def inject_into_profile(self, layout: Any):
+        anchor = get_private_field(layout, "gotoItem")
+        if anchor is None:
+            anchor = get_private_field(layout, "deleteItem")
+        if anchor is not None:
+            self.add_button(anchor, lambda: self.save_from_profile(layout))
+
+    def inject_into_search(self, pager: Any):
+        anchor = get_private_field(pager, "gotoItem")
+        if anchor is not None:
+            self.add_button(anchor, lambda: self.save_from_search(pager))
+
+    def save_from_profile(self, layout: Any):
+        messages = []
+        arrays = get_private_field(layout, "selectedFiles")
+        for i in range(len(arrays)):
+            sparse = arrays[i]
+            for j in range(sparse.size()):
+                messages.append(sparse.valueAt(j))
+        context = layout.getContext()
+        layout.closeActionMode(False)
+        run_on_queue(lambda: self.save_all(messages, context))
+
+    def save_from_search(self, pager: Any):
+        values = ArrayList(get_private_field(pager, "selectedFiles").values())
+        messages = [values.get(i) for i in range(values.size())]
+        context = pager.getContext()
+        pager.hideActionMode()
+        run_on_queue(lambda: self.save_all(messages, context))
+
+    def save_all(self, messages: List[Any], context: Any):
+        saved = 0
+        for message in messages:
+            try:
+                if self.save_one(message, context):
+                    saved += 1
+            except Exception:
+                log(traceback.format_exc())
+        if saved > 0:
+            BulletinHelper.show_file_saved_to_downloads("UNKNOWN", amount=saved)
+        else:
+            BulletinHelper.show_error("Не удалось сохранить файлы")
+
+    def save_one(self, message: Any, context: Any) -> bool:
+        document = message.getDocument()
+        if document is None:
+            return False
+        loader = FileLoader.getInstance(message.currentAccount)
+        name = str(FileLoader.getDocumentFileName(document) or "")
+        file = loader.getPathToMessage(message.messageOwner)
+        if file is None or not file.exists():
+            loader.loadFile(document, message, FileLoader.PRIORITY_NORMAL, 0)
+            deadline = time.time() + 900
+            while time.time() < deadline:
+                time.sleep(0.5)
+                file = loader.getPathToMessage(message.messageOwner)
+                if file is not None and file.exists():
+                    break
+            else:
+                return False
+        self.copy_to_downloads(file, context, name or str(file.getName()), document.mime_type)
+        return True
+
+    def app_folder(self, context: Any) -> str:
+        label = str(context.getApplicationInfo().loadLabel(context.getPackageManager()))
+        label = re.sub(r'[\\/:*?"<>|]', "_", label).strip().strip(".")
+        return label or "Telegram"
+
+    def copy_to_downloads(self, file: Any, context: Any, name: str, mime: Any):
+        values = ContentValues()
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        if mime:
+            values.put(MediaStore.MediaColumns.MIME_TYPE, str(mime))
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/" + self.app_folder(context))
+        resolver = context.getContentResolver()
+        uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            raise RuntimeError("MediaStore insert returned null")
+        stream = resolver.openOutputStream(uri)
+        try:
+            Files.copy(file.toPath(), stream)
+        finally:
+            stream.close()
