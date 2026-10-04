@@ -1,0 +1,616 @@
+import queue
+import re
+import threading
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from org.telegram.messenger import MessagesController, UserConfig, Utilities
+from java import dynamic_proxy
+from java.util import ArrayList
+from org.telegram.tgnet import ConnectionsManager, RequestDelegate, TLRPC
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment, send_request
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+__id__ = "type_effect"
+__name__ = "TypeEffect"
+__description__ = "Отправка сообщений с постепенной анимацией"
+__author__ = "@plin4ick"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+
+EDIT_FLAG_NO_WEBPAGE = 2
+EDIT_FLAG_MESSAGE = 2048
+SEND_FLAG_NO_WEBPAGE = 2
+SEND_FLAG_REPLY_TO = 1
+SEND_FLAG_ENTITIES = 8
+EDIT_FLAG_ENTITIES = 8
+
+CURSOR = "▌"
+Key = Tuple[int, int]
+
+
+def _int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _selected_account() -> int:
+    try:
+        return int(UserConfig.selectedAccount)
+    except Exception:
+        return 0
+
+
+def _mc(account: int):
+    return MessagesController.getInstance(account)
+
+
+class _Delegate(dynamic_proxy(RequestDelegate)):
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self, response, error):
+        try:
+            self._fn(response, error)
+        except Exception as e:
+            log(f"[TypeEffect] callback: {e}")
+
+
+def _send(req, cb, account: int):
+    try:
+        return ConnectionsManager.getInstance(account).sendRequest(req, _Delegate(cb))
+    except Exception as e:
+        log(f"[TypeEffect] direct send failed, fallback: {e}")
+    try:
+        return send_request(req, cb, account=account)
+    except TypeError:
+        pass
+    if account == _selected_account():
+        return send_request(req, cb)
+    raise RuntimeError("не удалось отправить запрос от нужного аккаунта")
+
+
+def _request_sync(req, account: int, timeout: float = 30.0, retries: int = 6):
+    last = "unknown"
+    for _ in range(retries):
+        done = threading.Event()
+        box = {"resp": None, "err": None}
+
+        def cb(response, error):
+            box["resp"] = response
+            box["err"] = error
+            done.set()
+
+        _send(req, cb, account)
+        if not done.wait(timeout):
+            last = "таймаут"
+            continue
+        err = box["err"]
+        if err is None:
+            return box["resp"]
+        text = str(getattr(err, "text", err))
+        last = text
+        m = re.search(r"FLOOD_WAIT_(\d+)", text)
+        if m:
+            time.sleep(int(m.group(1)) + 1)
+            continue
+        raise RuntimeError(text)
+    raise RuntimeError(last)
+
+
+def _random_id() -> int:
+    try:
+        return int(Utilities.random.nextLong())
+    except Exception:
+        import random
+        return random.getrandbits(63) - (1 << 62)
+
+
+def _upd_id(u, random_id):
+    try:
+        rid = getattr(u, "random_id", None)
+        if rid is not None:
+            if random_id is None or int(rid) == int(random_id):
+                mid = getattr(u, "id", None)
+                if mid is not None:
+                    return int(mid)
+            return None
+        msg = getattr(u, "message", None)
+        if msg is not None:
+            mid = getattr(msg, "id", None)
+            if mid is not None and getattr(msg, "out", True):
+                return int(mid)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_message_id(resp, random_id) -> Optional[int]:
+    if resp is None:
+        return None
+    best = None
+    updates = getattr(resp, "updates", None)
+    if updates is not None:
+        try:
+            for i in range(updates.size()):
+                u = updates.get(i)
+                mid = _upd_id(u, random_id)
+                if mid is not None:
+                    if getattr(u, "random_id", None) is not None:
+                        return mid
+                    best = mid
+        except Exception as e:
+            log(f"[TypeEffect] extract id: {e}")
+    if best is not None:
+        return best
+    direct = getattr(resp, "id", None)
+    if direct is not None:
+        try:
+            return int(direct)
+        except Exception:
+            pass
+    return None
+
+
+def _apply_updates(account: int, resp):
+    if resp is None:
+        return
+    try:
+        _mc(account).processUpdates(resp, False)
+    except Exception:
+        pass
+
+
+def _drawables(names: List[str]) -> Optional[List[int]]:
+    try:
+        from org.telegram.messenger import R
+        ids = [int(getattr(R.drawable, n)) for n in names]
+        return ids if all(ids) else None
+    except Exception:
+        return None
+
+
+def _u16len(text: str) -> int:
+    n = 0
+    for ch in text:
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return n
+
+
+def _clone_entity(e):
+    try:
+        cls = e.getClass()
+        c = cls.getConstructor().newInstance()
+        for f in cls.getFields():
+            try:
+                f.set(c, f.get(e))
+            except Exception:
+                pass
+        return c
+    except Exception:
+        return None
+
+
+def _clip_entities(entities, limit_u16: int):
+    out = ArrayList()
+    for e in entities:
+        try:
+            o = int(e.offset)
+            ln = int(e.length)
+        except Exception:
+            continue
+        if o >= limit_u16:
+            continue
+        new_len = min(ln, limit_u16 - o)
+        if new_len <= 0:
+            continue
+        c = _clone_entity(e)
+        if c is None:
+            continue
+        try:
+            c.offset = o
+            c.length = new_len
+        except Exception:
+            continue
+        out.add(c)
+    return out
+
+
+def _frames(text: str, mode: int, cursor: bool):
+    marks: List[int] = []
+    if mode == 1:
+        pos, n = 0, len(text)
+        while pos < n:
+            while pos < n and text[pos].isspace():
+                pos += 1
+            while pos < n and not text[pos].isspace():
+                pos += 1
+            marks.append(pos)
+    else:
+        marks = list(range(1, len(text) + 1))
+    if not marks:
+        marks = [len(text)]
+    if marks[-1] != len(text):
+        marks.append(len(text))
+
+    frames = []
+    for i, m in enumerate(marks):
+        partial = text[:m]
+        disp = partial + CURSOR if (cursor and i < len(marks) - 1) else partial
+        frames.append((disp if disp else CURSOR, m))
+    return frames
+
+
+class TypeEffectPlugin(BasePlugin):
+
+    _chats: Set[Key] = set()
+    _queue: Optional["queue.Queue"] = None
+    _running = False
+
+    def on_plugin_load(self):
+        self._load_state()
+        self._queue = queue.Queue()
+        self._running = True
+        threading.Thread(target=self._worker, daemon=True).start()
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="TypeEffect",
+            subtext="Печать по буквам",
+            icon="msg_edit",
+            on_click=self._on_chat_menu,
+            priority=3,
+        ))
+        self.add_on_send_message_hook()
+
+    def on_plugin_unload(self):
+        self._running = False
+        if self._queue:
+            self._queue.put(None)
+
+
+    def _scope(self) -> int:
+        return _int(self.get_setting("scope", 0), 0)
+
+    def _set_scope(self, value: int):
+        self.set_setting("scope", int(value))
+
+    def _load_state(self):
+        if self.get_setting("scope", None) is None and bool(self.get_setting("scope_all", False)):
+            self._set_scope(1)
+        raw = self.get_setting("chats", "") or ""
+        chats = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if ":" in part:
+                a, d = part.split(":", 1)
+                try:
+                    chats.add((int(a), int(d)))
+                except Exception:
+                    pass
+        self._chats = chats
+
+    def _save_chats(self):
+        self.set_setting("chats", ",".join(f"{a}:{d}" for a, d in self._chats))
+
+    def _enabled_for(self, key: Key) -> bool:
+        scope = self._scope()
+        if scope == 1:
+            return True
+        if scope == 2:
+            return key in self._chats
+        return False
+
+
+    def _clear_chats(self, view=None):
+        self._chats.clear()
+        self._save_chats()
+        if self._scope() == 2:
+            self._set_scope(0)
+        BulletinHelper.show_info("Список чатов очищен")
+        try:
+            self.set_setting("scope", self._scope(), reload_settings=True)
+        except Exception:
+            pass
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Режим"),
+            Selector(
+                key="scope",
+                text="Где работает",
+                default=0,
+                items=["Выключено", "Во всех чатах", "Только в выбранных"],
+                icon="msg_edit",
+            ),
+            Text(
+                text=f"Выбранные чаты: {len(self._chats)}",
+                subtext="Нажмите, чтобы очистить список",
+                icon="msg_delete",
+                on_click=self._clear_chats,
+            ),
+            Divider(text="Чат добавляется в выбранные через меню чата (⋮) → «TypeEffect»."),
+            Header(text="Анимация"),
+            Selector(
+                key="mode",
+                text="Как появляется текст",
+                default=0,
+                items=["По буквам", "По словам"],
+                icon="msg_edit",
+            ),
+            Input(
+                key="char_ms",
+                text="Задержка на шаг (мс)",
+                default="60",
+                subtext="Ровный интервал появления текста. Ниже 50 — риск FLOOD_WAIT от Telegram.",
+                icon="msg_recent",
+            ),
+            Switch(
+                key="cursor",
+                text="Показывать курсор ▌",
+                default=True,
+                icon="msg_info",
+            ),
+            Switch(
+                key="commands",
+                text="Команды .type on / off / all",
+                default=True,
+                icon="msg_bot",
+            ),
+            Divider(text="Эффект работает только для текста. Медиа, стикеры и голосовые уходят как обычно. "
+                         "Текст отправляется без форматирования (markdown/жирный)."),
+        ]
+
+
+    def _on_chat_menu(self, ctx: Dict[str, Any]):
+        dialog_id = ctx.get("dialog_id")
+        if dialog_id is None:
+            BulletinHelper.show_error("Не удалось определить чат")
+            return
+        acc = ctx.get("account")
+        account = _selected_account() if acc is None else int(acc)
+        self._open_chat_menu((account, int(dialog_id)))
+
+    def _open_chat_menu(self, key: Key):
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag else None
+        if act is None:
+            return
+
+        scope = self._scope()
+        here_on = scope == 2 and key in self._chats
+
+        if scope == 1:
+            status = "включён во всех чатах"
+            options = [
+                ("Выключить во всех чатах", "msg_cancel", "all_off"),
+                ("Оставить только в этом чате", "msg_edit", "only_here"),
+            ]
+        elif here_on:
+            status = "включён в этом чате"
+            options = [
+                ("Выключить в этом чате", "msg_cancel", "here_off"),
+                ("Включить во всех чатах", "msg_groups", "all_on"),
+            ]
+        else:
+            status = "выключен в этом чате"
+            options = [
+                ("Включить в этом чате", "msg_edit", "here_on"),
+                ("Включить во всех чатах", "msg_groups", "all_on"),
+            ]
+
+        def pick(bld, which):
+            bld.dismiss()
+            self._apply_choice(key, options[which][2])
+
+        b = AlertDialogBuilder(act)
+        b.set_title(f"TypeEffect — {status}")
+        icons = _drawables([o[1] for o in options])
+        if icons:
+            b.set_items([o[0] for o in options], pick, icons)
+        else:
+            b.set_items([o[0] for o in options], pick)
+        b.set_negative_button("Закрыть", lambda bld, w: bld.dismiss())
+        b.show()
+
+    def _apply_choice(self, key: Key, choice: str):
+        if choice == "here_on":
+            self._chats.add(key)
+            self._save_chats()
+            self._set_scope(2)
+            BulletinHelper.show_success("TypeEffect включён в этом чате")
+        elif choice == "here_off":
+            self._chats.discard(key)
+            self._save_chats()
+            if not self._chats:
+                self._set_scope(0)
+            BulletinHelper.show_info("TypeEffect выключен в этом чате")
+        elif choice == "all_on":
+            self._set_scope(1)
+            BulletinHelper.show_success("TypeEffect включён во всех чатах")
+        elif choice == "all_off":
+            self._set_scope(0)
+            BulletinHelper.show_info("TypeEffect выключен")
+        elif choice == "only_here":
+            self._chats = {key}
+            self._save_chats()
+            self._set_scope(2)
+            BulletinHelper.show_success("TypeEffect теперь работает только в этом чате")
+
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        raw = getattr(params, "message", None)
+        raw = "" if raw is None else str(raw)
+        try:
+            dialog_id = int(params.peer)
+        except Exception:
+            return HookResult()
+        key = (int(account), dialog_id)
+
+        stripped = raw.strip()
+
+        if self.get_setting("commands", True) and re.match(r"^\.type\b", stripped, re.IGNORECASE):
+            m = re.match(r"^\.type(?:\s+(\S+))?$", stripped, re.IGNORECASE)
+            arg = (m.group(1) or "").lower() if m else ""
+            if arg in ("all", "везде"):
+                self._set_scope(1)
+                BulletinHelper.show_success("TypeEffect включён во всех чатах")
+            elif arg in ("off", "выкл", "0"):
+                self._set_scope(0)
+                BulletinHelper.show_info("TypeEffect выключен")
+            elif arg in ("on", "here", "вкл", "1", ""):
+                if self._scope() == 1:
+                    BulletinHelper.show_info("TypeEffect уже работает во всех чатах")
+                else:
+                    self._chats.add(key)
+                    self._save_chats()
+                    self._set_scope(2)
+                    BulletinHelper.show_success("TypeEffect включён в этом чате")
+            else:
+                BulletinHelper.show_error("Варианты: .type on / off / all")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if not self._enabled_for(key):
+            return HookResult()
+        if not stripped or self._has_media(params):
+            return HookResult()
+
+        self._queue.put((int(account), dialog_id, raw, self._reply_id(params), self._grab_entities(params)))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _has_media(self, params) -> bool:
+        for attr in ("photo", "document", "path", "videoEditedInfo", "sticker", "location", "poll"):
+            try:
+                if getattr(params, attr, None):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _grab_entities(self, params):
+        out = []
+        try:
+            es = getattr(params, "entities", None)
+            if es is not None:
+                for i in range(es.size()):
+                    e = es.get(i)
+                    if e is not None:
+                        out.append(e)
+        except Exception:
+            pass
+        return out
+
+    def _reply_id(self, params) -> int:
+        try:
+            r = getattr(params, "replyToMsg", None)
+            if r is not None:
+                return int(r.getId())
+        except Exception:
+            pass
+        return 0
+
+
+    def _worker(self):
+        q = self._queue
+        while self._running:
+            try:
+                task = q.get()
+            except Exception:
+                continue
+            if task is None:
+                return
+            account, dialog_id, text, reply_id, entities = task
+            try:
+                self._run_one(account, dialog_id, text, reply_id, entities)
+            except Exception as e:
+                log(f"[TypeEffect] run: {e}")
+                run_on_ui_thread(lambda e=e: BulletinHelper.show_error(f"TypeEffect: {e}"))
+
+    def _run_one(self, account: int, dialog_id: int, text: str, reply_id: int, entities):
+        by_words = _int(self.get_setting("mode", 0), 0) == 1
+        cursor = bool(self.get_setting("cursor", True))
+        delay = max(30, _int(self.get_setting("char_ms", "60"), 60)) / 1000.0
+        frames = _frames(text, 1 if by_words else 0, cursor)
+
+        peer = _mc(account).getInputPeer(dialog_id)
+        if peer is None:
+            raise RuntimeError("нет доступа к чату")
+
+        disp0, reveal0 = frames[0]
+        rid = _random_id()
+        send_req = TLRPC.TL_messages_sendMessage()
+        send_req.peer = peer
+        send_req.message = disp0
+        send_req.random_id = rid
+        send_req.flags |= SEND_FLAG_NO_WEBPAGE
+        send_req.no_webpage = True
+        if entities:
+            ents0 = _clip_entities(entities, _u16len(text[:reveal0]))
+            if ents0.size() > 0:
+                send_req.entities = ents0
+                send_req.flags |= SEND_FLAG_ENTITIES
+        if reply_id:
+            self._set_reply(send_req, reply_id)
+
+        resp = _request_sync(send_req, account)
+        msg_id = _extract_message_id(resp, rid)
+        run_on_ui_thread(lambda: _apply_updates(account, resp))
+        if msg_id is None:
+            raise RuntimeError("не удалось получить id сообщения")
+
+        last_send = time.time()
+        n = len(frames)
+        for i in range(1, n):
+            wait = last_send + delay - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            if not self._running:
+                break
+
+            disp_i, reveal_i = frames[i]
+            edit_req = TLRPC.TL_messages_editMessage()
+            edit_req.peer = peer
+            edit_req.id = msg_id
+            edit_req.message = disp_i
+            edit_req.flags |= EDIT_FLAG_MESSAGE | EDIT_FLAG_NO_WEBPAGE
+            edit_req.no_webpage = True
+            if entities:
+                ents_i = _clip_entities(entities, _u16len(text[:reveal_i]))
+                if ents_i.size() > 0:
+                    edit_req.entities = ents_i
+                    edit_req.flags |= EDIT_FLAG_ENTITIES
+
+            last_send = time.time()
+            try:
+                eresp = _request_sync(edit_req, account, retries=5)
+            except RuntimeError as e:
+                et = str(e)
+                if "MESSAGE_NOT_MODIFIED" in et:
+                    continue
+                if "MESSAGE_ID_INVALID" in et or "MESSAGE_EDIT_TIME_EXPIRED" in et:
+                    return
+                raise
+            run_on_ui_thread(lambda r=eresp: _apply_updates(account, r))
+
+    def _set_reply(self, req, reply_id: int):
+        cls = getattr(TLRPC, "TL_inputReplyToMessage", None)
+        if cls is None:
+            return
+        try:
+            reply = cls()
+            reply.reply_to_msg_id = reply_id
+            req.reply_to = reply
+            req.flags |= SEND_FLAG_REPLY_TO
+        except Exception:
+            pass
