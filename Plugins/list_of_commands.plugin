@@ -1,6 +1,8 @@
 import os
 import ast
 import re
+import time
+import threading
 from typing import Any
 
 from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
@@ -8,23 +10,64 @@ from hook_utils import find_class
 from java.lang import Boolean as JBoolean, Integer as JInteger, Class as JClass
 from android_utils import run_on_ui_thread, log
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Switch, Input, Divider
+from ui.settings import Header, Switch, Input, Divider, Text
 from java.util import ArrayList
+
+# Версия для exteraGram: контроллер плагинов в com.exteragram.messenger.plugins
+PLUGIN_CONTROLLERS = []
+try:
+    from com.exteragram.messenger.plugins import PluginsController as _PC_extera
+    PLUGIN_CONTROLLERS.append(("com.exteragram", _PC_extera))
+except Exception:
+    pass
+
+# Классы Telegram для иконок плагинов. Если чего-то нет, плагин работает как раньше, просто без иконок.
+try:
+    from org.telegram.messenger import MediaDataController, ImageLocation, UserConfig
+    from org.telegram.tgnet import TLRPC
+    from android.graphics.drawable import ColorDrawable
+    ICONS_AVAILABLE = True
+except Exception as _icon_err:
+    ICONS_AVAILABLE = False
+    log(f"[list_of_commands] иконки недоступны: {_icon_err}")
+
+ICON_RE = re.compile(r"^([A-Za-z0-9_]+)/(\d+)$")
+
+
+def parse_icon(icon):
+    """'pack/3' -> ('pack', 3). Формат такой же, как у __icon__ в менеджере плагинов."""
+    m = ICON_RE.match(str(icon or "").strip())
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+def get_sticker_set(pack):
+    """Набор стикеров из кэша клиента. Если его ещё нет, запускает загрузку и возвращает None."""
+    mdc = MediaDataController.getInstance(UserConfig.selectedAccount)
+    st = mdc.getStickerSetByName(pack)
+    if st is not None:
+        return st
+    inp = TLRPC.TL_inputStickerSetShortName()
+    inp.short_name = pack
+    return mdc.getStickerSet(inp, False)
+
 
 __id__ = "list_of_commands"
 __name__ = "Меню доступных команд"
 __author__ = "@bandaliyev"
-__version__ = "1.0.7"
+__version__ = "2.0.0"
 __description__ = "Оптимизированное отображение команд"
 __icon__ = "pus_heen/12"
 __min_version__ = "11.12.0"
 
 class CommandSuggestionsHook(MethodHook):
     def __init__(self, plugin_instance):
+        super().__init__()
         self.plugin = plugin_instance
         self.plugins_dir = os.path.dirname(os.path.realpath(__file__))
         self.harvester = PluginCommandHarvester(self.plugins_dir)
         self._command_cache = {}
+        self._icon_map = {}
+        self.last_adapter = None
         
         # Кэшируем всё, что можно, один раз
         self.AdapterClass = JClass.forName("org.telegram.ui.Adapters.MentionsAdapter")
@@ -33,25 +76,43 @@ class CommandSuggestionsHook(MethodHook):
         self.f_commands = self.AdapterClass.getDeclaredField("searchResultCommands")
         self.f_help = self.AdapterClass.getDeclaredField("searchResultCommandsHelp")
         self.f_delegate = self.AdapterClass.getDeclaredField("delegate")
+        # В новых версиях Telegram onBindViewHolder читает ещё два списка.
+        # Если они null, происходит NPE (unboxing Boolean) и меню не показывается.
+        # Этих полей нет в более старых сборках Telegram (в том числе в некоторых версиях exteraGram),
+        # поэтому они необязательные.
+        self.f_users = self._optional_field("searchResultCommandsUsers")
+        self.f_ephemeral = self._optional_field("searchResultCommandsEphemeral")
         
-        for f in [self.f_commands, self.f_help, self.f_delegate]:
-            f.setAccessible(True)
+        for f in [self.f_commands, self.f_help, self.f_delegate, self.f_users, self.f_ephemeral]:
+            if f is not None:
+                f.setAccessible(True)
+
+    def _optional_field(self, name):
+        try:
+            return self.AdapterClass.getDeclaredField(name)
+        except Exception:
+            return None
 
     def _sanitize_key(self, command: str) -> str:
         return command.replace('.', '_dot_')
+
+    def icon_for(self, command, help_text):
+        return self._icon_map.get((command, help_text))
 
     def before_hooked_method(self, param):
         try:
             if not param.args or param.args[0] is None:
                 return
 
-            text = str(param.args[0].toString())
+            # Chaquopy может отдать CharSequence как Python str или как Java-объект
+            text = str(param.args[0])
             if not text.startswith("."):
                 return
                 
             mentions_adapter = param.thisObject
 
             def update_ui():
+                self.last_adapter = mentions_adapter
                 if not self._command_cache:
                     self._rebuild_cache()
 
@@ -73,8 +134,30 @@ class CommandSuggestionsHook(MethodHook):
                 for h in final_helps:
                     j_helps.add(h)
                 
+                j_users = ArrayList()
+                j_ephemeral = ArrayList()
+                for _ in final_cmds:
+                    j_users.add(None)
+                    j_ephemeral.add(JBoolean.FALSE)
+                
+                # getItemCount() даёт приоритет stickers > botContext > usernames > hashtags >
+                # commands > suggestions, поэтому старые результаты нужно сбросить.
+                for name in ("stickers", "searchResultBotContext", "searchResultUsernames",
+                             "searchResultUsernamesMap", "searchResultHashtags",
+                             "searchResultSuggestions"):
+                    try:
+                        f = self.AdapterClass.getDeclaredField(name)
+                        f.setAccessible(True)
+                        f.set(mentions_adapter, None)
+                    except Exception:
+                        pass  # поля может не быть в этой сборке Telegram
+                
                 self.f_commands.set(mentions_adapter, j_cmds)
                 self.f_help.set(mentions_adapter, j_helps)
+                if self.f_users is not None:
+                    self.f_users.set(mentions_adapter, j_users)
+                if self.f_ephemeral is not None:
+                    self.f_ephemeral.set(mentions_adapter, j_ephemeral)
                 
                 mentions_adapter.notifyDataSetChanged()
                 
@@ -109,6 +192,101 @@ class CommandSuggestionsHook(MethodHook):
         
         self._command_cache = {"cmds": cmds, "helps": helps}
 
+        icons = getattr(self.harvester, "icons", {})
+        self._icon_map = {}
+        packs = set()
+        for p_name, p_cmds in p_map.items():
+            icon = icons.get(p_name)
+            parsed = parse_icon(icon)
+            if not parsed:
+                continue
+            packs.add(parsed[0])
+            for c in p_cmds:
+                if c.startswith("."):
+                    self._icon_map[(c, p_name)] = icon
+        if ICONS_AVAILABLE:
+            for pack in packs:
+                try:
+                    get_sticker_set(pack)  # прогрев: загрузка набора стикеров начнётся заранее
+                except Exception as e:
+                    log(f"[{__id__}] не удалось запросить набор {pack}: {e}")
+
+class CommandIconHook(MethodHook):
+    """После отрисовки команды ставит иконку плагина (стикер из __icon__) в слот аватарки."""
+    MAX_TRIES = 4
+
+    def __init__(self, plugin_instance):
+        super().__init__()
+        self.plugin = plugin_instance
+        self._field = None
+        self._tries = {}
+        self._refresh_pending = False
+
+    def _image_view(self, cell):
+        if self._field is None:
+            f = JClass.forName("org.telegram.ui.Cells.MentionCell").getDeclaredField("imageView")
+            f.setAccessible(True)
+            self._field = f
+        return self._field.get(cell)
+
+    def _schedule_refresh(self, adapter):
+        if self._refresh_pending or adapter is None:
+            return
+        self._refresh_pending = True
+
+        def work():
+            time.sleep(1.5)
+            self._refresh_pending = False
+            def ui():
+                try:
+                    adapter.notifyDataSetChanged()
+                except Exception as e:
+                    log(f"[{__id__}] не удалось обновить список иконок: {e}")
+            run_on_ui_thread(ui)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_hooked_method(self, param):
+        try:
+            handler = getattr(self.plugin, "handler", None)
+            if handler is None or not self.plugin.get_setting("show_plugin_icons", True):
+                return
+            icon = handler.icon_for(str(param.args[0]), str(param.args[1]))
+            parsed = parse_icon(icon)
+            if not parsed:
+                return
+            pack, idx = parsed
+            st = get_sticker_set(pack)
+            docs = st.documents if st is not None else None
+            if docs is None or idx >= docs.size():
+                # набор ещё грузится: пробуем перерисовать несколько раз, но не бесконечно
+                n = self._tries.get(pack, 0)
+                if st is None and n < self.MAX_TRIES:
+                    self._tries[pack] = n + 1
+                    self._schedule_refresh(getattr(handler, "last_adapter", None))
+                elif st is not None:
+                    log(f"[{__id__}] в наборе {pack} нет стикера с номером {idx}")
+                return
+            doc = docs.get(idx)
+            iv = self._image_view(param.thisObject)
+            iv.setVisibility(0)  # View.VISIBLE: для команд без пользователя Telegram прячет слот
+            iv.setImage(ImageLocation.getForDocument(doc), "28_28", ColorDrawable(0), st)
+        except Exception as e:
+            log(f"[{__id__}] иконка не поставлена: {e}")
+
+
+class PluginToggleHook(MethodHook):
+    """Срабатывает после включения/выключения плагина и обновляет список в настройках."""
+    def __init__(self, plugin_instance):
+        super().__init__()
+        self.plugin = plugin_instance
+
+    def after_hooked_method(self, param: Any):
+        try:
+            log(f"[{__id__}] переключение плагина: {param.method.getName()}")
+        except Exception:
+            pass
+        self.plugin._schedule_refresh()
+
 class CommandHelperPlugin(BasePlugin):
     def on_plugin_load(self) -> None:
         try:
@@ -120,6 +298,7 @@ class CommandHelperPlugin(BasePlugin):
 
             m_class = JClass.forName("org.telegram.ui.Adapters.MentionsAdapter")
             target = m_class.getDeclaredMethod("searchUsernameOrHashtag", char_seq, int_t, arr_list, bool_t, bool_t)
+            target.setAccessible(True)
             
             self.handler = CommandSuggestionsHook(self) 
             self.unhook_ref = self.hook_method(target, self.handler, priority=10)
@@ -127,17 +306,84 @@ class CommandHelperPlugin(BasePlugin):
             self.add_on_send_message_hook()
         except Exception as e:
             log(f"[{__id__}] Load failed: {e}")
+        
+        # Иконки плагинов в слоте аватарки. Если не получилось, подсказки работают как раньше.
+        self.icon_unhook = None
+        if ICONS_AVAILABLE:
+            try:
+                cell_cls = JClass.forName("org.telegram.ui.Cells.MentionCell")
+                for m in cell_cls.getDeclaredMethods():
+                    if str(m.getName()) == "setBotCommand" and len(m.getParameterTypes()) == 4:
+                        m.setAccessible(True)
+                        self.icon_unhook = self.hook_method(m, CommandIconHook(self), priority=10)
+                        break
+                if self.icon_unhook is None:
+                    log(f"[{__id__}] MentionCell.setBotCommand не найден, иконок не будет")
+            except Exception as e:
+                log(f"[{__id__}] не удалось подключить иконки: {e}")
+
+        # Следим за включением/выключением плагинов, чтобы обновлять настройки
+        self.toggle_hooks = []
+        self._refresh_token = 0
+        try:
+            ctrl_class = JClass.forName("com.exteragram.messenger.plugins.PluginsController")
+            hooked = []
+            for m in ctrl_class.getDeclaredMethods():
+                name = str(m.getName())
+                if "$" in name or re.match(r"(?i)^(is|get|has|can)", name):
+                    continue
+                if not re.search(r"(?i)enable|disable|toggle", name):
+                    continue
+                self.toggle_hooks.append(self.hook_method(m, PluginToggleHook(self)))
+                hooked.append(name)
+            log(f"[{__id__}] слежу за переключением плагинов: {hooked}")
+        except Exception as e:
+            log(f"[{__id__}] не удалось подписаться на переключение плагинов: {e}")
+
+    def _reload_settings_ui(self):
+        def ui():
+            try:
+                self.set_setting("_ui_refresh", int(time.time() * 1000), reload_settings=True)
+            except Exception as e:
+                log(f"[{__id__}] не удалось обновить настройки: {e}")
+        run_on_ui_thread(ui)
+
+    def _schedule_refresh(self):
+        """Дебаунс: после переключения плагина ждём, пока его состояние установится."""
+        self._refresh_token += 1
+        token = self._refresh_token
+        def work():
+            # Два прохода: состояние плагина может установиться не сразу после вызова
+            for delay in (0.7, 1.8):
+                time.sleep(delay)
+                if token != self._refresh_token:
+                    return
+                if hasattr(self, 'handler'):
+                    self.handler._command_cache = {}
+                self._reload_settings_ui()
+        threading.Thread(target=work, daemon=True).start()
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        if params.message.strip().lower() == ".preload":
-            if hasattr(self, 'handler'):
-                self.handler._command_cache = {}
-                BulletinHelper.show_success("Кэш обновлен")
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+        if msg.strip().lower() == ".preload":
+            self._apply_preload()
             return HookResult(strategy=HookStrategy.CANCEL)
         return HookResult()
 
-    def create_settings(self):
-        # Чтобы не лагало в самом меню, собираем карту команд один раз здесь
+    def _apply_preload(self):
+        """Сбрасывает кэш команд (то же, что делает .preload). Используется и кнопкой в настройках."""
+        if hasattr(self, 'handler'):
+            self.handler._command_cache = {}
+            self._reload_settings_ui()
+            BulletinHelper.show_success("Кэш обновлен")
+        else:
+            BulletinHelper.show_error("Хук не активен: проверьте разрешение hooks")
+
+    def _build_commands_ui(self):
+        """Список переключателей. Вызывается при каждом открытии подстраницы, поэтому
+        состояние плагинов (включён/выключен) всегда актуальное."""
         harvester = PluginCommandHarvester(os.path.dirname(os.path.realpath(__file__)))
         p_map = harvester.get_command_map()
         
@@ -147,30 +393,85 @@ class CommandHelperPlugin(BasePlugin):
             for c in cmds:
                 key = f"cmd_enabled_{c.replace('.', '_dot_')}"
                 ui.append(Switch(key=key, text=c, subtext=f"Плагин: {p_name}", default=True))
-        
-        ui.extend([
-            Divider(),
-            Input(key="custom_commands", text="Свои команды", subtext=".cmd:инфо"),
-            Divider(text="Примените через .preload")
-        ])
         return ui
 
+    def create_settings(self):
+        # В exteraGram create_settings вызывается один раз при загрузке плагина, поэтому сам список
+        # команд вынесен на подстраницу, которая строится заново при каждом открытии.
+        return [
+            Header(text="Внешний вид"),
+            Switch(key="show_plugin_icons", text="Иконки плагинов",
+                   subtext="Показывать иконку плагина слева от команды", default=True),
+            Divider(),
+            Header(text="Команды"),
+            Text(text="Выбор команд плагинов", create_sub_fragment=self._build_commands_ui),
+            Divider(),
+            Input(key="custom_commands", text="Свои команды", subtext=".cmd:инфо"),
+            Text(text="Применить изменения", accent=True, on_click=lambda _: self._apply_preload()),
+            Divider(text="Нажмите кнопку (или отправьте .preload), чтобы изменения вступили в силу")
+        ]
+
     def on_plugin_unload(self):
+        self._refresh_token = getattr(self, "_refresh_token", 0) + 1
         if hasattr(self, 'unhook_ref') and self.unhook_ref:
             self.unhook_ref.unhook()
+        for h in getattr(self, "toggle_hooks", []):
+            try: h.unhook()
+            except Exception as e: log(f"[{__id__}] unhook toggle: {e}")
+        self.toggle_hooks = []
+        if getattr(self, 'icon_unhook', None):
+            try:
+                self.icon_unhook.unhook()
+            except Exception as e:
+                log(f"[{__id__}] unhook иконок: {e}")
+            self.icon_unhook = None
 
 class PluginCommandHarvester:
     def __init__(self, path: str):
         self.path = path
+        self.last_states = {}
+        self.icons = {}
 
-    def get_command_map(self):
+    def _states(self, pid):
+        """Ответы всех доступных источников о состоянии плагина (для выбора и диагностики)."""
+        out = {}
+        for tag, cls in PLUGIN_CONTROLLERS:
+            try:
+                pc = cls.getInstance()
+            except Exception as e:
+                out[tag + ".inst"] = "ERR"
+                continue
+            try:
+                model = pc.plugins.get(pid)
+                out[tag + ".model"] = None if model is None else bool(model.isEnabled())
+            except Exception:
+                out[tag + ".model"] = "ERR"
+            try:
+                out[tag + ".ctrl"] = bool(pc.isPluginEnabled(pid))
+            except Exception:
+                out[tag + ".ctrl"] = "ERR"
+        return out
+
+    def _is_enabled(self, pid):
+        """Плагин выключен, если хоть один источник явно ответил False. Иначе считаем включённым."""
+        if not pid:
+            return True
+        st = self._states(pid)
+        self.last_states[pid] = st
+        return not any(v is False for v in st.values())
+
+    def get_command_map(self, only_enabled=True):
         res = {}
+        skipped = []
+        self.icons = {}
         if not os.path.exists(self.path): return res
         
         # Используем упрощенный поиск имен классов и строк через регулярки 
         # внутри метода сбора, чтобы не нагружать AST при каждом клике
         p_name_re = re.compile(r"class\s+(\w+)\(BasePlugin\):")
         cmd_re = re.compile(r"['\"](\.[a-zA-Z0-9_-]+)[\s'\"]")
+        icon_re = re.compile(r"^__icon__\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+        id_re = re.compile(r"^__id__\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
 
         for f in os.listdir(self.path):
             if f.endswith(('.py', '.plugin')) and f != os.path.basename(__file__):
@@ -178,10 +479,24 @@ class PluginCommandHarvester:
                     with open(os.path.join(self.path, f), 'r', encoding='utf-8') as src:
                         content = src.read()
                         
+                    if only_enabled:
+                        id_match = id_re.search(content)
+                        pid = id_match.group(1) if id_match else os.path.splitext(f)[0]
+                        if not self._is_enabled(pid):
+                            skipped.append(pid)
+                            continue
+                        
                     name_match = p_name_re.search(content)
                     p_name = name_match.group(1) if name_match else f
                     
                     cmds = sorted(list(set(cmd_re.findall(content))))
-                    if cmds: res[p_name] = cmds
+                    if cmds:
+                        res[p_name] = cmds
+                        icon_match = icon_re.search(content)
+                        if icon_match:
+                            self.icons[p_name] = icon_match.group(1)
                 except: continue
+        if only_enabled:
+            log(f"[{__id__}] включены: {sorted(res)}; пропущены выключенные: {sorted(skipped)}; "
+                f"контроллеры: {[t for t, _ in PLUGIN_CONTROLLERS]}; состояния: {self.last_states}")
         return res
