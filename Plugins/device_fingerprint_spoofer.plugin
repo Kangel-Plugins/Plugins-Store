@@ -1,0 +1,1067 @@
+# -*- coding: utf-8 -*-
+"""
+Device Fingerprint Spoofer v3 — плагин для exteraGram / AyuGram.
+
+Подменяет device_model / system_version / app_version НА СЕРВЕРАХ Telegram
+(не локально): плагин отправляет серверу initConnection с новыми данными для
+вашей текущей сессии, и сервер запоминает их.
+
+Новое в v3:
+  * Редактор прямо в «Настройки -> Устройства»: нажмите на «Это устройство»
+    и выберите профиль / введите данные вручную / вернуть настоящие.
+    Нажатие на ДРУГИЕ сессии работает как обычно: их данные может менять
+    только то устройство, которому они принадлежат.
+  * Меньше нагрузки: дедупликация отправок, кэш классов и языков, один
+    отложенный таймер вместо потоков на каждое изменение, повтор при сбое.
+"""
+
+import random
+import threading
+import time
+import zlib
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Switch, Input, Selector, Divider, Text
+
+try:
+    from base_plugin import MethodHook
+except Exception:
+    MethodHook = object
+
+try:
+    from android_utils import log as _android_log
+except Exception:
+    _android_log = None
+
+try:
+    from android_utils import run_on_ui_thread
+except Exception:
+    run_on_ui_thread = None
+
+try:
+    from client_utils import send_request
+except Exception:
+    send_request = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    BulletinHelper = None
+
+from java import jclass
+
+try:
+    from java import jint
+except Exception:
+    jint = None
+
+__id__ = "device_fingerprint_spoofer"
+__name__ = "Device Fingerprint Spoofer"
+__description__ = "Подмена device_model, system_version и app_version на серверах Telegram (не локально). Редактор в «Устройствах», применяется сразу."
+__author__ = "Daxo-Developer @Daxo_OS"
+__version__ = "3.0.0"
+__min_version__ = "12.1.1"
+__icon__ = "DaxoOS/1"
+
+TAG = "[DeviceSpoofer]"
+
+PRESETS = [
+    ("Samsung Galaxy S24 Ultra", "samsungSM-S928B", 34),
+    ("Samsung Galaxy S23", "samsungSM-S911B", 34),
+    ("Samsung Galaxy A54", "samsungSM-A546B", 34),
+    ("Google Pixel 8 Pro", "GooglePixel 8 Pro", 35),
+    ("Google Pixel 7", "GooglePixel 7", 34),
+    ("Xiaomi 14", "Xiaomi23127PN0CG", 34),
+    ("POCO F5", "Xiaomi23049PCD8G", 34),
+    ("OnePlus 12", "OnePlusCPH2573", 34),
+    ("Nothing Phone (2)", "NothingA065", 34),
+    ("Sony Xperia 1 V", "SonyXQ-DQ72", 34),
+    ("Motorola Edge 40", "motorolamotorola edge 40", 34),
+]
+
+DEFAULT_APP_VERSION = "12.1.1"
+DEFAULT_CUSTOM_MODEL = "samsungSM-S928B"
+DEFAULT_CUSTOM_SYSVER = "SDK 34"
+
+_PROFILE_CACHE = {}
+_STATIC = {}  # кэш: язык, api_id, layer, оригинальный профиль
+
+
+def _log(msg):
+    try:
+        if _android_log is not None:
+            _android_log(TAG + " " + str(msg))
+            return
+    except Exception:
+        pass
+    try:
+        print(TAG + " " + str(msg))
+    except Exception:
+        pass
+
+
+def _i32(x):
+    x &= 0xFFFFFFFF
+    return x - 0x100000000 if x & 0x80000000 else x
+
+
+def _is_str(v):
+    if isinstance(v, str):
+        return True
+    try:
+        return str(v.getClass().getName()) == "java.lang.String"
+    except Exception:
+        return False
+
+
+def _to_int(v, default=None):
+    try:
+        return int(v)
+    except Exception:
+        pass
+    try:
+        return int(v.intValue())
+    except Exception:
+        return default
+
+
+def _find_class(name):
+    try:
+        from hook_utils import find_class
+        c = find_class(name)
+        if c is not None:
+            return c
+    except Exception:
+        pass
+    try:
+        app = jclass("org.telegram.messenger.ApplicationLoader")
+        return app.applicationContext.getClassLoader().loadClass(name)
+    except Exception:
+        pass
+    return jclass("java.lang.Class").forName(name)
+
+
+def _get_field(obj, name):
+    """Прочитать (в т.ч. приватное) поле объекта по имени, обходя суперклассы."""
+    cls = obj.getClass()
+    while cls is not None:
+        try:
+            f = cls.getDeclaredField(name)
+            f.setAccessible(True)
+            return f.get(obj)
+        except Exception:
+            cls = cls.getSuperclass()
+    return None
+
+
+def _ui(fn, delay_ms=0):
+    try:
+        if run_on_ui_thread is not None:
+            try:
+                run_on_ui_thread(fn, delay_ms) if delay_ms else run_on_ui_thread(fn)
+            except TypeError:
+                run_on_ui_thread(fn)
+            return
+    except Exception:
+        pass
+    fn()
+
+
+# --------------------------------------------------------------------------
+# Сырой TL-запрос: invokeWithLayer(initConnection(..., query))
+# --------------------------------------------------------------------------
+_RAW_OK = False
+_RAW_ERR = ""
+try:
+    from extera_utils.classes import Base, java_subclass, joverride
+    from org.telegram.tgnet import TLObject
+
+    @java_subclass(TLObject)
+    class _InitConnectionReq(Base):
+
+        @joverride("serializeToStream")
+        def serialize_to_stream(self, stream):
+            c = self.cfg
+            stream.writeInt32(_i32(0xDA9B0D0D))      # invokeWithLayer
+            stream.writeInt32(int(c["layer"]))
+            stream.writeInt32(_i32(0xC1CD5EA9))      # initConnection
+            stream.writeInt32(0)                     # flags
+            stream.writeInt32(int(c["api_id"]))
+            stream.writeString(c["device_model"])
+            stream.writeString(c["system_version"])
+            stream.writeString(c["app_version"])
+            stream.writeString(c["system_lang_code"])
+            stream.writeString(c["lang_pack"])
+            stream.writeString(c["lang_code"])
+            self.inner.serializeToStream(stream)
+
+        @joverride("deserializeResponse")
+        def deserialize_response(self, stream, constructor, exception):
+            return self.inner.deserializeResponse(stream, constructor, exception)
+
+    _RAW_OK = True
+except Exception as _e:
+    _RAW_ERR = repr(_e)
+
+
+# --------------------------------------------------------------------------
+# Обёртка клика по списку устройств
+# --------------------------------------------------------------------------
+_PROXY_OK = False
+_PROXY_ERR = ""
+try:
+    from java import dynamic_proxy
+    _CLICK_IFACE = jclass("org.telegram.ui.Components.RecyclerListView$OnItemClickListener")
+
+    class _ClickWrapper(dynamic_proxy(_CLICK_IFACE)):
+        def __init__(self, plugin, orig, fragment):
+            super().__init__()
+            self.plugin = plugin
+            self.orig = orig
+            self.fragment = fragment
+
+        def onItemClick(self, view, position):
+            try:
+                if self.plugin.is_current_session_click(self.fragment, view, _to_int(position, -1)):
+                    self.plugin.open_editor(self.fragment, view, self.orig, position)
+                    return
+            except Exception as e:
+                _log("клик по сессии: %r" % (e,))
+            self.orig.onItemClick(view, position)
+
+    _PROXY_OK = True
+except Exception as _e2:
+    _PROXY_ERR = repr(_e2)
+
+
+class _InitHook(MethodHook):
+    def __init__(self, plugin):
+        try:
+            super().__init__()
+        except Exception:
+            pass
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.patch_args(param)
+        except Exception as e:
+            _log("ошибка в хуке: %r" % (e,))
+
+    def after_hooked_method(self, param):
+        pass
+
+
+class _SessionsHook(MethodHook):
+    def __init__(self, plugin):
+        try:
+            super().__init__()
+        except Exception:
+            pass
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        pass
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.on_sessions_view(param)
+        except Exception as e:
+            _log("SessionsActivity.createView: %r" % (e,))
+
+
+def _mk(cls, **kw):
+    try:
+        return cls(**kw)
+    except TypeError:
+        kw.pop("on_change", None)
+        return cls(**kw)
+
+
+class DeviceFingerprintSpoofer(BasePlugin):
+
+    # ------------------------------------------------------------------ load
+    def on_plugin_load(self):
+        self._hooked = []
+        self._pending = []
+        self._timer = None
+        self._lock = threading.Lock()
+        self._acked = {}
+        self._retries = {}
+        self._wrapped = set()
+        self._sess_fragment = None
+        self._last_apply = 0.0
+
+        try:
+            self._install_hooks()
+        except Exception as e:
+            _log("хуки старта: %r" % (e,))
+            self._safe_set("hook_state", "хуки старта не установлены: %r" % (e,))
+
+        try:
+            self._install_sessions_hook()
+        except Exception as e:
+            _log("хук SessionsActivity: %r" % (e,))
+            self._safe_set("sessions_state", "редактор в «Устройствах» недоступен: %r" % (e,))
+
+        self._schedule_apply(6.0)
+
+    def on_plugin_unload(self):
+        _PROFILE_CACHE.clear()
+        try:
+            if self._timer is not None:
+                self._timer.cancel()
+        except Exception:
+            pass
+
+    def _install_hooks(self):
+        cls = _find_class("org.telegram.tgnet.ConnectionsManager")
+        count = 0
+        for name in ("native_init", "init"):
+            ok = False
+            try:
+                self.hook_all_methods(cls, name, _InitHook(self))
+                ok = True
+            except Exception as e1:
+                try:
+                    for m in cls.getDeclaredMethods():
+                        if str(m.getName()) == name:
+                            self.hook_method(m, _InitHook(self))
+                            ok = True
+                except Exception as e2:
+                    _log("ручной хук %s: %r / %r" % (name, e1, e2))
+            if ok:
+                count += 1
+                self._hooked.append(name)
+        if count == 0:
+            raise RuntimeError("не удалось перехватить ConnectionsManager")
+        self._safe_set("hook_state", "хуки старта: " + ", ".join(self._hooked))
+
+    def _install_sessions_hook(self):
+        if not _PROXY_OK:
+            raise RuntimeError("dynamic_proxy недоступен: %s" % _PROXY_ERR)
+        cls = _find_class("org.telegram.ui.SessionsActivity")
+        try:
+            self.hook_all_methods(cls, "createView", _SessionsHook(self))
+        except Exception:
+            done = False
+            for m in cls.getDeclaredMethods():
+                if str(m.getName()) == "createView":
+                    self.hook_method(m, _SessionsHook(self))
+                    done = True
+            if not done:
+                raise
+        self._safe_set("sessions_state", "редактор в «Устройствах»: готов")
+
+    # --------------------------------------------------------------- helpers
+    def _safe_set(self, key, value):
+        try:
+            self.set_setting(key, value)
+        except Exception:
+            pass
+
+    def _int_setting(self, key, default):
+        try:
+            return int(self.get_setting(key, default))
+        except Exception:
+            return default
+
+    def _str_setting(self, key, default):
+        try:
+            v = self.get_setting(key, default)
+            v = ("" if v is None else str(v)).strip()
+            return v if v else default
+        except Exception:
+            return default
+
+    def _bool_setting(self, key, default):
+        try:
+            return bool(self.get_setting(key, default))
+        except Exception:
+            return default
+
+    def _toast(self, msg, ok=True):
+        def _show():
+            try:
+                if BulletinHelper is None:
+                    return
+                if ok and hasattr(BulletinHelper, "show_success"):
+                    BulletinHelper.show_success(msg)
+                elif (not ok) and hasattr(BulletinHelper, "show_error"):
+                    BulletinHelper.show_error(msg)
+                else:
+                    BulletinHelper.show_info(msg)
+            except Exception:
+                pass
+        _ui(_show)
+
+    def _set_runtime(self, text):
+        self._safe_set("runtime_status", text)
+
+    # --------------------------------------------------------------- profile
+    def resolve_profile(self):
+        p = _PROFILE_CACHE.get("p")
+        if p is not None:
+            return p
+
+        idx = self._int_setting("profile", 1)
+        n = len(PRESETS)
+        if 1 <= idx <= n:
+            label, model, sdk = PRESETS[idx - 1]
+            sysver = "SDK %d" % sdk
+        elif idx == n + 1:
+            label = "Свой профиль"
+            model = self._str_setting("custom_model", DEFAULT_CUSTOM_MODEL)
+            sysver = self._str_setting("custom_sysver", DEFAULT_CUSTOM_SYSVER)
+        else:
+            label, model, sdk = random.choice(PRESETS)
+            label = "Случайный: " + label
+            sysver = "SDK %d" % sdk
+
+        app_version = None
+        if self._bool_setting("spoof_app", True):
+            app_version = self._str_setting("app_version", DEFAULT_APP_VERSION)
+
+        p = (model, sysver, app_version, label)
+        _PROFILE_CACHE["p"] = p
+        return p
+
+    def _real_profile(self):
+        r = _STATIC.get("real")
+        if r is not None:
+            return r
+        model = sysver = appver = None
+        try:
+            parts = str(self.get_setting("last_original", "") or "").split(" | ")
+            if len(parts) == 3 and all(parts):
+                model, sysver, appver = parts
+        except Exception:
+            pass
+        try:
+            Build = jclass("android.os.Build")
+            if not model:
+                model = str(Build.MANUFACTURER) + str(Build.MODEL)
+            if not sysver:
+                sysver = "SDK %d" % int(Build.VERSION.SDK_INT)
+            if not appver:
+                app = jclass("org.telegram.messenger.ApplicationLoader")
+                ctx = app.applicationContext
+                pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0)
+                appver = str(pi.versionName)
+        except Exception as e:
+            _log("real_profile: %r" % (e,))
+        r = (model or DEFAULT_CUSTOM_MODEL, sysver or DEFAULT_CUSTOM_SYSVER,
+             appver or DEFAULT_APP_VERSION)
+        _STATIC["real"] = r
+        return r
+
+    # --------------------------------------------- путь «на старте» (хуки)
+    def patch_args(self, param):
+        if not self._bool_setting("enabled", True):
+            return
+        args = param.args
+        try:
+            total = len(args)
+        except Exception:
+            total = int(args.length)
+
+        idxs = []
+        for i in range(total):
+            if _is_str(args[i]):
+                idxs.append(i)
+                if len(idxs) == 3:
+                    break
+        if len(idxs) < 3:
+            return
+
+        model, sysver, app_version, label = self.resolve_profile()
+        orig = (str(args[idxs[0]]), str(args[idxs[1]]), str(args[idxs[2]]))
+        if "real" not in _STATIC:
+            _STATIC["real"] = orig
+
+        args[idxs[0]] = model
+        args[idxs[1]] = sysver
+        if app_version:
+            args[idxs[2]] = app_version
+
+        if self._bool_setting("force_reinit", True) and jint is not None:
+            try:
+                vi = idxs[0] - 3
+                lv = _to_int(args[vi + 1], 0) if vi >= 0 else 0
+                if vi >= 0 and 100 <= lv <= 2000:
+                    ov = _to_int(args[vi], 0)
+                    salt = zlib.crc32(
+                        (model + sysver + (app_version or "")).encode("utf-8")
+                    ) % 900
+                    args[vi] = jint((ov + 1 + salt) & 0x7FFFFFFF)
+            except Exception as e:
+                _log("version: %r" % (e,))
+
+        self._safe_set("last_original", "%s | %s | %s" % orig)
+        self._safe_set(
+            "last_applied",
+            "%s -> %s | %s | %s" % (label, model, sysver, app_version or orig[2]),
+        )
+
+    # -------------------------------------------- рантайм-путь (без рестарта)
+    def _schedule_apply(self, delay=1.5, force=False):
+        try:
+            if self._timer is not None:
+                self._timer.cancel()
+        except Exception:
+            pass
+        t = threading.Timer(delay, lambda: self._apply_safe(force))
+        t.daemon = True
+        self._timer = t
+        t.start()
+
+    def _apply_safe(self, force=False):
+        if not self._lock.acquire(False):
+            self._schedule_apply(1.0, force)
+            return
+        try:
+            self.apply_runtime(force_new=False, notify=False, force=force)
+        except Exception as e:
+            _log("apply_runtime: %r" % (e,))
+            self._set_runtime("ошибка: %r" % (e,))
+        finally:
+            self._lock.release()
+
+    def _active_accounts(self):
+        res = []
+        UC = jclass("org.telegram.messenger.UserConfig")
+        n = _to_int(getattr(UC, "MAX_ACCOUNT_COUNT", 16), 16)
+        for a in range(n):
+            try:
+                if UC.getInstance(a).isClientActivated():
+                    res.append(a)
+            except Exception:
+                pass
+        return res
+
+    def _static_params(self):
+        s = _STATIC.get("net")
+        if s is not None:
+            return s
+        sys_lang, lang = "en", ""
+        try:
+            LC = jclass("org.telegram.messenger.LocaleController")
+            try:
+                sys_lang = str(LC.getSystemLocaleStringIso639()).lower() or "en"
+            except Exception:
+                pass
+            try:
+                lang = str(LC.getInstance().getCurrentLocaleInfo().getLangCode())
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            api_id = _to_int(jclass("org.telegram.messenger.BuildVars").APP_ID, 4)
+        except Exception:
+            api_id = 4
+        from org.telegram.tgnet import TLRPC
+        layer = _to_int(TLRPC.LAYER, 0)
+        s = {"sys_lang": sys_lang, "lang": lang or sys_lang,
+             "api_id": api_id, "layer": layer}
+        _STATIC["net"] = s
+        return s
+
+    def _build_request(self, model, sysver, appver):
+        from org.telegram.tgnet import TLRPC
+        s = self._static_params()
+        inner = TLRPC.TL_help_getNearestDc()
+
+        if _RAW_OK:
+            peer = _InitConnectionReq.new_instance()
+            peer.cfg = {
+                "layer": s["layer"], "api_id": s["api_id"],
+                "device_model": model, "system_version": sysver,
+                "app_version": appver, "system_lang_code": s["sys_lang"],
+                "lang_pack": "android", "lang_code": s["lang"],
+            }
+            peer.inner = inner
+            return peer.java, peer
+
+        ini = TLRPC.TL_initConnection()
+        ini.flags = 0
+        ini.api_id = s["api_id"]
+        ini.device_model = model
+        ini.system_version = sysver
+        ini.app_version = appver
+        ini.system_lang_code = s["sys_lang"]
+        ini.lang_pack = "android"
+        ini.lang_code = s["lang"]
+        ini.query = inner
+        inv = TLRPC.TL_invokeWithLayer()
+        inv.layer = s["layer"]
+        inv.query = ini
+        return inv, None
+
+    def apply_runtime(self, force_new=False, notify=False, force=False):
+        if send_request is None:
+            raise RuntimeError("client_utils.send_request недоступен")
+        if force_new:
+            _PROFILE_CACHE.clear()
+
+        if self._bool_setting("enabled", True):
+            model, sysver, appver, label = self.resolve_profile()
+            if not appver:
+                appver = self._real_profile()[2]
+        else:
+            model, sysver, appver = self._real_profile()
+            label = "Оригинал"
+
+        accounts = self._active_accounts()
+        if not accounts:
+            self._set_runtime("нет активных аккаунтов")
+            if notify:
+                self._toast("Нет активных аккаунтов", ok=False)
+            return
+
+        key = (model, sysver, appver)
+        sent = 0
+        skipped = 0
+        for acc in accounts:
+            if not force and self._acked.get(acc) == key:
+                skipped += 1
+                continue
+            try:
+                req, keep = self._build_request(model, sysver, appver)
+                if keep is not None:
+                    self._pending.append(keep)
+                    if len(self._pending) > 32:
+                        self._pending = self._pending[-16:]
+                send_request(
+                    req,
+                    self._make_cb(acc, key, model, sysver, appver, notify),
+                    account=acc,
+                )
+                sent += 1
+            except Exception as e:
+                msg = "акк %d: не удалось отправить: %r" % (acc, e)
+                _log(msg)
+                self._set_runtime(msg + ("" if _RAW_OK else " | proxy: " + _RAW_ERR))
+                if notify:
+                    self._toast("Ошибка отправки: %s" % (e,), ok=False)
+        if sent == 0 and skipped and notify:
+            self._toast("Уже применено: %s" % model, ok=True)
+        self._last_apply = time.time()
+
+    def _make_cb(self, acc, key, model, sysver, appver, notify):
+        def cb(response, error):
+            stamp = time.strftime("%H:%M:%S")
+            if error:
+                txt = getattr(error, "text", None) or str(error)
+                self._set_runtime("%s акк %d: ошибка сервера: %s" % (stamp, acc, txt))
+                tries = self._retries.get(acc, 0)
+                if tries < 2 and not notify:
+                    self._retries[acc] = tries + 1
+                    self._schedule_apply(8.0)
+                if notify:
+                    self._toast("Ошибка сервера: %s" % txt, ok=False)
+            else:
+                self._acked[acc] = key
+                self._retries[acc] = 0
+                self._set_runtime(
+                    "%s акк %d: принято сервером — %s | %s | %s"
+                    % (stamp, acc, model, sysver, appver)
+                )
+                if notify:
+                    self._toast("Устройство обновлено: %s" % model, ok=True)
+                    self._refresh_sessions()
+        return cb
+
+    def _refresh_sessions(self):
+        frag = self._sess_fragment
+        if frag is None:
+            return
+
+        def do():
+            try:
+                cls = frag.getClass()
+                while cls is not None:
+                    for m in cls.getDeclaredMethods():
+                        if str(m.getName()) == "loadSessions":
+                            m.setAccessible(True)
+                            if m.getParameterCount() == 1:
+                                m.invoke(frag, True)
+                            else:
+                                m.invoke(frag)
+                            return
+                    cls = cls.getSuperclass()
+            except Exception as e:
+                _log("обновление списка: %r" % (e,))
+            finally:
+                self._sess_fragment = None
+        _ui(do, 1200)
+
+    # ---------------------------------------------------------------- UI cb
+    def _on_changed(self, *args):
+        _PROFILE_CACHE.clear()
+        self._schedule_apply(1.5)
+
+    def _on_apply_now(self, *args):
+        def run():
+            try:
+                self.apply_runtime(force_new=True, notify=True, force=True)
+            except Exception as e:
+                _log("apply_now: %r" % (e,))
+                self._toast("Ошибка: %s" % (e,), ok=False)
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------- редактор в «Настройки → Устройства»
+    def on_sessions_view(self, param):
+        if not self._bool_setting("sessions_editor", True):
+            return
+        fragment = getattr(param, "thisObject", None)
+        root = None
+        try:
+            root = param.getResult()
+        except Exception:
+            root = getattr(param, "result", None)
+        if fragment is None or root is None:
+            return
+
+        RLV = _find_class("org.telegram.ui.Components.RecyclerListView")
+        found = []
+        self._collect(root, RLV, found)
+        if not found:
+            self._safe_set("sessions_state", "редактор: список устройств не найден")
+            return
+        lv = found[0]
+
+        ident = int(jclass("java.lang.System").identityHashCode(lv))
+        if ident in self._wrapped:
+            return
+
+        orig = None
+        iface_name = "org.telegram.ui.Components.RecyclerListView$OnItemClickListener"
+        cls = RLV
+        while cls is not None and orig is None:
+            for f in cls.getDeclaredFields():
+                if str(f.getType().getName()) == iface_name:
+                    f.setAccessible(True)
+                    orig = f.get(lv)
+                    break
+            cls = cls.getSuperclass()
+        if orig is None:
+            self._safe_set("sessions_state", "редактор: обработчик нажатий не найден")
+            return
+
+        lv.setOnItemClickListener(_ClickWrapper(self, orig, fragment))
+        self._wrapped.add(ident)
+        if len(self._wrapped) > 16:
+            self._wrapped = {ident}
+        self._safe_set("sessions_state", "редактор в «Устройствах»: подключён")
+
+    def _collect(self, v, cls, out, depth=0):
+        if out or depth > 12:
+            return
+        if cls.isInstance(v):
+            out.append(v)
+            return
+        VG = jclass("android.view.ViewGroup")
+        if VG.isInstance(v):
+            for i in range(int(v.getChildCount())):
+                self._collect(v.getChildAt(i), cls, out, depth + 1)
+                if out:
+                    return
+
+    def is_current_session_click(self, fragment, view, position):
+        if not self._bool_setting("sessions_editor", True):
+            return False
+        if not str(view.getClass().getName()).endswith("SessionCell"):
+            return False
+
+        # 1) строка текущей сессии известна фрагменту
+        row = _to_int(_get_field(fragment, "currentSessionRow"), None)
+        if row is not None and row >= 0:
+            return position == row
+
+        # 2) в ячейке хранится объект сессии
+        cls = view.getClass()
+        while cls is not None:
+            for f in cls.getDeclaredFields():
+                tn = str(f.getType().getName())
+                if tn.endswith("TL_authorization") or tn.endswith("TLObject"):
+                    try:
+                        f.setAccessible(True)
+                        s = f.get(view)
+                        if s is not None and str(s.getClass().getName()).endswith("TL_authorization"):
+                            return bool(s.current)
+                    except Exception:
+                        pass
+            cls = cls.getSuperclass()
+
+        # 3) сравнение по тексту: модель текущей сессии есть в тексте ячейки
+        cur = None
+        cls = fragment.getClass()
+        while cls is not None and cur is None:
+            for f in cls.getDeclaredFields():
+                if str(f.getType().getName()).endswith("TL_authorization"):
+                    try:
+                        f.setAccessible(True)
+                        s = f.get(fragment)
+                        if s is not None and bool(s.current):
+                            cur = s
+                            break
+                    except Exception:
+                        pass
+            cls = cls.getSuperclass()
+        if cur is None:
+            return False
+        model = str(cur.device_model or "")
+        if not model:
+            return False
+        texts = []
+        cls = view.getClass()
+        while cls is not None:
+            for f in cls.getDeclaredFields():
+                if "TextView" in str(f.getType().getName()):
+                    try:
+                        f.setAccessible(True)
+                        tv = f.get(view)
+                        if tv is not None:
+                            texts.append(str(tv.getText()))
+                    except Exception:
+                        pass
+            cls = cls.getSuperclass()
+        return any(model in t for t in texts)
+
+    def open_editor(self, fragment, view, orig, position):
+        from ui.alert import AlertDialogBuilder
+
+        self._sess_fragment = fragment
+        act = None
+        try:
+            act = fragment.getParentActivity()
+        except Exception:
+            pass
+        if act is None:
+            act = view.getContext()
+
+        n = len(PRESETS)
+        items = [
+            "📱 Выбрать профиль устройства…",
+            "✏️ Ввести данные вручную…",
+            "🎲 Случайный профиль",
+            "↩️ Вернуть настоящее устройство",
+            "ℹ️ Стандартные сведения Telegram",
+        ]
+
+        def pick_profile():
+            names = ["🎲 Случайный"] + [p[0] for p in PRESETS]
+            b2 = AlertDialogBuilder(act)
+            b2.set_title("Профиль устройства")
+
+            def on_profile(bld, which):
+                self._safe_set("profile", int(which))
+                self._safe_set("enabled", True)
+                self._apply_from_editor()
+            b2.set_items(names, on_profile)
+            b2.show()
+
+        def on_main(bld, which):
+            if which == 0:
+                _ui(pick_profile, 150)
+            elif which == 1:
+                _ui(lambda: self._manual_dialog(act), 150)
+            elif which == 2:
+                self._safe_set("profile", 0)
+                self._safe_set("enabled", True)
+                self._apply_from_editor()
+            elif which == 3:
+                self._safe_set("enabled", False)
+                self._apply_from_editor()
+            else:
+                try:
+                    orig.onItemClick(view, position)
+                except Exception as e:
+                    _log("стандартные сведения: %r" % (e,))
+
+        b = AlertDialogBuilder(act)
+        b.set_title("Это устройство · подмена на сервере")
+        b.set_items(items, on_main)
+        b.show()
+
+    def _apply_from_editor(self):
+        _PROFILE_CACHE.clear()
+
+        def run():
+            try:
+                self.apply_runtime(force_new=False, notify=True, force=True)
+            except Exception as e:
+                self._toast("Ошибка: %s" % (e,), ok=False)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _manual_dialog(self, act):
+        from ui.alert import AlertDialogBuilder
+
+        LinearLayout = jclass("android.widget.LinearLayout")
+        EditText = jclass("android.widget.EditText")
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+
+        if self._bool_setting("enabled", True):
+            cur_model, cur_sys, cur_app, _ = self.resolve_profile()
+            cur_app = cur_app or self._real_profile()[2]
+        else:
+            cur_model, cur_sys, cur_app = self._real_profile()
+
+        layout = LinearLayout(act)
+        layout.setOrientation(1)
+        pad = int(AU.dp(20.0))
+        layout.setPadding(pad, int(AU.dp(8.0)), pad, 0)
+
+        def mk(hint, text):
+            et = EditText(act)
+            et.setHint(hint)
+            et.setText(text)
+            et.setSingleLine(True)
+            try:
+                Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                et.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            except Exception:
+                pass
+            layout.addView(et)
+            return et
+
+        e_model = mk("device_model", cur_model)
+        e_sys = mk("system_version", cur_sys)
+        e_app = mk("app_version", cur_app)
+
+        b = AlertDialogBuilder(act)
+        b.set_title("Данные устройства (на сервере)")
+        b.set_view(layout)
+
+        def on_ok(bld, which):
+            model = str(e_model.getText()).strip()
+            sysv = str(e_sys.getText()).strip()
+            app = str(e_app.getText()).strip()
+            if not model or not sysv:
+                self._toast("device_model и system_version не должны быть пустыми", ok=False)
+                return
+            self._safe_set("custom_model", model)
+            self._safe_set("custom_sysver", sysv)
+            if app:
+                self._safe_set("app_version", app)
+                self._safe_set("spoof_app", True)
+            self._safe_set("profile", len(PRESETS) + 1)
+            self._safe_set("enabled", True)
+            self._apply_from_editor()
+
+        try:
+            b.set_positive_button("Применить", on_ok)
+            b.set_negative_button("Отмена")
+        except Exception:
+            b.set_positive_button("Применить", on_ok)
+        b.show()
+
+    # -------------------------------------------------------------- settings
+    def create_settings(self):
+        names = ["🎲 Случайный (при каждом применении)"]
+        names += [p[0] for p in PRESETS]
+        names.append("✏️ Свой профиль (поля ниже)")
+
+        runtime = self.get_setting("runtime_status", "") or "ещё не отправлялось"
+        hook_state = self.get_setting("hook_state", "хуки старта: не устанавливались")
+        sess_state = self.get_setting("sessions_state", "редактор в «Устройствах»: не подключён")
+        applied = self.get_setting("last_applied", "")
+        original = self.get_setting("last_original", "")
+
+        items = [
+            Header(text="Device Fingerprint Spoofer"),
+            _mk(Switch, key="enabled", text="Включить подмену", default=True,
+                subtext="Данные меняются на серверах Telegram. Выключите — вернутся настоящие.",
+                on_change=self._on_changed),
+            Divider(),
+            Header(text="Профиль устройства"),
+            _mk(Selector, key="profile", text="Профиль", default=1, items=names,
+                on_change=self._on_changed),
+            _mk(Input, key="custom_model", text="Свой device_model",
+                default=DEFAULT_CUSTOM_MODEL,
+                subtext="Только для режима «Свой профиль».",
+                on_change=self._on_changed),
+            _mk(Input, key="custom_sysver", text="Своя system_version",
+                default=DEFAULT_CUSTOM_SYSVER,
+                subtext="Для Android-клиента формат «SDK 34».",
+                on_change=self._on_changed),
+            Divider(),
+            Header(text="Версия приложения"),
+            _mk(Switch, key="spoof_app", text="Подменять app_version", default=True,
+                subtext="Скрывает, что используется exteraGram/AyuGram.",
+                on_change=self._on_changed),
+            _mk(Input, key="app_version", text="app_version",
+                default=DEFAULT_APP_VERSION, subtext="Например: 12.1.1",
+                on_change=self._on_changed),
+            Divider(),
+            Header(text="Редактор в «Устройствах»"),
+            _mk(Switch, key="sessions_editor",
+                text="Менять по нажатию на «Это устройство»", default=True,
+                subtext="Нажатие на другие сессии работает как обычно: их данные может менять только их устройство."),
+            Divider(),
+            Header(text="Дополнительно"),
+            _mk(Switch, key="force_reinit",
+                text="Переотправлять initConnection на старте", default=True,
+                subtext="Меняет внутреннюю «version», чтобы сервер точно получил данные при запуске."),
+            Divider(),
+            Header(text="Применение"),
+        ]
+
+        try:
+            items.append(Text(text="Применить сейчас (без перезапуска)", accent=True,
+                              on_click=self._on_apply_now))
+        except TypeError:
+            items.append(Text(text="Применить сейчас (без перезапуска)",
+                              on_click=self._on_apply_now))
+        try:
+            items.append(Text(text="Перезапустить приложение",
+                              on_click=self._on_restart_click))
+        except TypeError:
+            pass
+
+        items += [
+            Divider(),
+            Header(text="Статус"),
+            Divider(text="Сервер: %s" % runtime),
+            Divider(text=str(sess_state)),
+            Divider(text=str(hook_state)),
+        ]
+        if applied:
+            items.append(Divider(text="Старт: %s" % applied))
+        if original:
+            items.append(Divider(text="Оригинал был: %s" % original))
+        if not _RAW_OK:
+            items.append(Divider(text="Режим TLRPC (class proxy недоступен: %s)" % _RAW_ERR))
+        items.append(Divider(
+            text="Результат виден в Настройки → Устройства (иногда нужно переоткрыть экран)."))
+        return items
+
+    # --------------------------------------------------------------- restart
+    def _on_restart_click(self, *args):
+        self._toast("Перезапуск приложения…", ok=True)
+        threading.Timer(0.8, self._restart_app).start()
+
+    def _restart_app(self):
+        try:
+            app = jclass("org.telegram.messenger.ApplicationLoader")
+            ctx = app.applicationContext
+            Intent = jclass("android.content.Intent")
+            PendingIntent = jclass("android.app.PendingIntent")
+            AlarmManager = jclass("android.app.AlarmManager")
+            System = jclass("java.lang.System")
+            Process = jclass("android.os.Process")
+
+            intent = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName())
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            pi = PendingIntent.getActivity(
+                ctx, 0, intent,
+                PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_IMMUTABLE,
+            )
+            am = ctx.getSystemService("alarm")
+            am.set(AlarmManager.RTC, System.currentTimeMillis() + 500, pi)
+            Process.killProcess(Process.myPid())
+        except Exception as e:
+            _log("не удалось перезапустить: %r" % (e,))
+            self._toast("Закройте и откройте приложение вручную", ok=False)
