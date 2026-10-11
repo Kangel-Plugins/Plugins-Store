@@ -1,0 +1,1080 @@
+import colorsys
+import time
+
+from android.graphics import Bitmap, LinearGradient, Paint, Shader
+from java import jarray, jint
+from java.util import Collections, WeakHashMap
+from java.util.concurrent.atomic import AtomicBoolean
+
+try:
+    from android.widget import Toast
+except Exception:
+    Toast = None
+try:
+    from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+except Exception:
+    AndroidUtilities = ApplicationLoader = None
+try:
+    from org.telegram.messenger import MessageObject
+except Exception:
+    MessageObject = None
+try:
+    from org.telegram.ui.ActionBar import Theme
+except Exception:
+    Theme = None
+
+from base_plugin import BasePlugin, MethodHook
+try:
+    from base_plugin import HookFilter, hook_filters
+except ImportError:
+    HookFilter = hook_filters = None
+from hook_utils import find_class
+try:
+    from hook_utils import get_private_field
+except ImportError:
+    get_private_field = None
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "photo_bubbles"
+__name__ = "Photo Bubbles"
+__author__ = "@fanatkhimitsu"
+__description__ = "Красит облачко сообщения с фото градиентом, который повторяет расположение цветов на фото. Работает и с альбомами."
+__version__ = "0.7.3"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.10"
+
+GRID = 12
+MOS = 12
+COUNTS = [3, 5, 8]
+SAT_MULT = [0.7, 1.0, 1.4]
+THRESHOLDS = [2.0, 3.0, 4.5]
+WHITE = -1
+LIGHT_LINK = 0xFFB8DCFF - (1 << 32)
+SCAN_INTERVAL = 0.5
+DEFAULTS = {
+    "enabled": True,
+    "incoming": True,
+    "outgoing": True,
+    "video": False,
+    "readable": False,
+    "direction": 2,
+    "colors": 1,
+    "saturation": 1,
+    "white_text": True,
+    "white_threshold": 1,
+    "fast_filters": True,
+    "group_fast": False,
+}
+
+
+def pixels_to_grid(pixels):
+    grid = []
+    for p in pixels:
+        if ((p >> 24) & 0xFF) < 128:
+            grid.append(None)
+        else:
+            grid.append(((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF))
+    return grid
+
+
+def build_mosaic(items, cols, rows):
+    if MOS == GRID and cols == 1 and rows == 1 and len(items) == 1:
+        return list(items[0][0])
+    mos = [None] * (MOS * MOS)
+    for grid, x0, x1, y0, y1 in items:
+        cx0 = x0 * MOS // cols
+        cx1 = min(MOS, max(cx0 + 1, (x1 + 1) * MOS // cols))
+        cy0 = y0 * MOS // rows
+        cy1 = min(MOS, max(cy0 + 1, (y1 + 1) * MOS // rows))
+        w, h = cx1 - cx0, cy1 - cy0
+        if w <= 0 or h <= 0:
+            continue
+        for my in range(cy0, cy1):
+            gy = min(GRID - 1, (my - cy0) * GRID // h)
+            for mx in range(cx0, cx1):
+                gx = min(GRID - 1, (mx - cx0) * GRID // w)
+                mos[my * MOS + mx] = grid[gy * GRID + gx]
+    return mos
+
+
+def projection(direction, x, y):
+    if direction == 1:
+        return x
+    if direction == 2:
+        return y
+    if direction == 3:
+        return (x + 1.0 - y) / 2.0
+    return (x + y) / 2.0
+
+
+_BAND_IDX = {}
+
+
+def _band_index(direction, k):
+    key = (direction, k)
+    hit = _BAND_IDX.get(key)
+    if hit is None:
+        hit = [min(k - 1, int(projection(direction, (i % MOS + 0.5) / MOS, (i // MOS + 0.5) / MOS) * k))
+               for i in range(MOS * MOS)]
+        _BAND_IDX[key] = hit
+    return hit
+
+
+def band_colors(mos, direction, k):
+    sums = [[0, 0.0, 0.0, 0.0] for _ in range(k)]
+    bi = _band_index(direction, k)
+    for idx, px in enumerate(mos):
+        if px is None:
+            continue
+        s = sums[bi[idx]]
+        s[0] += 1
+        s[1] += px[0]
+        s[2] += px[1]
+        s[3] += px[2]
+    bands = [(s[1] / s[0], s[2] / s[0], s[3] / s[0]) if s[0] else None for s in sums]
+    known = [i for i, b in enumerate(bands) if b is not None]
+    if not known:
+        return None
+    for i, b in enumerate(bands):
+        if b is None:
+            bands[i] = bands[min(known, key=lambda q: abs(q - i))]
+    return bands
+
+
+def finalize(bands, sat_mult, base_l=None):
+    out = []
+    for r, g, b in bands:
+        h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        s = min(1.0, s * sat_mult)
+        if base_l is not None:
+            l = min(0.9, max(0.1, base_l + (l - 0.5) * 0.3))
+        r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+        argb = 0xFF000000 | int(r2 * 255 + 0.5) << 16 | int(g2 * 255 + 0.5) << 8 | int(b2 * 255 + 0.5)
+        out.append(argb - (1 << 32) if argb >= (1 << 31) else argb)
+    return out
+
+
+def jclass(cls):
+    if cls is None:
+        return None
+    if hasattr(cls, "getDeclaredMethods"):
+        return cls
+    try:
+        c = cls.getClass()
+        if hasattr(c, "getDeclaredMethods"):
+            return c
+    except Exception:
+        pass
+    return None
+
+
+def sig_of(m):
+    return m.getName() + "(" + ",".join(t.getSimpleName() for t in m.getParameterTypes()) + ")"
+
+
+def endpoints(direction, l, t, r, b):
+    cx, cy = (l + r) / 2.0, (t + b) / 2.0
+    if direction == 1:
+        return l, cy, r, cy
+    if direction == 2:
+        return cx, t, cx, b
+    if direction == 3:
+        return l, b, r, t
+    return l, t, r, b
+
+
+def _lin(c):
+    c /= 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def luminance(argb):
+    v = argb & 0xFFFFFF
+    return 0.2126 * _lin((v >> 16) & 255) + 0.7152 * _lin((v >> 8) & 255) + 0.0722 * _lin(v & 255)
+
+
+def contrast(l1, l2):
+    hi, lo = (l1, l2) if l1 >= l2 else (l2, l1)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def text_region(colors, direction):
+    if direction in (0, 2):
+        return colors[-max(1, int(len(colors) * 0.4 + 0.5)):]
+    return colors
+
+
+def contrast_pair(colors, text_argb, direction):
+    lums = [luminance(c) for c in text_region(colors, direction)]
+    orig = min(contrast(luminance(text_argb), l) for l in lums)
+    white = min(contrast(1.0, l) for l in lums)
+    return orig, white
+
+
+def needs_white(colors, text_argb, threshold, direction):
+    orig, white = contrast_pair(colors, text_argb, direction)
+    return orig < threshold and white > orig
+
+
+class PhotoBubblesPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._init_state()
+        try:
+            self._load()
+        except Exception as e:
+            self._err("load", e)
+
+    def _init_state(self):
+        self.cfg = {k: self.get_setting(k, d) for k, d in DEFAULTS.items()}
+        self.active = None
+        self.stat = {}
+        self.errors = []
+        self.notes = []
+        self.last_info = ""
+        self._warned = set()
+        self.photo_type = getattr(MessageObject, "TYPE_PHOTO", 1)
+        self.video_type = getattr(MessageObject, "TYPE_VIDEO", 3)
+        self.f_active = AtomicBoolean(False)
+        self.f_restore = AtomicBoolean(False)
+        self.white_set = Collections.newSetFromMap(WeakHashMap())
+        self.white_state = {}
+        self.group_mos = {}
+        self._last_scan = 0.0
+        self.group_seen_t = 0.0
+        self._bg_depth = 0
+        self._active_on = False
+        self._drew = False
+        self._restore = None
+        self._eng_depth = 0
+        self._white_depth = 0
+        self._white_saved = None
+        self._tc = {}
+        self._unhooks = {}
+        self.hook_counts = {}
+        self.first_media_t = 0.0
+        self._pi_modes = [0, 1, 2]
+        self._probed = False
+        self.cell_cls = None
+        self.drawable_cls = None
+        self.filtered = bool(HookFilter is not None and self.cfg["fast_filters"])
+        self._clear(full=True)
+
+    def _find(self, name):
+        cls = None
+        try:
+            cls = find_class(name)
+        except Exception as e:
+            self._err("find_class", e)
+        if cls is None:
+            try:
+                from java.lang import Class
+                cls = Class.forName(name)
+                self.notes.append(f"{name}: найден через Class.forName")
+            except Exception:
+                cls = None
+        return cls
+
+    def _drawable_from_cell(self):
+        jc = jclass(self.cell_cls)
+        if jc is None:
+            return None
+        try:
+            for f in jc.getDeclaredFields():
+                t = f.getType()
+                if t.getSimpleName() == "MessageDrawable":
+                    self.notes.append(f"MessageDrawable найден по полю {f.getName()}: {t.getName()}")
+                    return t
+        except Exception as e:
+            self._err("drawable_from_cell", e)
+        return None
+
+    def _dump_api(self):
+        try:
+            jc = jclass(self.cell_cls)
+            if jc is None:
+                self.notes.append("у класса ячейки нет getDeclaredMethods: отражение недоступно")
+                return
+            keys = ("ackground", "drawMessageText", "drawCaption", "didSetImage")
+            sigs = sorted({sig_of(m) for m in jc.getDeclaredMethods() if any(k in m.getName() for k in keys)})
+            self.notes.append(("ChatMessageCell: " + "; ".join(sigs))[:900])
+            fields = sorted({f.getName() + ":" + f.getType().getSimpleName() for f in jc.getDeclaredFields()
+                             if f.getType().getSimpleName() in ("ImageReceiver", "MessageDrawable", "GroupedMessages")})
+            self.notes.append(("поля: " + "; ".join(fields))[:500])
+            dc = jclass(self.drawable_cls)
+            if dc is not None:
+                dsigs = sorted({sig_of(m) for m in dc.getDeclaredMethods() if m.getName().startswith("draw")})
+                self.notes.append(("MessageDrawable: " + "; ".join(dsigs))[:700])
+        except Exception as e:
+            self._err("dump_api", e)
+
+    def _load(self):
+        self.cell_cls = self._find("org.telegram.ui.Cells.ChatMessageCell")
+        self.drawable_cls = self._find("org.telegram.ui.ActionBar.MessageDrawable") \
+            or self._find("org.telegram.ui.ActionBar.Theme$MessageDrawable")
+        if self.cell_cls and not self.drawable_cls:
+            self.drawable_cls = self._drawable_from_cell()
+        self._dump_api()
+        if not self.cell_cls or not self.drawable_cls:
+            self.notes.append("не нашёл ChatMessageCell или Theme$MessageDrawable")
+            self.log("Не нашёл ChatMessageCell или Theme$MessageDrawable, плагин не активен")
+            return
+        self._install_hooks()
+
+    def on_plugin_unload(self):
+        self.active = None
+        self._uninstall_hooks()
+        self._clear(full=True)
+
+
+    def _media_expr(self):
+        t = f"this.getMessageObject().type == {self.photo_type}"
+        if self.cfg["video"]:
+            t = f"({t} || this.getMessageObject().type == {self.video_type})"
+        return f"this.getMessageObject() != null && {t}"
+
+    def _handler(self, before=None, after=None, before_f=None, after_f=None):
+        ns = {}
+        if before:
+            fn = lambda _self, param: before(param)
+            if self.filtered and before_f is not None:
+                fn = hook_filters(before_f)(fn)
+            ns["before_hooked_method"] = fn
+        if after:
+            fn = lambda _self, param: after(param)
+            if self.filtered and after_f is not None:
+                fn = hook_filters(after_f)(fn)
+            ns["after_hooked_method"] = fn
+        return type("PhotoBubblesHook", (MethodHook,), ns)()
+
+    def _is_bg_method(self, m):
+        n = m.getName()
+        types = m.getParameterTypes()
+        return n.startswith("draw") and "ackground" in n and len(types) >= 1 and types[0].getSimpleName() == "Canvas"
+
+    def _is_text_method(self, m):
+        n = m.getName()
+        types = m.getParameterTypes()
+        return (n.startswith("drawMessageText") or n.startswith("drawCaption")) and len(types) >= 1 \
+            and types[0].getSimpleName() == "Canvas"
+
+    def _hook_all(self, tag, cls, name, handler, optional=False, alts=None):
+        found = []
+        try:
+            hooks = self.hook_all_methods(cls, name, handler)
+            found = list(hooks) if hooks else []
+        except Exception as e:
+            self._err("hook:" + tag, e)
+        if not found and alts is not None:
+            found = self._hook_by_reflection(cls, tag, handler, alts, skip=name)
+        self._unhooks.setdefault(tag, []).extend(found)
+        self.hook_counts[tag] = self.hook_counts.get(tag, 0) + len(found)
+        if not found and not optional:
+            self.notes.append(f"хук {tag} ({name}) не установлен")
+            self.log(f"Хук {tag} ({name}) не установлен")
+
+    def _hook_by_reflection(self, cls, tag, handler, pred, skip=""):
+        found = []
+        jc = jclass(cls)
+        if jc is None:
+            return found
+        try:
+            for m in jc.getDeclaredMethods():
+                if m.getName() != skip and pred(m):
+                    m.setAccessible(True)
+                    h = self.hook_method(m, handler)
+                    if h:
+                        found.append(h)
+                        self.notes.append(f"{tag}: подцеплен метод {sig_of(m)} (по шаблону)")
+        except Exception as e:
+            self._err("hook_by_reflection:" + tag, e)
+        return found
+
+    def _install_hooks(self):
+        try:
+            self._install_hooks_inner()
+        except Exception as e:
+            self._err("hooks", e)
+            if self.filtered:
+                self._fallback_filters("ошибка установки хуков с фильтрами")
+
+    def _install_hooks_inner(self):
+        cell, drw = self.cell_cls, self.drawable_cls
+        cond = HookFilter.Condition if self.filtered else None
+        media = self._media_expr()
+        f_active = cond("object.get()", object=self.f_active) if cond else None
+        f_restore = cond("object.get()", object=self.f_restore) if cond else None
+        h = self._handler
+        grouped = "this.getCurrentMessagesGroup() != null"
+        single = "this.getCurrentMessagesGroup() == null"
+        if self.cfg["group_fast"]:
+            inner = f"({media}) && ({single} || (param.args.length > 1 && param.args[1] == true))"
+            outer = f"({media}) && {grouped}"
+        else:
+            inner = outer = media
+
+        self._hook_all("bg", cell, "drawBackgroundInternal",
+                       h(before=self._bg_before, after=self._bg_after,
+                         before_f=cond(inner) if cond else None, after_f=cond(inner) if cond else None),
+                       alts=self._is_bg_method)
+        self._hook_all("bg_outer", cell, "drawBackground",
+                       h(before=self._bg_before, after=self._bg_after,
+                         before_f=cond(outer) if cond else None, after_f=cond(outer) if cond else None),
+                       optional=True)
+        self._hook_all("bg_outer", cell, "drawBackgroundInParent",
+                       h(before=self._bg_before, after=self._bg_after,
+                         before_f=cond(outer) if cond else None, after_f=cond(outer) if cond else None),
+                       optional=True)
+        self._hook_all("image", cell, "didSetImage",
+                       h(after=self._image_after, after_f=cond(media) if cond else None))
+        self._install_draw_hooks(drw, f_active, f_restore)
+        if self.cfg["white_text"] and Theme is not None:
+            in_white = "object.contains(this.getMessageObject())"
+            for name in ("drawMessageText", "drawCaptionLayout"):
+                self._hook_all("text", cell, name,
+                               h(before=self._text_before, after=self._text_after,
+                                 before_f=cond(in_white, object=self.white_set) if cond else None,
+                                 after_f=cond(in_white, object=self.white_set) if cond else None),
+                               optional=True)
+
+    def _install_draw_hooks(self, drw, f_active, f_restore):
+        h = self._handler
+        jc = jclass(drw)
+        methods = []
+        if jc is not None:
+            try:
+                for m in jc.getDeclaredMethods():
+                    name = m.getName()
+                    if name not in ("draw", "drawCached"):
+                        continue
+                    types = m.getParameterTypes()
+                    if not types or types[0].getSimpleName() != "Canvas":
+                        continue
+                    pidx = None
+                    for i, t in enumerate(types):
+                        if t.getSimpleName() == "Paint":
+                            pidx = i
+                            break
+                    methods.append((m, "draw" if name == "draw" else "cached", pidx))
+            except Exception as e:
+                self._err("draw_methods", e)
+                methods = []
+        if not methods:
+            for name, tag in (("draw", "draw"), ("drawCached", "cached")):
+                self._hook_all(tag, drw, name,
+                               h(before=lambda p, k=tag: self._draw_before(p, k), after=self._draw_after,
+                                 before_f=f_active, after_f=f_restore), optional=True)
+            return
+        for m, tag, pidx in methods:
+            try:
+                m.setAccessible(True)
+                handler = h(before=lambda p, k=pidx: self._draw_before(p, k), after=self._draw_after,
+                            before_f=f_active, after_f=f_restore)
+                hook = self.hook_method(m, handler)
+                if hook:
+                    self._unhooks.setdefault(tag, []).append(hook)
+                    self.hook_counts[tag] = self.hook_counts.get(tag, 0) + 1
+            except Exception as e:
+                self._err("hook_draw:" + tag, e)
+
+    def _uninstall_hooks(self):
+        self.hook_counts = {}
+        for hooks in self._unhooks.values():
+            for h in hooks:
+                try:
+                    self.unhook_method(h)
+                except Exception as e:
+                    self._err("unhook", e)
+        self._unhooks = {}
+        self._active_on = False
+        self._restore = None
+        self._eng_depth = 0
+        self._white_depth = 0
+        self.active = None
+        self._bg_depth = 0
+        self.white_set.clear()
+        self.white_state = {}
+        for f in (self.f_active, self.f_restore):
+            f.set(False)
+
+    def _reinstall(self):
+        if self.cell_cls and self.drawable_cls:
+            self._uninstall_hooks()
+            self._install_hooks()
+
+    def _disable_group_fast(self, why):
+        self.notes.append(f"ускорение альбомов отключено: {why}")
+        self.log(f"Ускорение альбомов отключено: {why}")
+        self.cfg["group_fast"] = False
+        self._reinstall()
+
+    def _fallback_filters(self, why):
+        self.notes.append(f"фильтры отключены: {why}")
+        self.log(f"Java-фильтры отключены: {why}")
+        self.filtered = False
+        self.cfg["fast_filters"] = False
+        self._reinstall()
+
+
+    def _clear(self, full=False):
+        self.colors = {}
+        self.layouts = {}
+        self.paints = {}
+        self.white_cache = {}
+        self.scan_at = {}
+        self.fast = {}
+        self.nobmp_until = {}
+        self._tc = {}
+        self.white_state = {}
+        self.white_set.clear()
+        self.ver = getattr(self, "ver", 0) + 1
+        if full or not hasattr(self, "grids"):
+            self.grids = {}
+            self.painted_ok = {}
+
+    def _put(self, cache, key, value, cap=400):
+        if len(cache) >= cap:
+            for k in list(cache)[:cap // 2]:
+                del cache[k]
+        cache[key] = value
+
+    def _inc(self, name):
+        self.stat[name] = self.stat.get(name, 0) + 1
+
+    def _err(self, tag, exc):
+        lines = str(exc).splitlines()
+        text = f"{tag}: {type(exc).__name__} {(lines[0] if lines else '')[:160]}"
+        if text not in self._warned:
+            self._warned.add(text)
+            self.errors.append(text)
+            self.log(text)
+
+    def _set(self, key, value):
+        self.cfg[key] = value
+        self._clear()
+        if key == "fast_filters":
+            self.filtered = bool(HookFilter is not None and value)
+            self._reinstall()
+        elif key in ("white_text", "video", "group_fast"):
+            self._reinstall()
+
+    def _setter(self, key, cast):
+        return lambda v: self._set(key, cast(v))
+
+    def _is_media(self, mo):
+        try:
+            t = mo.type
+        except Exception:
+            t = None
+            if get_private_field is not None:
+                try:
+                    t = get_private_field(mo, "type")
+                except Exception:
+                    t = None
+            if t is None:
+                return mo.isPhoto()
+        return t == self.photo_type or (self.cfg["video"] and t == self.video_type)
+
+    def _field(self, obj, name):
+        try:
+            return getattr(obj, name)
+        except Exception:
+            if get_private_field is None:
+                raise
+            v = get_private_field(obj, name)
+            if v is None:
+                raise AttributeError(name)
+            return v
+
+    def _group_of(self, cell):
+        try:
+            return cell.getCurrentMessagesGroup()
+        except Exception:
+            if get_private_field is None:
+                raise
+            return get_private_field(cell, "currentMessagesGroup")
+
+    def _photo_image(self, cell):
+        for mode in list(self._pi_modes):
+            try:
+                if mode == 0:
+                    v = cell.photoImage
+                elif mode == 1:
+                    v = cell.getPhotoImage()
+                elif get_private_field is not None:
+                    v = get_private_field(cell, "photoImage")
+                else:
+                    continue
+            except Exception:
+                continue
+            if v is not None:
+                if mode != self._pi_modes[0]:
+                    self._pi_modes.remove(mode)
+                    self._pi_modes.insert(0, mode)
+                return v
+        raise AttributeError("photoImage недоступен")
+
+    def _probe_once(self, cell, mo):
+        if self._probed:
+            return
+        self._probed = True
+        res = []
+
+        def check(name, fn):
+            try:
+                fn()
+                res.append(name + "=ok")
+            except Exception as e:
+                res.append(f"{name}=ОШИБКА {type(e).__name__}")
+
+        check("photoImage", lambda: self._photo_image(cell))
+        check("bitmap", lambda: self._photo_image(cell).getBitmap())
+        check("type", lambda: mo.type)
+        check("group", lambda: self._group_of(cell))
+        check("dialog", lambda: mo.getDialogId())
+        check("id", lambda: mo.getId())
+        check("out", lambda: mo.isOutOwner())
+        check("ключ_текста", lambda: Theme.key_chat_messageTextOut)
+        check("кисть_текста", lambda: Theme.chat_msgTextPaint)
+        check("ключ_облачка", lambda: Theme.key_chat_outBubble)
+        self.notes.append("проверка API: " + ", ".join(res))
+
+    def _set_active(self, on):
+        if on != self._active_on:
+            self._active_on = on
+            self.f_active.set(on)
+
+
+    def _scale(self, bmp, size):
+        return Bitmap.createScaledBitmap(bmp, size, size, True)
+
+    def _read_grid(self, bmp):
+        try:
+            small = self._scale(self._scale(bmp, 64), GRID)
+        except Exception:
+            copy = bmp.copy(Bitmap.Config.ARGB_8888, False)
+            small = self._scale(self._scale(copy, 64), GRID)
+        arr = jarray(jint)(GRID * GRID)
+        small.getPixels(arr, 0, GRID, 0, 0, GRID, GRID)
+        return pixels_to_grid(list(arr))
+
+    def _sample_cell(self, cell, mo, force=False):
+        key = (mo.getDialogId(), mo.getId())
+        if key in self.grids:
+            return
+        if not force:
+            wait = self.nobmp_until.get(key)
+            if wait is not None and time.monotonic() < wait:
+                return
+        bmp = self._photo_image(cell).getBitmap()
+        if bmp is None or bmp.isRecycled():
+            self._inc("nobmp")
+            self._put(self.nobmp_until, key, time.monotonic() + 0.3, 200)
+            return
+        self._put(self.grids, key, self._read_grid(bmp), 300)
+        self.ver += 1
+        self._inc("sampled")
+
+    def _image_after(self, param):
+        try:
+            if not self.cfg["enabled"]:
+                return
+            cell = param.thisObject
+            mo = cell.getMessageObject()
+            if mo is None or not self._is_media(mo):
+                return
+            self._probe_once(cell, mo)
+            self._sample_cell(cell, mo, force=True)
+            now = time.monotonic()
+            if not self.first_media_t:
+                self.first_media_t = now
+            elif self.filtered and not self.stat.get("bg_media") and now - self.first_media_t > 4.0:
+                self._fallback_filters("хук фона не вызывался при фото на экране")
+                return
+            if self.filtered and self.cfg["group_fast"] and self._group_of(cell) is not None:
+                if not self.group_seen_t:
+                    self.group_seen_t = now
+                elif not self.stat.get("painted_group") and now - self.group_seen_t > 4.0:
+                    self._disable_group_fast("альбом на экране, но ни разу не закрашен")
+        except Exception as e:
+            self._err("image", e)
+
+    def _scan_siblings(self, cell, gk):
+        now = time.monotonic()
+        last, interval = self.scan_at.get(gk, (0.0, SCAN_INTERVAL))
+        if now - last < interval or now - self._last_scan < 0.25:
+            return
+        self._last_scan = now
+        before = self.stat.get("sampled", 0)
+        self._inc("scan")
+        parent = cell.getParent()
+        for i in range(min(parent.getChildCount(), 40)):
+            child = parent.getChildAt(i)
+            try:
+                mo = child.getMessageObject()
+            except Exception:
+                continue
+            if mo is not None and self._is_media(mo):
+                self._sample_cell(child, mo, force=True)
+        found = self.stat.get("sampled", 0) > before
+        self._put(self.scan_at, gk, (now, SCAN_INTERVAL if found else min(interval * 2, 5.0)), 100)
+
+    def _layout(self, cell, mo):
+        try:
+            group = self._group_of(cell)
+            if group is None:
+                return None
+            msgs = self._field(group, "messages")
+            positions = self._field(group, "positions")
+            n = msgs.size()
+            if n < 2:
+                return None
+            gk = (mo.getDialogId(), mo.getGroupId())
+            cached = self.layouts.get(gk)
+            if cached is not None and cached[0] == n:
+                return cached[1:]
+            raw = []
+            for i in range(n):
+                m = msgs.get(i)
+                try:
+                    pos = positions.get(m)
+                    box = None if pos is None else (pos.minX, pos.maxX, pos.minY, pos.maxY)
+                except Exception:
+                    box = None
+                raw.append((m, box))
+            if any(box is None for _, box in raw):
+                raw = [(m, (0, 0, i, i)) for i, (m, _) in enumerate(raw)]
+                self._inc("layout_fallback")
+            cols = max(box[1] for _, box in raw) + 1
+            rows = max(box[3] for _, box in raw) + 1
+            entries = [((m.getDialogId(), m.getId()),) + box for m, box in raw if self._is_media(m)]
+            result = (entries, cols, rows, gk)
+            self._put(self.layouts, gk, (n,) + result, 100)
+            self._put(self.group_mos, gk, [m for m, _ in raw], 100)
+            self.white_state.pop(gk, None)
+            return result
+        except Exception as e:
+            self._err("group", e)
+            return None
+
+    def _bubble_colors(self, cell, mo):
+        cfg = self.cfg
+        key = (mo.getDialogId(), mo.getId())
+        hit = self.fast.get(key)
+        if hit is not None and hit[0] == self.ver and not cfg["readable"] \
+                and (not hit[5] or time.monotonic() < hit[5]):
+            is_out = hit[2]
+            if (is_out and not cfg["outgoing"]) or (not is_out and not cfg["incoming"]):
+                return None
+            return hit[1], is_out, hit[3], hit[4]
+
+        is_out = mo.isOutOwner()
+        if (is_out and not cfg["outgoing"]) or (not is_out and not cfg["incoming"]):
+            return None
+        if key not in self.grids:
+            self._sample_cell(cell, mo)
+        lay = self._layout(cell, mo)
+        if lay is None:
+            entries, cols, rows, gk = [(key, 0, 0, 0, 0)], 1, 1, key
+            grouped = False
+        else:
+            entries, cols, rows, gk = lay
+            grouped = True
+            self._inc("group")
+        avail = [e for e in entries if e[0] in self.grids]
+        partial = False
+        if grouped and len(avail) < len(entries):
+            self._scan_siblings(cell, gk)
+            avail = [e for e in entries if e[0] in self.grids]
+            if len(avail) < len(entries):
+                partial = True
+                self._inc("group_partial")
+        if not avail:
+            return None
+
+        base = 0
+        if cfg["readable"]:
+            base = Theme.getColor(Theme.key_chat_outBubble if is_out else Theme.key_chat_inBubble)
+        sig = (tuple(e[0] for e in avail), cols, rows,
+               cfg["direction"], cfg["colors"], cfg["saturation"], base)
+        out = self.colors.get(sig)
+        if out is None:
+            mosaic = build_mosaic([(self.grids[e[0]],) + tuple(e[1:]) for e in avail], cols, rows)
+            bands = band_colors(mosaic, cfg["direction"], COUNTS[cfg["colors"]])
+            if bands is None:
+                return None
+            base_l = None
+            if cfg["readable"]:
+                base_l = colorsys.rgb_to_hls(((base >> 16) & 255) / 255,
+                                             ((base >> 8) & 255) / 255,
+                                             (base & 255) / 255)[1]
+            out = tuple(finalize(bands, SAT_MULT[cfg["saturation"]], base_l))
+            self._put(self.colors, sig, out)
+            self.last_info = f"фото {len(avail)}/{len(entries)}, сетка {cols}x{rows}, цветов {len(out)}"
+            self._inc("colors_built")
+        until = time.monotonic() + self.scan_at.get(gk, (0.0, SCAN_INTERVAL))[1] if partial else 0
+        self._put(self.fast, key, (self.ver, out, is_out, gk, grouped, until), 600)
+        return out, is_out, gk, grouped
+
+
+    def _bg_before(self, param):
+        self._bg_depth += 1
+        if self._bg_depth > 4:
+            self._bg_depth = 1
+        if self._bg_depth > 1 and self.active is not None:
+            return
+        self.active = None
+        self._drew = False
+        try:
+            if not self.cfg["enabled"]:
+                return
+            cell = param.thisObject
+            mo = cell.getMessageObject()
+            if mo is None or (not self.filtered and not self._is_media(mo)):
+                return
+            self._inc("bg_media")
+            res = self._bubble_colors(cell, mo)
+            if res is not None:
+                self.active = (res[0], self.cfg["direction"], res[2], res[3])
+                self._set_active(True)
+                if self.cfg["white_text"]:
+                    self._sync_white(res, mo)
+        except Exception as e:
+            self._err("bg", e)
+
+    def _bg_after(self, param):
+        self._bg_depth = max(0, self._bg_depth - 1)
+        if self._bg_depth:
+            return
+        if self.active is not None and not self._drew:
+            self._inc("bg_nodraw_group" if self.active[3] else "bg_nodraw")
+        self.active = None
+        self._set_active(False)
+
+    def _sync_white(self, res, mo):
+        colors, is_out, gk, grouped = res
+        want = self._wants_white(colors, is_out)
+        if self.white_state.get(gk) == want:
+            return
+        self.white_state[gk] = want
+        members = (self.group_mos.get(gk) if grouped else None) or [mo]
+        for m in members:
+            if want:
+                self.white_set.add(m)
+            else:
+                self.white_set.remove(m)
+
+    def _draw_before(self, param, kind):
+        if self._restore is not None:
+            self._eng_depth += 1
+        spec = self.active
+        if spec is None:
+            return
+        try:
+            args = param.args
+            if isinstance(kind, str):
+                n = len(args)
+                if kind == "draw" and n == 2 and not isinstance(args[1], bool):
+                    idx = 1
+                elif kind == "cached" and n == 3 and not isinstance(args[2], bool):
+                    idx = 2
+                else:
+                    idx = None
+            else:
+                idx = kind
+            colors, direction, gk, grouped = spec
+            drawable = param.thisObject
+            rect = drawable.getBounds()
+            try:
+                bounds = rect.flattenToString()
+            except Exception:
+                bounds = f"{rect.left} {rect.top} {rect.right} {rect.bottom}"
+            key = (colors, direction, bounds)
+            hit = self.paints.get(key)
+            if hit is None:
+                l, t, r, b = (int(x) for x in bounds.split())
+                if r <= l or b <= t:
+                    return
+                x0, y0, x1, y1 = endpoints(direction, l, t, r, b)
+                shader = LinearGradient(float(x0), float(y0), float(x1), float(y1),
+                                        jarray(jint)(colors), None, Shader.TileMode.CLAMP)
+                paint = Paint(Paint.ANTI_ALIAS_FLAG)
+                paint.setShader(shader)
+                hit = (paint, shader)
+                self._put(self.paints, key, hit)
+            if idx is not None:
+                args[idx] = hit[0]
+                mode = "swap"
+            elif self._restore is None:
+                try:
+                    own = drawable.getPaint()
+                except Exception:
+                    own = drawable.paint
+                self._restore = (own, own.getShader())
+                own.setShader(hit[1])
+                self._eng_depth = 1
+                self.f_restore.set(True)
+                mode = "own"
+            else:
+                return
+            self._drew = True
+            self.painted_ok[gk] = colors
+            self._inc("painted_" + mode)
+            if grouped:
+                self._inc("painted_group")
+        except Exception as e:
+            self._err("drawable", e)
+
+    def _draw_after(self, param):
+        if self._restore is None:
+            return
+        self._eng_depth -= 1
+        if self._eng_depth <= 0:
+            own, old = self._restore
+            self._restore = None
+            self._eng_depth = 0
+            self.f_restore.set(False)
+            try:
+                own.setShader(old)
+            except Exception as e:
+                self._err("restore", e)
+
+
+    def _text_color(self, is_out):
+        now = time.monotonic()
+        hit = self._tc.get(is_out)
+        if hit is None or now - hit[0] > 2.0:
+            hit = (now, Theme.getColor(Theme.key_chat_messageTextOut if is_out else Theme.key_chat_messageTextIn))
+            self._tc[is_out] = hit
+        return hit[1]
+
+    def _wants_white(self, colors, is_out):
+        text = self._text_color(is_out)
+        cfg = self.cfg
+        sig = (colors, text, cfg["white_threshold"], cfg["direction"])
+        hit = self.white_cache.get(sig)
+        if hit is None:
+            orig, white = contrast_pair(colors, text, cfg["direction"])
+            hit = orig < THRESHOLDS[cfg["white_threshold"]] and white > orig
+            self._put(self.white_cache, sig, hit)
+            self.last_info += f"; контраст текста {orig:.1f}, белого {white:.1f}, белый={hit}"
+        return hit
+
+    def _apply_white(self, paint):
+        paint.setColor(jint(WHITE))
+        paint.linkColor = LIGHT_LINK
+
+    def _text_before(self, param):
+        try:
+            if self._white_depth:
+                self._white_depth += 1
+                self._apply_white(Theme.chat_msgTextPaint)
+                return
+            cfg = self.cfg
+            if not (cfg["enabled"] and cfg["white_text"]):
+                return
+            cell = param.thisObject
+            mo = cell.getMessageObject()
+            if mo is None or (not self.filtered and not self._is_media(mo)):
+                return
+            self._inc("text_media")
+            res = self._bubble_colors(cell, mo)
+            if res is None or not self._wants_white(res[0], res[1]):
+                return
+            if self.painted_ok.get(res[2]) != res[0]:
+                self._inc("white_skipped")
+                return
+            paint = Theme.chat_msgTextPaint
+            old = (paint.getColor(), paint.linkColor)
+            self._apply_white(paint)
+            self._white_saved = old
+            self._white_depth = 1
+            self._inc("white")
+        except Exception as e:
+            self._err("text", e)
+
+    def _text_after(self, param):
+        if not self._white_depth:
+            return
+        self._white_depth -= 1
+        if self._white_depth:
+            return
+        saved, self._white_saved = self._white_saved, None
+        if saved is not None:
+            try:
+                paint = Theme.chat_msgTextPaint
+                paint.setColor(jint(saved[0]))
+                paint.linkColor = saved[1]
+            except Exception as e:
+                self._err("text_restore", e)
+
+
+    def _diagnostics(self):
+        hooks = ", ".join(f"{k}={v}" for k, v in self.hook_counts.items()) or "нет"
+        lines = [
+            f"Photo Bubbles {__version__}",
+            f"API: фильтры {'есть' if HookFilter is not None else 'нет'}, Theme {'есть' if Theme is not None else 'нет'}, "
+            f"отражение {'есть' if jclass(self.cell_cls) is not None else 'нет'}",
+            f"режим: {'Java-фильтры' if self.filtered else 'без фильтров'}; хуки: {hooks}",
+            "счётчики: " + ", ".join(f"{k}={v}" for k, v in sorted(self.stat.items())),
+            f"кэш: фото {len(self.grids)}, цвета {len(self.colors)}, кисти {len(self.paints)}",
+            f"последнее: {self.last_info or 'ничего не считалось'}",
+        ]
+        if self.errors:
+            lines.append("ошибки: " + " | ".join(self.errors[-5:]))
+        if self.notes:
+            lines.append("заметки: " + " | ".join(self.notes[-8:]))
+        text = "\n".join(lines)
+        self.log(text)
+        try:
+            AndroidUtilities.addToClipboard(text)
+            Toast.makeText(ApplicationLoader.applicationContext,
+                           "Отчёт скопирован в буфер", Toast.LENGTH_SHORT).show()
+        except Exception as e:
+            self._err("report", e)
+
+
+    def create_settings(self):
+        return [
+            Header(text="Градиент из фото"),
+            Switch(key="enabled", text="Включить", default=True,
+                   on_change=self._setter("enabled", bool)),
+            Switch(key="incoming", text="Входящие сообщения", default=True,
+                   on_change=self._setter("incoming", bool)),
+            Switch(key="outgoing", text="Исходящие сообщения", default=True,
+                   on_change=self._setter("outgoing", bool)),
+            Switch(key="video", text="Также для видео", default=False,
+                   subtext="Цвета берутся из превью видео",
+                   on_change=self._setter("video", bool)),
+            Divider(),
+            Header(text="Внешний вид"),
+            Selector(key="direction", text="Направление", default=2,
+                     items=["Диагональ ↘", "Горизонталь →", "Вертикаль ↓", "Диагональ ↗"],
+                     on_change=self._setter("direction", int)),
+            Selector(key="colors", text="Детализация", default=1,
+                     items=["Мягкая (3 цвета)", "Средняя (5 цветов)", "Точная (8 цветов)"],
+                     on_change=self._setter("colors", int)),
+            Selector(key="saturation", text="Насыщенность", default=1,
+                     items=["Приглушённая", "Как на фото", "Яркая"],
+                     on_change=self._setter("saturation", int)),
+            Switch(key="readable", text="Читаемый текст", default=False,
+                   subtext="Подгоняет яркость под тему. Текст читается лучше, но чёрное уже не будет чёрным",
+                   on_change=self._setter("readable", bool)),
+            Switch(key="white_text", text="Белый текст на тёмном", default=True,
+                   subtext="Если текст плохо виден на цвете облачка, он станет белым",
+                   on_change=self._setter("white_text", bool)),
+            Selector(key="white_threshold", text="Когда включать белый", default=1,
+                     items=["Только совсем плохо", "Обычно", "Строго"],
+                     on_change=self._setter("white_threshold", int)),
+            Divider(),
+            Header(text="Производительность"),
+            Switch(key="fast_filters", text="Быстрые Java-фильтры", default=True,
+                   subtext="Python вызывается только для сообщений с фото. Если облачка перестали красить, выключи",
+                   on_change=self._setter("fast_filters", bool)),
+            Switch(key="group_fast", text="Ускорение альбомов", default=False,
+                   subtext="Хуки у альбомов только там, где рисуется облачко. Если альбомы перестали красится, выключи",
+                   on_change=self._setter("group_fast", bool)),
+            Divider(),
+            Text(text="Скопировать отчёт для диагностики", on_click=lambda view: self._diagnostics()),
+            Text(text="Сбросить кэш цветов", on_click=lambda view: self._clear(full=True)),
+        ]
