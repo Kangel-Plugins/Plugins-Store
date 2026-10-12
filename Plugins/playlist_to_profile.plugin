@@ -1,0 +1,2981 @@
+from typing import Any, List, Optional, Tuple
+import threading
+import time
+import os
+import re
+import json
+import base64
+import traceback
+import urllib.request
+import urllib.parse
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Input, Text, Switch, Divider
+try:
+    from ui.settings import Custom, SimpleSettingFactory
+    _HAS_CUSTOM = True
+except Exception:
+    _HAS_CUSTOM = False
+from ui.bulletin import BulletinHelper
+from android_utils import log
+try:
+    from android_utils import OnClickListener, run_on_ui_thread
+except Exception:
+    OnClickListener = None
+    run_on_ui_thread = None
+from client_utils import (
+    send_audio,
+    send_request,
+    get_user_config,
+)
+try:
+    from client_utils import get_selected_account
+except Exception:
+    get_selected_account = None
+from file_utils import get_cache_dir, ensure_dir_exists
+from org.telegram.tgnet import TLRPC
+from java.lang import Integer
+
+__id__ = "playlist_to_profile"
+__name__ = "Playlist to Profile"
+__description__ = "Добавляет треки из плейлиста (YouTube, Яндекс Музыка, VK, Spotify, SoundCloud...) в музыку профиля"
+__author__ = "@rei_plugins (@optimist_opti)"
+__version__ = "1.1"
+__icon__ = "rei_plugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+__requirements__ = ["yt-dlp", "mutagen"]
+
+
+def _java_list(obj):
+    if obj is None:
+        return []
+    try:
+        return list(obj)
+    except Exception:
+        pass
+    try:
+        return [obj.get(i) for i in range(obj.size())]
+    except Exception:
+        return []
+
+
+def _safe_name(s: str, max_len: int = 80) -> str:
+    s = (s or "track").strip()
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len] or "track"
+
+
+def _clean_artist_token(a: str) -> str:
+    a = (a or "").strip()
+    if a.endswith(" - Topic"):
+        a = a[: -len(" - Topic")].strip()
+    a = a.replace("_", " ")
+    a = re.sub(r"\s+", " ", a).strip()
+    return a
+
+
+def _is_nick(a: str) -> bool:
+    if not a or len(a) < 2:
+        return False
+    if re.match(r"^[A-Za-zА-Яа-яЁё]\.", a):
+        return False
+    if re.search(r"\b[A-Za-zА-Яа-яЁё]\.\s*[A-ZА-ЯЁ]", a):
+        return False
+    parts = a.split()
+    if len(parts) >= 3:
+        return False
+    if len(parts) == 2:
+        w1, w2 = parts[0], parts[1]
+        if w1[:1].isupper() and w2[:1].isupper() and w1.isalpha() and w2.isalpha():
+            if len(w1) >= 3 and len(w2) >= 3:
+                return False
+    return True
+
+
+def _pick_artists(info: dict) -> str:
+    candidates = []
+    artists = info.get("artists")
+    if isinstance(artists, list):
+        for x in artists:
+            if isinstance(x, str) and x.strip():
+                candidates.append(_clean_artist_token(x))
+            elif isinstance(x, dict):
+                n = x.get("name") or x.get("text") or ""
+                if n:
+                    candidates.append(_clean_artist_token(str(n)))
+    for key in ("artist", "album_artist", "creator"):
+        val = info.get(key)
+        if isinstance(val, list):
+            for x in val:
+                if isinstance(x, str) and x.strip():
+                    candidates.append(_clean_artist_token(x))
+        elif isinstance(val, str) and val.strip():
+            parts = re.split(r"\s*,\s*|\s*&\s*|\s+x\s+|\s+feat\.?\s+", val)
+            for p in parts:
+                p = _clean_artist_token(p)
+                if p:
+                    candidates.append(p)
+    for key in ("channel", "uploader"):
+        val = info.get(key)
+        if isinstance(val, str) and val.strip():
+            candidates.append(_clean_artist_token(val))
+    seen = set()
+    unique = []
+    for c in candidates:
+        key = c.lower()
+        if not c or key in seen:
+            continue
+        if "youtube" in key:
+            continue
+        seen.add(key)
+        unique.append(c)
+    nicks = [a for a in unique if _is_nick(a)]
+    if nicks:
+        return ", ".join(nicks[:2])
+    if unique:
+        return unique[0]
+    return "Unknown"
+
+
+def _clean_title(t: str, artist: str = "") -> str:
+    t = (t or "").strip()
+    t = re.sub(r"\.(m4a|mp3|mp4|webm|opus|ogg|flac|wav|aac)\b", "", t, flags=re.I)
+    t = t.strip(" .")
+    if artist:
+        for sep in (" — ", " – ", " - ", " | "):
+            prefix = artist + sep
+            if t.lower().startswith(prefix.lower()):
+                t = t[len(prefix):].strip()
+                break
+        first = artist.split(",")[0].strip()
+        if first and len(first) > 2:
+            for sep in (" — ", " – ", " - ", " | "):
+                prefix = first + sep
+                if t.lower().startswith(prefix.lower()):
+                    t = t[len(prefix):].strip()
+                    break
+    t = t.replace("_", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or "Unknown"
+
+
+def _pick_title(info: dict, fallback: str, artist: str = "") -> str:
+    for key in ("track", "title", "fulltitle"):
+        val = info.get(key)
+        if isinstance(val, str) and val.strip():
+            return _clean_title(val, artist)
+    return _clean_title(fallback or "Unknown", artist)
+
+
+class SourceError(Exception):
+    pass
+
+
+UA_BROWSER = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+UA_VK = "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
+YM_API = "https://api.music.yandex.net"
+
+_BAD_WORDS = (
+    "live", "cover", "remix", "karaoke", "instrumental", "nightcore",
+    "slowed", "reverb", "sped", "speed", "8d", "mashup", "minus", "concert",
+    "reaction", "минус", "кавер", "ремикс", "караоке", "лайв",
+)
+
+
+def _http_request(url, headers=None, data=None, timeout=20.0) -> bytes:
+    h = {"User-Agent": UA_BROWSER}
+    if headers:
+        h.update(headers)
+    body = None
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        h.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    req = urllib.request.Request(url, data=body, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _http_json(url, headers=None, data=None, timeout=20.0):
+    raw = _http_request(url, headers, data, timeout)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
+def _safe_id(s) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(s or "x"))[:60] or "x"
+
+
+def _norm(s) -> str:
+    return re.sub(r"[\W_]+", "", (s or "").lower(), flags=re.UNICODE)
+
+
+def _tokens(s) -> set:
+    return set(re.findall(r"\w+", (s or "").lower(), flags=re.UNICODE))
+
+
+def _first_artist(a) -> str:
+    return (a or "").split(",")[0].strip()
+
+
+def _score_search_entry(e: dict, artist: str, title: str, duration: int):
+    et = e.get("title") or ""
+    ch = e.get("channel") or e.get("uploader") or ""
+    try:
+        ed = int(e.get("duration") or 0)
+    except Exception:
+        ed = 0
+    score = 0.0
+    if duration and ed:
+        diff = abs(ed - duration)
+        if diff > max(20, duration * 0.12):
+            return None
+        if diff <= 3:
+            score += 50
+        elif diff <= 8:
+            score += 35
+        elif diff <= 15:
+            score += 15
+    t_tokens = _tokens(title)
+    e_tokens = _tokens(et)
+    a_tokens = _tokens(_first_artist(artist))
+    ea_tokens = e_tokens | _tokens(ch)
+    if t_tokens:
+        t_cov = len(t_tokens & e_tokens) / float(len(t_tokens))
+        if t_cov < 0.5:
+            return None
+        score += 40.0 * t_cov
+    if a_tokens:
+        score += 20.0 * len(a_tokens & ea_tokens) / len(a_tokens)
+    orig = t_tokens | _tokens(artist)
+    for w in _BAD_WORDS:
+        if w in e_tokens and w not in orig:
+            score -= 30
+    if ch.endswith(" - Topic"):
+        score += 25
+    if "official" in e_tokens:
+        score += 5
+    if "audio" in e_tokens:
+        score += 5
+    return score
+
+
+def _parse_yandex_url(url: str):
+    m = re.search(r"music\.yandex\.[a-z]+/users/([^/?#]+)/playlists/(\d+)", url)
+    if m:
+        return ("playlist", m.group(1), m.group(2))
+    m = re.search(r"music\.yandex\.[a-z]+/playlists/([^/?#]+)", url)
+    if m:
+        return ("playlist_uuid", m.group(1))
+    m = re.search(r"music\.yandex\.[a-z]+/album/(\d+)/track/(\d+)", url)
+    if m:
+        return ("track", m.group(1), m.group(2))
+    m = re.search(r"music\.yandex\.[a-z]+/album/(\d+)", url)
+    if m:
+        return ("album", m.group(1))
+    m = re.search(r"music\.yandex\.[a-z]+/track/(\d+)", url)
+    if m:
+        return ("track", None, m.group(1))
+    return None
+
+
+def _parse_vk_url(url: str):
+    m = re.search(r"vk\.(?:com|ru)/music/(?:playlist|album)/(-?\d+)_(\d+)(?:_([0-9a-zA-Z]+))?", url)
+    if m:
+        return ("playlist", m.group(1), m.group(2), m.group(3) or "")
+    m = re.search(r"act=audio_playlist(-?\d+)_(\d+)", url)
+    if m:
+        k = re.search(r"access_hash=([0-9a-zA-Z]+)", url)
+        return ("playlist", m.group(1), m.group(2), k.group(1) if k else "")
+    m = re.search(r"vk\.(?:com|ru)/audio(-?\d+_\d+)(?:_([0-9a-zA-Z]+))?(?:[?/#]|$)", url)
+    if m:
+        return ("audio", m.group(1), m.group(2) or "")
+    m = re.search(r"vk\.(?:com|ru)/audios(-?\d+)", url)
+    if m:
+        return ("audios", m.group(1))
+    return None
+
+
+def _parse_spotify_url(url: str):
+    m = re.search(r"(?:open\.spotify\.com/(?:intl-[a-z]+/)?|spotify:)(playlist|album|track)[/:]([A-Za-z0-9]+)", url)
+    if m:
+        return (m.group(1), m.group(2))
+    return None
+
+
+def _spotify_extract(html: str, kind: str) -> list:
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return []
+
+    def find_entity(o, depth=0):
+        if depth > 8:
+            return None
+        if isinstance(o, dict):
+            e = o.get("entity")
+            if isinstance(e, dict) and (e.get("trackList") is not None or e.get("artists") is not None
+                                        or e.get("title") or e.get("name")):
+                return e
+            for v in o.values():
+                r = find_entity(v, depth + 1)
+                if r is not None:
+                    return r
+        elif isinstance(o, list):
+            for v in o:
+                r = find_entity(v, depth + 1)
+                if r is not None:
+                    return r
+        return None
+
+    ent = find_entity(data)
+    if not ent:
+        return []
+
+    def clean(x):
+        return re.sub(r"\s+", " ", str(x or "").replace("\xa0", " ")).strip()
+
+    cover = ""
+    srcs = ((ent.get("coverArt") or {}).get("sources")) or ((ent.get("visualIdentity") or {}).get("image")) or []
+    if isinstance(srcs, list) and srcs:
+        try:
+            best = max((x for x in srcs if isinstance(x, dict) and x.get("url")),
+                       key=lambda x: int(x.get("width") or 0))
+            cover = best["url"]
+        except Exception:
+            cover = ""
+    out = []
+
+    def mk(title, artist, dur_ms, uri, cov, album=""):
+        title, artist = clean(title), clean(artist)
+        if not title:
+            return
+        try:
+            dur = int(float(dur_ms or 0) / 1000)
+        except Exception:
+            dur = 0
+        sid = _safe_id((uri or "").split(":")[-1] or ("%s_%d" % (kind, len(out))))
+        out.append({
+            "id": "sp_" + sid, "provider": "spotify", "title": title,
+            "artist": ", ".join([a.strip() for a in artist.split(",") if a.strip()][:3]),
+            "url": "", "cover_url": cov, "duration": dur, "album": clean(album),
+        })
+
+    tl = ent.get("trackList")
+    if isinstance(tl, list):
+        for t in tl:
+            if isinstance(t, dict):
+                mk(t.get("title"), t.get("subtitle"), t.get("duration"), t.get("uri"),
+                   cover if kind == "album" else "",
+                   (ent.get("title") or ent.get("name")) if kind == "album" else "")
+    else:
+        names = [a.get("name") for a in (ent.get("artists") or []) if isinstance(a, dict) and a.get("name")]
+        artist = ", ".join(names) if names else ent.get("subtitle")
+        mk(ent.get("title") or ent.get("name"), artist, ent.get("duration"), ent.get("uri"), cover)
+    return out
+
+
+def _ya_track(t) -> Optional[dict]:
+    if not isinstance(t, dict):
+        return None
+    raw_id = t.get("realId") or t.get("id")
+    if not raw_id:
+        return None
+    tid = str(raw_id).split(":")[0]
+    title = (t.get("title") or "").strip()
+    if not title:
+        return None
+    ver = (t.get("version") or "").strip()
+    if ver:
+        title = "%s (%s)" % (title, ver)
+    names = []
+    for a in (t.get("artists") or []):
+        if isinstance(a, dict) and a.get("name"):
+            names.append(str(a["name"]).strip())
+    album_id = None
+    album_title = ""
+    albums = t.get("albums") or []
+    if albums and isinstance(albums[0], dict):
+        album_id = albums[0].get("id")
+        album_title = (albums[0].get("title") or "").strip()
+    cover = t.get("coverUri") or t.get("ogImage") or ""
+    cover_url = ""
+    if cover:
+        cover = cover.replace("%%", "1000x1000")
+        cover_url = cover if cover.startswith("http") else "https://" + cover
+    url = ""
+    if album_id:
+        url = "https://music.yandex.ru/album/%s/track/%s" % (album_id, tid)
+    try:
+        duration = int((t.get("durationMs") or 0) / 1000)
+    except Exception:
+        duration = 0
+    return {
+        "id": "ym_" + tid,
+        "provider": "yandex",
+        "title": title,
+        "artist": ", ".join(names[:3]),
+        "album": album_title,
+        "url": url,
+        "cover_url": cover_url,
+        "duration": duration,
+    }
+
+
+def _vk_track(it) -> Optional[dict]:
+    if not isinstance(it, dict):
+        return None
+    title = (it.get("title") or "").strip()
+    if not title:
+        return None
+    sub = (it.get("subtitle") or "").strip()
+    if sub:
+        title = "%s (%s)" % (title, sub)
+    cover = ""
+    album_title = ""
+    alb = it.get("album")
+    if isinstance(alb, dict):
+        album_title = (alb.get("title") or "").strip()
+    if isinstance(alb, dict) and isinstance(alb.get("thumb"), dict):
+        th = alb["thumb"]
+        cover = th.get("photo_600") or th.get("photo_1200") or th.get("photo_300") or ""
+    try:
+        duration = int(it.get("duration") or 0)
+    except Exception:
+        duration = 0
+    return {
+        "id": "vk_%s_%s" % (it.get("owner_id"), it.get("id")),
+        "provider": "vk",
+        "title": title,
+        "artist": (it.get("artist") or "").strip(),
+        "album": album_title,
+        "url": "",
+        "cover_url": cover,
+        "duration": duration,
+    }
+
+
+def _image_kind(data: bytes) -> Optional[str]:
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _normalize_cover(src: str, dst: str, size: int = 800) -> bool:
+    parts = []
+    try:
+        from android.graphics import BitmapFactory, Bitmap
+        from java.io import FileOutputStream
+        bmp = BitmapFactory.decodeFile(src)
+        if bmp is not None:
+            parts.append(bmp)
+            w, h = int(bmp.getWidth()), int(bmp.getHeight())
+            side = min(w, h)
+            sq = Bitmap.createBitmap(bmp, (w - side) // 2, (h - side) // 2, side, side)
+            parts.append(sq)
+            if side > size:
+                sq = Bitmap.createScaledBitmap(sq, size, size, True)
+                parts.append(sq)
+            out = FileOutputStream(dst)
+            try:
+                ok = sq.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                out.flush()
+            finally:
+                out.close()
+            if ok and os.path.isfile(dst) and os.path.getsize(dst) > 500:
+                return True
+    except Exception as e:
+        log("[P2P] cover normalize (android): %s" % str(e)[:120])
+    finally:
+        for b in parts:
+            try:
+                b.recycle()
+            except Exception:
+                pass
+    try:
+        from PIL import Image
+        with Image.open(src) as raw:
+            im = raw.convert("RGB")
+        w, h = im.size
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        im = im.crop((left, top, left + side, top + side))
+        if side > size:
+            im = im.resize((size, size), getattr(Image, "LANCZOS", 1))
+        im.save(dst, "JPEG", quality=90)
+        im.close()
+        return os.path.isfile(dst) and os.path.getsize(dst) > 500
+    except Exception as e:
+        log("[P2P] cover normalize (PIL): %s" % str(e)[:120])
+    return False
+
+
+def _open_ogg(filepath: str):
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+    try:
+        return OggOpus(filepath)
+    except Exception:
+        return OggVorbis(filepath)
+
+
+def _embed_cover(filepath: str, cover_path: str) -> bool:
+    if not cover_path or not os.path.isfile(cover_path):
+        return False
+    low = filepath.lower()
+    try:
+        with open(cover_path, "rb") as f:
+            data = f.read()
+        is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
+        mime = "image/png" if is_png else "image/jpeg"
+        if low.endswith((".m4a", ".mp4", ".m4b")):
+            from mutagen.mp4 import MP4, MP4Cover
+            audio = MP4(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            fmt = MP4Cover.FORMAT_PNG if is_png else MP4Cover.FORMAT_JPEG
+            audio.tags["covr"] = [MP4Cover(data, imageformat=fmt)]
+            audio.save()
+        elif low.endswith(".mp3"):
+            from mutagen.id3 import ID3, APIC, error as ID3Error
+            try:
+                tags = ID3(filepath)
+            except ID3Error:
+                tags = ID3()
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+            tags.save(filepath, v2_version=3)
+        elif low.endswith(".flac"):
+            from mutagen.flac import FLAC, Picture
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.data = data
+            audio = FLAC(filepath)
+            audio.clear_pictures()
+            audio.add_picture(pic)
+            audio.save()
+        elif low.endswith((".ogg", ".opus", ".oga")):
+            from mutagen.flac import Picture
+            pic = Picture()
+            pic.type = 3
+            pic.mime = mime
+            pic.data = data
+            audio = _open_ogg(filepath)
+            audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+            audio.save()
+        else:
+            log("[P2P] cover: формат не поддерживает вшивание: " + os.path.basename(filepath))
+            return False
+        log("[P2P] cover embedded (%s)" % os.path.splitext(filepath)[1])
+        return True
+    except Exception as e:
+        log("[P2P] cover embed failed: " + str(e)[:150])
+        return False
+
+
+def _tag_audio(filepath: str, title: str, artist: str, duration: int = 0, album: str = "") -> None:
+    low = filepath.lower()
+    try:
+        if low.endswith((".m4a", ".mp4", ".m4b")):
+            from mutagen.mp4 import MP4
+            audio = MP4(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            if title:
+                audio.tags["\xa9nam"] = [title]
+            if artist:
+                audio.tags["\xa9ART"] = [artist]
+                audio.tags["aART"] = [artist]
+            if album:
+                audio.tags["\xa9alb"] = [album]
+            audio.save()
+            log("[P2P] m4a tags: %s — %s" % (artist, title))
+        elif low.endswith(".mp3"):
+            from mutagen.id3 import ID3, TIT2, TPE1, TALB, error as ID3Error
+            try:
+                tags = ID3(filepath)
+            except ID3Error:
+                tags = ID3()
+            if title:
+                tags["TIT2"] = TIT2(encoding=3, text=title)
+            if artist:
+                tags["TPE1"] = TPE1(encoding=3, text=artist)
+            if album:
+                tags["TALB"] = TALB(encoding=3, text=album)
+            tags.save(filepath)
+            log("[P2P] mp3 tags: %s — %s" % (artist, title))
+        elif low.endswith(".flac"):
+            from mutagen.flac import FLAC
+            audio = FLAC(filepath)
+            if title:
+                audio["title"] = [title]
+            if artist:
+                audio["artist"] = [artist]
+            if album:
+                audio["album"] = [album]
+            audio.save()
+            log("[P2P] flac tags: %s — %s" % (artist, title))
+        elif low.endswith((".ogg", ".opus", ".oga")):
+            audio = _open_ogg(filepath)
+            if title:
+                audio["title"] = [title]
+            if artist:
+                audio["artist"] = [artist]
+            if album:
+                audio["album"] = [album]
+            audio.save()
+            log("[P2P] ogg tags: %s — %s" % (artist, title))
+    except Exception as e:
+        log("[P2P] tag write failed: " + str(e)[:150])
+
+
+def _file_duration(path: str) -> int:
+    try:
+        import mutagen
+        f = mutagen.File(path)
+        if f is not None and getattr(f, "info", None) is not None:
+            return int(getattr(f.info, "length", 0) or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _selected_account() -> Optional[int]:
+    if get_selected_account is not None:
+        try:
+            return int(get_selected_account())
+        except Exception:
+            pass
+    try:
+        from org.telegram.messenger import UserConfig
+        return int(UserConfig.selectedAccount)
+    except Exception:
+        return None
+
+
+_SHORT_HOSTS = ("on.soundcloud.com",)
+
+
+def _resolve_redirect(url: str, timeout: float = 10.0) -> str:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA_BROWSER})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            final = resp.geturl()
+        return final or url
+    except Exception as e:
+        log("[P2P] resolve redirect: %s" % str(e)[:100])
+        return url
+
+
+class _YtdlpLog:
+    def __init__(self):
+        self.errors = []
+
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        self.errors.append(str(msg))
+
+
+def _explain_ytdlp_error(errors: list, url: str) -> str:
+    text = " ".join(errors)
+    host = urllib.parse.urlparse(url).netloc or url[:40]
+    low = text.lower()
+    if "unsupported url" in low:
+        return "Ссылка не поддерживается: " + host
+    if "sign in" in low or "log in" in low or "login" in low or "cookies" in low:
+        return "Нужен вход: подключите cookies.txt в настройках"
+    if "private" in low or "not available" in low or "unavailable" in low:
+        return "Плейлист недоступен или приватный"
+    first = re.sub(r"^\s*ERROR:\s*", "", errors[0]).strip().replace("\n", " ")
+    return "Не удалось прочитать ссылку: " + first[:100]
+
+
+_UI = {"plugin": None, "start": None, "stop": None, "retry": None,
+       "view": None, "failed": False, "pal": None,
+       "card": None, "slots": None, "front": 0, "H": 0, "t_swap": 0.0}
+_ICON_CACHE = {}
+_SLOT_KEYS = ("root", "cover", "glyph", "title", "sub", "count", "fill", "stage", "stage_icon")
+_SLOTS = [dict.fromkeys(_SLOT_KEYS), dict.fromkeys(_SLOT_KEYS)]
+for _sl in _SLOTS:
+    _sl["label"] = ""
+    _sl["occupied"] = False
+
+_NOW = {"active": False, "run_id": 0, "title": "", "artist": "", "album": "",
+        "bmp": None, "stage": "", "frac": 0.0, "idx": 0, "total": 0,
+        "state": "run", "t_post": 0.0}
+_NOW_LOCK = threading.Lock()
+
+
+def _icon(*names) -> str:
+    if names in _ICON_CACHE:
+        return _ICON_CACHE[names]
+    result = None
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        res = ctx.getResources()
+        pkg = ctx.getPackageName()
+        for n in names:
+            if res.getIdentifier(n, "drawable", pkg) != 0:
+                result = n
+                break
+            log("[P2P] icon missing: " + n)
+        if result is None:
+            result = "msg_info"
+    except Exception:
+        result = names[0]
+    _ICON_CACHE[names] = result
+    return result
+
+
+def _i32(c: int) -> int:
+    c &= 0xFFFFFFFF
+    return c - (1 << 32) if c > 0x7FFFFFFF else c
+
+
+def _with_alpha(c: int, alpha: int) -> int:
+    return _i32((c & 0x00FFFFFF) | (alpha << 24))
+
+
+def _lum(c: int) -> float:
+    c &= 0xFFFFFF
+    return 0.299 * ((c >> 16) & 255) + 0.587 * ((c >> 8) & 255) + 0.114 * (c & 255)
+
+
+def _contrast_text(bg: int) -> int:
+    return _i32(0xFF101010) if _lum(bg) > 150 else _i32(0xFFFFFFFF)
+
+
+def _theme_color(key_name: str, fallback: int) -> int:
+    try:
+        from org.telegram.ui.ActionBar import Theme
+        return int(Theme.getColor(getattr(Theme, key_name)))
+    except Exception:
+        return _i32(fallback)
+
+
+def _palette() -> dict:
+    return {
+        "accent": _theme_color("key_windowBackgroundWhiteBlueText", 0xFF3390EC),
+        "red": _theme_color("key_text_RedBold", 0xFFE53935),
+        "gray": _theme_color("key_windowBackgroundWhiteGrayText", 0xFF8A8A8A),
+        "text": _theme_color("key_windowBackgroundWhiteBlackText", 0xFFFFFFFF),
+        "green": _i32(0xFF43A047),
+    }
+
+
+def _px(dp_value: int) -> int:
+    from org.telegram.messenger import AndroidUtilities
+    return AndroidUtilities.dp(dp_value)
+
+
+def _round_bg(color: int, radius_px: int):
+    from android.graphics.drawable import GradientDrawable
+    gd = GradientDrawable()
+    gd.setColor(_i32(color))
+    gd.setCornerRadius(float(radius_px))
+    return gd
+
+
+def _make_button(context, label: str, fg: int, bg: int, height_dp: int = 46, icon=None) -> dict:
+    from android.widget import LinearLayout, TextView, ImageView
+    from android.view import Gravity
+    from android.graphics import Typeface
+    from android.graphics.drawable import RippleDrawable
+    from android.content.res import ColorStateList
+    root = LinearLayout(context)
+    root.setOrientation(LinearLayout.HORIZONTAL)
+    root.setGravity(Gravity.CENTER)
+    gd = _round_bg(bg, _px(height_dp // 2))
+    try:
+        root.setBackground(RippleDrawable(ColorStateList.valueOf(_with_alpha(fg, 0x30)), gd, None))
+    except Exception:
+        root.setBackground(gd)
+    root.setClickable(True)
+    d = _load_drawable(context, icon, fg) if icon else None
+    if d is not None:
+        iv = ImageView(context)
+        iv.setImageDrawable(d)
+        lp = LinearLayout.LayoutParams(_px(20), _px(20))
+        lp.setMargins(0, 0, _px(8), 0)
+        root.addView(iv, lp)
+    tv = TextView(context)
+    tv.setText(label)
+    tv.setTextColor(_i32(fg))
+    tv.setTextSize(15.0)
+    tv.setTypeface(None, Typeface.BOLD)
+    tv.setSingleLine(True)
+    root.addView(tv, LinearLayout.LayoutParams(-2, -2))
+    return {"root": root, "label": tv}
+
+
+_ICONS = {
+    "start": "ic_play",
+    "stop": "filled_profile_stop_24",
+    "cover": "filter_note",
+    "stage": None,
+    "retry": ("msg_retry", "msg_reset"),
+}
+
+
+def _load_drawable(context, names, color: int):
+    if not names:
+        return None
+    try:
+        if isinstance(names, str):
+            names = (names,)
+        res = context.getResources()
+        pkg = context.getPackageName()
+        for n in names:
+            rid = res.getIdentifier(n, "drawable", pkg)
+            if not rid:
+                log("[P2P] drawable missing: " + n)
+                continue
+            d = context.getDrawable(rid)
+            if d is None:
+                continue
+            d = d.mutate()
+            from android.graphics import PorterDuff, PorterDuffColorFilter
+            d.setColorFilter(PorterDuffColorFilter(_i32(color), PorterDuff.Mode.SRC_IN))
+            return d
+    except Exception as e:
+        log("[P2P] load drawable: %s" % str(e)[:100])
+    return None
+
+
+def _rounded_bitmap(path: str, size: int, radius: int):
+    parts = []
+    try:
+        from android.graphics import (BitmapFactory, Bitmap, Canvas, Paint,
+                                      BitmapShader, Shader, RectF)
+        src = BitmapFactory.decodeFile(path)
+        if src is None:
+            return None
+        parts.append(src)
+        w, h = int(src.getWidth()), int(src.getHeight())
+        side = min(w, h)
+        sq = Bitmap.createBitmap(src, (w - side) // 2, (h - side) // 2, side, side)
+        parts.append(sq)
+        sc = Bitmap.createScaledBitmap(sq, size, size, True)
+        parts.append(sc)
+        out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(out)
+        paint = Paint()
+        paint.setAntiAlias(True)
+        paint.setShader(BitmapShader(sc, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
+        canvas.drawRoundRect(RectF(0.0, 0.0, float(size), float(size)),
+                             float(radius), float(radius), paint)
+        return out
+    except Exception as e:
+        log("[P2P] rounded bitmap: %s" % str(e)[:120])
+        return None
+    finally:
+        for b in parts:
+            try:
+                b.recycle()
+            except Exception:
+                pass
+
+
+def _post(fn, delay: int = 0):
+    if run_on_ui_thread is None:
+        return
+    try:
+        if delay:
+            run_on_ui_thread(fn, delay)
+        else:
+            run_on_ui_thread(fn)
+    except Exception:
+        pass
+
+
+def now_begin_run():
+    with _NOW_LOCK:
+        _NOW.update(active=True, run_id=_NOW["run_id"] + 1, title="Получение списка треков…",
+                    artist="", album="", bmp=None, stage="Подготовка", frac=0.0,
+                    idx=0, total=0, state="run")
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("begin", snap))
+
+
+def now_begin_track(track: dict, idx: int, total: int, stage: str = "Подготовка"):
+    with _NOW_LOCK:
+        _NOW.update(active=True, title=track.get("title") or track.get("id") or "Трек",
+                    artist=track.get("artist") or "", album=track.get("album") or "",
+                    bmp=None, stage=stage, frac=0.0, idx=idx, total=total, state="run")
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("begin", snap))
+
+
+def now_stage(label: str, frac: float):
+    now = time.time()
+    with _NOW_LOCK:
+        same_base = (_stage_label(label) == _stage_label(_NOW["stage"]))
+        _NOW.update(stage=label, frac=frac, state="run")
+        if same_base and now - _NOW["t_post"] < 0.15:
+            return
+        _NOW["t_post"] = now
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("stage", snap))
+
+
+def now_meta(title=None, artist=None, album=None):
+    with _NOW_LOCK:
+        if title:
+            _NOW["title"] = title
+        if artist is not None:
+            _NOW["artist"] = artist
+        if album is not None:
+            _NOW["album"] = album
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("meta", snap))
+
+
+def now_cover(path: str):
+    bmp = None
+    try:
+        size = _px(64)
+        bmp = _rounded_bitmap(path, size, _px(10))
+    except Exception:
+        bmp = None
+    with _NOW_LOCK:
+        _NOW["bmp"] = bmp
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("cover", snap))
+
+
+def now_end(state: str, label: str):
+    with _NOW_LOCK:
+        _NOW.update(state=state, stage=label, frac=1.0)
+        snap = dict(_NOW)
+    _post(lambda: _ui_event("end", snap))
+
+
+def now_finish_run():
+    with _NOW_LOCK:
+        rid = _NOW["run_id"]
+    _post(lambda: _ui_event("finish", {"run_id": rid}), 1300)
+
+
+def _build_slot(context, pal: dict, idx: int) -> None:
+    from android.widget import LinearLayout, FrameLayout, TextView, ImageView
+    from android.view import Gravity, View
+    from android.graphics import Typeface
+    from android.text import TextUtils
+    dp = _px
+
+    root = LinearLayout(context)
+    root.setOrientation(LinearLayout.HORIZONTAL)
+    root.setGravity(Gravity.CENTER_VERTICAL)
+    root.setPadding(dp(12), dp(10), dp(14), dp(10))
+    root.setBackground(_round_bg(_with_alpha(pal["gray"], 0x26), dp(16)))
+
+    cover_box = FrameLayout(context)
+    cover_box.setBackground(_round_bg(_with_alpha(pal["gray"], 0x33), dp(10)))
+    d_cover = _load_drawable(context, _ICONS["cover"], pal["gray"])
+    if d_cover is not None:
+        glyph = ImageView(context)
+        glyph.setImageDrawable(d_cover)
+        cover_box.addView(glyph, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+    else:
+        glyph = TextView(context)
+        glyph.setText("♪")
+        glyph.setTextSize(26.0)
+        glyph.setTextColor(_i32(pal["gray"]))
+        glyph.setGravity(Gravity.CENTER)
+        cover_box.addView(glyph, FrameLayout.LayoutParams(-1, -1))
+    cover = ImageView(context)
+    cover_box.addView(cover, FrameLayout.LayoutParams(-1, -1))
+    root.addView(cover_box, LinearLayout.LayoutParams(dp(64), dp(64)))
+
+    col = LinearLayout(context)
+    col.setOrientation(LinearLayout.VERTICAL)
+    lp_col = LinearLayout.LayoutParams(0, -2, 1.0)
+    lp_col.setMargins(dp(12), 0, 0, 0)
+    root.addView(col, lp_col)
+
+    row1 = LinearLayout(context)
+    row1.setOrientation(LinearLayout.HORIZONTAL)
+    row1.setGravity(Gravity.CENTER_VERTICAL)
+    title = TextView(context)
+    title.setTextColor(_i32(pal["text"]))
+    title.setTextSize(16.0)
+    title.setTypeface(None, Typeface.BOLD)
+    title.setSingleLine(True)
+    title.setEllipsize(TextUtils.TruncateAt.END)
+    row1.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+    count = TextView(context)
+    count.setTextColor(_i32(pal["gray"]))
+    count.setTextSize(12.0)
+    row1.addView(count, LinearLayout.LayoutParams(-2, -2))
+    col.addView(row1, LinearLayout.LayoutParams(-1, -2))
+
+    sub = TextView(context)
+    sub.setTextColor(_i32(pal["gray"]))
+    sub.setTextSize(13.0)
+    sub.setSingleLine(True)
+    sub.setEllipsize(TextUtils.TruncateAt.END)
+    col.addView(sub, LinearLayout.LayoutParams(-1, -2))
+
+    track = FrameLayout(context)
+    track.setBackground(_round_bg(_with_alpha(pal["gray"], 0x40), dp(2)))
+    fill = View(context)
+    fill.setBackground(_round_bg(pal["accent"], dp(2)))
+    fill.setPivotX(0.0)
+    fill.setScaleX(0.0)
+    track.addView(fill, FrameLayout.LayoutParams(-1, -1))
+    lp_tr = LinearLayout.LayoutParams(-1, dp(4))
+    lp_tr.setMargins(0, dp(8), 0, 0)
+    col.addView(track, lp_tr)
+
+    stage_row = LinearLayout(context)
+    stage_row.setOrientation(LinearLayout.HORIZONTAL)
+    stage_row.setGravity(Gravity.CENTER_VERTICAL)
+    stage_icon = None
+    d_stage = _load_drawable(context, _ICONS["stage"], pal["gray"])
+    if d_stage is not None:
+        stage_icon = ImageView(context)
+        stage_icon.setImageDrawable(d_stage)
+        lp_si = LinearLayout.LayoutParams(dp(14), dp(14))
+        lp_si.setMargins(0, 0, dp(6), 0)
+        stage_row.addView(stage_icon, lp_si)
+    stage = TextView(context)
+    stage.setTextColor(_i32(pal["gray"]))
+    stage.setTextSize(12.0)
+    stage.setSingleLine(True)
+    stage_row.addView(stage, LinearLayout.LayoutParams(-2, -2))
+    lp_st = LinearLayout.LayoutParams(-1, -2)
+    lp_st.setMargins(0, dp(6), 0, 0)
+    col.addView(stage_row, lp_st)
+
+    views = {"root": root, "cover": cover, "glyph": glyph, "title": title, "sub": sub,
+             "count": count, "fill": fill, "stage": stage, "stage_icon": stage_icon}
+    for key, v in views.items():
+        if v is not None:
+            v.setTag("p2p:s%d:%s" % (idx, key))
+    return root
+
+
+def _fill_color(state: str, pal: dict) -> int:
+    return {"ok": pal["green"], "fail": pal["red"], "skip": pal["gray"]}.get(state, pal["accent"])
+
+
+def _set_stage_color(slot: dict, color: int):
+    slot["stage"].setTextColor(_i32(color))
+    if slot.get("stage_icon") is not None:
+        try:
+            slot["stage_icon"].setColorFilter(_i32(color))
+        except Exception:
+            pass
+
+
+def _stage_label(text) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[\d%]+", "", str(text or ""))).strip()
+
+
+def _set_sub(slot: dict, snap: dict):
+    from android.view import View
+    sub = snap.get("artist") or ""
+    if snap.get("album"):
+        sub = (sub + " · " if sub else "") + snap["album"]
+    slot["sub"].setText(sub)
+    slot["sub"].setVisibility(View.VISIBLE if sub else View.GONE)
+
+
+def _set_cover(slot: dict, bmp):
+    from android.view import View
+    try:
+        if bmp is not None:
+            slot["cover"].setImageBitmap(bmp)
+            slot["glyph"].setVisibility(View.GONE)
+        else:
+            slot["cover"].setImageDrawable(None)
+            slot["glyph"].setVisibility(View.VISIBLE)
+    except Exception as e:
+        log("[P2P] set cover: %s" % str(e)[:100])
+
+
+def _bind_slot(slot: dict, snap: dict):
+    pal = _UI.get("pal") or _palette()
+    slot["title"].setText(str(snap.get("title") or ""))
+    _set_sub(slot, snap)
+    total = int(snap.get("total") or 0)
+    slot["count"].setText(("%d/%d" % (snap.get("idx") or 0, total)) if total else "")
+    slot["stage"].setText(str(snap.get("stage") or ""))
+    slot["label"] = _stage_label(snap.get("stage"))
+    state = snap.get("state") or "run"
+    _set_stage_color(slot, _fill_color(state, pal) if state != "run" else pal["gray"])
+    slot["fill"].setBackground(_round_bg(_fill_color(state, pal), _px(2)))
+    slot["fill"].setScaleX(float(snap.get("frac") or 0.0))
+    _set_cover(slot, snap.get("bmp"))
+    slot["root"].setTranslationY(0.0)
+    slot["root"].setAlpha(1.0)
+    slot["occupied"] = True
+
+
+def _slide_in(slot: dict):
+    from android.view.animation import OvershootInterpolator
+    v = slot["root"]
+    v.setTranslationY(float(_UI["H"]))
+    v.setAlpha(0.0)
+    v.animate().translationY(0.0).alpha(1.0).setDuration(420).setInterpolator(
+        OvershootInterpolator(0.7)).start()
+
+
+def _slide_out(slot: dict):
+    from android.view.animation import AccelerateInterpolator
+    slot["root"].animate().translationY(-float(_UI["H"])).alpha(0.0).setDuration(300).setInterpolator(
+        AccelerateInterpolator()).start()
+    slot["occupied"] = False
+
+
+def _hide_card_if_idle():
+    try:
+        from android.view import View
+        if _NOW["active"]:
+            return
+        with _NOW_LOCK:
+            _NOW["bmp"] = None
+        if _UI.get("card") is not None:
+            _UI["card"].setVisibility(View.GONE)
+        for sl in _SLOTS:
+            if sl.get("cover") is not None:
+                sl["cover"].setImageDrawable(None)
+    except Exception as e:
+        log("[P2P] hide card: %s" % str(e)[:100])
+
+
+def _ui_event(kind: str, snap: dict):
+    try:
+        slots = _UI.get("slots")
+        if not slots:
+            return
+        from android.view import View
+        pal = _UI.get("pal") or _palette()
+        front = _UI["front"]
+        cur = slots[front]
+        if kind == "begin":
+            now = time.time()
+            if not cur["occupied"]:
+                _UI["card"].setVisibility(View.VISIBLE)
+                _bind_slot(cur, snap)
+                _slide_in(cur)
+            elif now - _UI["t_swap"] < 0.45:
+                _bind_slot(cur, snap)
+            else:
+                back = slots[1 - front]
+                _bind_slot(back, snap)
+                _slide_in(back)
+                _slide_out(cur)
+                _UI["front"] = 1 - front
+            _UI["t_swap"] = now
+        elif kind == "stage":
+            if not cur["occupied"]:
+                return
+            cur["stage"].setText(str(snap.get("stage") or ""))
+            label = _stage_label(snap.get("stage"))
+            if label != cur["label"]:
+                cur["label"] = label
+                cur["stage"].setAlpha(0.3)
+                cur["stage"].animate().alpha(1.0).setDuration(180).start()
+            _set_stage_color(cur, pal["gray"])
+            cur["fill"].setBackground(_round_bg(pal["accent"], _px(2)))
+            cur["fill"].animate().scaleX(float(snap.get("frac") or 0.0)).setDuration(250).start()
+        elif kind == "meta":
+            if cur["occupied"]:
+                cur["title"].setText(str(snap.get("title") or ""))
+                _set_sub(cur, snap)
+        elif kind == "cover":
+            if cur["occupied"]:
+                _set_cover(cur, snap.get("bmp"))
+        elif kind == "end":
+            if not cur["occupied"]:
+                return
+            col = _fill_color(snap.get("state") or "run", pal)
+            cur["stage"].setText(str(snap.get("stage") or ""))
+            _set_stage_color(cur, col)
+            cur["fill"].setBackground(_round_bg(col, _px(2)))
+            cur["fill"].animate().scaleX(1.0).setDuration(250).start()
+        elif kind == "finish":
+            with _NOW_LOCK:
+                same_run = (snap.get("run_id") == _NOW["run_id"])
+                if same_run:
+                    _NOW["active"] = False
+            if same_run and cur["occupied"]:
+                _slide_out(cur)
+                _post(_hide_card_if_idle, 340)
+    except Exception as e:
+        log("[P2P] ui event %s: %s" % (kind, str(e)[:150]))
+
+
+def _ui_call(method_name: str):
+    p = _UI.get("plugin")
+    if p is not None:
+        try:
+            getattr(p, method_name)()
+        except Exception as e:
+            log("[P2P] ui call %s: %s" % (method_name, e))
+
+
+def _apply_state():
+    try:
+        from android.view import View
+        p = _UI.get("plugin")
+        start, stop, retry = _UI["start"], _UI["stop"], _UI["retry"]
+        if p is None or start is None:
+            return
+        running = bool(p._running)
+        start["root"].setEnabled(not running)
+        start["root"].setAlpha(0.4 if running else 1.0)
+        stop["root"].setEnabled(running)
+        stop["root"].setAlpha(1.0 if running else 0.4)
+        n = len(p._retry_tracks or [])
+        retry["root"].setVisibility(View.VISIBLE if (n and not running) else View.GONE)
+        retry["label"].setText("Повторить неудачные (%d)" % n)
+    except Exception as e:
+        log("[P2P] apply state: %s" % str(e)[:120])
+
+
+def _refresh_controls():
+    if run_on_ui_thread is None:
+        return
+    try:
+        run_on_ui_thread(_apply_state)
+    except Exception:
+        pass
+
+
+def _release_views():
+    _UI.update(start=None, stop=None, retry=None, view=None, card=None, slots=None)
+    for sl in _SLOTS:
+        for k in _SLOT_KEYS:
+            sl[k] = None
+
+
+def _restore_from_now():
+    from android.view import View
+    slots = _UI.get("slots")
+    card = _UI.get("card")
+    if not slots or card is None:
+        return
+    front = _UI["front"]
+    for i, sl in enumerate(slots):
+        if i != front:
+            sl["root"].setAlpha(0.0)
+            sl["occupied"] = False
+    with _NOW_LOCK:
+        snap = dict(_NOW)
+    if snap["active"]:
+        card.setVisibility(View.VISIBLE)
+        _bind_slot(slots[front], snap)
+    else:
+        card.setVisibility(View.GONE)
+        slots[front]["root"].setAlpha(0.0)
+        slots[front]["occupied"] = False
+
+
+def _acquire_refs(root, fresh: bool = False) -> bool:
+    def find(tag):
+        return root.findViewWithTag(tag)
+
+    start_root = find("p2p:start")
+    if start_root is None:
+        return False
+    _UI["start"] = {"root": start_root, "label": find("p2p:start_label")}
+    _UI["stop"] = {"root": find("p2p:stop"), "label": find("p2p:stop_label")}
+    _UI["retry"] = {"root": find("p2p:retry"), "label": find("p2p:retry_label")}
+    _UI["card"] = find("p2p:card")
+    _UI["view"] = root
+    for i, sl in enumerate(_SLOTS):
+        for k in _SLOT_KEYS:
+            sl[k] = find("p2p:s%d:%s" % (i, k))
+        if fresh:
+            sl["label"] = ""
+            sl["occupied"] = False
+    if fresh:
+        _UI["front"] = 0
+        _UI["t_swap"] = 0.0
+    _UI["slots"] = _SLOTS
+    return True
+
+
+def _make_detach_listener():
+    from java import dynamic_proxy
+    from android.view import View
+
+    class _Listener(dynamic_proxy(View.OnAttachStateChangeListener)):
+        def onViewAttachedToWindow(self, v):
+            try:
+                if _UI.get("slots") is None and _acquire_refs(v):
+                    _restore_from_now()
+                    _apply_state()
+            except Exception as e:
+                log("[P2P] attach: %s" % str(e)[:100])
+
+        def onViewDetachedFromWindow(self, v):
+            _release_views()
+
+    return _Listener()
+
+
+def _ctrl_create_view(context, list_view, current_account, class_guid, resources_provider):
+    from android.widget import LinearLayout, FrameLayout, TextView
+    from android.view import View
+    dp = _px
+    try:
+        pal = _palette()
+        _UI["pal"] = pal
+        root = LinearLayout(context)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(16), dp(10), dp(16), dp(14))
+        try:
+            from androidx.recyclerview.widget import RecyclerView
+            root.setLayoutParams(RecyclerView.LayoutParams(-1, -2))
+        except Exception:
+            from android.view import ViewGroup
+            root.setLayoutParams(ViewGroup.LayoutParams(-1, -2))
+
+        row = LinearLayout(context)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        start = _make_button(context, "Старт", _contrast_text(pal["accent"]), pal["accent"],
+                             icon=_ICONS["start"])
+        stop = _make_button(context, "Стоп", pal["red"], _with_alpha(pal["red"], 0x2A),
+                            icon=_ICONS["stop"])
+        retry = _make_button(context, "Повторить неудачные", pal["accent"],
+                             _with_alpha(pal["accent"], 0x2A), 40, icon=_ICONS["retry"])
+        for name, btn in (("start", start), ("stop", stop), ("retry", retry)):
+            btn["root"].setTag("p2p:" + name)
+            btn["label"].setTag("p2p:%s_label" % name)
+        lp1 = LinearLayout.LayoutParams(0, dp(46), 1.0)
+        lp1.setMargins(0, 0, dp(5), 0)
+        lp2 = LinearLayout.LayoutParams(0, dp(46), 1.0)
+        lp2.setMargins(dp(5), 0, 0, 0)
+        row.addView(start["root"], lp1)
+        row.addView(stop["root"], lp2)
+        root.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+        lp3 = LinearLayout.LayoutParams(-1, dp(40))
+        lp3.setMargins(0, dp(8), 0, 0)
+        root.addView(retry["root"], lp3)
+
+        H = dp(92)
+        card = FrameLayout(context)
+        card.setClipChildren(True)
+        card.setTag("p2p:card")
+        for idx in range(2):
+            slot_root = _build_slot(context, pal, idx)
+            slot_root.setAlpha(0.0)
+            card.addView(slot_root, FrameLayout.LayoutParams(-1, H))
+        lp4 = LinearLayout.LayoutParams(-1, H)
+        lp4.setMargins(0, dp(12), 0, 0)
+        root.addView(card, lp4)
+        card.setVisibility(View.GONE)
+
+        start["root"].setOnClickListener(OnClickListener(lambda v: _ui_call("_on_start_click")))
+        stop["root"].setOnClickListener(OnClickListener(lambda v: _ui_call("_on_stop_click")))
+        retry["root"].setOnClickListener(OnClickListener(lambda v: _ui_call("_on_retry_click")))
+
+        _UI["H"] = H
+        if not _acquire_refs(root, fresh=True):
+            raise RuntimeError("view refs not found")
+        try:
+            root.addOnAttachStateChangeListener(_make_detach_listener())
+        except Exception as e:
+            log("[P2P] detach listener unavailable: %s" % str(e)[:100])
+        _restore_from_now()
+        _apply_state()
+        return root
+    except Exception as e:
+        log("[P2P] controls view failed: %s" % str(e)[:200])
+        log(traceback.format_exc())
+        _UI["failed"] = True
+        _release_views()
+        tv = TextView(context)
+        tv.setText("Не удалось построить кнопки — см. лог. Откройте настройки заново.")
+        return tv
+
+
+def _ctrl_bind_view(view, item, divider, adapter, list_view):
+    try:
+        if _UI.get("slots") is None and _acquire_refs(view):
+            _restore_from_now()
+    except Exception as e:
+        log("[P2P] bind: %s" % str(e)[:100])
+    _apply_state()
+
+
+_CTRL_FACTORY = None
+if _HAS_CUSTOM and OnClickListener is not None:
+    try:
+        _CTRL_FACTORY = SimpleSettingFactory(
+            _ctrl_create_view, _ctrl_bind_view, is_clickable=False, is_shadow=False)
+    except Exception as _e:
+        log("[P2P] custom factory unavailable: %s" % _e)
+        _CTRL_FACTORY = None
+
+
+class PlaylistToProfilePlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._stop_flag = False
+        self._progress = "Ожидание"
+        self._worker = None
+        self._cache_dir = None
+        self._pending_audio_meta = None
+        self._retry_tracks = []
+        self._run_account = None
+        self._paused = False
+
+    def on_plugin_load(self):
+        self._cache_dir = os.path.join(get_cache_dir(), "p2p_tracks")
+        ensure_dir_exists(self._cache_dir)
+        self._purge_cache()
+        _UI["plugin"] = self
+        _UI["failed"] = False
+        self.add_on_send_message_hook()
+        log("[P2P] Плейлист в профиль v0.8.0 loaded")
+
+    def on_plugin_unload(self):
+        self._stop_flag = True
+        self._running = False
+        self._pending_audio_meta = None
+        self._retry_tracks = []
+        self._worker = None
+        _release_views()
+        with _NOW_LOCK:
+            _NOW.update(active=False, bmp=None)
+        if _UI.get("plugin") is self:
+            _UI.update(plugin=None)
+
+    def _purge_cache(self, max_age: float = 6 * 3600.0):
+        try:
+            now = time.time()
+            for name in os.listdir(self._cache_dir):
+                p = os.path.join(self._cache_dir, name)
+                try:
+                    if os.path.isfile(p) and now - os.path.getmtime(p) > max_age:
+                        os.remove(p)
+                except Exception:
+                    pass
+        except Exception as e:
+            log("[P2P] purge cache: %s" % e)
+
+    def _wait_for_account(self) -> bool:
+        if self._run_account is None:
+            return not self._stop_flag
+        if _selected_account() == self._run_account:
+            return not self._stop_flag
+        with _NOW_LOCK:
+            prev_stage, prev_frac = _NOW["stage"], _NOW["frac"]
+        self._paused = True
+        BulletinHelper.show_info("Пауза: вы переключились на другой аккаунт. Вернитесь в исходный, чтобы продолжить")
+        self._update_progress("Пауза: другой аккаунт")
+        now_stage("Пауза: другой аккаунт", prev_frac)
+        while not self._stop_flag and _selected_account() != self._run_account:
+            time.sleep(0.5)
+        self._paused = False
+        if self._stop_flag:
+            return False
+        BulletinHelper.show_info("Продолжаю: вы вернулись в исходный аккаунт")
+        self._update_progress("Продолжаю")
+        now_stage(prev_stage, prev_frac)
+        return True
+
+    def on_send_message_hook(self, account: int, params) -> HookResult:
+        meta = self._pending_audio_meta
+        if not meta:
+            return HookResult()
+        if self._run_account is not None and account != self._run_account:
+            return HookResult()
+        sent_path = getattr(params, "path", None)
+        has_path = isinstance(sent_path, str) and bool(sent_path)
+        if has_path and meta.get("path"):
+            if os.path.abspath(sent_path) != os.path.abspath(meta["path"]):
+                return HookResult()
+        try:
+            document = None
+            for attr_name in ("document", "params"):
+                obj = getattr(params, attr_name, None)
+                if obj is None:
+                    continue
+                if hasattr(obj, "attributes") and hasattr(obj, "mime_type"):
+                    document = obj
+                    break
+                doc = getattr(obj, "document", None)
+                if doc is not None and hasattr(doc, "attributes"):
+                    document = doc
+                    break
+            media = getattr(params, "media", None) or getattr(params, "messageMedia", None)
+            if document is None and media is not None:
+                document = getattr(media, "document", None)
+            if document is None:
+                for name in dir(params):
+                    if name.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(params, name)
+                    except Exception:
+                        continue
+                    if val is not None and type(val).__name__ in (
+                        "TL_document", "TLRPC$TL_document", "Document"
+                    ):
+                        document = val
+                        break
+                    if hasattr(val, "document") and getattr(val, "document", None) is not None:
+                        document = val.document
+                        break
+            if document is None:
+                log("[P2P] send hook: document not found, type=%s" % type(params).__name__)
+                return HookResult()
+            if not has_path and meta.get("size"):
+                doc_size = int(getattr(document, "size", 0) or 0)
+                if doc_size and doc_size != meta["size"]:
+                    return HookResult()
+            attrs = getattr(document, "attributes", None)
+            if attrs is None:
+                return HookResult()
+            audio_attr = None
+            try:
+                size = attrs.size()
+                for i in range(size):
+                    a = attrs.get(i)
+                    if "Audio" in type(a).__name__:
+                        audio_attr = a
+                        break
+            except Exception:
+                for a in list(attrs):
+                    if "Audio" in type(a).__name__:
+                        audio_attr = a
+                        break
+            if audio_attr is None:
+                audio_attr = TLRPC.TL_documentAttributeAudio()
+                try:
+                    attrs.add(audio_attr)
+                except Exception:
+                    log("[P2P] send hook: cannot add audio attr")
+                    return HookResult()
+            title = meta.get("title") or ""
+            artist = meta.get("artist") or ""
+            duration = int(meta.get("duration") or 0)
+            if duration > 0:
+                audio_attr.duration = duration
+            if title:
+                audio_attr.title = title
+            if artist:
+                audio_attr.performer = artist
+            try:
+                flags = 0
+                if title:
+                    flags |= 1
+                if artist:
+                    flags |= 2
+                audio_attr.flags = flags
+            except Exception as e:
+                log("[P2P] send hook flags: %s" % e)
+            log("[P2P] send hook: %s — %s (%ss)" % (artist, title, duration))
+            self._pending_audio_meta = None
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        except Exception as e:
+            log("[P2P] send hook error: %s" % e)
+            log(traceback.format_exc())
+            return HookResult()
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Плейлист"),
+            Input(
+                key="playlist_url",
+                text="Ссылка на плейлист",
+                default="",
+                subtext="YouTube / Яндекс / VK / Spotify / SoundCloud и др.",
+                icon=_icon("msg_link", "msg_link2"),
+            ),
+            *self._controls_rows(),
+            Divider(),
+            Header(text="Загрузка"),
+            Input(
+                key="delay",
+                text="Пауза между треками (сек)",
+                default="5",
+                subtext="Рекомендуется 4–8 секунд",
+                icon=_icon("msg_timer"),
+            ),
+            Input(
+                key="max_tracks",
+                text="Макс. треков (0 = все)",
+                default="0",
+                subtext="Удобно для пробного запуска",
+                icon=_icon("msg_list"),
+            ),
+            Switch(
+                key="skip_existing",
+                text="Пропускать уже добавленные",
+                default=True,
+                subtext="Не качать то, что уже есть в музыке профиля",
+                icon=_icon("msg_filter", "msg_list"),
+            ),
+            Switch(
+                key="delete_after",
+                text="Чистить Избранное",
+                default=True,
+                subtext="Убирать временное сообщение после добавления",
+                icon=_icon("msg_clear", "msg_delete"),
+            ),
+            Switch(
+                key="clear_existing",
+                text="Очистить музыку профиля перед запуском",
+                default=False,
+                subtext="Удалит все текущие треки профиля — необратимо",
+                icon=_icon("msg_delete"),
+            ),
+            Divider(),
+            Header(text="Звук и обложки"),
+            Switch(
+                key="fallback_youtube",
+                text="Искать звук на YouTube",
+                default=True,
+                subtext="Если у источника нет звука или он отдаёт превью (VK, Spotify, Яндекс)",
+                icon=_icon("filled_sound_on", "msg_search"),
+            ),
+            Switch(
+                key="itunes_covers",
+                text="Обложки из iTunes",
+                default=True,
+                subtext="Если у трека нет своей обложки",
+                icon=_icon("msg_photos", "msg_photo", "msg_media"),
+            ),
+            Divider(),
+            Header(text="Дополнительно"),
+            Text(
+                text="Источники и аккаунты",
+                subtext="Токены Яндекс Музыки и VK, cookies.txt",
+                icon=_icon("msg_secret", "msg_permissions", "msg_settings"),
+                create_sub_fragment=self._sources_page,
+            ),
+        ]
+
+    def _sources_page(self) -> List[Any]:
+        return [
+            Header(text="Яндекс Музыка"),
+            Input(
+                key="yandex_token",
+                text="Токен",
+                default="",
+                subtext="Нужен только для приватных плейлистов",
+                icon=_icon("msg_secret", "msg_permissions"),
+            ),
+            Divider(),
+            Header(text="VK"),
+            Input(
+                key="vk_token",
+                text="Токен",
+                default="",
+                subtext="Обязателен для плейлистов VK",
+                icon=_icon("msg_permissions", "msg_secret"),
+            ),
+            Divider(),
+            Header(text="yt-dlp"),
+            Input(
+                key="cookies_path",
+                text="Путь к cookies.txt",
+                default="",
+                subtext="Возрастные ролики и закрытые плейлисты",
+                icon=_icon("msg_folders", "msg_info"),
+            ),
+            Divider(text="Spotify работает без токена: достаточно ссылки на публичный плейлист"),
+        ]
+
+    def _controls_rows(self) -> List[Any]:
+        if _CTRL_FACTORY is not None and not _UI.get("failed"):
+            try:
+                return [Custom(factory=_CTRL_FACTORY.instance.java)]
+            except Exception as e:
+                log("[P2P] Custom row error: %s" % e)
+        return [
+            Text(
+                text="Старт",
+                subtext="Начать добавление треков в профиль",
+                icon=_icon("msg_play", "msg_arrow_forward"),
+                accent=True,
+                on_click=self._on_start_click,
+            ),
+            Text(
+                text="Повторить неудачные",
+                subtext="Неудачные и необработанные треки прошлого запуска",
+                icon=_icon("msg_retry", "msg_reset", "msg_arrow_forward"),
+                on_click=self._on_retry_click,
+            ),
+            Text(
+                text="Стоп",
+                subtext="Остановить текущий запуск",
+                icon=_icon("msg_close", "msg_cancel"),
+                red=True,
+                on_click=self._on_stop_click,
+            ),
+            Text(
+                text="Статус",
+                subtext=self._progress + " (нажми, чтобы обновить)",
+                icon=_icon("msg_info"),
+                on_click=self._on_status_click,
+            ),
+        ]
+
+    def _on_start_click(self, view=None):
+        self._start()
+
+    def _on_retry_click(self, view=None):
+        self._start(retry=True)
+
+    def _on_status_click(self, view=None):
+        BulletinHelper.show_info(self._progress[:200])
+
+    def _on_stop_click(self, view=None):
+        self._stop_flag = True
+        self._update_progress("Остановка...")
+        BulletinHelper.show_info("Остановка...")
+
+    def _update_progress(self, text: str):
+        self._progress = text
+        log("[P2P] " + text)
+        _refresh_controls()
+
+    def _sleep(self, secs: float):
+        end = time.time() + secs
+        while time.time() < end:
+            if self._stop_flag:
+                return
+            time.sleep(min(0.5, max(0.0, end - time.time())))
+
+    def _start(self, retry: bool = False):
+        if self._running:
+            BulletinHelper.show_error("Уже запущено")
+            return
+        url = ""
+        preset = None
+        if retry:
+            preset = list(self._retry_tracks)
+            if not preset:
+                BulletinHelper.show_error("Нет неудачных треков")
+                return
+        else:
+            url = (self.get_setting("playlist_url") or "").strip()
+            if not url:
+                BulletinHelper.show_error("Сначала вставь ссылку на плейлист")
+                return
+        self._running = True
+        self._stop_flag = False
+        self._paused = False
+        self._run_account = _selected_account()
+        self._update_progress("Запуск...")
+        BulletinHelper.show_info("Запущено")
+
+        def worker():
+            try:
+                self._process_playlist(url, preset_tracks=preset)
+            except Exception as e:
+                self._update_progress("Ошибка: " + str(e)[:80])
+                log("[P2P] Fatal: " + str(e) + "\n" + traceback.format_exc())
+            finally:
+                self._running = False
+                self._run_account = None
+                self._paused = False
+                self._worker = None
+                _refresh_controls()
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
+
+    def _process_playlist(self, url: str, preset_tracks=None):
+        now_begin_run()
+        try:
+            self._process_playlist_inner(url, preset_tracks)
+        finally:
+            now_finish_run()
+            self._clear_cache()
+
+    def _process_playlist_inner(self, url: str, preset_tracks=None):
+        if preset_tracks is None:
+            self._update_progress("Получение списка треков...")
+            try:
+                tracks = self._extract_tracks(url)
+            except SourceError as e:
+                self._update_progress(str(e)[:80])
+                BulletinHelper.show_error(str(e)[:200])
+                now_end("fail", str(e)[:60])
+                return
+            if not tracks:
+                self._update_progress("Треки не найдены")
+                BulletinHelper.show_error("Треки не найдены")
+                now_end("fail", "Треки не найдены")
+                return
+            max_t = 0
+            try:
+                max_t = int(self.get_setting("max_tracks") or 0)
+            except Exception:
+                pass
+            if max_t > 0:
+                tracks = tracks[:max_t]
+        else:
+            tracks = list(preset_tracks)
+        total = len(tracks)
+        self._update_progress("Найдено треков: %d" % total)
+        BulletinHelper.show_info("Найдено треков: %d" % total)
+
+        cleared = False
+        if preset_tracks is None and self.get_setting("clear_existing", False):
+            self._update_progress("Очистка музыки профиля...")
+            removed = self._clear_profile_music()
+            cleared = True
+            BulletinHelper.show_info("Удалено старых треков: %d" % removed)
+
+        skip_existing = bool(self.get_setting("skip_existing", True))
+        pairs = []
+        if skip_existing and not cleared:
+            pairs = self._profile_pairs()
+            log("[P2P] в профиле уже: %d" % len(pairs))
+
+        delay = 5.0
+        try:
+            delay = max(3.0, float(self.get_setting("delay") or 5))
+        except Exception:
+            pass
+        delete_after = self.get_setting("delete_after", True)
+
+        stats = {"nocover": 0}
+        added = 0
+        skipped = 0
+        errors = 0
+        failed = []
+        limit_hit = False
+        stopped = False
+        begun = -1
+        for i, track in enumerate(tracks, 1):
+            if self._stop_flag or not self._wait_for_account():
+                failed.extend(tracks[i - 1:])
+                stopped = True
+                break
+            title = (track.get("title") or track.get("id") or "track")[:50]
+            self._update_progress("[%d/%d] %s" % (i, total, title))
+            if begun != i:
+                now_begin_track(track, i, total)
+            now_stage("Подготовка", 0.02)
+            status = "fail"
+            try:
+                status = self._download_and_add(
+                    track, delete_after, skip_existing, pairs, stats)
+            except Exception as e:
+                log("[P2P] Track error: %s -> %s" % (title, e))
+                log(traceback.format_exc())
+            log("[P2P] %s: %s" % (status.upper(), title))
+            if status == "ok":
+                now_end("ok", "Добавлено")
+            elif status == "skipped":
+                now_end("skip", "Уже в профиле — пропущено")
+            elif status == "limit":
+                now_end("fail", "Лимит музыки профиля")
+            else:
+                now_end("fail", "Не удалось добавить")
+            if status == "ok":
+                added += 1
+            elif status == "skipped":
+                skipped += 1
+            elif status == "limit":
+                failed.extend(tracks[i - 1:])
+                limit_hit = True
+                break
+            else:
+                errors += 1
+                failed.append(track)
+            if i % 5 == 0 and i < total:
+                BulletinHelper.show_info("Обработано %d/%d, добавлено %d" % (i, total, added))
+            if status in ("ok", "fail") and i < total:
+                self._pause(delay, tracks[i], i + 1, total)
+                begun = i + 1
+
+        self._retry_tracks = failed
+        summary = "добавлено %d, пропущено %d, ошибок %d" % (added, skipped, errors)
+        if stats["nocover"]:
+            summary += ", без обложки %d" % stats["nocover"]
+        if limit_hit:
+            msg = "Достигнут лимит музыки профиля: " + summary
+        elif stopped:
+            msg = "Остановлено: " + summary
+        else:
+            msg = "Готово: " + summary
+        if errors and not limit_hit and not stopped:
+            msg += " (можно повторить неудачные)"
+        self._update_progress(msg)
+        BulletinHelper.show_info(msg[:200])
+
+
+    def _doc_audio_meta(self, doc) -> Tuple[str, str]:
+        try:
+            for a in _java_list(getattr(doc, "attributes", None)):
+                if "Audio" in type(a).__name__:
+                    return (str(getattr(a, "title", "") or ""),
+                            str(getattr(a, "performer", "") or ""))
+        except Exception:
+            pass
+        return "", ""
+
+    def _profile_pairs(self) -> list:
+        pairs = []
+        try:
+            for d in self._get_profile_music_documents():
+                t, p = self._doc_audio_meta(d)
+                nt = _norm(t)
+                if nt:
+                    pairs.append((nt, _norm(_first_artist(p))))
+        except Exception as e:
+            log("[P2P] profile pairs: %s" % e)
+        return pairs
+
+    def _already_in_profile(self, artist, title, pairs) -> bool:
+        hay = _norm("%s %s" % (artist or "", title or ""))
+        if not hay:
+            return False
+        for pt, pa in pairs:
+            if len(pt) < 2 or not pa or pa == "unknown":
+                continue
+            if pt in hay and pa in hay:
+                return True
+        return False
+
+    def _normalize_url(self, url: str) -> str:
+        url = (url or "").strip()
+        url = url.replace("music.youtube.com", "www.youtube.com")
+        m = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
+        if m:
+            return "https://www.youtube.com/playlist?list=" + m.group(1)
+        return url
+
+
+    def _ydl_opts(self, extra: Optional[dict] = None) -> dict:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "retries": 2,
+            "fragment_retries": 2,
+            "socket_timeout": 30,
+        }
+        cookies = (self.get_setting("cookies_path", "") or "").strip()
+        if cookies and os.path.isfile(cookies):
+            opts["cookiefile"] = cookies
+        if extra:
+            opts.update(extra)
+        return opts
+
+    def _extract_tracks(self, url: str) -> list:
+        url = (url or "").strip()
+        low = url.lower()
+        if "spotify.com" in low or low.startswith("spotify:"):
+            return self._tracks_spotify(url)
+        if any(h in low for h in _SHORT_HOSTS):
+            url = _resolve_redirect(url)
+            low = url.lower()
+        if "music.yandex." in low:
+            return self._tracks_yandex(url)
+        is_vk_video = ("/video" in low or "/clip" in low or "vkvideo." in low)
+        if ("vk.com/" in low or "vk.ru/" in low) and not is_vk_video:
+            return self._tracks_vk(url)
+        return self._tracks_ytdlp(url)
+
+    def _tracks_ytdlp(self, url: str) -> list:
+        collector = _YtdlpLog()
+        tracks = self._tracks_ytdlp_raw(url, collector)
+        if not tracks and collector.errors:
+            log("[P2P] extract failed: " + " | ".join(collector.errors)[:300])
+            raise SourceError(_explain_ytdlp_error(collector.errors, url))
+        return tracks
+
+    def _tracks_ytdlp_raw(self, url: str, collector) -> list:
+        try:
+            import yt_dlp
+        except ImportError as e:
+            log("[P2P] yt-dlp import failed: " + str(e))
+            raise SourceError("Не удалось загрузить yt-dlp")
+        if "youtube" in url or "youtu.be" in url:
+            url = self._normalize_url(url)
+        log("[P2P] extract url: " + url)
+        opts = self._ydl_opts({
+            "extract_flat": True,
+            "skip_download": True,
+            "ignoreerrors": True,
+            "logger": collector,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                for _ in range(3):
+                    if info and info.get("_type") == "url" and str(info.get("url") or "").startswith("http"):
+                        info = ydl.extract_info(info["url"], download=False)
+                    else:
+                        break
+                if not info:
+                    return []
+                entries = info.get("entries")
+                if entries is None:
+                    entries = [info] if info.get("id") else []
+                tracks = []
+                for e in list(entries):
+                    if not e:
+                        continue
+                    tid = e.get("id") or ""
+                    u = e.get("url") or e.get("webpage_url") or ""
+                    if u.startswith("http"):
+                        track_url = u
+                    elif tid and re.match(r"^[A-Za-z0-9_-]{11}$", tid):
+                        track_url = "https://www.youtube.com/watch?v=" + tid
+                    else:
+                        m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", u)
+                        if not m:
+                            continue
+                        tid = tid or m.group(1)
+                        track_url = "https://www.youtube.com/watch?v=" + m.group(1)
+                    if not tid:
+                        tid = _safe_id(track_url[-20:])
+                    tracks.append({
+                        "id": tid,
+                        "provider": "ytdlp",
+                        "title": e.get("title") or tid,
+                        "artist": "",
+                        "url": track_url,
+                        "cover_url": "",
+                        "duration": int(e.get("duration") or 0),
+                    })
+                if not tracks:
+                    log("[P2P] extract empty: type=%s keys=%s" % (
+                        info.get("_type"), ",".join(sorted(info.keys()))[:200]))
+                log("[P2P] extract OK: %d tracks" % len(tracks))
+                return tracks
+        except Exception as e:
+            log("[P2P] extract error: " + str(e)[:250])
+            collector.errors.append(str(e))
+            return []
+
+
+    def _tracks_spotify(self, url: str) -> list:
+        parsed = _parse_spotify_url(url)
+        if not parsed:
+            raise SourceError("Не понимаю ссылку Spotify (нужен плейлист, альбом или трек)")
+        kind, sid = parsed
+        embed = "https://open.spotify.com/embed/%s/%s" % (kind, sid)
+        try:
+            raw = _http_request(embed, headers={"Accept-Language": "en-US,en;q=0.9"}, timeout=20.0)
+            html = raw.decode("utf-8", "replace")
+        except Exception as e:
+            raise SourceError("Spotify недоступен: " + str(e)[:80])
+        tracks = _spotify_extract(html, kind)
+        if not tracks:
+            raise SourceError("Не удалось прочитать плейлист Spotify (он публичный?)")
+        log("[P2P] spotify: %d tracks" % len(tracks))
+        if kind == "playlist" and len(tracks) >= 100:
+            BulletinHelper.show_info("Spotify отдаёт первые ~100 треков плейлиста")
+        return tracks
+
+
+    def _ya_headers(self) -> dict:
+        h = {
+            "X-Yandex-Music-Client": "YandexMusicAndroid/24023231",
+            "Accept": "application/json",
+            "Accept-Language": "ru",
+        }
+        tok = (self.get_setting("yandex_token", "") or "").strip()
+        if tok:
+            h["Authorization"] = "OAuth " + tok
+        return h
+
+    def _ya_fetch_tracks_by_ids(self, ids: list) -> dict:
+        out = {}
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            try:
+                data = _http_json(
+                    YM_API + "/tracks",
+                    headers=self._ya_headers(),
+                    data={"track-ids": ",".join(chunk), "with-positions": "False"},
+                )
+                for t in (data.get("result") or []):
+                    if isinstance(t, dict):
+                        rid = str(t.get("realId") or t.get("id") or "").split(":")[0]
+                        if rid:
+                            out[rid] = t
+            except Exception as e:
+                log("[P2P] ya tracks: %s" % str(e)[:150])
+        return out
+
+    def _tracks_yandex(self, url: str) -> list:
+        parsed = _parse_yandex_url(url)
+        if not parsed:
+            raise SourceError("Не понимаю ссылку Яндекс Музыки")
+        hdr = self._ya_headers()
+        raw_tracks = []
+        try:
+            kind = parsed[0]
+            items = []
+            if kind == "playlist":
+                data = _http_json(YM_API + "/users/%s/playlists/%s" % (parsed[1], parsed[2]), headers=hdr)
+                res = data.get("result")
+                if isinstance(res, list) and res:
+                    res = res[0]
+                items = (res or {}).get("tracks") or []
+            elif kind == "playlist_uuid":
+                data = _http_json(YM_API + "/playlist/" + parsed[1], headers=hdr)
+                items = (data.get("result") or {}).get("tracks") or []
+            elif kind == "album":
+                data = _http_json(YM_API + "/albums/%s/with-tracks" % parsed[1], headers=hdr)
+                for vol in ((data.get("result") or {}).get("volumes") or []):
+                    items.extend(vol or [])
+            elif kind == "track":
+                items = [{"id": parsed[2], "albumId": parsed[1]}]
+            def _full(it):
+                if not isinstance(it, dict):
+                    return None
+                if isinstance(it.get("track"), dict):
+                    return it["track"]
+                if it.get("title") and it.get("artists") is not None:
+                    return it
+                return None
+
+            missing = [str(it["id"]).split(":")[0] for it in items
+                       if isinstance(it, dict) and it.get("id") and _full(it) is None]
+            fetched = self._ya_fetch_tracks_by_ids(missing) if missing else {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                t = _full(it) or fetched.get(str(it.get("id") or "").split(":")[0])
+                if t:
+                    raw_tracks.append(t)
+        except Exception as e:
+            log("[P2P] yandex api error: %s" % str(e)[:200])
+            raw_tracks = []
+        tracks = [x for x in (_ya_track(t) for t in raw_tracks) if x]
+        if tracks:
+            log("[P2P] yandex: %d tracks" % len(tracks))
+            return tracks
+        log("[P2P] yandex api пуст, пробую yt-dlp")
+        try:
+            tracks = self._tracks_ytdlp(url)
+        except SourceError:
+            tracks = []
+        if not tracks:
+            raise SourceError("Не удалось получить плейлист Яндекс Музыки (он публичный?)")
+        return tracks
+
+
+    def _vk_call(self, method: str, params: dict):
+        token = (self.get_setting("vk_token", "") or "").strip()
+        if not token:
+            raise SourceError("Для VK нужен токен: Настройки плагина → Токен VK")
+        p = {"v": "5.131", "access_token": token}
+        p.update(params)
+        try:
+            data = _http_json("https://api.vk.com/method/" + method,
+                              headers={"User-Agent": UA_VK}, data=p)
+        except Exception as e:
+            raise SourceError("VK недоступен: " + str(e)[:80])
+        err = data.get("error") if isinstance(data, dict) else None
+        if err:
+            code = err.get("error_code")
+            msg = err.get("error_msg") or "ошибка"
+            if code == 5:
+                raise SourceError("VK: токен недействителен")
+            raise SourceError("VK: %s (%s)" % (msg[:80], code))
+        return data.get("response")
+
+    def _tracks_vk(self, url: str) -> list:
+        parsed = _parse_vk_url(url)
+        if not parsed:
+            raise SourceError("Не понимаю ссылку VK (нужен плейлист или аудио)")
+        kind = parsed[0]
+        raw = []
+        if kind == "audio":
+            audios = parsed[1] + (("_" + parsed[2]) if parsed[2] else "")
+            resp = self._vk_call("audio.getById", {"audios": audios})
+            raw = list(resp or [])
+        else:
+            params = {"count": 1000}
+            if kind == "playlist":
+                params["owner_id"] = parsed[1]
+                params["album_id"] = parsed[2]
+                if parsed[3]:
+                    params["access_key"] = parsed[3]
+            else:
+                params["owner_id"] = parsed[1]
+            offset = 0
+            while True:
+                if self._stop_flag:
+                    break
+                params["offset"] = offset
+                resp = self._vk_call("audio.get", params) or {}
+                items = resp.get("items") or []
+                raw.extend(items)
+                total = int(resp.get("count") or 0)
+                offset += len(items)
+                if not items or (total and offset >= total):
+                    break
+        tracks = [x for x in (_vk_track(it) for it in raw) if x]
+        log("[P2P] vk: %d tracks" % len(tracks))
+        return tracks
+
+    def _download_best_thumb(self, info: dict, tid: str) -> Optional[str]:
+        candidates = []
+        tid = str(tid or "")
+        for t in (info.get("thumbnails") or []):
+            if not isinstance(t, dict):
+                continue
+            u = t.get("url") or ""
+            if not u:
+                continue
+            w = int(t.get("width") or 0)
+            h = int(t.get("height") or 0)
+            area = w * h
+            square = 1 if (w and h and 0.85 <= (w / float(h)) <= 1.15) else 0
+            has_tid = 1 if tid and tid in u else 0
+            is_jpg = 1 if any(x in u.lower() for x in (".jpg", ".jpeg", "jpg", "jpeg")) else 0
+            is_webp = 1 if "webp" in u.lower() else 0
+            if is_webp and not is_jpg:
+                continue
+            score = area + square * 500000 + has_tid * 300000 + is_jpg * 50000
+            candidates.append((score, w, h, u))
+        if info.get("thumbnail"):
+            u = info["thumbnail"]
+            if "webp" not in u.lower():
+                candidates.append((100000, 0, 0, u))
+        if tid:
+            for name, bonus in (
+                ("maxresdefault.jpg", 900000),
+                ("sddefault.jpg", 700000),
+                ("hqdefault.jpg", 500000),
+                ("mqdefault.jpg", 300000),
+            ):
+                u = "https://i.ytimg.com/vi/%s/%s" % (tid, name)
+                candidates.append((bonus, 0, 0, u))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        out = os.path.join(self._cache_dir, tid + "_cover.jpg")
+        try:
+            import urllib.request
+            seen = set()
+            for score, w, h, u in candidates:
+                if u in seen:
+                    continue
+                seen.add(u)
+                try:
+                    req = urllib.request.Request(u, headers={
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36",
+                    })
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        data = resp.read()
+                    if len(data) < 800:
+                        continue
+                    if data[:3] == b"\xff\xd8\xff":
+                        with open(out, "wb") as f:
+                            f.write(data)
+                        log("[P2P] thumb %dx%d %dB score=%d" % (w, h, len(data), score))
+                        return out
+                    if data[:8] == b"\x89PNG\r\n\x1a\n":
+                        with open(out, "wb") as f:
+                            f.write(data)
+                        log("[P2P] thumb png %dB" % len(data))
+                        return out
+                except Exception:
+                    continue
+        except Exception as e:
+            log("[P2P] thumb download: %s" % e)
+        return None
+
+
+    def _pick_youtube_match(self, artist: str, title: str, duration: int) -> Optional[str]:
+        try:
+            import yt_dlp
+        except ImportError:
+            return None
+        query = "ytsearch6:%s %s" % (artist.replace(",", " "), title)
+        opts = self._ydl_opts({
+            "extract_flat": True,
+            "skip_download": True,
+            "ignoreerrors": True,
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+        except Exception as e:
+            log("[P2P] youtube search error: %s" % str(e)[:150])
+            return None
+        best, best_score = None, -1e9
+        for e in ((info or {}).get("entries") or []):
+            if not e:
+                continue
+            s = _score_search_entry(e, artist, title, duration)
+            log("[P2P] search cand: %s | %s -> %s" % (
+                (e.get("title") or "")[:50], e.get("channel") or e.get("uploader") or "", s))
+            if s is not None and s > best_score:
+                best, best_score = e, s
+        if best is None or best_score < 45:
+            log("[P2P] youtube match not found (best=%s)" % best_score)
+            return None
+        u = best.get("url") or ""
+        if not u.startswith("http"):
+            if not best.get("id"):
+                return None
+            u = "https://www.youtube.com/watch?v=" + best["id"]
+        log("[P2P] youtube match: %s (score %.0f)" % (u, best_score))
+        return u
+
+
+    def _locate_downloaded(self, ydl, info: dict, tid: str) -> Optional[str]:
+        filepath = ydl.prepare_filename(info)
+        if not os.path.isfile(filepath):
+            base = os.path.splitext(filepath)[0]
+            for ext in (".m4a", ".webm", ".mp3", ".opus", ".ogg", ".mp4", ".flac"):
+                cand = base + ext
+                if os.path.isfile(cand):
+                    filepath = cand
+                    break
+        if not os.path.isfile(filepath):
+            for f in os.listdir(self._cache_dir):
+                if f.startswith(tid) and not f.lower().endswith(
+                    (".part", ".jpg", ".webp", ".png", ".json", ".ytdl")
+                ):
+                    filepath = os.path.join(self._cache_dir, f)
+                    break
+        if os.path.isfile(filepath) and os.path.getsize(filepath) > 1000:
+            return filepath
+        return None
+
+    def _locate_thumb(self, filepath: str, tid: str) -> Optional[str]:
+        base0 = os.path.splitext(filepath)[0]
+        for ext in (".jpg", ".png", ".webp"):
+            cand = base0 + ext
+            if os.path.isfile(cand):
+                return cand
+        for f in os.listdir(self._cache_dir):
+            if f.startswith(tid) and f.lower().endswith((".jpg", ".png", ".webp")):
+                return os.path.join(self._cache_dir, f)
+        return None
+
+    def _ytdlp_download(self, url: str, tid: str) -> Optional[dict]:
+        try:
+            import yt_dlp
+        except ImportError:
+            return None
+        is_yt = ("youtube.com" in url or "youtu.be" in url)
+        out_tmpl = os.path.join(self._cache_dir, tid + ".%(ext)s")
+        format_candidates = [
+            "140/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best",
+            "bestaudio/best",
+        ]
+        client_sets = [["android"], ["ios"], ["tv"]] if is_yt else [None]
+
+        def _hook(d):
+            try:
+                if d.get("status") == "downloading":
+                    tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    if tot:
+                        frac = min(1.0, float(d.get("downloaded_bytes") or 0) / tot)
+                        now_stage("Скачивание %d%%" % int(frac * 100), 0.10 + 0.45 * frac)
+                elif d.get("status") == "finished":
+                    now_stage("Обработка файла", 0.57)
+            except Exception:
+                pass
+        for clients in client_sets:
+            for fmt in format_candidates:
+                if self._stop_flag:
+                    return None
+                opts = self._ydl_opts({
+                    "format": fmt,
+                    "outtmpl": out_tmpl,
+                    "ignoreerrors": False,
+                    "writethumbnail": True,
+                    "progress_hooks": [_hook],
+                })
+                if clients:
+                    opts["extractor_args"] = {"youtube": {"player_client": clients}}
+                    opts["http_headers"] = {
+                        "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip",
+                    }
+                try:
+                    log("[P2P] download %s clients=%s" % (url[-40:], ",".join(clients or [])))
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        if not info:
+                            continue
+                        if info.get("entries"):
+                            ents = [x for x in info["entries"] if x]
+                            if not ents:
+                                continue
+                            info = ents[0]
+                        filepath = self._locate_downloaded(ydl, info, tid)
+                        if not filepath:
+                            continue
+                        return {
+                            "path": filepath,
+                            "info": info,
+                            "thumb": self._locate_thumb(filepath, tid),
+                        }
+                except Exception as e:
+                    log("[P2P] download err: %s" % str(e)[:200])
+                    time.sleep(0.8)
+        return None
+
+    def _acquire(self, track: dict) -> Optional[dict]:
+        tid = _safe_id(track.get("id") or "x")
+        provider = track.get("provider") or "ytdlp"
+        artist0 = (track.get("artist") or "").strip()
+        title0 = (track.get("title") or "").strip()
+        exp = int(track.get("duration") or 0)
+        dl = None
+        how = ""
+        direct = track.get("url") or ""
+        if direct:
+            how = "direct"
+            now_stage("Скачивание", 0.10)
+            dl = self._ytdlp_download(direct, tid)
+            if dl and provider != "ytdlp" and exp:
+                got = int((dl["info"] or {}).get("duration") or 0) or _file_duration(dl["path"])
+                if got and got < exp * 0.8 - 3:
+                    log("[P2P] direct = превью (%ds из %ds), отбрасываю" % (got, exp))
+                    self._remove_files([dl["path"], dl.get("thumb")])
+                    dl = None
+        if (dl is None and provider != "ytdlp" and artist0 and title0
+                and not self._stop_flag and self.get_setting("fallback_youtube", True)):
+            now_stage("Поиск на YouTube", 0.08)
+            yurl = self._pick_youtube_match(artist0, title0, exp)
+            if yurl:
+                how = "youtube-search"
+                dl = self._ytdlp_download(yurl, tid)
+        if dl is None:
+            return None
+
+        info = dl.get("info") or {}
+        path = dl["path"]
+        temps = [path]
+        if dl.get("thumb"):
+            temps.append(dl["thumb"])
+        if provider != "ytdlp" and artist0 and title0:
+            artist, title = artist0, title0
+        else:
+            artist = _pick_artists(info)
+            title = _pick_title(info, title0 or tid, artist)
+        duration = int(info.get("duration") or 0) or exp or _file_duration(path)
+        album = (info.get("album") or track.get("album") or "").strip()
+        now_meta(title=title, artist=artist, album=album)
+
+        raw_ext = os.path.splitext(path)[1].lower() or ".m4a"
+        out_ext = ".m4a" if raw_ext in (".mp4", ".m4a") else raw_ext
+        new_path = os.path.join(self._cache_dir, _safe_name("%s - %s" % (artist, title), 90) + out_ext)
+        try:
+            if os.path.abspath(new_path) != os.path.abspath(path):
+                os.replace(path, new_path)
+                temps = [new_path] + temps[1:]
+                path = new_path
+        except Exception as e:
+            log("[P2P] rename skip: " + str(e))
+
+        now_stage("Теги", 0.60)
+        _tag_audio(path, title, artist, duration, album)
+        now_stage("Обложка", 0.66)
+        cover_path, cover_src = self._get_cover(track, artist, title, dl.get("thumb"), info, tid, temps)
+        if cover_path:
+            now_cover(cover_path)
+        now_stage("Вшиваю обложку", 0.72)
+        embedded = _embed_cover(path, cover_path) if cover_path else False
+        log("[P2P] file=%s | %s — %s (%ds) via %s | cover src=%s embedded=%s" % (
+            os.path.basename(path), artist, title, duration, how, cover_src, embedded))
+        return {
+            "path": path,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration": duration,
+            "temps": temps,
+            "cover_embedded": embedded,
+        }
+
+
+    def _download_image(self, url: str, name: str, temps: list) -> Optional[str]:
+        try:
+            data = _http_request(url, timeout=12.0)
+        except Exception as e:
+            log("[P2P] image download: %s" % str(e)[:120])
+            return None
+        kind = _image_kind(data) if data and len(data) > 800 else None
+        if not kind:
+            return None
+        out = os.path.join(self._cache_dir, "%s.%s" % (name, kind))
+        try:
+            with open(out, "wb") as f:
+                f.write(data)
+        except Exception:
+            return None
+        temps.append(out)
+        return out
+
+    def _itunes_cover_url(self, artist: str, title: str) -> Optional[str]:
+        na, nt = _norm(_first_artist(artist)), _norm(title)
+        if not na or not nt:
+            return None
+        for country in ("US", "RU"):
+            try:
+                q = urllib.parse.urlencode({
+                    "term": "%s %s" % (_first_artist(artist), title),
+                    "entity": "song", "limit": 5, "country": country,
+                })
+                data = _http_json("https://itunes.apple.com/search?" + q, timeout=6.0)
+            except Exception as e:
+                log("[P2P] itunes (%s): %s" % (country, str(e)[:100]))
+                continue
+            for r in (data.get("results") or []):
+                ra, rt = _norm(r.get("artistName")), _norm(r.get("trackName"))
+                if not ra or not rt:
+                    continue
+                if (nt in rt or rt in nt) and (na in ra or ra in na):
+                    art = r.get("artworkUrl100") or ""
+                    if art:
+                        return re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/1000x1000bb.jpg", art)
+        return None
+
+    def _cover_candidates(self, track, artist, title, raw_thumb, info, tid, temps):
+        u = track.get("cover_url")
+        if u:
+            p = track.get("_pre_cover")
+            if not (p and os.path.isfile(p)):
+                p = self._download_image(u, tid + "_c1", temps)
+            if p:
+                yield "provider", p
+        if self.get_setting("itunes_covers", True) and artist and title:
+            u = self._itunes_cover_url(artist, title)
+            if u:
+                p = self._download_image(u, tid + "_c2", temps)
+                if p:
+                    yield "itunes", p
+        if raw_thumb and os.path.isfile(raw_thumb):
+            yield "video", raw_thumb
+        p = self._download_best_thumb(info or {}, tid)
+        if p:
+            temps.append(p)
+            yield "video-jpg", p
+
+    def _get_cover(self, track, artist, title, raw_thumb, info, tid, temps):
+        dst = os.path.join(self._cache_dir, tid + "_cover.jpg")
+        try:
+            for label, src in self._cover_candidates(track, artist, title, raw_thumb, info, tid, temps):
+                if _normalize_cover(src, dst):
+                    temps.append(dst)
+                    return dst, label
+                try:
+                    with open(src, "rb") as f:
+                        head = f.read(16)
+                except Exception:
+                    continue
+                if _image_kind(head) in ("jpg", "png"):
+                    return src, label + "-raw"
+        except Exception as e:
+            log("[P2P] cover error: %s" % str(e)[:150])
+        return None, "none"
+
+
+    def _remove_files(self, paths):
+        for p in paths:
+            if p and os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    def _cleanup_track(self, tid: str, meta: Optional[dict]):
+        if meta:
+            self._remove_files(meta.get("temps") or [])
+        try:
+            for f in os.listdir(self._cache_dir):
+                if f.startswith(tid + ".") or f.startswith(tid + "_"):
+                    self._remove_files([os.path.join(self._cache_dir, f)])
+        except Exception:
+            pass
+
+    def _prefetch_cover(self, track: dict, tid: str):
+        u = track.get("cover_url")
+        if not u:
+            return
+        p = track.get("_pre_cover")
+        if not (p and os.path.isfile(p)):
+            p = self._download_image(u, tid + "_pre", [])
+            if p:
+                track["_pre_cover"] = p
+        if p:
+            now_cover(p)
+
+    def _pause(self, delay: float, next_track: dict, idx: int, total: int):
+        t0 = time.time()
+        now_begin_track(next_track, idx, total, stage="Пауза %d с" % int(delay))
+        try:
+            self._prefetch_cover(next_track, _safe_id(next_track.get("id") or "x"))
+        except Exception as e:
+            log("[P2P] prefetch: %s" % e)
+        end = t0 + delay
+        while not self._stop_flag:
+            if not self._wait_for_account():
+                break
+            left = end - time.time()
+            if left <= 0:
+                break
+            now_stage("Пауза %d с" % int(left + 0.99), 0.0)
+            time.sleep(min(0.5, left))
+
+    def _clear_cache(self):
+        try:
+            for name in os.listdir(self._cache_dir):
+                self._remove_files([os.path.join(self._cache_dir, name)])
+        except Exception as e:
+            log("[P2P] clear cache: %s" % e)
+
+    def _resolve_tl_class(self, *names):
+        for name in names:
+            cls = getattr(TLRPC, name, None)
+            if cls is not None:
+                return cls
+        try:
+            for attr in dir(TLRPC):
+                low = attr.lower()
+                for name in names:
+                    if name.lower() == low or name.lower() in low:
+                        cls = getattr(TLRPC, attr, None)
+                        if cls is not None and callable(cls):
+                            return cls
+        except Exception:
+            pass
+        try:
+            from org.telegram.tgnet import tl as tg_tl
+            for mod_name in dir(tg_tl):
+                mod = getattr(tg_tl, mod_name, None)
+                if mod is None:
+                    continue
+                for name in names:
+                    cls = getattr(mod, name, None)
+                    if cls is not None:
+                        return cls
+                    for attr in dir(mod):
+                        if name.lower() in attr.lower():
+                            cls = getattr(mod, attr, None)
+                            if cls is not None and callable(cls):
+                                return cls
+        except Exception as e:
+            log("[P2P] tl scan: %s" % e)
+        return None
+
+
+    def _rpc(self, req, timeout: float = 12.0, retries: int = 2):
+        for attempt in range(retries + 1):
+            if not self._wait_for_account():
+                return None, "STOPPED"
+            holder = {"resp": None, "err": None, "done": threading.Event()}
+
+            def callback(response, error, _h=holder):
+                if error:
+                    _h["err"] = str(error.text if hasattr(error, "text") else error)
+                else:
+                    _h["resp"] = response
+                _h["done"].set()
+
+            try:
+                send_request(req, callback)
+            except Exception as e:
+                return None, "EXC: %s" % str(e)[:100]
+            if not holder["done"].wait(timeout):
+                return None, "TIMEOUT"
+            err = holder["err"]
+            if err is None:
+                return holder["resp"], None
+            m = re.search(r"FLOOD_WAIT_(\d+)", err)
+            if m and attempt < retries:
+                secs = min(int(m.group(1)) + 1, 180)
+                self._update_progress("Telegram просит подождать %d с..." % secs)
+                self._sleep(secs)
+                if self._stop_flag:
+                    return None, err
+                continue
+            return None, err
+        return None, "RETRIES"
+
+    def _fetch_saved_messages(self, limit: int = 30) -> list:
+        try:
+            me_id = get_user_config().getClientUserId()
+            req = TLRPC.TL_messages_getHistory()
+            peer = TLRPC.TL_inputPeerUser()
+            peer.user_id = me_id
+            peer.access_hash = 0
+            req.peer = peer
+            req.offset_id = 0
+            req.offset_date = 0
+            req.add_offset = 0
+            req.limit = limit
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
+        except Exception as e:
+            log("[P2P] getHistory exception: " + str(e))
+            return []
+        resp, err = self._rpc(req, 10.0)
+        if err:
+            log("[P2P] getHistory error: " + err)
+            return []
+        return _java_list(getattr(resp, "messages", None))
+
+    def _max_msg_id(self) -> int:
+        max_id = 0
+        for msg in self._fetch_saved_messages(limit=5):
+            mid = getattr(msg, "id", 0) or 0
+            if mid > max_id:
+                max_id = mid
+        return max_id
+
+    def _doc_file_name(self, document) -> str:
+        for a in _java_list(getattr(document, "attributes", None)):
+            if "Filename" in type(a).__name__:
+                return str(getattr(a, "file_name", "") or "")
+        return ""
+
+    def _is_our_message(self, msg, after_id: int, caption: str, size: int, name: str):
+        mid = getattr(msg, "id", 0) or 0
+        if mid <= after_id:
+            return None
+        media = getattr(msg, "media", None)
+        document = getattr(media, "document", None) if media else None
+        if document is None:
+            return None
+        try:
+            doc_size = int(getattr(document, "size", 0) or 0)
+        except Exception:
+            return None
+        if not size or doc_size != size:
+            return None
+        text = (getattr(msg, "message", None) or "").strip()
+        if self._doc_file_name(document) == name or (text and text == caption.strip()):
+            return document
+        return None
+
+    def _find_new_audio(self, after_id: int, caption: str, size: int, name: str, timeout: float = 45.0):
+        start = time.time()
+        deadline = start + timeout
+        while time.time() < deadline:
+            if self._stop_flag:
+                return None, 0
+            messages = self._fetch_saved_messages(limit=30)
+            ids = [getattr(m, "id", 0) or 0 for m in messages]
+            log("[P2P] getHistory: %d msgs, max_id=%s after_id=%s" % (
+                len(messages), max(ids) if ids else 0, after_id))
+            now_stage("Отправка в Избранное",
+                      0.75 + 0.15 * min(1.0, (time.time() - start) / max(8.0, timeout * 0.4)))
+            for msg in messages:
+                document = self._is_our_message(msg, after_id, caption, size, name)
+                if document is not None:
+                    mid = getattr(msg, "id", 0) or 0
+                    log("[P2P] matched msg_id=%s size=%s" % (mid, size))
+                    return document, mid
+            self._sleep(2.0 if time.time() - start < 20 else 4.0)
+        return None, 0
+
+    def _download_and_add(self, track: dict, delete_after: bool, skip_existing: bool,
+                          pairs: list, stats: dict) -> str:
+        tid = _safe_id(track.get("id") or "x")
+        meta = None
+        try:
+            if skip_existing and self._already_in_profile(track.get("artist"), track.get("title"), pairs):
+                return "skipped"
+            self._prefetch_cover(track, tid)
+            meta = self._acquire(track)
+            if not meta:
+                return "fail"
+            path = meta["path"]
+            title = meta["title"]
+            artist = meta["artist"]
+            if skip_existing and self._already_in_profile(artist, title, pairs):
+                log("[P2P] уже в профиле: %s — %s" % (artist, title))
+                return "skipped"
+            caption = "%s — %s" % (artist, title)
+            now_stage("Отправка в Избранное", 0.75)
+            before_id = self._max_msg_id()
+            log("[P2P] before_id=%s" % before_id)
+            if not self._wait_for_account():
+                return "fail"
+            try:
+                me_id = get_user_config().getClientUserId()
+                file_size = os.path.getsize(path) if os.path.isfile(path) else 0
+                self._pending_audio_meta = {
+                    "title": title,
+                    "artist": artist,
+                    "duration": int(meta.get("duration") or 0),
+                    "path": path,
+                    "size": file_size,
+                }
+                send_audio(me_id, path, caption=caption)
+                log("[P2P] send_audio: %s" % caption)
+            except Exception as e:
+                log("[P2P] send_audio error: " + str(e))
+                return "fail"
+            size_mb = file_size / (1024 * 1024.0) if file_size else 1
+            time.sleep(1.5)
+            document, msg_id = self._find_new_audio(
+                after_id=before_id, caption=caption, size=file_size,
+                name=os.path.basename(path), timeout=45.0 + size_mb * 6)
+            self._pending_audio_meta = None
+            if document is None:
+                log("[P2P] audio not found in Saved Messages")
+                return "fail"
+            has_thumb = bool(_java_list(getattr(document, "thumbs", None)))
+            log("[P2P] server thumb=%s, embedded=%s" % (has_thumb, meta.get("cover_embedded")))
+            if not has_thumb:
+                stats["nocover"] = stats.get("nocover", 0) + 1
+            now_stage("Добавляю в профиль", 0.92)
+            ok, err = self._save_music(document)
+            if not ok:
+                log("[P2P] saveMusic failed: %s" % err)
+                if err and "LIMIT" in err.upper():
+                    return "limit"
+                return "fail"
+            log("[P2P] saveMusic OK")
+            pairs.append((_norm(title), _norm(_first_artist(artist))))
+            if delete_after and msg_id:
+                try:
+                    now_stage("Уборка", 0.97)
+                    self._delete_message(msg_id)
+                    log("[P2P] deleted msg_id=%s" % msg_id)
+                except Exception as e:
+                    log("[P2P] delete failed: " + str(e))
+            return "ok"
+        finally:
+            self._pending_audio_meta = None
+            self._cleanup_track(tid, meta)
+
+    def _get_profile_music_documents(self) -> list:
+        req_cls = self._resolve_tl_class(
+            "TL_getSavedMusic",
+            "TL_users_getSavedMusic",
+            "TL_account_getSavedMusic",
+            "getSavedMusic",
+        )
+        if req_cls is None:
+            log("[P2P] getSavedMusic class not found")
+            return []
+        log("[P2P] request class: %s" % req_cls)
+        documents = []
+        offset = 0
+        limit = 100
+        while True:
+            try:
+                req = req_cls()
+                try:
+                    req.id = TLRPC.TL_inputUserSelf()
+                except Exception:
+                    u = TLRPC.TL_inputUser()
+                    u.user_id = get_user_config().getClientUserId()
+                    u.access_hash = 0
+                    req.id = u
+                try:
+                    req.offset = offset
+                    req.limit = limit
+                    req.hash = 0
+                except Exception:
+                    pass
+            except Exception as e:
+                log("[P2P] getSavedMusic exception: " + str(e))
+                break
+            resp, err = self._rpc(req, 12.0)
+            if err:
+                log("[P2P] getSavedMusic error: " + err)
+                break
+            if resp is None:
+                break
+            docs = _java_list(getattr(resp, "documents", None))
+            if not docs:
+                break
+            documents.extend(docs)
+            log("[P2P] getSavedMusic: +%d (total %d)" % (len(docs), len(documents)))
+            count = int(getattr(resp, "count", 0) or 0)
+            if count and len(documents) >= count:
+                break
+            if len(docs) < limit:
+                break
+            offset += len(docs)
+        return documents
+
+    def _input_doc(self, document):
+        input_doc = TLRPC.TL_inputDocument()
+        input_doc.id = document.id
+        input_doc.access_hash = document.access_hash
+        input_doc.file_reference = document.file_reference
+        return input_doc
+
+    def _unsave_music(self, document) -> bool:
+        try:
+            req = TLRPC.TL_account_saveMusic()
+            req.flags = 1
+            req.unsave = True
+            req.id = self._input_doc(document)
+        except Exception as e:
+            log("[P2P] unsave exception: " + str(e))
+            return False
+        resp, err = self._rpc(req, 10.0)
+        if err:
+            log("[P2P] unsave error: " + err)
+        return err is None
+
+    def _clear_profile_music(self) -> int:
+        docs = self._get_profile_music_documents()
+        if not docs:
+            log("[P2P] profile music empty")
+            return 0
+        removed = 0
+        for doc in docs:
+            if self._stop_flag:
+                break
+            if self._unsave_music(doc):
+                removed += 1
+                time.sleep(0.35)
+        log("[P2P] cleared %d tracks" % removed)
+        return removed
+
+    def _save_music(self, document):
+        try:
+            req = TLRPC.TL_account_saveMusic()
+            req.flags = 0
+            req.unsave = False
+            req.id = self._input_doc(document)
+        except Exception as e:
+            log("[P2P] saveMusic exception: " + str(e))
+            log(traceback.format_exc())
+            return False, "EXC: %s" % str(e)[:100]
+        resp, err = self._rpc(req, 12.0)
+        return err is None, err
+
+    def _delete_message(self, msg_id: int):
+        try:
+            req = TLRPC.TL_messages_deleteMessages()
+            req.id.add(Integer(int(msg_id)))
+            req.revoke = True
+        except Exception as e:
+            log("[P2P] delete exception: " + str(e))
+            return
+        resp, err = self._rpc(req, 8.0, retries=1)
+        if err:
+            log("[P2P] delete error: " + err)
+        else:
+            log("[P2P] delete OK")
