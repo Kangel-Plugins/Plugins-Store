@@ -26,6 +26,7 @@ import copy
 import json
 import zlib
 import shlex
+import types
 import asyncio
 import inspect
 import logging
@@ -92,12 +93,12 @@ __description__ = (
 )
 __icon__ = "zwyPluginsIcons/0"
 __id__ = "zwylib"
-__version__ = "2.0.9"
+__version__ = "2.0.10"
 __author__ = "@zwylair"
 __min_version__ = "12.5.1"
 
 _T = TypeVar("_T")
-
+_ASYNC_SHARED_KEY = "_zwylib_async_shared"
 MATCH_PARENT = -1
 WRAP_CONTENT = -2
 
@@ -1364,7 +1365,7 @@ class Requests:
 
     @classmethod
     async def async_send(cls, req: TLObject, delay: Optional[int] = None, **kwargs) -> TLObject:
-        loop = async_manager.loop
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         def callback(response: TLObject, error: TLRPC.TL_error):
@@ -1992,11 +1993,24 @@ class _PrefsUtils:
 
 def open_message(peer_id: int, msg_id: int, topic_id: Optional[int] = None):
     launch_activity = cast(LaunchActivity, get_last_fragment().getParentActivity())
-    launch_activity.openMessage(peer_id, msg_id, None, None, topic_id or 0, -1, None)
+    if is_client_version_sufficient("12.9.2"):
+        launch_activity.openMessage(
+            peer_id,  # dialogId
+            msg_id,  # messageId
+            None,  # quote
+            None,  # progress
+            topic_id or 0,  # fromMessageId
+            -1,  # quoteOffset
+            None,  # task_id
+            None,  # pollOption
+        )
+    else:
+        # same but without pollOption
+        launch_activity.openMessage(peer_id, msg_id, None, None, topic_id or 0, -1, None)
 
 
 async def safe_open_message(peer_id: int, msg_id: int, topic_id=0, chat_username: Optional[str] = None):
-    loop = async_manager.loop
+    loop = asyncio.get_running_loop()
     future = loop.create_future()
 
     access_hash = get_messages_controller().getInputPeer(-peer_id)
@@ -2008,11 +2022,10 @@ async def safe_open_message(peer_id: int, msg_id: int, topic_id=0, chat_username
         _logger.warning(f"No access_hash and no username for peer '{peer_id}'.")
         return
 
-    def resolve(chat: Optional[TLRPC.Chat]):
-        if not future.done():
-            loop.call_soon_threadsafe(future.set_result, chat)
-
-    ChatUtils.getInstance().resolveChannel(chat_username, Callback1(resolve))
+    ChatUtils.getInstance().resolveChannel(
+        chat_username,
+        Callback1(lambda chat: _safe_set_future_result(future, chat))
+    )
 
     if await future:
         open_message(peer_id, msg_id, topic_id)
@@ -2028,14 +2041,9 @@ class _AsyncMarker:
 
 
 def _wrap_callback_methods(marker: _AsyncMarker, future: Future):
-    loop = async_manager.loop
     target_obj = marker.obj
 
     def get_and_save_original(method_name: str) -> Callable:
-        """
-        Searches for the original method. If the method has already been wrapped
-        earlier, takes it from the 'save' so as not wrap already wrapped method.
-        """
         original_attr_name = f"__zwy_orig_{method_name}"
 
         if hasattr(target_obj, original_attr_name):
@@ -2050,7 +2058,7 @@ def _wrap_callback_methods(marker: _AsyncMarker, future: Future):
     def wrapped_success(*cb_args):
         pure_success(*cb_args)
         res = cb_args[0] if len(cb_args) == 1 else cb_args
-        loop.call_soon_threadsafe(future.set_result, res)
+        _safe_set_future_result(future, res)
 
     setattr(target_obj, marker.success_method, wrapped_success)
 
@@ -2060,39 +2068,68 @@ def _wrap_callback_methods(marker: _AsyncMarker, future: Future):
         def wrapped_error(*cb_args):
             pure_error(*cb_args)
             err_msg = "Java error: " + " ".join(map(str, cb_args))
-            loop.call_soon_threadsafe(future.set_exception, Exception(err_msg))
+            _safe_set_future_exception(future, Exception(err_msg))
 
         setattr(target_obj, marker.error_method, wrapped_error)
 
 
+def _get_async_shared_state():
+    state = sys.modules.get(_ASYNC_SHARED_KEY)
+    if state is None:
+        state = types.ModuleType(_ASYNC_SHARED_KEY)
+        state.loop = None
+        state.thread = None
+        state.lock = threading.Lock()
+        state = sys.modules.setdefault(_ASYNC_SHARED_KEY, state)
+    return state
+
+
 class _AsyncManager:
     def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_event_loop, daemon=True, name="ZwyAsyncThread")
+        self._shared = _get_async_shared_state()
+        with self._shared.lock:
+            loop = self._shared.loop
+            if loop is None or loop.is_closed():
+                loop = asyncio.new_event_loop()
+                self._shared.loop = loop
+                self._shared.thread = None
+        self.loop = loop
         self.tasks: Dict[str, Set[asyncio.Task]] = defaultdict(set)
-        self.started = False
+
+    @property
+    def thread(self) -> Optional[threading.Thread]:
+        return self._shared.thread
+
+    @property
+    def started(self) -> bool:
+        thread = self._shared.thread
+        return thread is not None and thread.is_alive()
 
     def _run_event_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
     def start(self):
-        if self.started:
-            _async_logger.warning("Async thread is already started.")
-            return
-        self.thread.start()
-        self.started = True
+        with self._shared.lock:
+            thread = self._shared.thread
+            if thread is not None and thread.is_alive():
+                _async_logger.warning("Async thread is already started.")
+                return
+            thread = threading.Thread(target=self._run_event_loop, daemon=True, name="ZwyAsyncThread")
+            self._shared.thread = thread
+            thread.start()
         _async_logger.debug("Async thread has been started.")
 
     def stop(self):
-        if not self.started:
-            _async_logger.warning("Async thread is not started.")
-            return
-
-        # noinspection PyTypeChecker
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join()
-        _async_logger.debug("Async loop has been stopped.")
+        cancelled = 0
+        for plugin_id in list(self.tasks.keys()):
+            tasks_to_cancel = self.tasks[plugin_id].copy()
+            for task in tasks_to_cancel:
+                # noinspection PyTypeChecker
+                self.loop.call_soon_threadsafe(task.cancel)
+            self.tasks[plugin_id].clear()
+            cancelled += len(tasks_to_cancel)
+        _async_logger.debug(f"Async manager stopped, cancelled {cancelled} tasks.")
 
     def run_task(self, coro: Coroutine):
         if not self.started:
@@ -2136,7 +2173,7 @@ class _AsyncManager:
         return _AsyncMarker(callback_obj, success, error)
 
     async def wrap_java_call(self, java_method, *args, **kwargs):
-        loop = self.loop
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         mutable_args = list(args)
@@ -2203,9 +2240,9 @@ class DialogPicker:
                     else:
                         picked.users.append(i)
 
-                loop.call_soon_threadsafe(self.future.set_result, picked)
+                _safe_set_future_result(self.future, picked)
             except Exception as e:
-                loop.call_soon_threadsafe(self.future.set_exception, e)
+                _safe_set_future_exception(self.future, e)
 
     class _GroupCreateAdapterHook(MethodHook):
         def after_hooked_method(self, param: XC_MethodHook.MethodHookParam):
@@ -2233,16 +2270,13 @@ class DialogPicker:
                 dialog_id = j_topic_key.dialogId
                 topic_id = j_topic_key.topicId
 
-                async_manager.loop.call_soon_threadsafe(
-                    self.future.set_result,
-                    _TopicKey(-dialog_id, topic_id)
-                )
+                _safe_set_future_result(self.future, _TopicKey(-dialog_id, topic_id))
 
                 run_on_ui_thread(lambda: get_last_fragment().finishFragment(not bool(topic_id)))
                 if topic_id:
                     run_on_ui_thread(lambda: get_last_fragment().finishFragment(True))
             except Exception as e:
-                async_manager.loop.call_soon_threadsafe(self.future.set_exception, e)
+                _safe_set_future_exception(self.future, e)
             return True
 
     class _OnFragmentDestroyHook(MethodHook):
@@ -2255,17 +2289,13 @@ class DialogPicker:
                 for i in self.hooks:
                     HookUtils.unhook(i)
 
-                if not self.future.done():
-                    async_manager.loop.call_soon_threadsafe(
-                        self.future.set_exception,
-                        Exception("Cancelled.")
-                    )
+                _safe_set_future_exception(self.future, Exception("Cancelled."))
             except Exception:
                 _logger.error("An error occurred:", exc_info=True)
 
     @classmethod
     async def pick_dialogs(cls, pre_picked: Optional[List[int]] = None, chats_only=False) -> PickedDialogs:
-        loop = async_manager.loop
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         plugin_id = _get_plugin_id_from_stack(__id__)
 
@@ -2297,7 +2327,7 @@ class DialogPicker:
 
     @classmethod
     async def pick_chat(cls, groups=True, channels=True, topics=False) -> _TopicKey:
-        future = async_manager.loop.create_future()
+        future = asyncio.get_running_loop().create_future()
         plugin_id = _get_plugin_id_from_stack(__id__)
 
         try:
@@ -2497,12 +2527,11 @@ class UI:
                 on_build_view: Callable[[LinearLayout, Any, Any], None] = None,
                 get_result: Callable[[], _T] = None
         ) -> Optional[_T]:
-            loop = async_manager.loop
+            loop = asyncio.get_running_loop()
             future = loop.create_future()
 
             def resolve(result):
-                if not future.done():
-                    loop.call_soon_threadsafe(future.set_result, result)
+                _safe_set_future_result(future, result)
 
             def show_dialog_on_ui():
                 fragment = get_last_fragment()
@@ -2573,12 +2602,11 @@ class UI:
 
         @classmethod
         async def show(cls, title: str, items: List[str], current_index: int = -1) -> Optional[int]:
-            loop = async_manager.loop
+            loop = asyncio.get_running_loop()
             future = loop.create_future()
 
             def resolve(result):
-                if not future.done():
-                    loop.call_soon_threadsafe(future.set_result, result)
+                _safe_set_future_result(future, result)
 
             def show_on_ui():
                 fragment = get_last_fragment()
@@ -2755,10 +2783,10 @@ class _MediaDownloadObserver:
         loop = async_manager.loop
         if notification_id == NotificationCenter.fileLoaded:
             _logger.debug(f"File '{self.target_file_name}' downloaded successfully.")
-            loop.call_soon_threadsafe(self.future.set_result, True)
+            _safe_set_future_result(self.future, True)
         elif notification_id == NotificationCenter.fileLoadFailed:
             _logger.debug(f"File '{self.target_file_name}' download failed.")
-            loop.call_soon_threadsafe(self.future.set_result, False)
+            _safe_set_future_result(self.future, False)
 
 
 async def ensure_media_downloaded(msg_obj: MessageObject) -> bool:
@@ -2778,7 +2806,7 @@ async def ensure_media_downloaded(msg_obj: MessageObject) -> bool:
 
     _logger.debug(f"Starting download for {file_name}...")
 
-    future = async_manager.loop.create_future()
+    future = asyncio.get_running_loop().create_future()
     observer = _MediaDownloadObserver(file_name, future)
     nc = get_notification_center()
 
@@ -2949,11 +2977,11 @@ class PluginUtils:
         def install_callback(error: Optional[str]):
             if error:
                 _logger.error(f"Error installing '{file_path}':", exc_info=Exception(error))
-                loop.call_soon_threadsafe(future.set_result, False)
+                _safe_set_future_result(future, False)
             else:
-                loop.call_soon_threadsafe(future.set_result, True)
+                _safe_set_future_result(future, True)
 
-        loop = async_manager.loop
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
 
         _logger.debug(f"Installing '{os.path.split(file_path)[1]}' plugin...")
@@ -2961,7 +2989,7 @@ class PluginUtils:
         try:
             cls.get_python_engine().loadPluginFromFile(file_path, None, Callback1(install_callback))
         except Exception:
-            future.set_result(False)
+            _safe_set_future_result(future, False)
             _logger.error(f"Error installing '{file_path}':", exc_info=True)
 
         return await future
@@ -3346,18 +3374,22 @@ def _get_reflection_member_name(member: Union[Method, Constructor]) -> str:
     return "unknown"
 
 
+def _hook_filters_to_arraylist(filters: Union[Callable, List, None], hook_instance: Any) -> ArrayList:
+    if callable(filters):
+        filters = filters(hook_instance)
+    return iterable_to_arraylist(filters or [], int_auto_convert=False)
+
+
 def _wrap_hook_callback(
         member: Member,
         callback: Callable[[XC_MethodHook.MethodHookParam], None]
 ) -> Callable[[XC_MethodHook.MethodHookParam], None]:
     def wrapped_hook_callback(param):
         try:
-            safe_func_call(callback, [param])
+            return safe_func_call(callback, [param])
         except Exception:
-            _hu_logger.error(
-                f"An unexpected error occurred in '{_get_reflection_member_name(member)}' before hook:", 
-                exc_info=True
-            )
+            _hu_logger.error(f"An unexpected error occurred in '{_get_reflection_member_name(member)}' hook:", exc_info=True)
+            return None
     return wrapped_hook_callback
 
 
@@ -3395,9 +3427,9 @@ class HookUtils:
                     java_callback_instance = PyMethodHook(plugin_id, xposed_hook)
 
                 if hasattr(method := getattr(xposed_hook, PluginsConstants.Xposed.BEFORE_HOOKED_METHOD, None), PluginsConstants.Xposed.HOOK_FILTERS):
-                    java_callback_instance.setBeforeHookedFilters(iterable_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
+                    java_callback_instance.setBeforeHookedFilters(_hook_filters_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
                 if hasattr(method := getattr(xposed_hook, PluginsConstants.Xposed.AFTER_HOOKED_METHOD, None), PluginsConstants.Xposed.HOOK_FILTERS):
-                    java_callback_instance.setAfterHookedFilters(iterable_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
+                    java_callback_instance.setAfterHookedFilters(_hook_filters_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
             elif hasattr(xposed_hook, PluginsConstants.Xposed.REPLACE_HOOKED_METHOD):
                 if priority is not None:
                     java_callback_instance = PyMethodReplacement(plugin_id, xposed_hook, priority)
@@ -3410,9 +3442,9 @@ class HookUtils:
                     java_callback_instance = PyMethodHook(plugin_id, xposed_hook)
 
                 if hasattr(method := getattr(xposed_hook, PluginsConstants.Xposed.BEFORE_HOOKED_METHOD, None), PluginsConstants.Xposed.HOOK_FILTERS):
-                    java_callback_instance.setBeforeHookedFilters(iterable_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
+                    java_callback_instance.setBeforeHookedFilters(_hook_filters_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
                 if hasattr(method := getattr(xposed_hook, PluginsConstants.Xposed.AFTER_HOOKED_METHOD, None), PluginsConstants.Xposed.HOOK_FILTERS):
-                    java_callback_instance.setAfterHookedFilters(iterable_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
+                    java_callback_instance.setAfterHookedFilters(_hook_filters_to_arraylist(getattr(method, PluginsConstants.Xposed.HOOK_FILTERS), xposed_hook))
         elif (before or after) and (not before or isinstance(before, Callable)) and (not after or isinstance(after, Callable)):
             base_hook = BaseHook(None, before=before, after=after, before_filters=before_filters, after_filters=after_filters)
             args = [base_hook]
@@ -3422,9 +3454,9 @@ class HookUtils:
             java_callback_instance = PyMethodHook(plugin_id, *args)
 
             if before_filters:
-                java_callback_instance.setBeforeHookedFilters(iterable_to_arraylist(getattr(base_hook.before_hooked_method, PluginsConstants.Xposed.HOOK_FILTERS), base_hook))
+                java_callback_instance.setBeforeHookedFilters(_hook_filters_to_arraylist(getattr(base_hook.before_hooked_method, PluginsConstants.Xposed.HOOK_FILTERS), base_hook))
             if after_filters:
-                java_callback_instance.setAfterHookedFilters(iterable_to_arraylist(getattr(base_hook.after_hooked_method, PluginsConstants.Xposed.HOOK_FILTERS), base_hook))
+                java_callback_instance.setAfterHookedFilters(_hook_filters_to_arraylist(getattr(base_hook.after_hooked_method, PluginsConstants.Xposed.HOOK_FILTERS), base_hook))
         else:
             raise TypeError("xposed_hook or before or after cannot be None")
 
@@ -3621,7 +3653,7 @@ class HookUtils:
 
         class ReplaceHook(MethodReplacement):
             def replace_hooked_method(self, param):
-                callback(param)
+                return callback(param)
 
         kwargs.pop("xposed_hook", None)
         return cls.hook(
@@ -3643,6 +3675,34 @@ def hook_max_args_method(clazz: JClass, method_name: str, hook_instance: XposedH
         _get_plugin_id_from_stack(__id__),
         method, hook_instance
     )
+
+
+def _safe_set_future_result(future: Future, result: Any) -> None:
+    if future.done():
+        return
+
+    try:
+        loop = future.get_loop()
+        if loop.is_closed():
+            return
+
+        loop.call_soon_threadsafe(future.set_result, result)
+    except Exception:
+        _async_logger.error("Failed to set future result:", exc_info=True)
+
+
+def _safe_set_future_exception(future: Future, exc: BaseException) -> None:
+    if future.done():
+        return
+
+    try:
+        loop = future.get_loop()
+        if loop.is_closed():
+            return
+
+        loop.call_soon_threadsafe(future.set_exception, exc)
+    except Exception:
+        _async_logger.error("Failed to set future exception:", exc_info=True)
 
 
 plugin_cell_setting_factory_instance = PluginCellSettingFactory.new_instance().java
