@@ -1,0 +1,548 @@
+"""
+Групповые упоминания (Group Mentions) — плагин exteraGram.
+
+Идея: создаём группы юзернеймов с произвольным названием-командой
+(например, «Разрабы»). Если это слово встречается в отправляемом
+сообщении, оно заменяется на упоминания (@username) всех участников
+группы. Работу плагина можно ограничить по типу чата: личка / группы —
+отдельными тумблерами в настройках.
+"""
+
+import json
+import re
+import time
+import uuid
+from typing import Any, List, Optional
+
+from android.util import TypedValue
+from android.view import ViewGroup
+from android.widget import EditText as AndroidEditText
+from android.widget import LinearLayout
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_last_fragment, get_messages_controller
+from org.telegram.ui.ActionBar import Theme
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+__id__ = "group_mentions"
+__name__ = "Group Mentions"
+__description__ = "Создавайте группы юзернеймов и упоминайте всех сразу одной командой-словом в сообщении"
+__author__ = "@Hikerys"
+__version__ = "1.1"
+__icon__ = "kano_plugins/0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+MAX_USERS_PER_GROUP = 7
+MAX_GROUPS_COUNT = 5
+COOLDOWN_SECONDS = 60
+USERNAME_SPLIT_RE = re.compile(r"[,\s\n;]+")
+VALID_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+
+
+def _parse_usernames(raw: str) -> List[str]:
+    """Достаёт из текста список валидных латинских юзернеймов без '@' и без дублей."""
+    if not raw:
+        return []
+    seen = set()
+    result: List[str] = []
+    for chunk in USERNAME_SPLIT_RE.split(raw.strip()):
+        uname = chunk.strip().strip("@").strip(".,;")
+        if not uname or not VALID_USERNAME_RE.match(uname):
+            continue
+        key = uname.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(uname)
+    return result
+
+
+class GroupMentionsPlugin(BasePlugin):
+    # ------------------------------------------------------------------
+    # Жизненный цикл
+    # ------------------------------------------------------------------
+
+    def on_plugin_load(self):
+        self._last_trigger_times = {}
+        self._load_groups()
+        self.add_on_send_message_hook()
+        self.log(f"[GroupMentions] Плагин загружен, групп: {len(self.groups)}/{MAX_GROUPS_COUNT}")
+
+    def on_plugin_unload(self):
+        self._last_trigger_times = {}
+        self.log("[GroupMentions] Плагин выгружен")
+
+    # ------------------------------------------------------------------
+    # Хранение групп (список dict: id / command / usernames)
+    # ------------------------------------------------------------------
+
+    def _load_groups(self):
+        raw = self.get_setting("groups_data", "[]")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(data, list):
+                data = []
+        except Exception:
+            data = []
+
+        groups = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command", "")).strip()
+            usernames = item.get("usernames", [])
+            if not command or not isinstance(usernames, list):
+                continue
+
+            clean_users = [
+                str(u).strip().lstrip("@")
+                for u in usernames
+                if str(u).strip() and VALID_USERNAME_RE.match(str(u).strip().lstrip("@"))
+            ]
+            clean_users = clean_users[:MAX_USERS_PER_GROUP]
+            if not clean_users:
+                continue
+
+            groups.append({
+                "id": str(item.get("id") or uuid.uuid4().hex[:10]),
+                "command": command,
+                "usernames": clean_users,
+            })
+            if len(groups) >= MAX_GROUPS_COUNT:
+                break
+        self.groups = groups
+
+    def _persist_groups(self):
+        self.set_setting(
+            "groups_data",
+            json.dumps(self.groups, ensure_ascii=False),
+            reload_settings=True,
+        )
+
+    def _find_group_by_id(self, group_id: str) -> Optional[dict]:
+        for group in self.groups:
+            if group["id"] == group_id:
+                return group
+        return None
+
+    def _find_group_by_command(self, command: str) -> Optional[dict]:
+        case_sensitive = self.get_setting("case_sensitive", False)
+        target = command.strip()
+        target_norm = target if case_sensitive else target.lower()
+
+        for group in self.groups:
+            cand = group["command"].strip()
+            cand_norm = cand if case_sensitive else cand.lower()
+            if cand_norm == target_norm:
+                return group
+        return None
+
+    # ------------------------------------------------------------------
+    # Настройки — главная страница
+    # ------------------------------------------------------------------
+
+    def create_settings(self) -> List[Any]:
+        self._load_groups()
+
+        rows: List[Any] = [
+            Header(text="Group Mentions"),
+            Text(
+                text="Как это работает",
+                subtext="Слово в сообщении → упоминания участников",
+                icon="msg_info",
+                on_click=lambda view: self._show_info_dialog(),
+            ),
+            Text(
+                text="Настройки",
+                subtext=self._settings_summary(),
+                icon="msg_settings",
+                create_sub_fragment=self._build_settings_page,
+            ),
+            Header(text=f"Группы ({len(self.groups)} из {MAX_GROUPS_COUNT})"),
+        ]
+
+        if not self.groups:
+            rows.append(
+                Text(
+                    text="Групп пока нет",
+                    subtext="Нажмите «Добавить группу» ниже",
+                    icon="msg_info",
+                )
+            )
+        else:
+            for group in self.groups:
+                usernames = group["usernames"]
+                preview = ", ".join(f"@{u}" for u in usernames[:2])
+                if len(usernames) > 2:
+                    preview += f" и ещё {len(usernames) - 2}"
+                subtext = f"{len(usernames)} чел. — {preview}" if usernames else "Нет участников"
+                rows.append(
+                    Text(
+                        text=group["command"],
+                        subtext=subtext,
+                        icon="msg_edit",
+                        on_click=lambda view, gid=group["id"]: self._show_group_dialog(gid),
+                    )
+                )
+
+        if len(self.groups) < MAX_GROUPS_COUNT:
+            rows.append(
+                Text(
+                    text="Добавить группу",
+                    accent=True,
+                    on_click=lambda view: self._show_group_dialog(),
+                )
+            )
+        else:
+            rows.append(
+                Text(
+                    text="Лимит групп исчерпан",
+                    subtext=f"Максимум {MAX_GROUPS_COUNT} групп",
+                    icon="msg_info",
+                    on_click=lambda view: BulletinHelper.show_error(f"Достигнут лимит: максимум {MAX_GROUPS_COUNT} групп"),
+                )
+            )
+
+        return rows
+
+    def _settings_summary(self) -> str:
+        chat_types = []
+        if self.get_setting("enabled_private", True):
+            chat_types.append("личка")
+        if self.get_setting("enabled_groups", True):
+            chat_types.append("группы")
+        chats_part = ", ".join(chat_types) if chat_types else "нигде не работает"
+        case_part = "с учётом регистра" if self.get_setting("case_sensitive", False) else "без учёта регистра"
+        return f"{chats_part} · {case_part}"
+
+    def _build_settings_page(self) -> List[Any]:
+        return [
+            Header(text="Где работает плагин"),
+            Switch(
+                key="enabled_private",
+                text="Личные чаты",
+                default=True,
+                subtext="Диалоги один на один",
+            ),
+            Switch(
+                key="enabled_groups",
+                text="Группы",
+                default=True,
+                subtext="Обычные группы и супергруппы",
+            ),
+            Divider(text="В выключенном типе чата команда уходит как обычный текст, без замены."),
+            Header(text="Регистр"),
+            Switch(
+                key="case_sensitive",
+                text="Учитывать регистр",
+                default=False,
+                subtext="Иначе сработает в любом регистре",
+            ),
+            Divider(text='Включено — сработает только точное написание, например «Разрабы», но не «разрабы».'),
+        ]
+
+    def _show_info_dialog(self):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return
+
+        def build_and_show():
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Как это работает")
+            builder.set_message(
+                "Впишите название группы прямо в текст сообщения и отправьте — оно "
+                "превратится в упоминания всех участников группы.\n\n"
+                'Пример: группа «Разрабы» → @Is_Kano, @MsPipl.\n'
+                'Сообщение «Разрабы, гляньте баг» уйдёт как «@Is_Kano @MsPipl, гляньте баг».'
+            )
+            builder.set_positive_button("Понятно", lambda bld, w: bld.dismiss())
+            builder.show()
+
+        run_on_ui_thread(build_and_show)
+
+    # ------------------------------------------------------------------
+    # Диалог добавления / редактирования группы
+    # ------------------------------------------------------------------
+
+    def _show_group_dialog(self, group_id: Optional[str] = None):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_error("Не удалось открыть диалог")
+            return
+
+        existing = self._find_group_by_id(group_id) if group_id else None
+
+        if existing is None and len(self.groups) >= MAX_GROUPS_COUNT:
+            BulletinHelper.show_error(f"Достигнут лимит: максимум {MAX_GROUPS_COUNT} групп")
+            return
+
+        def build_and_show():
+            metrics = activity.getResources().getDisplayMetrics()
+            margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 20, metrics))
+            gap_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 10, metrics))
+
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setPadding(margin_px, gap_px, margin_px, 0)
+
+            name_field = AndroidEditText(activity)
+            name_field.setHint("Название группы")
+            name_field.setSingleLine(True)
+            name_field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            name_field.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            name_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            name_field.setLayoutParams(name_params)
+            layout.addView(name_field)
+
+            users_field = AndroidEditText(activity)
+            users_field.setHint("@юзернейм1, @юзернейм2")
+            users_field.setMinLines(2)
+            users_field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            users_field.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            users_params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            users_params.setMargins(0, gap_px, 0, 0)
+            users_field.setLayoutParams(users_params)
+            layout.addView(users_field)
+
+            if existing:
+                name_field.setText(existing["command"])
+                users_field.setText(", ".join(existing["usernames"]))
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Изменить группу" if existing else "Новая группа")
+            builder.set_message("Например: Разрабы. Юзернеймы через запятую или пробел (до 7 чел.).")
+            builder.set_view(layout)
+
+            def on_save(bld, which):
+                name = name_field.getText().toString().strip()
+                raw_users_text = users_field.getText().toString().strip()
+
+                if not name:
+                    BulletinHelper.show_error("Введите название группы")
+                    return
+                if not raw_users_text:
+                    BulletinHelper.show_error("Добавьте хотя бы одного участника")
+                    return
+
+                raw_chunks = [
+                    c.strip().strip("@").strip(".,;")
+                    for c in USERNAME_SPLIT_RE.split(raw_users_text)
+                    if c.strip().strip("@").strip(".,;")
+                ]
+                if not raw_chunks:
+                    BulletinHelper.show_error("Добавьте хотя бы одного участника")
+                    return
+
+                for c in raw_chunks:
+                    if not VALID_USERNAME_RE.match(c):
+                        BulletinHelper.show_error(f"Юзернейм «{c}» невалиден: разрешена только латиница")
+                        return
+
+                usernames = _parse_usernames(raw_users_text)
+                if not usernames:
+                    BulletinHelper.show_error("Добавьте хотя бы одного участника")
+                    return
+                if len(usernames) > MAX_USERS_PER_GROUP:
+                    BulletinHelper.show_error(f"Максимум {MAX_USERS_PER_GROUP} участников в группе")
+                    return
+                if existing is None and len(self.groups) >= MAX_GROUPS_COUNT:
+                    BulletinHelper.show_error(f"Лимит: максимум {MAX_GROUPS_COUNT} групп")
+                    return
+
+                duplicate = self._find_group_by_command(name)
+                if duplicate is not None and (existing is None or duplicate["id"] != existing["id"]):
+                    BulletinHelper.show_error(f'Группа «{name}» уже существует')
+                    return
+
+                if existing:
+                    existing["command"] = name
+                    existing["usernames"] = usernames
+                    BulletinHelper.show_success(f'Группа «{name}» сохранена')
+                else:
+                    self.groups.append({
+                        "id": uuid.uuid4().hex[:10],
+                        "command": name,
+                        "usernames": usernames,
+                    })
+                    BulletinHelper.show_success(f'Группа «{name}» добавлена ({len(usernames)} чел.)')
+
+                self._persist_groups()
+                bld.dismiss()
+
+            builder.set_positive_button("Сохранить", on_save)
+            builder.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+
+            if existing:
+                def on_delete(bld, which):
+                    self.groups = [g for g in self.groups if g["id"] != existing["id"]]
+                    self._persist_groups()
+                    BulletinHelper.show_success(f'Группа «{existing["command"]}» удалена')
+                    bld.dismiss()
+
+                builder.set_neutral_button("Удалить", on_delete)
+                if hasattr(AlertDialogBuilder, "BUTTON_NEUTRAL") and hasattr(builder, "make_button_red"):
+                    try:
+                        builder.make_button_red(AlertDialogBuilder.BUTTON_NEUTRAL)
+                    except Exception:
+                        pass
+
+            builder.show()
+
+        run_on_ui_thread(build_and_show)
+
+    # ------------------------------------------------------------------
+    # Определение типа текущего чата (личка / группа / канал)
+    # ------------------------------------------------------------------
+
+    def _resolve_chat_type(self, params: Any, account: int = 0) -> Optional[str]:
+        dialog_id = getattr(params, "peer", None)
+        if dialog_id is None:
+            return None
+        try:
+            dialog_id = int(dialog_id)
+        except (TypeError, ValueError):
+            return None
+
+        if dialog_id > 0:
+            return "private"
+
+        chat_id = -dialog_id
+        try:
+            try:
+                controller = get_messages_controller(account)
+            except TypeError:
+                controller = get_messages_controller()
+            chat = controller.getChat(chat_id)
+        except Exception as e:
+            self.log(f"[GroupMentions] Не удалось получить чат {chat_id}: {e}")
+            return None
+
+        if chat is None:
+            return None
+
+        if bool(getattr(chat, "broadcast", False)):
+            return "channel"
+        if bool(getattr(chat, "megagroup", False)):
+            return "group"
+        return "group"
+
+    # ------------------------------------------------------------------
+    # Замена команд в исходящем сообщении
+    # ------------------------------------------------------------------
+
+    def _expand_groups(self, text: str):
+        if not self.groups:
+            return text, False
+
+        case_sensitive = self.get_setting("case_sensitive", False)
+        flags = re.UNICODE if case_sensitive else (re.IGNORECASE | re.UNICODE)
+
+        valid_groups = [g for g in self.groups if g.get("command") and g.get("usernames")]
+        if not valid_groups:
+            return text, False
+
+        # Сортируем: сначала более длинные команды
+        sorted_groups = sorted(valid_groups, key=lambda g: len(g["command"].strip()), reverse=True)
+
+        lookup = {}
+        patterns = []
+        for g in sorted_groups:
+            cmd = g["command"].strip()
+            if not cmd:
+                continue
+
+            clean_u = [
+                u.lstrip("@")
+                for u in g["usernames"][:MAX_USERS_PER_GROUP]
+                if u and VALID_USERNAME_RE.match(u.lstrip("@"))
+            ]
+            mentions = " ".join(f"@{u}" for u in clean_u)
+            if not mentions:
+                continue
+
+            # Команда проверяется точь-в-точь как сохранена в группе
+            key = cmd if case_sensitive else cmd.lower()
+            lookup[key] = mentions
+
+            esc = re.escape(cmd)
+            first_char = cmd[0]
+            last_char = cmd[-1]
+
+            # Границы: команда должна быть отдельным словом/токеном
+            if re.match(r"\w", first_char, re.UNICODE):
+                left_bound = r"(?<![\w@])"
+            else:
+                left_bound = rf"(?<![\w{re.escape(first_char)}])"
+
+            if re.match(r"\w", last_char, re.UNICODE):
+                right_bound = r"(?!\w)"
+            else:
+                right_bound = rf"(?![\w{re.escape(last_char)}])"
+
+            patterns.append(f"{left_bound}{esc}{right_bound}")
+
+        if not patterns:
+            return text, False
+
+        full_pattern = re.compile("|".join(patterns), flags)
+
+        def repl(match):
+            m_text = match.group(0)
+            k = m_text if case_sensitive else m_text.lower()
+            return lookup.get(k, m_text)
+
+        new_text, count = full_pattern.subn(repl, text)
+        return new_text, count > 0
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not self.groups:
+            return HookResult()
+
+        if not isinstance(getattr(params, "message", None), str):
+            return HookResult()
+
+        text = params.message
+        if not text or not text.strip():
+            return HookResult()
+
+        chat_type = self._resolve_chat_type(params, account)
+        if chat_type == "channel":
+            return HookResult()
+
+        if chat_type == "private" and not self.get_setting("enabled_private", True):
+            return HookResult()
+        if chat_type == "group" and not self.get_setting("enabled_groups", True):
+            return HookResult()
+
+        new_text, replaced = self._expand_groups(text)
+        if not replaced:
+            return HookResult()
+
+        # Кулдаун 60 секунд на чат
+        dialog_id = getattr(params, "peer", None)
+        try:
+            dialog_id = int(dialog_id) if dialog_id is not None else 0
+        except (TypeError, ValueError):
+            dialog_id = 0
+
+        now = time.time()
+        last_time = getattr(self, "_last_trigger_times", {}).get(dialog_id, 0.0)
+        elapsed = now - last_time
+        if elapsed < COOLDOWN_SECONDS:
+            remaining = int(COOLDOWN_SECONDS - elapsed) + 1
+            run_on_ui_thread(lambda rem=remaining: BulletinHelper.show_error(
+                f"Подождите ещё {rem} сек. перед повторным упоминанием"
+            ))
+            return HookResult()
+
+        if not hasattr(self, "_last_trigger_times"):
+            self._last_trigger_times = {}
+        self._last_trigger_times[dialog_id] = now
+
+        params.message = new_text
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
