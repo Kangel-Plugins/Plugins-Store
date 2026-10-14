@@ -1,17 +1,41 @@
 from typing import Any, List
+import weakref
 
 from java import jclass
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
 from ui.settings import Header, Switch, Divider, Text
 
+# Optional optimization: older SDKs keep using ordinary Python hooks.
+try:
+    from base_plugin import HookFilter
+except ImportError:
+    HookFilter = None
+
+try:
+    WeakReference = jclass("java.lang.ref.WeakReference")
+    JavaSystem = jclass("java.lang.System")
+except Exception:
+    WeakReference = None
+    JavaSystem = None
+
+try:
+    AtomicBoolean = jclass("java.util.concurrent.atomic.AtomicBoolean")
+except Exception:
+    AtomicBoolean = None
+
+try:
+    ReferenceQueue = jclass("java.lang.ref.ReferenceQueue")
+except Exception:
+    ReferenceQueue = None
+
 __id__ = "auto_marquee"
 __name__ = "Auto Marquee"
 __description__ = "Auto-scrolling (marquee) for long titles: chat header (profiles/groups/channels), profile name, screen titles and settings rows. Instead of fading/ellipsis the text smoothly scrolls"
 __author__ = "@chestertech"
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 __icon__ = "exteraPlugins/1"
-__app_version__ = ">=12.8.1"
+__app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.3.10"
 
 try:
@@ -62,6 +86,9 @@ def _has_method(obj: Any, name: str) -> bool:
     if cached is not None:
         return cached
     ok = callable(getattr(obj, name, None))
+    # Only strings/bools are cached; bound methods or Java objects never are.
+    if len(_CAPABILITY_CACHE) >= 256:
+        _CAPABILITY_CACHE.clear()
     _CAPABILITY_CACHE[cache_key] = ok
     return ok
 
@@ -330,77 +357,215 @@ def _get_field(obj: Any, name: str) -> Any:
     return None
 
 
-class _ViewRegistry:
-    def __init__(self):
-        self.simple = {}
-        self.plain = {}
-
-    def has(self, key):
-        return key in self.simple or key in self.plain
-
-    def clear(self):
-        self.simple.clear()
-        self.plain.clear()
-
-
-def _apply_marquee(plugin: "AutoMarqueePlugin", view: Any) -> None:
-    if view is None:
-        return
-
-    registry = plugin._registry
-
+def _read_view_state(view, simple):
+    if simple:
+        value = _get_field(view, "scrollNonFitText")
+        # Do not overwrite a state which cannot be restored safely.
+        if value is None:
+            return None
+        return {"scroll": bool(value)}
     try:
-        key = view.hashCode()
-    except Exception:
-        key = None
-
-    if key is not None and registry.has(key):
-        return
-
-    if _has_method(view, "setScrollNonFitText"):
         try:
-            view.setScrollNonFitText(True)
-            if key is not None:
-                registry.simple[key] = view
-            return
+            horizontal = view.isHorizontallyScrollable()
         except Exception:
-            pass
+            horizontal = _get_field(view, "mHorizontallyScrolling")
+            if horizontal is None:
+                return None
+        return {
+            "ellipsize": view.getEllipsize(),
+            "repeat": view.getMarqueeRepeatLimit(),
+            "fading": view.isHorizontalFadingEdgeEnabled(),
+            "selected": view.isSelected(),
+            "min_lines": view.getMinLines(),
+            "max_lines": view.getMaxLines(),
+            "horizontal": bool(horizontal),
+        }
+    except Exception:
+        return None
 
-    if TruncateAt is None or not _has_method(view, "setEllipsize"):
-        return
 
-    try:
-        view.setSingleLine(True)
+def _set_marquee(view, simple):
+    if simple:
+        view.setScrollNonFitText(True)
+    else:
+        # Unlike setSingleLine(), these calls do not change the input type
+        # or replace the view's transformation method.
+        view.setMaxLines(1)
+        view.setHorizontallyScrolling(True)
         view.setEllipsize(TruncateAt.MARQUEE)
         view.setMarqueeRepeatLimit(-1)
         view.setHorizontalFadingEdgeEnabled(True)
         view.setSelected(True)
-        if key is not None:
-            registry.plain[key] = view
-    except Exception:
-        pass
 
 
-def _revert_view(view: Any, is_simple: bool) -> None:
-    try:
-        if is_simple:
-            view.setScrollNonFitText(False)
-        else:
-            view.setSelected(False)
-            view.setHorizontalFadingEdgeEnabled(False)
-            if TruncateAt is not None:
-                view.setEllipsize(TruncateAt.END)
-            view.setMarqueeRepeatLimit(3)
-    except Exception:
-        pass
+def _restore_view(view, simple, state):
+    if simple:
+        operations = [("setScrollNonFitText", state["scroll"])]
+    else:
+        operations = [
+            ("setEllipsize", state["ellipsize"]),
+            ("setMarqueeRepeatLimit", state["repeat"]),
+            ("setHorizontalFadingEdgeEnabled", state["fading"]),
+            ("setSelected", state["selected"]),
+            ("setMinLines", state["min_lines"]),
+            ("setMaxLines", state["max_lines"]),
+            ("setHorizontallyScrolling", state["horizontal"]),
+        ]
+    # One failing setter must not prevent the remaining restoration.
+    for name, value in operations:
+        try:
+            getattr(view, name)(value)
+        except Exception:
+            pass
 
 
-class _ChatAvatarContainerHook(MethodHook):
+class _ViewRegistry:
+    def __init__(self):
+        self.entries = {}
+        self.additions = 0
+        self.queue = ReferenceQueue() if ReferenceQueue is not None else None
+        self.reference_keys = {}
+
+    def _remove(self, key):
+        entry = self.entries.pop(key, None)
+        if entry is None:
+            return
+        ref_id = entry.get("ref_id")
+        keys = self.reference_keys.get(ref_id)
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                self.reference_keys.pop(ref_id, None)
+
+    def _drain_queue(self):
+        if self.queue is None:
+            return
+        while True:
+            ref = self.queue.poll()
+            if ref is None:
+                return
+            ref_id = int(JavaSystem.identityHashCode(ref))
+            # Handle identity-hash collisions without holding any referent.
+            for key in list(self.reference_keys.get(ref_id, ())):
+                entry = self.entries.get(key)
+                if entry is not None and entry["ref"].get() is None:
+                    self._remove(key)
+
+    def _prune(self):
+        for key, entry in list(self.entries.items()):
+            if entry["ref"].get() is None:
+                self._remove(key)
+
+    def track(self, view, section):
+        if WeakReference is None or JavaSystem is None:
+            return None
+        self._drain_queue()
+        # Identity-hash lookup avoids a linear search in hot hooks.
+        # Identity is compared only among still-live weak references.
+        try:
+            identity = int(JavaSystem.identityHashCode(view))
+        except Exception:
+            return None
+        bucket = self.entries.get(identity)
+        if bucket is not None:
+            old = bucket["ref"].get()
+            if old is not None:
+                try:
+                    same = bool(old.equals(view))
+                except Exception:
+                    same = old is view
+                if same:
+                    bucket["sections"].add(section)
+                    return bucket
+                # Extremely rare identity-hash collision: skip safely.
+                return None
+            self._remove(identity)
+        simple = _has_method(view, "setScrollNonFitText")
+        if not simple and (TruncateAt is None or not _has_method(view, "setEllipsize")):
+            return None
+        state = _read_view_state(view, simple)
+        if state is None:
+            return None
+        ref = WeakReference(view, self.queue) if self.queue is not None else WeakReference(view)
+        ref_id = int(JavaSystem.identityHashCode(ref))
+        entry = {"ref": ref, "ref_id": ref_id, "simple": simple,
+                 "state": state, "sections": {section}, "applied": False}
+        self.entries[identity] = entry
+        self.reference_keys.setdefault(ref_id, set()).add(identity)
+        self.additions += 1
+        if self.additions % 64 == 0:
+            self._prune()
+        return entry
+
+    def refresh(self, plugin=None, unloading=False):
+        try:
+            self._drain_queue()
+            for key, entry in list(self.entries.items()):
+                try:
+                    view = entry["ref"].get()
+                    if view is None:
+                        self._remove(key)
+                        continue
+                    wanted = (not unloading and plugin is not None
+                              and any(plugin._section_enabled(s) for s in entry["sections"]))
+                    _update_entry(view, entry, wanted)
+                except Exception:
+                    # An invalid/destroyed view must not block cleanup of others.
+                    continue
+        finally:
+            if unloading:
+                self.entries.clear()
+                self.reference_keys.clear()
+                self._drain_queue()
+
+
+def _update_entry(view, entry, wanted):
+    if wanted == entry["applied"]:
+        return
+    if wanted:
+        # Capture again when re-enabling: the app may have changed the view.
+        state = _read_view_state(view, entry["simple"])
+        if state is None:
+            return
+        entry["state"] = state
+        try:
+            _set_marquee(view, entry["simple"])
+            entry["applied"] = True
+        except Exception:
+            _restore_view(view, entry["simple"], state)
+    else:
+        _restore_view(view, entry["simple"], entry["state"])
+        entry["applied"] = False
+
+
+def _apply_marquee(plugin: "AutoMarqueePlugin", view: Any, section: str) -> None:
+    if view is None or not plugin._section_enabled(section):
+        return
+    entry = plugin._registry.track(view, section)
+    if entry is not None:
+        _update_entry(view, entry, True)
+
+
+class _PluginHook(MethodHook):
+    def __init__(self, plugin):
+        self._plugin_ref = weakref.ref(plugin)
+
+    @property
+    def _plugin(self):
+        plugin = self._plugin_ref()
+        return plugin if plugin is not None and getattr(plugin, "_active", False) else None
+
+
+class _ChatAvatarContainerHook(_PluginHook):
+    _section = "chat_header"
+
     def __init__(self, plugin: "AutoMarqueePlugin"):
-        self._plugin = plugin
+        self._plugin_ref = weakref.ref(plugin)
 
     def after_hooked_method(self, param):
         p = self._plugin
+        if p is None:
+            return
         try:
             if not (p.get_setting("enabled", True) and p.get_setting("chat_header", True)):
                 return
@@ -408,22 +573,26 @@ class _ChatAvatarContainerHook(MethodHook):
             if container is None:
                 return
             if not _has_method(container, "getTitleTextView"):
-                _apply_marquee(p, _get_field(container, "titleTextView"))
+                _apply_marquee(p, _get_field(container, "titleTextView"), "chat_header")
                 return
             try:
-                _apply_marquee(p, container.getTitleTextView())
+                _apply_marquee(p, container.getTitleTextView(), "chat_header")
             except Exception:
                 pass
         except Exception:
             pass
 
 
-class _ActionBarTitleHook(MethodHook):
+class _ActionBarTitleHook(_PluginHook):
+    _section = "action_bar"
+
     def __init__(self, plugin: "AutoMarqueePlugin"):
-        self._plugin = plugin
+        self._plugin_ref = weakref.ref(plugin)
 
     def after_hooked_method(self, param):
         p = self._plugin
+        if p is None:
+            return
         try:
             if not (p.get_setting("enabled", True) and p.get_setting("action_bar", True)):
                 return
@@ -446,22 +615,26 @@ class _ActionBarTitleHook(MethodHook):
             if hasattr(title_view, "__len__") and not _has_method(title_view, "setEllipsize"):
                 try:
                     for view in title_view:
-                        _apply_marquee(p, view)
+                        _apply_marquee(p, view, "action_bar")
                     return
                 except Exception:
                     pass
 
-            _apply_marquee(p, title_view)
+            _apply_marquee(p, title_view, "action_bar")
         except Exception:
             pass
 
 
-class _ProfileNameHook(MethodHook):
+class _ProfileNameHook(_PluginHook):
+    _section = "profile_name"
+
     def __init__(self, plugin: "AutoMarqueePlugin"):
-        self._plugin = plugin
+        self._plugin_ref = weakref.ref(plugin)
 
     def after_hooked_method(self, param):
         p = self._plugin
+        if p is None:
+            return
         try:
             if not (p.get_setting("enabled", True) and p.get_setting("profile_name", True)):
                 return
@@ -474,21 +647,25 @@ class _ProfileNameHook(MethodHook):
             if hasattr(names, "__len__") and not _has_method(names, "setScrollNonFitText"):
                 try:
                     for view in names:
-                        _apply_marquee(p, view)
+                        _apply_marquee(p, view, "profile_name")
                     return
                 except Exception:
                     pass
-            _apply_marquee(p, names)
+            _apply_marquee(p, names, "profile_name")
         except Exception:
             pass
 
 
-class _SettingsCellHook(MethodHook):
+class _SettingsCellHook(_PluginHook):
+    _section = "settings_cells"
+
     def __init__(self, plugin: "AutoMarqueePlugin"):
-        self._plugin = plugin
+        self._plugin_ref = weakref.ref(plugin)
 
     def after_hooked_method(self, param):
         p = self._plugin
+        if p is None:
+            return
         try:
             if not (p.get_setting("enabled", True) and p.get_setting("settings_cells", True)):
                 return
@@ -498,66 +675,99 @@ class _SettingsCellHook(MethodHook):
             for field_name in TEXT_FIELD_CANDIDATES:
                 view = _get_field(cell, field_name)
                 if view is not None:
-                    _apply_marquee(p, view)
+                    _apply_marquee(p, view, "settings_cells")
         except Exception:
             pass
 
 
-class _LanguageChangeHook(MethodHook):
+class _LanguageChangeHook(_PluginHook):
 
     def __init__(self, plugin: "AutoMarqueePlugin"):
-        self._plugin = plugin
+        self._plugin_ref = weakref.ref(plugin)
 
     def after_hooked_method(self, param):
+        plugin = self._plugin
+        if plugin is None:
+            return
         try:
-            self._plugin._refresh_language()
+            plugin._refresh_language()
         except Exception:
             pass
+
+
+def _weak_setting_callback(plugin, method_name, *prefix):
+    plugin_ref = weakref.ref(plugin)
+
+    def callback(value):
+        owner = plugin_ref()
+        if owner is not None and getattr(owner, "_active", False):
+            getattr(owner, method_name)(*prefix, value)
+    return callback
 
 
 class AutoMarqueePlugin(BasePlugin):
+    def _section_enabled(self, section):
+        return (getattr(self, "_active", False)
+                and bool(self.get_setting("enabled", True))
+                and bool(self.get_setting(section, True)))
+
+    def _sync_gates(self):
+        for section, gate in getattr(self, "_gates", {}).items():
+            gate.set(self._section_enabled(section))
+
     def _hook_members(self, members: List[Any], hook: Any) -> List[Any]:
         unhooks = []
+        section = getattr(hook, "_section", None)
+        gate = self._gates.get(section)
         for member in members:
             try:
                 member.setAccessible(True)
             except Exception:
                 pass
-            try:
-                unhook = self.hook_method(member, hook)
-            except Exception:
-                unhook = None
+            unhook = None
+            if gate is not None and HookFilter is not None:
+                try:
+                    # Java AtomicBoolean is mutable; MVEL never calls Python
+                    # to read the enabled/section switches.
+                    unhook = self.hook_method(
+                        member, after=hook.after_hooked_method,
+                        after_filters=[HookFilter.Condition(
+                            "object.get() && param.thisObject != null", object=gate)],
+                    )
+                except (TypeError, AttributeError):
+                    pass  # Older SDK: fall back to the class-based hook.
+                except Exception as exc:
+                    self._report("Filtered hook registration failed", exc)
+            if not unhook:
+                try:
+                    unhook = self.hook_method(member, hook)
+                except Exception as exc:
+                    self._report("Hook registration failed", exc)
             if unhook:
                 unhooks.append(unhook)
+        self._unhooks.extend(unhooks)
         return unhooks
+
+    def _report(self, message, exc):
+        try:
+            self.log("Auto Marquee: %s: %s" % (message, exc))
+        except Exception:
+            pass
 
     def _hook_constructors(self, clazz: Any, hook: Any) -> List[Any]:
-        try:
-            unhooks = self.hook_all_constructors(clazz, hook)
-        except Exception:
-            unhooks = None
-        if unhooks:
-            unhooks = list(unhooks)
-        else:
-            unhooks = self._hook_members(_collect_constructors(clazz), hook)
-        self._unhooks.extend(unhooks)
-        return unhooks
+        return self._hook_members(_collect_constructors(clazz), hook)
 
     def _hook_methods(self, clazz: Any, method_name: str, hook: Any) -> List[Any]:
-        try:
-            unhooks = self.hook_all_methods(clazz, method_name, hook)
-        except Exception:
-            unhooks = None
-        if unhooks:
-            unhooks = list(unhooks)
-        else:
-            unhooks = self._hook_members(_collect_methods(clazz, method_name), hook)
-        self._unhooks.extend(unhooks)
-        return unhooks
+        return self._hook_members(_collect_methods(clazz, method_name), hook)
 
     def on_plugin_load(self):
         global _LAST_LANG
+        self._active = True
         self._registry = _ViewRegistry()
+        self._gates = {}
+        if AtomicBoolean is not None and HookFilter is not None:
+            for section in ("chat_header", "action_bar", "profile_name", "settings_cells"):
+                self._gates[section] = AtomicBoolean(self._section_enabled(section))
         self._unhooks = []
         _CAPABILITY_CACHE.clear()
 
@@ -608,33 +818,55 @@ class AutoMarqueePlugin(BasePlugin):
             pass
 
     def on_plugin_unload(self):
-        self._revert_all()
+        self._active = False
+        self._sync_gates()
+        # Do not rely solely on the SDK's later automatic teardown.
+        for unhook in list(getattr(self, "_unhooks", ())):
+            try:
+                self.unhook_method(unhook)
+            except Exception as exc:
+                self._report("Explicit unhook failed (SDK cleanup still applies)", exc)
+        self._unhooks.clear()
+        self._gates.clear()
+        registry = getattr(self, "_registry", None)
+        self._refresh_views(unloading=True)
+        # The queued restoration owns only this old weak registry, not self.
+        # Replace it so callbacks cannot re-use the unloaded generation.
+        if self._registry is registry:
+            self._registry = _ViewRegistry()
+        _CAPABILITY_CACHE.clear()
 
-    def _revert_all(self):
+    def _refresh_views(self, unloading=False):
         registry = getattr(self, "_registry", None)
         if registry is None:
             return
+        plugin_ref = weakref.ref(self)
 
-        def do_revert():
-            try:
-                for view in list(registry.simple.values()):
-                    _revert_view(view, is_simple=True)
-                for view in list(registry.plain.values()):
-                    _revert_view(view, is_simple=False)
-                registry.clear()
-            except Exception:
-                pass
+        def update():
+            plugin = plugin_ref()
+            if unloading:
+                registry.refresh(unloading=True)
+            elif (plugin is not None and getattr(plugin, "_active", False)
+                  and getattr(plugin, "_registry", None) is registry):
+                registry.refresh(plugin)
 
         try:
             if run_on_ui_thread is not None:
-                run_on_ui_thread(do_revert)
+                run_on_ui_thread(update)
             else:
-                do_revert()
-        except Exception:
-            pass
+                update()
+        except Exception as exc:
+            if unloading:
+                # Scheduling failure must not leave stale registry metadata.
+                # No unsafe off-thread writes to Android views here.
+                registry.entries.clear()
+                registry.reference_keys.clear()
+            self._report("View refresh failed", exc)
 
     def _refresh_language(self):
         global _LAST_LANG
+        if not getattr(self, "_active", False):
+            return
         try:
             lang = _get_lang()
         except Exception:
@@ -643,9 +875,16 @@ class AutoMarqueePlugin(BasePlugin):
             return
         _LAST_LANG = lang
 
+        plugin_ref = weakref.ref(self)
+        generation = self._registry
+
         def do_reload():
+            plugin = plugin_ref()
+            if (plugin is None or not getattr(plugin, "_active", False)
+                    or getattr(plugin, "_registry", None) is not generation):
+                return
             for name in ("reload_settings", "reloadSettings"):
-                fn = getattr(self, name, None)
+                fn = getattr(plugin, name, None)
                 if callable(fn):
                     try:
                         fn()
@@ -653,11 +892,11 @@ class AutoMarqueePlugin(BasePlugin):
                     except Exception:
                         pass
             try:
-                tick = int(self.get_setting("lang_tick", 0) or 0) + 1
+                tick = int(plugin.get_setting("lang_tick", 0) or 0) + 1
             except Exception:
                 tick = 1
             try:
-                self.set_setting("lang_tick", tick, reload_settings=True)
+                plugin.set_setting("lang_tick", tick, reload_settings=True)
             except Exception:
                 pass
 
@@ -670,9 +909,14 @@ class AutoMarqueePlugin(BasePlugin):
             pass
 
     def _on_master_switch(self, enabled: bool):
-        self.set_setting("enabled", bool(enabled), reload_settings=False)
-        if not enabled:
-            self._revert_all()
+        self.set_setting("enabled", bool(enabled), reload_settings=True)
+        self._sync_gates()
+        self._refresh_views()
+
+    def _on_section_switch(self, section, enabled):
+        self.set_setting(section, bool(enabled), reload_settings=False)
+        self._sync_gates()
+        self._refresh_views()
 
     def create_settings(self) -> List[Any]:
         global _LAST_LANG
@@ -682,37 +926,46 @@ class AutoMarqueePlugin(BasePlugin):
         def tr(key):
             return STRINGS.get(lang, STRINGS['en']).get(key, key)
 
-        return [
+        self._sync_gates()
+        items = [
             Header(text=tr('header_main')),
             Switch(
                 key="enabled",
                 text=tr('enabled_title'),
                 subtext=tr('enabled_sub'),
                 default=True,
-                on_change=self._on_master_switch,
+                on_change=_weak_setting_callback(self, "_on_master_switch"),
             ),
+        ]
+        if not self.get_setting("enabled", True):
+            return items + [Divider(), Text(text=tr('note'))]
+        items.extend([
             Divider(),
             Header(text=tr('header_where')),
             Switch(
                 key="chat_header",
+                on_change=_weak_setting_callback(self, "_on_section_switch", "chat_header"),
                 text=tr('chat_header_title'),
                 subtext=tr('chat_header_sub'),
                 default=True,
             ),
             Switch(
                 key="profile_name",
+                on_change=_weak_setting_callback(self, "_on_section_switch", "profile_name"),
                 text=tr('profile_name_title'),
                 subtext=tr('profile_name_sub'),
                 default=True,
             ),
             Switch(
                 key="action_bar",
+                on_change=_weak_setting_callback(self, "_on_section_switch", "action_bar"),
                 text=tr('action_bar_title'),
                 subtext=tr('action_bar_sub'),
                 default=True,
             ),
             Switch(
                 key="settings_cells",
+                on_change=_weak_setting_callback(self, "_on_section_switch", "settings_cells"),
                 text=tr('settings_cells_title'),
                 subtext=tr('settings_cells_sub'),
                 default=True,
@@ -721,7 +974,8 @@ class AutoMarqueePlugin(BasePlugin):
             Text(
                 text=tr('note'),
             ),
-        ]
+        ])
+        return items
 
 
 def create_plugin():
