@@ -1,0 +1,461 @@
+from typing import Optional
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field, set_private_field
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch
+
+__id__ = "spen_support"
+__name__ = "Samsung S-Pen Support"
+__description__ = ("Поддержка кнопки S Pen в чатах.\n\n"
+                   "- Выделение текста пером с зажатой кнопкой\n"
+                   "- Выделение всего текста двойным касанием\n"
+                   "- Выбор сообщений свайпом по фону чата\n"
+                   "- Нажатие кнопкой над экраном вместо касания")
+__author__ = "@huecoder"
+__version__ = "1.6.0"
+__icon__ = "5879841310902324730"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+__permissions__ = ["hooks"]
+
+
+SETTING_INSTANT_SELECTION = "instant_selection"
+SETTING_DOUBLE_TAP_SELECT_ALL = "double_tap_select_all"
+SETTING_MESSAGE_SELECTION = "message_selection"
+SETTING_HOVER_CLICK = "hover_click_menu"
+
+TOOL_TYPE_STYLUS = 2
+
+ACTION_DOWN = 0
+ACTION_UP = 1
+ACTION_MOVE = 2
+ACTION_CANCEL = 3
+ACTION_HOVER_ENTER = 9
+ACTION_HOVER_EXIT = 10
+ACTION_BUTTON_PRESS = 11
+ACTION_BUTTON_RELEASE = 12
+
+SAMSUNG_PEN_ACTIONS = {
+    211: ACTION_DOWN,
+    212: ACTION_UP,
+    213: ACTION_MOVE,
+    214: ACTION_CANCEL,
+}
+
+BUTTON_SECONDARY = 2
+BUTTON_STYLUS_PRIMARY = 32
+PEN_BUTTON_MASK = BUTTON_SECONDARY | BUTTON_STYLUS_PRIMARY
+
+SOURCE_TOUCHSCREEN = 0x00001002
+SYNTHETIC_TAP_MS = 40
+
+GESTURE_SELECT_ALL = "select_all"
+GESTURE_SELECT_MESSAGES = "select_messages"
+
+DOUBLE_TAP_MS = 400
+DOUBLE_TAP_DISTANCE_PX = 100
+
+MOTION_EVENT_CLASS = "android.view.MotionEvent"
+VIEW_CLASS = "android.view.View"
+ACTIVITY_CLASS = "android.app.Activity"
+SYSTEM_CLOCK_CLASS = "android.os.SystemClock"
+CHAT_ACTIVITY_CLASS = "org.telegram.ui.ChatActivity"
+CHAT_MESSAGE_CELL_CLASS = "org.telegram.ui.Cells.ChatMessageCell"
+ANDROID_UTILITIES_CLASS = "org.telegram.messenger.AndroidUtilities"
+
+
+def is_stylus(event) -> bool:
+    return event.getPointerCount() > 0 and event.getToolType(0) == TOOL_TYPE_STYLUS
+
+
+def is_pen_button_pressed(event) -> bool:
+    return (event.getButtonState() & PEN_BUTTON_MASK) != 0
+
+
+def screen_origin(view):
+    from java import jarray, jint
+    origin = jarray(jint)([0, 0])
+    view.getLocationOnScreen(origin)
+    return origin[0], origin[1]
+
+
+def char_count(text) -> int:
+    return len(text) if isinstance(text, str) else text.length()
+
+
+class PenClickDetector:
+
+    def __init__(self):
+        self.button_was_pressed = False
+        self.click_armed = False
+
+    def is_click(self, event) -> bool:
+        action = event.getActionMasked()
+        if action == ACTION_BUTTON_PRESS:
+            pressed = True
+        elif action == ACTION_BUTTON_RELEASE:
+            pressed = False
+        else:
+            pressed = is_pen_button_pressed(event)
+        was_pressed, self.button_was_pressed = self.button_was_pressed, pressed
+
+        if action in (ACTION_HOVER_ENTER, ACTION_HOVER_EXIT):
+            self.click_armed = False
+            return False
+        if pressed and not was_pressed:
+            self.click_armed = True
+        elif was_pressed and not pressed and self.click_armed:
+            self.click_armed = False
+            return True
+        return False
+
+
+class PenTouchHook(MethodHook):
+    def __init__(self, plugin: "SPenPlugin"):
+        super().__init__()
+        self.plugin = plugin
+        self.gesture = None
+
+    def before_hooked_method(self, param):
+        event = param.args[0]
+        if not is_stylus(event):
+            return
+        samsung_action = SAMSUNG_PEN_ACTIONS.get(event.getActionMasked())
+        if samsung_action is not None:
+            event.setAction(samsung_action)
+        action = event.getActionMasked()
+
+        if self.gesture is not None:
+            param.setResult(True)
+            self.continue_gesture(action, event)
+            return
+        if action != ACTION_DOWN:
+            return
+        if samsung_action is None and not is_pen_button_pressed(event):
+            return
+        self.gesture = self.plugin.on_pen_button_touch(event)
+        if self.gesture is not None:
+            param.setResult(True)
+
+    def continue_gesture(self, action, event):
+        finished = action in (ACTION_UP, ACTION_CANCEL)
+        if self.gesture == GESTURE_SELECT_MESSAGES:
+            if finished:
+                self.plugin.safely(self.plugin.finish_message_selection)
+            else:
+                self.plugin.safely(self.plugin.drag_message_selection, event)
+        if finished:
+            self.gesture = None
+
+
+class WindowHoverHook(MethodHook):
+    def __init__(self, plugin: "SPenPlugin"):
+        super().__init__()
+        self.plugin = plugin
+        self.detector = PenClickDetector()
+
+    def before_hooked_method(self, param):
+        event = param.args[0]
+        if event.isTouchEvent() or not is_stylus(event):
+            return
+        self.plugin.window_hook_alive = True
+        if self.plugin.hover_click and self.detector.is_click(event):
+            self.plugin.post_tap(param.thisObject, event)
+
+
+class ActivityHoverHook(MethodHook):
+    def __init__(self, plugin: "SPenPlugin"):
+        super().__init__()
+        self.plugin = plugin
+        self.detector = PenClickDetector()
+
+    def before_hooked_method(self, param):
+        if self.plugin.window_hook_alive:
+            return
+        event = param.args[0]
+        if is_stylus(event) and self.plugin.hover_click and self.detector.is_click(event):
+            self.plugin.post_tap(param.thisObject.getWindow().getDecorView(), event)
+
+
+class SPenPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.instant_selection = bool(self.get_setting(SETTING_INSTANT_SELECTION, True))
+        self.double_tap_select_all = bool(self.get_setting(SETTING_DOUBLE_TAP_SELECT_ALL, True))
+        self.hover_click = bool(self.get_setting(SETTING_HOVER_CLICK, True))
+        self.message_selection = bool(self.get_setting(SETTING_MESSAGE_SELECTION, True))
+        self.selecting_list = None
+        self.last_tap_time = None
+        self.last_tap_x = 0.0
+        self.last_tap_y = 0.0
+        self.get_text_method = None
+        self.window_hook_alive = False
+
+        self.motion_event_class = find_class(MOTION_EVENT_CLASS)
+        self.system_clock = find_class(SYSTEM_CLOCK_CLASS)
+        self.android_utilities = find_class(ANDROID_UTILITIES_CLASS)
+        self.chat_activity_class = find_class(CHAT_ACTIVITY_CLASS)
+        self.chat_message_cell_class = find_class(CHAT_MESSAGE_CELL_CLASS)
+        self.check_text_selection = self.find_motion_method(CHAT_MESSAGE_CELL_CLASS, "checkTextSelection")
+
+        failed = [name for name, installed in (
+            ("выделение", self.install_hook(ACTIVITY_CLASS, "dispatchTouchEvent", PenTouchHook(self))),
+            ("нажатие кнопкой", self.install_hook(ACTIVITY_CLASS, "dispatchGenericMotionEvent", ActivityHoverHook(self))),
+        ) if not installed]
+        if self.check_text_selection is None and "выделение" not in failed:
+            failed.append("выделение")
+        if not self.install_hook(VIEW_CLASS, "dispatchPointerEvent", WindowHoverHook(self)):
+            self.log("window hover hook not installed, menus and dialogs are not covered")
+        if failed:
+            BulletinHelper.show_error("S Pen: не работает " + ", ".join(failed)
+                                      + ". Проверьте разрешения плагина")
+
+    def find_motion_method(self, class_name: str, method_name: str):
+        try:
+            owner = find_class(class_name)
+            if owner is None or self.motion_event_class is None:
+                raise LookupError(class_name + " not found")
+            method = owner.getClass().getDeclaredMethod(method_name, self.motion_event_class.getClass())
+            method.setAccessible(True)
+            return method
+        except Exception as error:
+            self.log(f"{class_name}.{method_name} not found: {error}")
+            return None
+
+    def install_hook(self, class_name: str, method_name: str, handler: MethodHook) -> bool:
+        method = self.find_motion_method(class_name, method_name)
+        if method is None:
+            return False
+        try:
+            return self.hook_method(method, handler) is not None
+        except Exception as error:
+            self.log(f"hook {class_name}.{method_name} failed: {error}")
+            return False
+
+    def safely(self, action, *args):
+        try:
+            return action(*args)
+        except Exception as error:
+            self.log(f"{action.__name__} failed: {error}")
+            return None
+
+    def create_settings(self):
+        return [
+            Header(text="Выделение"),
+            Switch(key=SETTING_INSTANT_SELECTION, text="Выделение с кнопкой", default=True,
+                   subtext="Удерживайте кнопку и проведите пером по тексту",
+                   on_change=self.on_instant_selection_change),
+            Switch(key=SETTING_DOUBLE_TAP_SELECT_ALL, text="Выделить весь текст", default=True,
+                   subtext="Двойное касание сообщения с зажатой кнопкой",
+                   on_change=self.on_double_tap_select_all_change),
+            Switch(key=SETTING_MESSAGE_SELECTION, text="Выбор сообщений", default=True,
+                   subtext="Удерживайте кнопку и проведите пером по фону чата",
+                   on_change=self.on_message_selection_change),
+            Header(text="Кнопка над экраном"),
+            Switch(key=SETTING_HOVER_CLICK, text="Нажатие кнопкой", default=True,
+                   subtext="Кнопка работает как касание там, где находится перо",
+                   on_change=self.on_hover_click_change),
+        ]
+
+    def on_instant_selection_change(self, enabled: bool):
+        self.instant_selection = bool(enabled)
+
+    def on_double_tap_select_all_change(self, enabled: bool):
+        self.double_tap_select_all = bool(enabled)
+
+    def on_message_selection_change(self, enabled: bool):
+        self.message_selection = bool(enabled)
+
+    def on_hover_click_change(self, enabled: bool):
+        self.hover_click = bool(enabled)
+
+    def current_chat_activity(self) -> Optional[object]:
+        fragment = get_last_fragment()
+        if fragment is None or self.chat_activity_class is None:
+            return None
+        return fragment if isinstance(fragment, self.chat_activity_class) else None
+
+    def is_over_chat_chrome(self, chat, raw_y: float) -> bool:
+        action_bar = chat.getActionBar()
+        if action_bar is not None and raw_y < screen_origin(action_bar)[1] + action_bar.getHeight():
+            return True
+        enter_view = get_private_field(chat, "chatActivityEnterView")
+        return (enter_view is not None and enter_view.isShown()
+                and raw_y >= screen_origin(enter_view)[1])
+
+    def message_cell_at(self, raw_x: float, raw_y: float):
+        chat = self.current_chat_activity()
+        if chat is None or self.is_over_chat_chrome(chat, raw_y):
+            return None
+        list_view = get_private_field(chat, "chatListView")
+        if list_view is None:
+            return None
+        list_x, list_y = screen_origin(list_view)
+        x, y = raw_x - list_x, raw_y - list_y
+        cell = list_view.findChildViewUnder(x, y)
+        if not isinstance(cell, self.chat_message_cell_class):
+            return None
+        return cell, x - cell.getX(), y - cell.getY()
+
+    def post_tap(self, root, event):
+        raw_x, raw_y = event.getRawX(), event.getRawY()
+        run_on_ui_thread(lambda: self.safely(self.tap_view_at, root, raw_x, raw_y))
+
+    def tap_view_at(self, view, raw_x: float, raw_y: float):
+        if view is None or self.motion_event_class is None:
+            return
+        view_x, view_y = screen_origin(view)
+        x, y = raw_x - view_x, raw_y - view_y
+        down_time = self.system_clock.uptimeMillis()
+        down = self.motion_event_class.obtain(down_time, down_time, ACTION_DOWN, x, y, 0)
+        up = self.motion_event_class.obtain(down_time, down_time + SYNTHETIC_TAP_MS, ACTION_UP, x, y, 0)
+        try:
+            down.setSource(SOURCE_TOUCHSCREEN)
+            up.setSource(SOURCE_TOUCHSCREEN)
+            view.dispatchTouchEvent(down)
+            view.dispatchTouchEvent(up)
+        finally:
+            down.recycle()
+            up.recycle()
+
+    def on_pen_button_touch(self, event):
+        raw_x, raw_y, now = event.getRawX(), event.getRawY(), event.getEventTime()
+        is_double_tap = (self.double_tap_select_all and self.last_tap_time is not None
+                         and now - self.last_tap_time < DOUBLE_TAP_MS
+                         and abs(raw_x - self.last_tap_x) < DOUBLE_TAP_DISTANCE_PX
+                         and abs(raw_y - self.last_tap_y) < DOUBLE_TAP_DISTANCE_PX)
+        if is_double_tap:
+            self.last_tap_time = None
+            if self.safely(self.select_all_at, raw_x, raw_y):
+                return GESTURE_SELECT_ALL
+        self.last_tap_time, self.last_tap_x, self.last_tap_y = now, raw_x, raw_y
+        if self.instant_selection and self.safely(self.select_text_at, raw_x, raw_y):
+            return None
+        if self.message_selection and self.safely(self.start_message_selection, raw_x, raw_y):
+            return GESTURE_SELECT_MESSAGES
+        return None
+
+    def start_message_selection(self, raw_x: float, raw_y: float) -> bool:
+        chat = self.current_chat_activity()
+        if chat is None or self.is_over_chat_chrome(chat, raw_y):
+            return False
+        list_view = chat.chatListView
+        list_x, list_y = screen_origin(list_view)
+        cell = self.message_cell_nearest(list_view, raw_y - list_y)
+        if cell is None or cell.getDelegate() is None:
+            return False
+        cell_x, cell_y = raw_x - list_x - cell.getX(), raw_y - list_y - cell.getY()
+        if chat.getActionBar().isActionModeShowed():
+            click_listener = get_private_field(chat, "onItemClickListener")
+            if click_listener is None:
+                return False
+            click_listener.onItemClick(cell, list_view.getChildAdapterPosition(cell), cell_x, cell_y)
+        else:
+            cell.getDelegate().didLongPress(cell, cell_x, cell_y)
+        if not list_view.isMultiselect():
+            return False
+        self.selecting_list = list_view
+        return True
+
+    def message_cell_nearest(self, list_view, y: float):
+        nearest, nearest_distance = None, None
+        for index in range(list_view.getChildCount()):
+            child = list_view.getChildAt(index)
+            if not isinstance(child, self.chat_message_cell_class):
+                continue
+            top = child.getY()
+            distance = max(top - y, y - (top + child.getHeight()), 0)
+            if nearest is None or distance < nearest_distance:
+                nearest, nearest_distance = child, distance
+        return nearest
+
+    def drag_message_selection(self, event):
+        list_view = self.selecting_list
+        if list_view is None:
+            return
+        list_x, list_y = screen_origin(list_view)
+        list_event = self.motion_event_class.obtain(event)
+        try:
+            list_event.setLocation(event.getRawX() - list_x, event.getRawY() - list_y)
+            list_view.onTouchEvent(list_event)
+        finally:
+            list_event.recycle()
+
+    def finish_message_selection(self):
+        list_view, self.selecting_list = self.selecting_list, None
+        if list_view is None:
+            return
+        now = self.system_clock.uptimeMillis()
+        cancel = self.motion_event_class.obtain(now, now, ACTION_CANCEL, 0.0, 0.0, 0)
+        try:
+            list_view.onTouchEvent(cancel)
+        finally:
+            cancel.recycle()
+
+    def select_text_at(self, raw_x: float, raw_y: float):
+        target = self.message_cell_at(raw_x, raw_y)
+        if target is None or self.check_text_selection is None:
+            return None
+        cell, cell_x, cell_y = target
+        delegate = cell.getDelegate()
+        helper = delegate.getTextSelectionHelper() if delegate is not None else None
+        if helper is None:
+            return None
+
+        forced_gate = (not get_private_field(cell, "drawSelectionBackground")
+                       and set_private_field(cell, "drawSelectionBackground", True))
+        cell_event = self.motion_event_class.obtain(0, 0, ACTION_DOWN, cell_x, cell_y, 0)
+        try:
+            text_hit = self.check_text_selection.invoke(cell, cell_event)
+        finally:
+            cell_event.recycle()
+            if forced_gate:
+                set_private_field(cell, "drawSelectionBackground", False)
+        if not text_hit:
+            return None
+
+        start_selection = get_private_field(helper, "startSelectionRunnable")
+        if start_selection is None:
+            return None
+        self.android_utilities.cancelRunOnUIThread(start_selection)
+        start_selection.run()
+        return (helper, cell) if helper.isInSelectionMode() else None
+
+    def select_all_at(self, raw_x: float, raw_y: float) -> bool:
+        started = self.select_text_at(raw_x, raw_y)
+        if started is None:
+            return False
+        helper, cell = started
+        text = self.selectable_text(helper, cell)
+        if not text:
+            return False
+        helper.select(cell, 0, char_count(text))
+        set_private_field(helper, "movingHandle", False)
+        set_private_field(helper, "isOneTouch", False)
+        show_actions = get_private_field(helper, "showActionsRunnable")
+        if show_actions is not None:
+            self.android_utilities.cancelRunOnUIThread(show_actions)
+            show_actions.run()
+        return True
+
+    def selectable_text(self, helper, cell):
+        if self.get_text_method is None:
+            self.get_text_method = self.find_get_text_method(helper, cell)
+        if self.get_text_method is None:
+            return None
+        return self.get_text_method.invoke(helper, cell, False)
+
+    def find_get_text_method(self, helper, cell):
+        current = helper.getClass()
+        while current is not None:
+            for method in current.getDeclaredMethods():
+                params = method.getParameterTypes()
+                if (method.getName() == "getText" and len(params) == 2
+                        and params[0].isInstance(cell)):
+                    method.setAccessible(True)
+                    return method
+            current = current.getSuperclass()
+        self.log("TextSelectionHelper.getText not found")
+        return None
