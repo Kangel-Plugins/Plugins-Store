@@ -1,0 +1,845 @@
+from typing import Any, List, Optional, Tuple
+
+from java import jboolean, jint, jlong
+from java.lang import Boolean, Integer, Long, Object as JObject
+from java.util import ArrayList
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field, set_private_field
+from ui.settings import Divider, Header, Switch, Text
+
+from org.telegram.messenger import (
+    ApplicationLoader,
+    MediaController,
+    MediaDataController,
+    MessageObject,
+    MessagesController,
+    NotificationCenter,
+    SharedConfig,
+)
+
+__id__ = "ok_playlists"
+__name__ = "OK Playlists"
+__description__ = (
+    "Fixes music playback:\n"
+    "• progress is not preserved when switching tracks\n"
+    "• only music from the current group topic is played"
+)
+__author__ = "@hi_hr_js"
+__version__ = "1.0.0"
+__icon__ = "AnimatedEmojies/335"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+# Telegram stores the position of music this long in the "media_saved_pos" prefs.
+LONG_TRACK_SECONDS = 10 * 60
+
+
+# ---------------------------------------------------------------- helpers ---
+
+def _int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        pass
+    try:
+        return int(x.longValue())
+    except Exception:
+        pass
+    try:
+        return int(x.intValue())
+    except Exception:
+        return default
+
+
+def _float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        pass
+    try:
+        return float(x.floatValue())
+    except Exception:
+        return default
+
+
+def _bool(x) -> bool:
+    try:
+        return bool(x.booleanValue())
+    except Exception:
+        return bool(x)
+
+
+def _same_message(a, b) -> bool:
+    if a is None or b is None:
+        return False
+    return (
+        _int(a.getDialogId()) == _int(b.getDialogId())
+        and _int(a.getId()) == _int(b.getId())
+        and (_int(a.eventId) == 0) == (_int(b.eventId) == 0)
+    )
+
+
+def _reset_progress(msg) -> None:
+    if msg is None:
+        return
+    try:
+        msg.resetPlayingProgress()
+    except Exception:
+        try:
+            msg.audioProgress = 0.0
+            msg.audioProgressSec = 0
+        except Exception:
+            pass
+    try:
+        msg.audioProgressMs = 0
+    except Exception:
+        pass
+    try:
+        msg.forceSeekTo = -1.0
+    except Exception:
+        pass
+
+
+def _file_name(msg) -> str:
+    try:
+        name = msg.getFileName()
+        return name or ""
+    except Exception:
+        return ""
+
+
+def _forget_saved_position(msg) -> None:
+    """Drop the 'resume long audio' position Telegram keeps in SharedPreferences."""
+    try:
+        name = _file_name(msg)
+        if not name:
+            return
+        prefs = ApplicationLoader.applicationContext.getSharedPreferences("media_saved_pos", 0)
+        if prefs.contains(name):
+            prefs.edit().remove(name).commit()
+    except Exception:
+        pass
+
+
+def _topic_of(msg) -> Optional[int]:
+    """Topic id of a message. General topic is 1."""
+    if msg is None:
+        return None
+    try:
+        tid = _int(msg.getTopicId())
+        if tid:
+            return tid
+    except Exception:
+        pass
+    try:
+        tid = _int(MessageObject.getTopicId(msg.currentAccount, msg.messageOwner, True))
+        if tid:
+            return tid
+    except Exception:
+        pass
+    try:
+        owner = msg.messageOwner
+        if owner is not None and owner.action is not None:
+            if "TopicCreate" in type(owner.action).__name__:
+                return _int(msg.getId()) or 1
+        reply = owner.reply_to if owner is not None else None
+        if reply is not None and _bool(getattr(reply, "forum_topic", False)):
+            return _int(reply.reply_to_top_id) or _int(reply.reply_to_msg_id) or 1
+        return 1
+    except Exception:
+        return None
+
+
+def _topic_from_open_chat(dialog_id) -> Optional[int]:
+    """Topic id of the currently open ChatActivity, if it is this dialog."""
+    try:
+        frag = get_last_fragment()
+        if frag is None:
+            return None
+        frag_did = 0
+        try:
+            frag_did = _int(frag.getDialogId())
+        except Exception:
+            frag_did = _int(get_private_field(frag, "dialogId"), 0)
+        if not frag_did or frag_did != _int(dialog_id):
+            return None
+        try:
+            tid = _int(frag.getTopicId())
+            if tid:
+                return tid
+        except Exception:
+            pass
+        tid = _int(get_private_field(frag, "threadMessageId"), 0)
+        return tid or None
+    except Exception:
+        return None
+
+
+def _is_forum(account, dialog_id) -> bool:
+    try:
+        return bool(MessagesController.getInstance(account).isForum(dialog_id))
+    except Exception:
+        return False
+
+
+def _list_size(lst) -> int:
+    if lst is None:
+        return 0
+    try:
+        return lst.size()
+    except Exception:
+        try:
+            return len(lst)
+        except Exception:
+            return 0
+
+
+def _list_get(lst, index):
+    try:
+        return lst.get(index)
+    except Exception:
+        return lst[index]
+
+
+def _filter_list_for_topic(lst, dialog_id, topic) -> int:
+    """Keep messages of this dialog+topic (and other dialogs, e.g. merged)."""
+    if lst is None:
+        return 0
+    kept = []
+    removed = 0
+    for i in range(_list_size(lst)):
+        try:
+            msg = _list_get(lst, i)
+        except Exception:
+            continue
+        if msg is None:
+            continue
+        try:
+            if _int(msg.getDialogId()) != dialog_id:
+                kept.append(msg)
+                continue
+        except Exception:
+            kept.append(msg)
+            continue
+        t = _topic_of(msg)
+        if t is None or t == topic:
+            kept.append(msg)
+        else:
+            removed += 1
+    if removed:
+        try:
+            lst.clear()
+            for msg in kept:
+                lst.add(msg)
+        except Exception:
+            pass
+    return removed
+
+
+def _as_class(obj):
+    """find_class() already returns Class; imported Java types need .class_ / getClass()."""
+    if obj is None:
+        return None
+    try:
+        if hasattr(obj, "getDeclaredMethod") and hasattr(obj, "getName"):
+            name = obj.getName()
+            if isinstance(name, str) and "." in name:
+                return obj
+    except Exception:
+        pass
+    for attr in ("class_", "CLASS"):
+        c = getattr(obj, attr, None)
+        if c is not None:
+            return c
+    try:
+        return obj.getClass()
+    except Exception:
+        return obj
+
+
+class _Hook(MethodHook):
+    def __init__(self, plugin, name, before=None, after=None):
+        self.plugin = plugin
+        self.name = name
+        self._before = before
+        self._after = after
+
+    def before_hooked_method(self, param):
+        if self._before is None:
+            return
+        try:
+            self._before(param)
+        except Exception:
+            self.plugin.logger.exception("%s before-hook failed", self.name)
+
+    def after_hooked_method(self, param):
+        if self._after is None:
+            return
+        try:
+            self._after(param)
+        except Exception:
+            self.plugin.logger.exception("%s after-hook failed", self.name)
+
+
+# ----------------------------------------------------------------- plugin ---
+
+class MusicFixesPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._hook_counts = {}
+        self._hook_errors = []
+        self._topic_lock = None  # type: Optional[Tuple[int, int]]
+        self._fresh_start = None
+        self._last_load_media = "no loadMedia yet"
+        self._music_did_load = _int(getattr(NotificationCenter, "musicDidLoad", None), -2)
+        self._media_did_load = _int(getattr(NotificationCenter, "mediaDidLoad", None), -3)
+        self._media_music = _int(getattr(MediaDataController, "MEDIA_MUSIC", None), -2)
+
+        mc = _as_class(find_class("org.telegram.messenger.MediaController")) or _as_class(MediaController)
+        mdc = _as_class(find_class("org.telegram.messenger.MediaDataController")) or _as_class(MediaDataController)
+        msg_cls = _as_class(find_class("org.telegram.messenger.MessageObject")) or _as_class(MessageObject)
+        alist = find_class("java.util.ArrayList") or ArrayList
+        if not mc or not mdc:
+            self._hook_errors.append("MediaController / MediaDataController class not found")
+            self.logger.error("MediaController / MediaDataController not found")
+            return
+        if not msg_cls:
+            self._hook_errors.append("MessageObject class not found")
+
+        self.logger.info("mc=%s mdc=%s msg=%s", mc, mdc, msg_cls)
+
+        bools = [Boolean.TYPE, jboolean]
+        ints = [Integer.TYPE, jint]
+        longs = [Long.TYPE, jlong]
+
+        play_sigs = []
+        if msg_cls:
+            play_sigs.append((msg_cls,))
+            for b in bools:
+                play_sigs.append((msg_cls, b))
+        self._hook_counts["playMessage"] = self._install(
+            mc, "playMessage",
+            before=self._before_play_message, after=self._after_play_message,
+            signatures=play_sigs,
+        )
+        self._hook_counts["playPreviousMessage"] = self._install(
+            mc, "playPreviousMessage", before=self._before_play_previous,
+            signatures=[()],
+        )
+        self._hook_counts["playMessageAtIndex"] = self._install(
+            mc, "playMessageAtIndex", before=self._before_play_at_index,
+            signatures=[(t,) for t in ints],
+        )
+        params_cls = find_class(
+            "org.telegram.messenger.MediaController$PlaylistGlobalSearchParams"
+        )
+        set_playlist_sigs = []
+        if msg_cls and alist:
+            for lg in longs:
+                set_playlist_sigs.append((alist, msg_cls, lg))
+                for b in bools:
+                    set_playlist_sigs.append((alist, msg_cls, lg, b))
+                    if params_cls is not None:
+                        set_playlist_sigs.append((alist, msg_cls, lg, b, params_cls))
+        self._hook_counts["setPlaylist"] = self._install(
+            mc, "setPlaylist",
+            before=self._before_set_playlist, after=self._after_set_playlist,
+            signatures=set_playlist_sigs,
+        )
+        obj_arr = find_class("[Ljava.lang.Object;")
+        did_sigs = []
+        for a in ints:
+            for b in ints:
+                did_sigs.append((a, b))
+                if obj_arr is not None:
+                    did_sigs.append((a, b, obj_arr))
+        self._hook_counts["didReceivedNotification"] = self._install(
+            mc, "didReceivedNotification",
+            before=self._before_notification, after=self._after_notification,
+            signatures=did_sigs,
+        )
+        self._hook_counts["loadMedia"] = self._install(
+            mdc, "loadMedia", before=self._before_load_media,
+            signatures=self._load_media_signatures(longs, ints),
+        )
+
+        self.logger.info("Hooks: %s", self._hook_counts)
+        self.logger.info(
+            "ids: musicDidLoad=%s mediaDidLoad=%s MEDIA_MUSIC=%s",
+            self._music_did_load, self._media_did_load, self._media_music)
+        if self._hook_errors:
+            self.logger.error("Hook errors: %s", self._hook_errors)
+
+    def _load_media_signatures(self, longs, ints):
+        vis = find_class(
+            "org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble$VisibleReaction"
+        )
+        str_cls = find_class("java.lang.String")
+        int_t = ints[0] if ints else Integer.TYPE
+        sigs = []
+        # loadMedia(long did, int count, int max_id, int min_id, int type,
+        #           long topicId, int fromCache, int classGuid, int requestIndex,
+        #           VisibleReaction tag, String query)
+        for d in longs:
+            for t in longs:
+                core = (d, int_t, int_t, int_t, int_t, t, int_t, int_t, int_t)
+                sigs.append(core)
+                if vis is not None and str_cls is not None:
+                    sigs.append(core + (vis, str_cls))
+        return sigs
+
+    def _note(self, msg: str) -> None:
+        self.logger.error("%s", msg)
+        if msg not in self._hook_errors:
+            self._hook_errors.append(msg)
+
+    def _install(self, clazz, name, before=None, after=None, signatures=None) -> int:
+        hook = _Hook(self, name, before=before, after=after)
+        count = 0
+
+        # 1) SDK helper — does not call getDeclaredMethods() from Python.
+        try:
+            unhooks = self.hook_all_methods(clazz, name, hook)
+            if unhooks:
+                count = len(unhooks) if hasattr(unhooks, "__len__") else 1
+                if count:
+                    self.logger.info("hook_all_methods %s -> %s", name, count)
+                    return count
+        except Exception as e:
+            self._note("hook_all_methods(%s): %s" % (name, e))
+
+        # 2) Explicit getDeclaredMethod — never list every method on MediaController.
+        if signatures:
+            for sig in signatures:
+                try:
+                    method = clazz.getDeclaredMethod(name, *sig) if sig else clazz.getDeclaredMethod(name)
+                    method.setAccessible(True)
+                    if self.hook_method(method, hook):
+                        count += 1
+                        self.logger.info("hooked %s%s", name, sig)
+                except Exception as e:
+                    self.logger.info("getDeclaredMethod %s%s: %s", name, sig, e)
+
+        if count == 0:
+            self._note("No hook installed for %s" % name)
+        return count
+
+    # ---- 1) progress is not kept when switching between tracks ----------
+
+    def _reset_all_copies(self, mc, msg, forget_long: bool) -> None:
+        _reset_progress(msg)
+        if forget_long:
+            _forget_saved_position(msg)
+        if mc is None or msg is None:
+            return
+        for field in ("playlist", "shuffledPlaylist"):
+            lst = get_private_field(mc, field)
+            for i in range(_list_size(lst)):
+                try:
+                    other = _list_get(lst, i)
+                except Exception:
+                    continue
+                if other is not None and other is not msg and _same_message(other, msg):
+                    _reset_progress(other)
+
+    def _force_start_at_zero(self, mc, msg) -> None:
+        if mc is None or msg is None:
+            return
+        forget_long = self.get_setting("reset_progress", True)
+        self._reset_all_copies(mc, msg, forget_long)
+        try:
+            set_private_field(mc, "seekToProgressPending", 0.0)
+        except Exception:
+            pass
+        try:
+            playing = mc.getPlayingMessageObject()
+            if playing is not None and _same_message(playing, msg):
+                mc.seekToProgress(playing, 0.0)
+        except Exception:
+            pass
+
+    def _schedule_zero(self, mc, msg) -> None:
+        """Beat prefs restore + late ExoPlayer STATE_READY seeks."""
+        self._force_start_at_zero(mc, msg)
+
+        def later():
+            try:
+                playing = mc.getPlayingMessageObject()
+                if playing is None or not _same_message(playing, msg):
+                    return
+                self._force_start_at_zero(mc, playing)
+            except Exception:
+                pass
+
+        run_on_ui_thread(later, 50)
+        run_on_ui_thread(later, 250)
+
+    def _before_play_message(self, param):
+        self._fresh_start = None
+        if not param.args:
+            return
+        incoming = param.args[0]
+        if incoming is None:
+            return
+        mc = param.thisObject
+        if self.get_setting("topic_playlist", True):
+            self._ensure_topic_lock(incoming)
+            self._filter_controller_playlist(mc)
+
+        if not self.get_setting("reset_progress", True):
+            return
+        current = mc.getPlayingMessageObject()
+        if current is None or not current.isMusic() or not incoming.isMusic():
+            return
+        if _same_message(current, incoming):
+            return
+
+        forget_long = self.get_setting("reset_progress", True)
+        self._reset_all_copies(mc, current, forget_long)
+        self._reset_all_copies(mc, incoming, forget_long)
+        self._fresh_start = incoming
+        self.logger.info("switch %s -> %s, reset both", _int(current.getId()), _int(incoming.getId()))
+
+    def _after_play_message(self, param):
+        if not param.args:
+            return
+        incoming = param.args[0]
+        marker = self._fresh_start
+        self._fresh_start = None
+        if not self.get_setting("reset_progress", True):
+            return
+        if incoming is None or marker is None or not _same_message(incoming, marker):
+            return
+        # playMessage restores long-track position from prefs AFTER the before-hook.
+        self._schedule_zero(param.thisObject, incoming)
+
+    def _before_play_previous(self, param):
+        if not self.get_setting("reset_progress", True):
+            return
+        mc = param.thisObject
+        current = mc.getPlayingMessageObject()
+        if current is None or not current.isMusic():
+            return
+        try:
+            if _int(current.audioProgressSec) > 10:
+                return
+        except Exception:
+            pass
+        target = self._playlist_neighbor(mc, previous=True)
+        if target is None or _same_message(target, current):
+            return
+        self._reset_all_copies(mc, target, self.get_setting("reset_progress", True))
+        self.logger.info("previous -> %s, cleared leftover progress", _int(target.getId()))
+
+    def _before_play_at_index(self, param):
+        if not self.get_setting("reset_progress", True):
+            return
+        if not param.args:
+            return
+        mc = param.thisObject
+        try:
+            index = _int(param.args[0])
+            playlist = get_private_field(mc, "playlist")
+            if playlist is None or index < 0 or index >= playlist.size():
+                return
+            target = playlist.get(index)
+        except Exception:
+            return
+        if target is None:
+            return
+        current = mc.getPlayingMessageObject()
+        if current is not None and _same_message(current, target):
+            return
+        self._reset_all_copies(mc, target, self.get_setting("reset_progress", True))
+
+    def _playlist_neighbor(self, mc, previous: bool):
+        try:
+            use_shuffle = _bool(SharedConfig.shuffleMusic)
+        except Exception:
+            use_shuffle = False
+        lst = get_private_field(mc, "shuffledPlaylist" if use_shuffle else "playlist")
+        n = _list_size(lst)
+        if n <= 0:
+            return None
+        idx = _int(get_private_field(mc, "currentPlaylistNum"), 0)
+        try:
+            reversed_order = _bool(SharedConfig.playOrderReversed)
+        except Exception:
+            reversed_order = False
+        step = -1 if previous else 1
+        if reversed_order:
+            step = -step
+        nxt = idx + step
+        if nxt < 0:
+            nxt = n - 1
+        elif nxt >= n:
+            nxt = 0
+        try:
+            return _list_get(lst, nxt)
+        except Exception:
+            return None
+
+    # ---- 2) forums: keep the playlist inside the topic -------------------
+
+    def _ensure_topic_lock(self, msg, force: bool = False) -> Optional[Tuple[int, int]]:
+        if msg is None:
+            return self._topic_lock
+        try:
+            dialog_id = _int(msg.getDialogId())
+            account = msg.currentAccount
+        except Exception:
+            return self._topic_lock
+        if not _is_forum(account, dialog_id):
+            self._topic_lock = None
+            return None
+        if not force and self._topic_lock and self._topic_lock[0] == dialog_id:
+            return self._topic_lock
+        topic = _topic_from_open_chat(dialog_id) or _topic_of(msg)
+        if topic is None:
+            return None
+        self._topic_lock = (dialog_id, topic)
+        self.logger.info("lock playlist to dialog %s topic %s", dialog_id, topic)
+        return self._topic_lock
+
+    def _filter_controller_playlist(self, mc) -> int:
+        if mc is None or not self.get_setting("topic_playlist", True):
+            return 0
+        lock = self._topic_lock
+        if lock is None:
+            playing = mc.getPlayingMessageObject()
+            lock = self._ensure_topic_lock(playing)
+        if lock is None:
+            return 0
+        dialog_id, topic = lock
+        playlist = get_private_field(mc, "playlist")
+        removed = _filter_list_for_topic(playlist, dialog_id, topic)
+        shuffled = get_private_field(mc, "shuffledPlaylist")
+        _filter_list_for_topic(shuffled, dialog_id, topic)
+
+        pmap = get_private_field(mc, "playlistMap")
+        if pmap is not None and playlist is not None:
+            try:
+                pmap.clear()
+                for i in range(playlist.size()):
+                    item = playlist.get(i)
+                    pmap.put(item.getId(), item)
+            except Exception:
+                self.logger.exception("playlistMap rebuild failed")
+
+        playing = mc.getPlayingMessageObject()
+        if playing is not None and playlist is not None:
+            try:
+                for i in range(playlist.size()):
+                    if _same_message(playlist.get(i), playing):
+                        set_private_field(mc, "currentPlaylistNum", i)
+                        break
+            except Exception:
+                pass
+
+        if removed:
+            self.logger.info(
+                "filtered playlist to topic %s, dropped %s, now %s",
+                topic, removed, _list_size(playlist))
+        return removed
+
+    def _before_set_playlist(self, param):
+        args = param.args
+        if not args or len(args) < 2:
+            return
+        if not self.get_setting("topic_playlist", True):
+            self._topic_lock = None
+            return
+        messages, current = args[0], args[1]
+        if current is None:
+            return
+        # 5-arg: (messages, current, mergeDialogId, loadMusic, searchParams)
+        if len(args) >= 5 and args[4] is not None:
+            return
+        if len(args) >= 4 and not _bool(args[3]):
+            return
+        self._topic_lock = None
+        lock = self._ensure_topic_lock(current, force=True)
+        if lock is None:
+            return
+        dialog_id, topic = lock
+        if messages is None:
+            return
+
+        kept = ArrayList()
+        for i in range(_list_size(messages)):
+            msg = _list_get(messages, i)
+            if msg is None:
+                continue
+            try:
+                if not msg.isMusic():
+                    continue
+            except Exception:
+                continue
+            t = _topic_of(msg)
+            if t is None or t == topic:
+                kept.add(msg)
+        args[0] = kept
+        self.logger.info(
+            "setPlaylist topic %s: %s -> %s tracks",
+            topic, _list_size(messages), kept.size())
+
+    def _after_set_playlist(self, param):
+        if not self.get_setting("topic_playlist", True):
+            return
+        current = param.args[1] if param.args and len(param.args) > 1 else None
+        self._ensure_topic_lock(current)
+        self._filter_controller_playlist(param.thisObject)
+
+    def _notification_id(self, param) -> int:
+        try:
+            return _int(param.args[0], -1)
+        except Exception:
+            return -1
+
+    def _before_notification(self, param):
+        if not self.get_setting("topic_playlist", True):
+            return
+        nid = self._notification_id(param)
+        if nid == self._music_did_load:
+            self._filter_music_did_load_payload(param)
+        elif nid == self._media_did_load:
+            self._filter_media_did_load_payload(param)
+
+    def _after_notification(self, param):
+        if not self.get_setting("topic_playlist", True):
+            return
+        nid = self._notification_id(param)
+        if nid in (self._music_did_load, self._media_did_load):
+            self._filter_controller_playlist(param.thisObject)
+
+    def _payload(self, param):
+        args = param.args
+        if args is None or len(args) < 3:
+            return None
+        return args[2]
+
+    def _filter_music_did_load_payload(self, param):
+        mc = param.thisObject
+        playing = mc.getPlayingMessageObject()
+        payload = self._payload(param)
+        if playing is None or payload is None:
+            return
+        try:
+            dialog_id = _int(payload[0], 0)
+            begin, end = payload[1], payload[2]
+        except Exception:
+            self.logger.info("musicDidLoad payload not indexable: %s", type(payload))
+            return
+        if dialog_id != _int(playing.getDialogId()):
+            return
+        lock = self._ensure_topic_lock(playing)
+        if lock is None:
+            return
+        _, topic = lock
+        removed = (
+            _filter_list_for_topic(begin, lock[0], topic)
+            + _filter_list_for_topic(end, lock[0], topic)
+        )
+        self.logger.info(
+            "musicDidLoad topic %s: dropped %s extra tracks (begin=%s end=%s)",
+            topic, removed, _list_size(begin), _list_size(end))
+
+    def _filter_media_did_load_payload(self, param):
+        payload = self._payload(param)
+        if payload is None:
+            return
+        try:
+            arr = payload[2]
+            guid = _int(payload[3], -1)
+            media_type = _int(payload[4], -1)
+        except Exception:
+            return
+        if media_type != self._media_music:
+            return
+        mc = param.thisObject
+        class_guid = _int(get_private_field(mc, "playlistClassGuid"), 0)
+        if class_guid == 0 or guid != class_guid:
+            return
+        lock = self._topic_lock
+        if lock is None:
+            lock = self._ensure_topic_lock(mc.getPlayingMessageObject())
+        if lock is None:
+            return
+        removed = _filter_list_for_topic(arr, lock[0], lock[1])
+        if removed:
+            self.logger.info("mediaDidLoad topic %s: dropped %s", lock[1], removed)
+
+    def _before_load_media(self, param):
+        args = param.args
+        try:
+            ptypes = [t.getName() for t in param.method.getParameterTypes()]
+        except Exception:
+            ptypes = []
+        dumped = []
+        for i, a in enumerate(args or []):
+            dumped.append("%s=%s" % (i, a))
+        line = "loadMedia(%s) %s" % (", ".join(ptypes), " ".join(dumped))
+        self._last_load_media = line
+        self.logger.info(line)
+
+        if not self.get_setting("topic_playlist", True):
+            return
+        if args is None or len(args) < 8:
+            return
+        # loadMedia(dialogId, count, max_id, min_id, type, topicId, fromCache, classGuid, ...)
+        if _int(args[4], -1) != self._media_music:
+            return
+        controller = MediaController.getInstance()
+        guid = _int(get_private_field(controller, "playlistClassGuid"), 0)
+        if guid == 0 or _int(args[7], -1) != guid:
+            return
+        playing = controller.getPlayingMessageObject()
+        if playing is None or _int(args[0], 0) != _int(playing.getDialogId()):
+            return
+        lock = self._ensure_topic_lock(playing)
+        if lock is None:
+            return
+        topic = lock[1]
+        already = _int(args[5], 0)
+        try:
+            args[5] = jlong(topic)
+        except Exception:
+            args[5] = topic
+        self.logger.info("loadMedia(music): topicId %s -> %s (guid=%s)", already, topic, guid)
+
+    # ------------------------------------------------------------ settings ---
+
+    def _hook_status(self) -> str:
+        counts = getattr(self, "_hook_counts", {})
+        if not counts:
+            return "not installed"
+        return ", ".join("%s %s" % (k, "✓" if v else "✗") for k, v in counts.items())
+
+    def _lock_status(self) -> str:
+        lock = getattr(self, "_topic_lock", None)
+        if not lock:
+            return "no topic locked — play a track in a forum topic"
+        return "dialog %s / topic %s" % lock
+
+    def _error_status(self) -> str:
+        errors = getattr(self, "_hook_errors", None) or []
+        if not errors:
+            return "none"
+        return " | ".join(errors[:6])
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Settings"),
+            Switch(
+                key="reset_progress",
+                text="Start tracks from the beginning",
+                default=True,
+            ),
+            Switch(
+                key="topic_playlist",
+                text="Play music within the group topic",
+                default=True,
+            ),
+        ]
