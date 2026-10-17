@@ -1,0 +1,302 @@
+__id__ = "ping_all"
+__name__ = "Ping All"
+__description__ = "Команда .все пингует всех участников группы одним сообщением, каждого по 3 раза. .стоп останавливает."
+__author__ = "@nyashkazxcgram"
+__version__ = "2.3.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.9.0"
+
+import re
+import time
+import threading
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import send_message
+from android_utils import log
+from java import dynamic_proxy
+from org.telegram.tgnet import TLRPC, ConnectionsManager, RequestDelegate
+from org.telegram.messenger import MessagesController, UserConfig, UserObject
+from ui.settings import Header, Input, Text
+
+CMD = re.compile(r"^[./](все|all|пинг)(?:\s+(.+))?$", re.IGNORECASE | re.DOTALL)
+STOP = re.compile(r"^[./](стоп|stop)$", re.IGNORECASE)
+
+PAGE_DELAY = 0.35
+
+
+class _Delegate(dynamic_proxy(RequestDelegate)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self, response, error, *args):
+        self.fn(response, error)
+
+
+def _call(account, req):
+    box = {}
+    ev = threading.Event()
+
+    def done(resp, err):
+        box["r"], box["e"] = resp, err
+        ev.set()
+
+    ConnectionsManager.getInstance(account).sendRequest(req, _Delegate(done))
+    ev.wait(30)
+    return box.get("r"), box.get("e")
+
+
+def _username(u):
+    un = None
+    try:
+        un = UserObject.getPublicUsername(u)
+    except Exception:
+        pass
+    if not un:
+        un = getattr(u, "username", None)
+    if not un:
+        try:
+            lst = getattr(u, "usernames", None)
+            if lst is not None:
+                for i in range(lst.size()):
+                    item = lst.get(i)
+                    if getattr(item, "active", True) and getattr(item, "username", None):
+                        un = item.username
+                        break
+        except Exception:
+            pass
+    return str(un) if un else None
+
+
+def _int(value, default, lo, hi):
+    try:
+        v = int(float(str(value).replace(",", ".")))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
+def _float(value, default, lo, hi):
+    try:
+        v = float(str(value).replace(",", "."))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
+def _parse_excluded(value):
+    out = set()
+    for part in re.split(r"[\s,;|]+", str(value or "")):
+        part = part.strip().lstrip("@")
+        part = re.sub(r"^(https?://)?t\.me/", "", part, flags=re.IGNORECASE)
+        if part:
+            out.add(part.lower())
+    return out
+
+
+class PingAllPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.running = set()
+        self.stop = set()
+        self.last_error = ""
+        self.add_on_send_message_hook()
+
+    # ---------- настройки ----------
+    def create_settings(self):
+        return [
+            Header(text="Пинг всех"),
+            Input(key="repeats", text="Сколько раз упомянуть каждого", default="3",
+                  subtext="В одном сообщении, 1-5"),
+            Input(key="delay", text="Пауза между сообщениями, сек", default="1.5",
+                  subtext="Нужна только если список не влез в одно сообщение"),
+            Input(key="cap", text="Максимум участников", default="200",
+                  subtext="Защита от случайного пинга огромных групп (1-500)"),
+            Input(key="exclude", text="Исключения (юзернеймы)", default="",
+                  subtext="Этих людей не пинговать. Через пробел или запятую, с @ или без: @user1 user2"),
+            Text(text="Команды: .все или .все текст (пингует всех одним сообщением), .стоп (останавливает). Если список не помещается в одно сообщение (лимит Telegram 4096 символов), он делится на несколько. "
+                      "Пингуются только люди с @юзернеймом, боты, удалённые и люди из списка исключений пропускаются."),
+        ]
+
+    def _get(self, key, default):
+        try:
+            return self.get_setting(key, default)
+        except Exception:
+            return default
+
+    # ---------- хук ----------
+    def on_send_message_hook(self, account, params) -> HookResult:
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+        text = msg.strip()
+
+        if STOP.match(text):
+            self.stop.add(params.peer)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        m = CMD.match(text)
+        if not m:
+            return HookResult()
+
+        dialog_id = params.peer
+        if dialog_id in self.running:
+            return HookResult(strategy=HookStrategy.CANCEL)
+        self.running.add(dialog_id)
+        self.stop.discard(dialog_id)
+        prefix = (m.group(2) or "").strip()
+        threading.Thread(
+            target=self._worker, args=(account, dialog_id, prefix), daemon=True
+        ).start()
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # ---------- работа ----------
+    def _worker(self, account, dialog_id, prefix):
+        try:
+            if dialog_id > 0:
+                send_message({"peer": dialog_id, "message": "Команда работает только в группах."})
+                return
+
+            repeats = _int(self._get("repeats", "3"), 3, 1, 5)
+            delay = _float(self._get("delay", "1.5"), 1.5, 1.0, 10.0)
+            cap = _int(self._get("cap", "200"), 200, 1, 500)
+
+            names = self._members(account, dialog_id, cap)
+            if not names:
+                msg = "Не нашёл участников с юзернеймом."
+                if self.last_error:
+                    msg += " (" + self.last_error + ")"
+                send_message({"peer": dialog_id, "message": msg})
+                return
+
+            # каждый участник повторяется repeats раз подряд: @a @a @a @b @b @b ...
+            parts = [" ".join(["@" + n] * repeats) for n in names]
+
+            # всё в одно сообщение; делим только если не влезаем в лимит
+            limit = 4000
+            chunks = []
+            cur = []
+            cur_len = (len(prefix) + 1) if prefix else 0
+            for p in parts:
+                add = len(p) + 1
+                if cur and cur_len + add > limit:
+                    chunks.append(cur)
+                    cur = []
+                    cur_len = 0
+                cur.append(p)
+                cur_len += add
+            if cur:
+                chunks.append(cur)
+
+            for i, c in enumerate(chunks):
+                if dialog_id in self.stop:
+                    return
+                line = " ".join(c)
+                text = (prefix + "\n" + line) if (prefix and i == 0) else line
+                send_message({"peer": dialog_id, "message": text})
+                if i < len(chunks) - 1:
+                    time.sleep(delay)
+        except Exception as e:
+            log("PingAll error: " + str(e))
+        finally:
+            self.running.discard(dialog_id)
+            self.stop.discard(dialog_id)
+
+    def _members(self, account, dialog_id, cap):
+        mc = MessagesController.getInstance(account)
+        me = UserConfig.getInstance(account).getClientUserId()
+        names = []
+        seen = set()
+        self.last_error = ""
+        excluded = _parse_excluded(self._get("exclude", ""))
+
+        def add(users):
+            for i in range(users.size()):
+                u = users.get(i)
+                if u.id == me or getattr(u, "bot", False) or getattr(u, "deleted", False):
+                    continue
+                un = _username(u)
+                if un and un.lower() in excluded:
+                    continue
+                if un and u.id not in seen:
+                    seen.add(u.id)
+                    names.append(un)
+
+        # 1) обычный путь: список участников группы
+        try:
+            cid = -dialog_id
+            if cid > 1000000000000:
+                ch = mc.getInputChannel(cid - 1000000000000)
+                offset = 0
+                while offset < 5000 and len(names) < cap:
+                    req = TLRPC.TL_channels_getParticipants()
+                    req.channel = ch
+                    req.filter = TLRPC.TL_channelParticipantsRecent()
+                    req.offset = offset
+                    req.limit = 200
+                    req.hash = 0
+                    res, err = _call(account, req)
+                    if err is not None:
+                        self.last_error = str(getattr(err, "text", "ошибка запроса"))
+                        break
+                    users = getattr(res, "users", None)
+                    parts = getattr(res, "participants", None)
+                    if users is None or parts is None or parts.size() == 0:
+                        break
+                    add(users)
+                    offset += parts.size()
+                    if parts.size() < 200:
+                        break
+                    time.sleep(PAGE_DELAY)
+            else:
+                req = TLRPC.TL_messages_getFullChat()
+                req.chat_id = cid
+                res, err = _call(account, req)
+                if err is not None:
+                    self.last_error = str(getattr(err, "text", "ошибка запроса"))
+                users = getattr(res, "users", None) if err is None and res is not None else None
+                if users is not None:
+                    add(users)
+        except Exception as e:
+            self.last_error = str(e)
+
+        # 2) запасной путь: список участников скрыт или пуст,
+        #    берём авторов недавних сообщений (до 4000 последних)
+        if not names:
+            try:
+                self._from_history(account, dialog_id, cap, names, add)
+            except Exception as e:
+                self.last_error = str(e)
+        return names[:cap]
+
+    def _from_history(self, account, dialog_id, cap, names, add):
+        mc = MessagesController.getInstance(account)
+        peer = mc.getInputPeer(dialog_id)
+        offset_id = 0
+        for _ in range(40):
+            if len(names) >= cap or dialog_id in self.stop:
+                break
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = peer
+            req.offset_id = offset_id
+            req.offset_date = 0
+            req.add_offset = 0
+            req.limit = 100
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
+            res, err = _call(account, req)
+            if err is not None:
+                txt = str(getattr(err, "text", ""))
+                fm = re.search(r"FLOOD_WAIT_(\d+)", txt)
+                if fm:
+                    time.sleep(int(fm.group(1)) + 1)
+                    continue
+                self.last_error = txt
+                break
+            if res is None or res.messages.size() == 0:
+                break
+            add(res.users)
+            offset_id = res.messages.get(res.messages.size() - 1).id
+            if res.messages.size() < 100:
+                break
+            time.sleep(PAGE_DELAY)
