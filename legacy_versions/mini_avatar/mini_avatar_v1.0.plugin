@@ -1,0 +1,1003 @@
+__id__ = "mini_avatar"
+__name__ = "Mini Avatar"
+__description__ = "Заменяет стандартный аватар около сообщения на мини аватар\nКастомизация положения пузыря смс по горизонтали\nКастомизация размера мини аватара, положения по вертикали и горизонтали."
+__icon__ = "M_A665/0" 
+__author__ = "@KUNSESHBOY"
+__version__ = "1.0"
+__min_version__ = "12.10.6"
+import threading
+
+from android.view import MotionEvent
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
+from hook_utils import get_private_field, set_private_field
+from java import dynamic_proxy, jclass
+from java.lang import Class
+from org.telegram.messenger import AndroidUtilities, MessageObject
+from ui.settings import Divider, Header, Input
+
+try:
+    from ui.settings import Switch
+except ImportError:
+    Switch = None
+
+try:
+    from ui.settings import Custom, SimpleSettingFactory
+except ImportError:
+    Custom = None
+    SimpleSettingFactory = None
+
+OFFSET_RANGE = 48
+BUBBLE_LEFT_LIMIT = -35
+RANGES = {
+    "off_x": (-OFFSET_RANGE, OFFSET_RANGE),
+    "off_y": (-OFFSET_RANGE, OFFSET_RANGE),
+    "bubble_x": (BUBBLE_LEFT_LIMIT, OFFSET_RANGE),
+}
+SIZE_MIN = 0
+SIZE_MAX = 50
+SIZE_DEFAULT = 16
+SLIDERS = {
+    "off_x": "Аватар: влево / вправо",
+    "off_y": "Аватар: вверх / вниз",
+    "bubble_x": "Пузырь: влево / вправо",
+}
+
+ZERO = {"off_x": -20, "off_y": 0, "bubble_x": 30}
+
+SIZE_KEY = "size"
+SIZE_LABEL = "Размер аватара"
+
+SUBMENU_KEY = "submenu"
+SUBMENU_LABEL = "Настройки в меню чата"
+HINT_TEXT = (
+    "Включаешь → Заходишь в беседу → 3 точки справа вверху → Настраиваешь → Радуешься\n\n"
+    "Рекомендуемые настройки\n\n"
+    "• Размер аватара : +30dp\n"
+    "• Аватар: влево / вправо : -10dp\n"
+    "• Аватар: вверх / вниз : 0dp\n"
+    "• Пузырь: влево / вправо : +5dp"
+)
+
+System = jclass("java.lang.System")
+
+_plugin = [None]
+_cfg = {"size": SIZE_DEFAULT, "off_x": 0, "off_y": 0, "bubble_x": 0}
+
+
+_mini = set()
+_rect = {}
+_pressed = set()
+_radius = {}
+_prev_flag = {}
+_layout_stack = []
+_suppress = {"n": 0, "tid": 0}
+_logged = set()
+_offscreen = set()
+
+_shift = {}
+_cells = {}
+_rows = {}
+_delegate_cls = [None]
+_parents = set()
+
+
+def _h(obj):
+    return System.identityHashCode(obj)
+
+
+def _skip(cell):
+    """Не трогать ячейки, которые рендерятся в оффскрин bitmap.
+    Атрибут drawingToBitmap выставляют quotecreate и подобные плагины,
+    которые формируют изображение сообщения через cell.draw(canvas)."""
+    return bool(get_private_field(cell, "drawingToBitmap"))
+
+
+def _is_album(cell):
+    """Фото/видео-альбомы собираются из нескольких ячеек: пузырь группы
+    рисуется в нетранслированных координатах, а левая колонка теряет
+    отступ аватара. Сдвиг только части ячеек разрывает альбом, поэтому
+    такие сообщения остаются нативными."""
+    group = cell.getCurrentMessagesGroup()
+    return group is not None and not group.isDocuments
+
+
+def _log(key, e):
+    if key in _logged:
+        return
+    _logged.add(key)
+    if _plugin[0] is not None:
+        _plugin[0].log("mini_avatar/" + key + ": " + str(e))
+
+
+def _hook_named(plugin, clazz, name, hook_factory):
+    """Поштучно вешает хук на каждый метод с именем `name`.
+
+    Штатный hook_all_methods из SDK собирает список методов через java-Stream
+    (Stream.toList() есть только в Java 16 / Android 14+), поэтому на обычных
+    устройствах он падает с
+    "'ReferencePipeline$Head' object has no attribute 'toList'"
+    и не вешает вообще ни одного хука. Тот же результат делаем обычным
+    перебором getDeclaredMethods() и одиночным hook_method() — работает везде.
+    Для каждого перегруза создаётся свой экземпляр хука.
+    """
+    handles = []
+    try:
+        methods = clazz.getDeclaredMethods()
+    except Exception as e:
+        _log("methods_" + name, e)
+        return handles
+    for i in range(len(methods)):
+        method = methods[i]
+        try:
+            if method.getName() != name:
+                continue
+            handle = plugin.hook_method(method, hook_factory())
+        except Exception as e:
+            _log("hook_" + name, e)
+            continue
+        if handle is not None:
+            handles.append(handle)
+    if not handles:
+        _log("miss_" + name, "no methods named " + name + " in " + str(clazz.getName()))
+    return handles
+
+
+def _int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _clamp(key, value):
+    lo, hi = RANGES[key]
+    return max(lo, min(hi, value))
+
+
+def _fmt(value):
+    return ("+" if value > 0 else "") + str(value) + " dp"
+
+
+def _progress(key, value):
+    lo, hi = RANGES[key]
+    return (value - lo) / float(hi - lo)
+
+
+def _clamp_size(value):
+    return max(SIZE_MIN, min(SIZE_MAX, value))
+
+
+def _fmt_size(value):
+    return str(value) + " dp"
+
+
+def _progress_size(value):
+    span = float(SIZE_MAX - SIZE_MIN)
+    if span <= 0:
+        return 0.0
+    return (value - SIZE_MIN) / span
+
+
+def _eff(key):
+    return ZERO[key] + _cfg[key]
+
+
+def _reload_cfg(plugin):
+    _cfg["size"] = _clamp_size(_int(plugin.get_setting(SIZE_KEY, SIZE_DEFAULT), SIZE_DEFAULT))
+
+    if _int(plugin.get_setting("zero_ver", 0)) < 1:
+        for key in SLIDERS:
+            plugin.set_setting(key, 0)
+        plugin.set_setting("zero_ver", 1)
+    for key in SLIDERS:
+        _cfg[key] = _clamp(key, _int(plugin.get_setting(key, 0)))
+
+
+def _sync_shift(cell):
+    
+    h = _h(cell)
+    want = float(AndroidUtilities.dp(_eff("bubble_x"))) if h in _mini else 0.0
+    have = _shift.get(h, 0.0)
+    if want == 0.0 and have == 0.0:
+        return
+    cur = cell.getTranslationX()
+    if have != 0.0 and cur == 0.0:
+        have = 0.0
+    if want != have:
+        cell.setTranslationX(cur - have + want)
+    if want != 0.0:
+        _shift[h] = want
+        _cells[h] = cell
+    else:
+        _shift.pop(h, None)
+        _cells.pop(h, None)
+
+
+def _reset_shifts():
+    items = [(cell, _shift.get(h, 0.0)) for h, cell in list(_cells.items())]
+    _cells.clear()
+    _shift.clear()
+
+    def run():
+        for cell, have in items:
+            try:
+                if have and cell.getTranslationX() != 0.0:
+                    cell.setTranslationX(cell.getTranslationX() - have)
+            except Exception as e:
+                _log("reset", e)
+
+    try:
+        from android_utils import run_on_ui_thread
+
+        run_on_ui_thread(run)
+    except Exception:
+        run()
+
+
+def _draw_mini(cell, canvas):
+    h = _h(cell)
+    if get_private_field(cell, "drawPinnedBottom"):
+        _rect.pop(h, None)
+        return
+    pos = cell.getCurrentPosition()
+    if pos is not None:
+        need = MessageObject.POSITION_FLAG_BOTTOM | MessageObject.POSITION_FLAG_LEFT
+        if (pos.flags & need) != need:
+            _rect.pop(h, None)
+            return
+
+    avatar = get_private_field(cell, "avatarImage")
+    size = AndroidUtilities.dp(_cfg["size"])
+    left = cell.getBackgroundDrawableLeft()
+    bottom = cell.getBackgroundDrawableBottom()
+
+    if get_private_field(cell, "mediaBackground"):
+        x = max(AndroidUtilities.dp(1), left - size // 2)
+    else:
+        x = left + AndroidUtilities.dp(1)
+    x += AndroidUtilities.dp(_eff("off_x"))
+    y = bottom - size - AndroidUtilities.dp(2) + AndroidUtilities.dp(_eff("off_y"))
+
+    radius = size // 2
+    if _radius.get(h) != radius:
+        avatar.setRoundRadius(radius)
+        _radius[h] = radius
+
+    avatar.setImageCoords(x, y, size, size)
+    avatar.setVisible(True, False)
+    avatar.setAlpha(1.0)
+    avatar.draw(canvas)
+    _rect[h] = (x, y, x + size, y + size)
+
+
+def _open_profile(cell, x, y):
+    delegate = cell.getDelegate()
+    if delegate is None:
+        return
+    user = get_private_field(cell, "currentUser")
+    chat = get_private_field(cell, "currentChat")
+    if user is not None:
+        if user.id == 0:
+            delegate.didPressHiddenForward(cell)
+        else:
+            delegate.didPressUserAvatar(cell, user, x, y)
+    elif chat is not None:
+        target = chat
+        post_id = 0
+        fwd = cell.getMessageObject().messageOwner.fwd_from
+        if fwd is not None:
+            if (fwd.flags & 16) != 0:
+                post_id = fwd.saved_from_msg_id
+            else:
+                post_id = fwd.channel_post
+                channel = get_private_field(cell, "currentForwardChannel")
+                if channel is not None:
+                    target = channel
+        delegate.didPressChannelAvatar(cell, target, post_id, x, y)
+
+
+class ContentHook(MethodHook):
+
+    def before_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if _skip(cell):
+                _offscreen.add(_h(cell))
+                return
+            if _h(cell) in _mini:
+                set_private_field(cell, "isAvatarVisible", True)
+        except Exception as e:
+            _log("content_before", e)
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            h = _h(cell)
+            if h in _offscreen:
+                _offscreen.discard(h)
+                return
+            if get_private_field(cell, "isAvatarVisible") and not _is_album(cell):
+                set_private_field(cell, "isAvatarVisible", False)
+                _mini.add(h)
+
+                get_private_field(cell, "avatarImage").setParentView(cell)
+            else:
+                _mini.discard(h)
+                _rect.pop(h, None)
+            _sync_shift(cell)
+        except Exception as e:
+            _log("content_after", e)
+
+
+class FlagHook(MethodHook):
+
+    def before_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if _skip(cell):
+                return
+            h = _h(cell)
+            if h in _mini:
+                _prev_flag[h] = get_private_field(cell, "isAvatarVisible")
+                set_private_field(cell, "isAvatarVisible", True)
+        except Exception as e:
+            _log("flag_before", e)
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if _skip(cell):
+                return
+            h = _h(cell)
+            if h in _prev_flag:
+                set_private_field(cell, "isAvatarVisible", _prev_flag.pop(h))
+        except Exception as e:
+            _log("flag_after", e)
+
+
+class NeedAvatarHook(MethodHook):
+
+    def after_hooked_method(self, param):
+        if _suppress["n"] and threading.get_ident() == _suppress["tid"]:
+            param.setResult(False)
+
+
+class LayoutHook(MethodHook):
+    def before_hooked_method(self, param):
+        if _skip(param.thisObject):
+            _layout_stack.append(False)
+            return
+        active = _h(param.thisObject) in _mini
+        _layout_stack.append(active)
+        if active:
+            _suppress["n"] += 1
+            _suppress["tid"] = threading.get_ident()
+
+    def after_hooked_method(self, param):
+        if _layout_stack and _layout_stack.pop():
+            _suppress["n"] -= 1
+
+
+class DrawHook(LayoutHook):
+
+    def before_hooked_method(self, param):
+        LayoutHook.before_hooked_method(self, param)
+        if _skip(param.thisObject):
+            return
+        try:
+            _sync_shift(param.thisObject)
+        except Exception as e:
+            _log("shift", e)
+
+    def after_hooked_method(self, param):
+        LayoutHook.after_hooked_method(self, param)
+        try:
+            cell = param.thisObject
+            if not _skip(cell) and _h(cell) in _mini:
+                _draw_mini(cell, param.args[0])
+        except Exception as e:
+            _log("draw", e)
+
+
+class TranslationHook(MethodHook):
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if _skip(cell):
+                return
+            _shift.pop(_h(cell), None)
+            _sync_shift(cell)
+        except Exception as e:
+            _log("translation", e)
+
+
+class ParentDrawHook(MethodHook):
+
+    def after_hooked_method(self, param):
+        try:
+            child = param.args[1]
+            h = _h(child)
+            if h not in _mini or h not in _rect or h not in _shift:
+                return
+            avatar = get_private_field(child, "avatarImage")
+            canvas = param.args[0]
+            canvas.save()
+            try:
+                canvas.translate(child.getX(), child.getY())
+                avatar.setAlpha(child.getAlpha())
+                avatar.draw(canvas)
+            finally:
+                avatar.setAlpha(1.0)
+                canvas.restore()
+        except Exception as e:
+            _log("parent_draw", e)
+
+
+def _hook_parent(cell):
+    plugin = _plugin[0]
+    parent = cell.getParent()
+    if plugin is None or parent is None:
+        return
+    cls = parent.getClass()
+    name = cls.getName()
+    if name in _parents:
+        return
+    if _skip(cell):
+        return
+    _parents.add(name)
+    _hook_named(plugin, cls, "drawChild", ParentDrawHook)
+
+
+class TouchHook(MethodHook):
+    def before_hooked_method(self, param):
+        cell = param.thisObject
+        if _skip(cell):
+            return
+        h = _h(cell)
+        rect = _rect.get(h)
+        if rect is None and h not in _pressed:
+            return
+        try:
+            ev = param.args[0]
+            action = ev.getActionMasked()
+            x = ev.getX()
+            y = ev.getY()
+            pad = AndroidUtilities.dp(4)
+            inside = (
+                rect is not None
+                and rect[0] - pad <= x <= rect[2] + pad
+                and rect[1] - pad <= y <= rect[3] + pad
+            )
+            if action == MotionEvent.ACTION_DOWN:
+                delegate = cell.getDelegate()
+                if inside and (delegate is None or delegate.canPerformActions()):
+                    _pressed.add(h)
+                    param.setResult(True)
+                return
+            if h not in _pressed:
+                return
+            param.setResult(True)
+            if action == MotionEvent.ACTION_UP:
+                _pressed.discard(h)
+                if inside:
+                    cell.playSoundEffect(0)
+                    _open_profile(cell, x, y)
+            elif action == MotionEvent.ACTION_CANCEL:
+                _pressed.discard(h)
+            elif action == MotionEvent.ACTION_MOVE and not inside:
+                _pressed.discard(h)
+        except Exception as e:
+            _log("touch", e)
+
+
+class AttachHook(MethodHook):
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if _skip(cell):
+                return
+            if _h(cell) in _mini:
+                get_private_field(cell, "avatarImage").setParentView(cell)
+            _sync_shift(cell)
+            _hook_parent(cell)
+        except Exception as e:
+            _log("attach", e)
+
+
+class DetachHook(MethodHook):
+    def after_hooked_method(self, param):
+        cell = param.thisObject
+        h = _h(cell)
+        _rect.pop(h, None)
+        _pressed.discard(h)
+        try:
+            have = _shift.pop(h, 0.0)
+            _cells.pop(h, None)
+            if have and cell.getTranslationX() != 0.0:
+                cell.setTranslationX(cell.getTranslationX() - have)
+        except Exception as e:
+            _log("detach", e)
+
+
+def _s32(value):
+    return value - (1 << 32) if value >= (1 << 31) else value
+
+
+def _color(name, provider, fallback):
+    try:
+        from org.telegram.ui.ActionBar import Theme
+
+        key = getattr(Theme, name)
+        if provider is None:
+            return Theme.getColor(key)
+        return Theme.getColor(key, provider)
+    except Exception as e:
+        _log("color_" + name, e)
+        return _s32(fallback)
+
+
+def _set_progress(seek, value):
+    try:
+        seek.setProgress(value)
+    except Exception:
+        seek.setProgress(value, False)
+
+
+def _on_drag(state, stop, progress):
+    if state.key == SIZE_KEY:
+        value = _clamp_size(int(round(SIZE_MIN + progress * (SIZE_MAX - SIZE_MIN))))
+        state.label.setText(_fmt_size(value))
+        if _cfg[state.key] != value:
+            _cfg[state.key] = value
+            if _plugin[0] is not None:
+                _plugin[0].set_setting(state.key, value)
+                _plugin[0]._refresh_chat()
+        if stop:
+            _set_progress(state.seek, _progress_size(value))
+        return
+    lo, hi = RANGES[state.key]
+    value = _clamp(state.key, int(round(lo + progress * (hi - lo))))
+    state.label.setText(_fmt(value))
+    if _cfg[state.key] != value:
+        _cfg[state.key] = value
+        if _plugin[0] is not None:
+            _plugin[0].set_setting(state.key, value)
+            _plugin[0]._refresh_chat()
+    if stop:
+        _set_progress(state.seek, _progress(state.key, value))
+
+
+def _delegate_class():
+    if _delegate_cls[0] is None:
+        iface = jclass("org.telegram.ui.Components.SeekBarView$SeekBarViewDelegate")
+
+        class Delegate(dynamic_proxy(iface)):
+            def __init__(self, key, label, seek):
+                super().__init__()
+                self.key = key
+                self.label = label
+                self.seek = seek
+
+            def onSeekBarDrag(self, stop, progress):
+                try:
+                    _on_drag(self, stop, progress)
+                except Exception as e:
+                    _log("seek_drag", e)
+
+            def onSeekBarPressed(self, pressed):
+                pass
+
+            def getContentDescription(self):
+                return None
+
+            def getStepsCount(self):
+                return 0
+
+            def needVisuallyDivideSteps(self):
+                return True
+
+        _delegate_cls[0] = Delegate
+    return _delegate_cls[0]
+
+
+def _make_seek(context, provider):
+    from org.telegram.ui.Components import SeekBarView
+
+    try:
+        return SeekBarView(context, provider)
+    except Exception:
+        return SeekBarView(context)
+
+
+def _create_slider(context, provider, key):
+    from android.util import TypedValue
+    from android.view import Gravity
+    from android.widget import LinearLayout, TextView
+
+    dp = AndroidUtilities.dp
+
+    root = LinearLayout(context)
+    root.setOrientation(LinearLayout.VERTICAL)
+    root.setBackgroundColor(_color("key_windowBackgroundWhite", provider, 0xFFFFFFFF))
+
+    head = LinearLayout(context)
+    head.setOrientation(LinearLayout.HORIZONTAL)
+    head.setGravity(Gravity.CENTER_VERTICAL)
+    head.setPadding(dp(21), dp(12), dp(21), 0)
+    root.addView(head, LinearLayout.LayoutParams(-1, -2))
+
+    title = TextView(context)
+    title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16.0)
+    title.setTextColor(_color("key_windowBackgroundWhiteBlackText", provider, 0xFF000000))
+    title.setText(SIZE_LABEL if key == SIZE_KEY else SLIDERS[key])
+    head.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+
+    label = TextView(context)
+    label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0)
+    label.setTextColor(_color("key_windowBackgroundWhiteValueText", provider, 0xFF3390EC))
+    head.addView(label, LinearLayout.LayoutParams(-2, -2))
+
+    seek = _make_seek(context, provider)
+    seek.setReportChanges(True)
+    seek.setDelegate(_delegate_class()(key, label, seek))
+    params = LinearLayout.LayoutParams(-1, dp(38))
+    params.setMargins(dp(6), 0, dp(6), dp(6))
+    root.addView(seek, params)
+    _bind_slider(root, key)
+    return root
+
+
+def _bind_slider(view, key):
+    value = _cfg[key]
+    is_size = key == SIZE_KEY
+    view.getChildAt(0).getChildAt(1).setText(
+        _fmt_size(value) if is_size else _fmt(value)
+    )
+    _set_progress(
+        view.getChildAt(1),
+        _progress_size(value) if is_size else _progress(key, value),
+    )
+
+
+def _slider_row(key):
+    is_size = key == SIZE_KEY
+    if SimpleSettingFactory is None or Custom is None:
+
+        if is_size:
+            def on_input_size(value):
+                _cfg[key] = _clamp_size(_int(value, SIZE_DEFAULT))
+
+            return Input(
+                key=key,
+                text=SIZE_LABEL + " (dp)",
+                default=str(SIZE_DEFAULT),
+                subtext="От " + str(SIZE_MIN) + " до " + str(SIZE_MAX),
+                on_change=on_input_size,
+            )
+
+        def on_input(value):
+            _cfg[key] = _clamp(key, _int(value))
+
+        return Input(
+            key=key,
+            text=SLIDERS[key] + " (dp)",
+            default="0",
+            subtext="От " + str(RANGES[key][0]) + " до " + str(RANGES[key][1]),
+            on_change=on_input,
+        )
+
+    row = _rows.get(key)
+    if row is None:
+
+        def create(context, list_view, account, guid, provider):
+            try:
+                return _create_slider(context, provider, key)
+            except Exception as e:
+                _log("slider_create", e)
+                from android.widget import TextView
+
+                return TextView(context)
+
+        def bind(view, item, divider, adapter, list_view):
+            try:
+                _bind_slider(view, key)
+            except Exception as e:
+                _log("slider_bind", e)
+
+        row = SimpleSettingFactory(create, bind)
+        _rows[key] = row
+    return Custom(factory=row.instance.java)
+
+
+class Plugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._menu_item_id = None
+        self._settings_dialog = None
+        self._settings_panel = None
+        self._settings_collapsed = False
+        self._settings_strip = None
+
+    def _sync_menu_item(self):
+        wanted = bool(self.get_setting(SUBMENU_KEY, True))
+        if wanted and self._menu_item_id is None:
+            try:
+                self._menu_item_id = self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Настройки мини-аватара",
+                    on_click=self.show_settings_dialog,
+                    icon="msg_settings",
+                    priority=100,
+                ))
+            except Exception as e:
+                _log("chat_menu", e)
+        elif not wanted and self._menu_item_id is not None:
+            try:
+                self.remove_menu_item(self._menu_item_id)
+            except Exception as e:
+                _log("menu_remove", e)
+            self._menu_item_id = None
+
+    def _on_submenu_change(self, *args):
+        self._sync_menu_item()
+
+    def _place_dialog_at_right(self, builder):
+        try:
+            from android.view import Gravity
+
+            dialog = builder.get_dialog()
+            if dialog is None:
+                return
+            window = dialog.getWindow()
+            if window is None:
+                return
+            attrs = window.getAttributes()
+            attrs.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL
+            attrs.x = 0
+            attrs.y = 0
+            window.setAttributes(attrs)
+            window.setLayout(AndroidUtilities.dp(260), -2)
+        except Exception as e:
+            _log("dialog_place", e)
+
+    def _toggle_settings_panel(self):
+        try:
+            from android.view import Gravity, View, WindowManager
+            from android.widget import FrameLayout, TextView
+            from android.graphics.drawable import ColorDrawable
+
+            if self._settings_dialog is None or self._settings_panel is None:
+                return
+            collapsed = not self._settings_collapsed
+            dialog = self._settings_dialog.get_dialog()
+            if dialog is None:
+                return
+            window = dialog.getWindow()
+            if window is None:
+                return
+            decor = window.getDecorView()
+            if collapsed:
+                attrs = window.getAttributes()
+                children = [(decor.getChildAt(i), decor.getChildAt(i).getVisibility())
+                            for i in range(decor.getChildCount())]
+                saved = {
+                    "geometry": (attrs.width, attrs.height, attrs.gravity, attrs.x, attrs.y),
+                    "flags": attrs.flags,
+                    "background": decor.getBackground(),
+                    "padding": (decor.getPaddingLeft(), decor.getPaddingTop(),
+                                decor.getPaddingRight(), decor.getPaddingBottom()),
+                    "children": children,
+                }
+                handle = TextView(decor.getContext())
+                handle.setText("‹")
+                handle.setTextSize(26.0)
+                handle.setGravity(Gravity.CENTER)
+                handle.setContentDescription("Развернуть настройки мини-аватара")
+                handle.setTextColor(_color("key_windowBackgroundWhiteValueText", None, 0xFF3390EC))
+                background = ColorDrawable(_color("key_windowBackgroundWhite", None, 0xFFFFFFFF))
+                handle.setBackground(background)
+
+                class ExpandClick(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+                    def onClick(inner_self, view):
+                        self._toggle_settings_panel()
+
+                handle.setOnClickListener(ExpandClick())
+                saved["handle"] = handle
+                self._settings_strip = saved
+                for child, visibility in children:
+                    child.setVisibility(View.GONE)
+                dp = AndroidUtilities.dp
+                decor.addView(handle, FrameLayout.LayoutParams(-1, -1))
+                window.setBackgroundDrawable(ColorDrawable(0))
+                decor.setPadding(0, 0, 0, 0)
+                window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                attrs = window.getAttributes()
+                attrs.gravity = Gravity.RIGHT | Gravity.CENTER_VERTICAL
+                attrs.x = 0
+                attrs.y = 0
+                window.setAttributes(attrs)
+                window.setLayout(dp(32), dp(120))
+            else:
+                saved = self._settings_strip
+                if saved is None:
+                    return
+                decor.removeView(saved["handle"])
+                window.setBackgroundDrawable(saved["background"])
+                decor.setPadding(*saved["padding"])
+                for child, visibility in saved["children"]:
+                    child.setVisibility(visibility)
+                width, height, gravity, x, y = saved["geometry"]
+                attrs = window.getAttributes()
+                attrs.flags = saved["flags"]
+                attrs.gravity, attrs.x, attrs.y = gravity, x, y
+                window.setAttributes(attrs)
+                window.setLayout(width, height)
+                self._settings_strip = None
+            self._settings_dialog.set_dim_enabled(not collapsed)
+            self._settings_collapsed = collapsed
+        except Exception as e:
+            _log("settings_collapse", e)
+
+    def _refresh_chat(self):
+        try:
+            from client_utils import get_last_fragment
+
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            if not str(fragment.getClass().getName()).startswith("org.telegram.ui.ChatActivity"):
+                return
+            list_view = get_private_field(fragment, "chatListView")
+            if list_view is None:
+                return
+            for index in range(list_view.getChildCount()):
+                child = list_view.getChildAt(index)
+                if _h(child) in _mini:
+                    _sync_shift(child)
+                child.invalidate()
+            list_view.invalidate()
+        except Exception as e:
+            _log("chat_refresh", e)
+
+    def show_settings_dialog(self, context=None):
+        try:
+            from android.widget import LinearLayout, ScrollView, TextView
+            from android.view import Gravity
+            from client_utils import get_last_fragment
+            from ui.alert import AlertDialogBuilder
+
+            fragment = context.get("fragment") if isinstance(context, dict) else None
+            if fragment is None:
+                fragment = get_last_fragment()
+            if fragment is None:
+                return
+            activity = fragment.getParentActivity()
+            if activity is None:
+                return
+            if self._settings_dialog is not None:
+                if self._settings_collapsed:
+                    self._toggle_settings_panel()
+                return
+            _reload_cfg(self)
+            try:
+                provider = fragment.getResourceProvider()
+            except Exception:
+                provider = None
+
+            content = LinearLayout(activity)
+            content.setOrientation(LinearLayout.VERTICAL)
+            for key in (SIZE_KEY, "off_x", "off_y", "bubble_x"):
+                content.addView(
+                    _create_slider(activity, provider, key),
+                    LinearLayout.LayoutParams(-1, -2),
+                )
+            scroll = ScrollView(activity)
+            scroll.addView(content)
+            panel = LinearLayout(activity)
+            panel.setOrientation(LinearLayout.VERTICAL)
+            toggle = TextView(activity)
+            toggle.setText("Свернуть")
+            toggle.setTextSize(16.0)
+            toggle.setTextColor(_color("key_windowBackgroundWhiteValueText", provider, 0xFF3390EC))
+            toggle.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT)
+            dp = AndroidUtilities.dp
+            toggle.setPadding(dp(21), dp(12), dp(21), dp(12))
+
+            class ToggleClick(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+                def onClick(inner_self, view):
+                    self._toggle_settings_panel()
+
+            toggle.setOnClickListener(ToggleClick())
+            panel.addView(toggle, LinearLayout.LayoutParams(-1, -2))
+            panel.addView(scroll, LinearLayout.LayoutParams(-1, -2))
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Настройки мини-аватара")
+            builder.set_view(panel)
+            builder.set_positive_button("Закрыть", lambda bld, which: bld.dismiss())
+
+            def on_dismiss(bld):
+                if self._settings_dialog is bld:
+                    self._settings_dialog = None
+                    self._settings_panel = None
+                    self._settings_collapsed = False
+                    self._settings_strip = None
+
+            builder.set_on_dismiss_listener(on_dismiss)
+            self._settings_dialog = builder
+            self._settings_panel = (scroll, toggle)
+            self._settings_collapsed = False
+            builder.show()
+            builder.set_canceled_on_touch_outside(False)
+            self._place_dialog_at_right(builder)
+        except Exception as e:
+            _log("settings_dialog", e)
+
+    def on_plugin_load(self):
+        _plugin[0] = self
+        _reload_cfg(self)
+        self._sync_menu_item()
+        try:
+            cell_cls = Class.forName("org.telegram.ui.Cells.ChatMessageCell")
+            msg_cls = Class.forName("org.telegram.messenger.MessageObject")
+            _hook_named(self, msg_cls, "needDrawAvatar", NeedAvatarHook)
+            _hook_named(self, cell_cls, "setAvatar", FlagHook)
+            _hook_named(self, cell_cls, "isUserDataChanged", FlagHook)
+            _hook_named(self, cell_cls, "onLayout", LayoutHook)
+            _hook_named(self, cell_cls, "onDraw", DrawHook)
+            _hook_named(self, cell_cls, "onTouchEvent", TouchHook)
+            _hook_named(self, cell_cls, "onAttachedToWindow", AttachHook)
+            _hook_named(self, cell_cls, "onDetachedFromWindow", DetachHook)
+            try:
+                _hook_named(self, cell_cls, "updateTranslation", TranslationHook)
+            except Exception as e:
+                self.log("updateTranslation hook skipped: " + str(e))
+
+            _hook_named(self, cell_cls, "setMessageContent", ContentHook)
+        except Exception as e:
+            self.log("Не удалось установить хуки: " + str(e))
+
+    def on_plugin_unload(self):
+        if self._settings_dialog is not None:
+            try:
+                self._settings_dialog.dismiss()
+            except Exception as e:
+                _log("dialog_dismiss", e)
+            self._settings_dialog = None
+        self._settings_panel = None
+        self._settings_collapsed = False
+        self._settings_strip = None
+        if self._menu_item_id is not None:
+            try:
+                self.remove_menu_item(self._menu_item_id)
+            except Exception as e:
+                _log("menu_remove", e)
+            self._menu_item_id = None
+        _reset_shifts()
+        _mini.clear()
+        _rect.clear()
+        _pressed.clear()
+        _radius.clear()
+        _prev_flag.clear()
+        _rows.clear()
+        _parents.clear()
+        _offscreen.clear()
+        _layout_stack[:] = []
+        _suppress["n"] = 0
+        _plugin[0] = None
+
+    def create_settings(self):
+        rows = []
+        if Switch is not None:
+            rows.append(Switch(
+                key=SUBMENU_KEY,
+                text=SUBMENU_LABEL,
+                subtext="Пункт «Настройки мини-аватара» в меню чата",
+                default=True,
+                on_change=self._on_submenu_change,
+            ))
+        else:
+            rows.append(Header(text=SUBMENU_LABEL))
+        rows.append(Divider(text=HINT_TEXT))
+        return rows
