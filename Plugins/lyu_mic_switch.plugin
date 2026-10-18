@@ -1,0 +1,1446 @@
+# Запасной микрофон: кружки и голосовые пишутся сразу с двух микрофонов телефона, и в каждом
+# кусочке звука остаётся тот, который не закрыт пальцем. В Telegram уходит обычное моно.
+from base_plugin import BasePlugin, MethodHook, HookFilter
+from android_utils import run_on_ui_thread
+from hook_utils import get_private_field, set_private_field
+from ui.settings import Header, Switch, Text, Divider, Custom, SimpleSettingFactory
+from java import jclass, dynamic_proxy, jarray, jint, jfloat, jbyte
+from java.lang import Class as JavaClass, System, Thread
+from java.lang.ref import WeakReference
+from java.util import Collections, WeakHashMap
+from android.view import View, Gravity, HapticFeedbackConstants
+from android.widget import LinearLayout, TextView
+from android.graphics import Color
+from android.graphics.drawable import GradientDrawable, RippleDrawable
+from android.content.res import ColorStateList
+from android.os import Build, Looper
+from android.util import Log
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader, LocaleController
+from org.telegram.ui.ActionBar import Theme
+from array import array
+import math
+import operator
+import time
+
+__id__ = "lyu_mic_switch"
+__name__ = "Запасной микрофон"
+__description__ = "Если во время кружка или голосового закрыть микрофон пальцем, запись сама продолжится с другого микрофона телефона, и вас будет слышно."
+__author__ = "@lyuto_bor"
+__version__ = "0.1.1.1"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+
+STRINGS = {
+    "title": ("Запасной микрофон", "Backup Mic"),
+    "description": ("Если во время кружка или голосового закрыть микрофон пальцем, запись сама продолжится с другого микрофона телефона, и вас будет слышно.",
+                    "If you cover the microphone with a finger while recording a video or voice message, recording continues from another microphone of the phone so you can still be heard."),
+    "where": ("Где работает", "Where it works"),
+    "round": ("Кружки", "Video messages"),
+    "round_hint": ("Видеосообщения в кружке", "Round video messages"),
+    "voice": ("Голосовые сообщения", "Voice messages"),
+    "voice_hint": ("Запись голосовых в чатах", "Voice messages in chats"),
+    "switching": ("Переключение", "Switching"),
+    "careful": ("Осторожно", "Careful"),
+    "normal": ("Обычно", "Normal"),
+    "fast": ("Быстро", "Fast"),
+    "careful_hint": ("Только когда микрофон закрыт плотно и дольше ~0,15 с. Меньше лишних переключений.",
+                     "Only when the microphone is covered tightly for over ~0.15 s. Fewer needless switches."),
+    "normal_hint": ("Переход за ~0,08 с после того, как микрофон заглох.",
+                    "Switches ~0.08 s after the microphone gets muffled."),
+    "fast_hint": ("Переход почти сразу, даже при неплотном касании. Возможны лишние переключения.",
+                  "Switches almost at once, even on a light touch. Extra switches are possible."),
+    "level": ("Выравнивать громкость", "Match loudness"),
+    "level_hint": ("Запасной микрофон звучит так же громко, как основной", "The backup microphone sounds as loud as the main one"),
+    "last": ("Последняя запись", "Last recording"),
+    "last_none": ("Пока ничего не записано", "Nothing recorded yet"),
+    "last_round": ("Кружок", "Video message"),
+    "last_voice": ("Голосовое", "Voice message"),
+    "last_mono": ("Телефон не дал второй микрофон — запись шла как обычно", "The phone did not provide a second microphone, recording went as usual"),
+    "last_stats": ("%s · %d с · переключений: %d", "%s · %d s · switches: %d"),
+    "last_backup": (" · с запасного: %d с", " · on backup: %d s"),
+    "hint": ("Плагин пишет звук сразу с двух микрофонов и каждые ~10 мс оставляет тот, который звучит чисто. Закрытый пальцем микрофон глохнет, особенно на высоких частотах, — запись плавно переходит на другой и возвращается, когда микрофон снова открыт. В Telegram уходит обычный звук, собеседник ничего не заметит. Звонки не меняются. Нужен телефон со стереозаписью; если её нет, запись идёт как обычно.",
+             "The plugin records from two microphones at once and every ~10 ms keeps the one that sounds clear. A microphone covered by a finger gets muffled, especially at high frequencies, so recording smoothly moves to the other one and returns once the microphone is open again. Telegram gets normal audio, the other side notices nothing. Calls are not changed. Requires a phone with stereo recording; without it recording works as usual."),
+    "group": ("Мои плагины", "My plugins"),
+    "author": ("Автор: @lyuto_bor", "Author: @lyuto_bor"),
+}
+
+CAREFUL, NORMAL, FAST = 0, 1, 2
+MODES = ("careful", "normal", "fast")
+# (порог в дБ, сколько секунд речи микрофон должен быть заглушён)
+MODE_RULES = {CAREFUL: (10.0, 0.15), NORMAL: (7.0, 0.08), FAST: (5.0, 0.04)}
+KINDS = (("round", True), ("voice", True))
+SWITCHES = KINDS + (("level", True),)
+
+MONO, STEREO, PCM_16 = 16, 12, 2
+FAST_TAU = 0.03                     # сглаживание уровней для решения
+LEARN_TAU = 4.0                     # норма микрофонов подстраивается за столько секунд речи
+RECENT_TAU = 2.0                    # громкость «перед пальцем»: за столько секунд речи
+WARM_SECONDS = 1.0                  # столько речи нужно, чтобы выучить норму с нуля
+WARM_MARGIN = 6.0                   # пока нормы нет, другой микрофон берётся, только если громче на столько дБ
+DULL_SHARE = 0.7                    # закрытый микрофон глохнет и сам по себе: доля порога
+SPEECH_ABOVE = 9.0                  # речь: громкость хотя бы одного микрофона выше его шума на столько дБ
+NOISE_RISE = 3.0                    # дБ/с: как быстро может подрасти оценка шума
+DEAD_LEVEL = 6.0                    # дБ: тише собственного шума любого живого микрофона — канал заглушён
+RETURN_AFTER = 0.5                  # сколько основной микрофон должен звучать нормально, чтобы вернуться
+GAIN_LIMITS = (-6.0, 24.0)          # выравнивание громкости запасного микрофона, дБ
+NORM_LIMIT = 60.0                   # сохранённая норма за этими пределами — мусор
+STALL_SECONDS = 1.0                 # запас буфера записи: столько звука переживает заминку без потерь
+SLOW_SHARE, SLOW_CHUNKS = 0.3, 3    # обработка дольше 30 % длины куска трижды подряд → лёгкий режим
+ROUND_CALLERS = ("com.exteragram.messenger.camera.RoundVideoEncoder",
+                 "org.telegram.utils.camera.roundvideo.RoundVideoCodecRecorder",
+                 "org.telegram.ui.Components.InstantCameraView")
+VOICE_CALLERS = ("org.telegram.messenger.MediaController",)
+AUDIO_RECORD = "android.media.AudioRecord"
+TAG = "LYU_MIC_SWITCH"
+
+
+def db(value):
+    return 20.0 * math.log10(float(value) + 1.0)
+
+
+def smoothing(dt, tau):
+    return 1.0 - math.exp(-dt / tau)
+
+
+def measure(channel):
+    """(громкость, средние частоты): средний модуль сигнала и разности сумм по 4 отсчёта
+    (~1,5–6 кГц: здесь палец глушит сильнее всего, а голос слышен даже дальнему микрофону)."""
+    count = len(channel) // 4
+    if count < 2:
+        return 0.0, 0.0
+    level = sum(map(abs, channel)) / len(channel)
+    add = operator.add
+    blocks = list(map(add, map(add, channel[0::4], channel[1::4]), map(add, channel[2::4], channel[3::4])))[:count]
+    mid = sum(map(abs, map(operator.sub, blocks[1:], blocks[:-1]))) / (4.0 * (count - 1))
+    return level, mid
+
+
+def median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def clip(value):
+    return -32768 if value < -32768 else (32767 if value > 32767 else value)
+
+
+def scaled(channel, gain):
+    if abs(gain - 1.0) < 0.02:
+        return channel
+    return array("h", [clip(int(v * gain)) for v in channel])
+
+
+def crossfade(old, new, old_gain, new_gain):
+    count = len(old)
+    return array("h", [clip(int((a * old_gain * (count - i) + b * new_gain * i) / count))
+                       for i, (a, b) in enumerate(zip(old, new))])
+
+
+def left_only(raw):
+    samples = array("h")
+    samples.frombytes(raw[:len(raw) - len(raw) % 4])
+    return samples[0::2].tobytes()
+
+
+def parse_norms(text):
+    """Сохранённые нормы микрофонов: «вид:источник=4 числа;…» → {(вид, источник): [4 числа]}."""
+    norms = {}
+    for item in str(text or "").split(";"):
+        try:
+            key, values = item.split("=")
+            kind, source = key.split(":")
+            numbers = [float(v) for v in values.split(",")]
+            if kind in ("round", "voice") and len(numbers) == 4 and all(abs(v) < NORM_LIMIT for v in numbers):
+                norms[(kind, int(source))] = numbers
+        except ValueError:
+            continue
+    return norms
+
+
+def format_norms(norms):
+    return ";".join("%s:%d=%s" % (kind, source, ",".join("%.2f" % v for v in values))
+                    for (kind, source), values in sorted(norms.items()))
+
+
+def caller_kind(class_names):
+    """Кто создаёт запись: кружок, голосовое или чужой код (звонки, камера и т. п.)."""
+    for name in class_names:
+        if name.startswith(ROUND_CALLERS):
+            return "round"
+        if name.startswith(VOICE_CALLERS):
+            return "voice"
+    return None
+
+
+class MicPicker:
+    """Выбор микрофона для одной записи. Получает чередующиеся стереосэмплы (левый, правый),
+    возвращает моно того микрофона, который сейчас не заглушён.
+
+    Норма (norm) — как микрофоны этого телефона обычно звучат в речи, всё в дБ: разница средних
+    частот левый − правый, разница громкости и «яркость» каждого (средние частоты минус громкость).
+    Дальний от рта микрофон может быть тише основного на 20 дБ и больше — это и есть норма."""
+
+    def __init__(self, kind, mode, match_level, norm=None, rate=48000, source=0):
+        self.kind, self.rate, self.source = kind, rate, source
+        self.scratch = None                 # свой Java-буфер для стереочтения
+        self.threshold, self.hold = MODE_RULES.get(mode, MODE_RULES[NORMAL])
+        self.match_level = match_level
+        self.norm = [float(v) for v in norm] if norm is not None and len(norm) == 4 else None
+        self.warm = []                      # первая речь, пока нормы нет
+        self.preferred = 0 if self.norm is None or self.norm[0] >= 0 else 1
+        self.current = self.preferred
+        self.fast = None                    # [разница, яркость Л, яркость П] относительно нормы
+        self.recent = None                  # громкость речи каждого микрофона за последние секунды, дБ
+        self.floor = None                   # шум каждого микрофона, дБ
+        self.event = self.calm = 0.0
+        self.seconds = self.backup_seconds = 0.0
+        self.switches = 0
+        self.log_at = 0.0
+        self.last_dev = 0.0
+        self.light = self.light_logged = False   # лёгкий режим: текущий микрофон без анализа
+        self.slow_chunks = self.errors = 0
+
+    def gain(self, channel):
+        if not self.match_level or self.norm is None or channel == self.preferred:
+            return 1.0
+        if self.recent is not None:
+            # Запасной звучит так же громко, как основной перед тем, как его закрыли.
+            value = self.recent[self.preferred] - self.recent[channel]
+        else:
+            value = self.norm[1] if channel == 1 else -self.norm[1]
+        value = max(GAIN_LIMITS[0], min(GAIN_LIMITS[1], value))
+        return 1.0 if abs(value) < 1.0 else 10.0 ** (value / 20.0)
+
+    def speech(self, levels, dt):
+        """Есть ли голос: громкость хотя бы одного микрофона заметно выше его шума.
+        В паузах оба микрофона звучат одинаково тихо — сравнивать там нечего."""
+        if self.floor is None:
+            self.floor = list(levels)
+        active = False
+        for i in (0, 1):
+            if levels[i] < self.floor[i]:
+                self.floor[i] += smoothing(dt, 0.05) * (levels[i] - self.floor[i])
+            else:
+                self.floor[i] += min(levels[i] - self.floor[i], NOISE_RISE * dt)
+            active = active or levels[i] - self.floor[i] >= SPEECH_ABOVE
+        return active
+
+    def decide(self, mid_left, mid_right, level_left, level_right, dt):
+        """Обновляет оценки и возвращает микрофон (0 — левый, 1 — правый) для этого кусочка."""
+        mids = (db(mid_left), db(mid_right))
+        levels = (db(level_left), db(level_right))
+        if not self.speech(levels, dt):
+            return self.current
+        values = (mids[0] - mids[1], levels[0] - levels[1], mids[0] - levels[0], mids[1] - levels[1])
+        if self.norm is None:
+            # Нормы ещё нет: учим её по первой секунде речи (медиана — всплески не мешают),
+            # а пока пишем с того микрофона, который заметно громче.
+            self.warm.append(values)
+            if len(self.warm) * dt < WARM_SECONDS:
+                louder = (values[1], -values[1])
+                return 1 - self.current if louder[1 - self.current] > WARM_MARGIN else self.current
+            self.norm = [median(column) for column in zip(*self.warm)]
+            self.warm = []
+            if abs(self.norm[0]) >= WARM_MARGIN / 2:
+                self.preferred = 0 if self.norm[0] >= 0 else 1
+            else:
+                self.preferred = self.current   # микрофоны почти одинаковы: не переключаться зря
+            return self.preferred
+        norm = self.norm
+        now = (values[0] - norm[0], values[2] - norm[2], values[3] - norm[3])
+        if self.fast is None:
+            self.fast = list(now)
+        k = smoothing(dt, FAST_TAU)
+        for i in (0, 1, 2):
+            self.fast[i] += k * (now[i] - self.fast[i])
+        dev = self.last_dev = self.fast[0]
+        # Насколько микрофон заглушён (дБ): относительно соседа и относительно себя обычного.
+        muffled = (-dev, dev)
+        dull = (-self.fast[1], -self.fast[2])
+        current, other = self.current, 1 - self.current
+        # Плотно закрытый микрофон Samsung может приглушить почти до нулей — ниже собственного шума
+        # живого микрофона; «яркости» у такого канала нет, поэтому отдельная проверка.
+        dead = levels[current] < DEAD_LEVEL
+        covered = muffled[current] > self.threshold and (dull[current] > self.threshold * DULL_SHARE or dead)
+        if current == self.preferred and not covered:
+            # Норма медленно подстраивается под то, как человек держит телефон; пока основной
+            # микрофон похож на закрытый — не учим, иначе палец станет «нормой».
+            slow = smoothing(dt, LEARN_TAU if abs(dev) < self.threshold else LEARN_TAU * 3)
+            for i in range(4):
+                norm[i] += slow * (values[i] - norm[i])
+            # Громкость на слух — среднее общей громкости и средних частот; пока основной закрыт
+            # или пишет запасной, не меняется: по ней запасной подтягивается до прежней громкости.
+            loud = ((levels[0] + mids[0]) * 0.5, (levels[1] + mids[1]) * 0.5)
+            if self.recent is None:
+                self.recent = list(loud)
+            else:
+                k = smoothing(dt, RECENT_TAU)
+                for i in (0, 1):
+                    self.recent[i] += k * (loud[i] - self.recent[i])
+        if covered:
+            # Закрыт пальцем: глуше соседа и глуше себя обычного. Шум трения пальца о соседний
+            # микрофон делает соседа «ярче», но текущий от этого не глохнет — переключения нет.
+            self.calm = 0.0
+            self.event += dt
+            if self.event >= self.hold:
+                self.event = 0.0
+                return other
+            return current
+        self.event = max(0.0, self.event - dt)
+        if current != self.preferred:
+            # Возврат, когда основной снова звучит как обычно; редкие всплески не обнуляют счёт.
+            preferred = self.preferred
+            if muffled[preferred] < self.threshold * 0.5 and dull[preferred] < self.threshold * 0.5:
+                self.calm += dt
+                if self.calm >= RETURN_AFTER:
+                    self.calm = 0.0
+                    return preferred
+            elif muffled[preferred] > self.threshold:
+                self.calm = 0.0
+            else:
+                self.calm = max(0.0, self.calm - dt)
+        return current
+
+    def process(self, raw):
+        """Чередующийся стерео PCM 16 бит → моно байты половинной длины."""
+        samples = array("h")
+        samples.frombytes(raw[:len(raw) - len(raw) % 4])
+        left, right = samples[0::2], samples[1::2]
+        frames = len(left)
+        if frames == 0:
+            return b""
+        dt = frames / float(self.rate)
+        if self.light:
+            self.seconds += dt
+            if self.current != self.preferred:
+                self.backup_seconds += dt
+            return (left, right)[self.current].tobytes()
+        level_left, mid_left = measure(left)
+        level_right, mid_right = measure(right)
+        choice = self.decide(mid_left, mid_right, level_left, level_right, dt)
+        channels = (left, right)
+        if choice != self.current:
+            out = crossfade(channels[self.current], channels[choice], self.gain(self.current), self.gain(choice))
+            self.current = choice
+            self.switches += 1
+        else:
+            out = scaled(channels[choice], self.gain(choice))
+        self.seconds += dt
+        if self.current != self.preferred:
+            self.backup_seconds += dt
+        return out.tobytes()
+
+    def note_time(self, spent, dt):
+        """Сколько занял весь путь куска (ожидание Python, пересылка, анализ). Если телефон не
+        успевает несколько раз подряд — дальше без анализа, но звук не прерывается."""
+        if spent > dt * SLOW_SHARE:
+            self.slow_chunks += 1
+            self.light = self.light or self.slow_chunks >= SLOW_CHUNKS
+        else:
+            self.slow_chunks = 0
+
+    def fail(self):
+        """Ошибка обработки: после нескольких подряд — лёгкий режим до конца записи."""
+        self.errors += 1
+        self.light = self.light or self.errors >= 3
+
+
+# ----- Helpers -------------------------------------------------------------------
+
+def language():
+    try:
+        info = LocaleController.getInstance().getCurrentLocaleInfo()
+        code = str(info.baseLangCode or info.shortName or "en").lower().replace("_", "-")
+    except Exception:
+        code = "en"
+    return "ru" if code.split("-")[0] == "ru" else "en"
+
+
+def dp(value):
+    return int(AndroidUtilities.dp(float(value)))
+
+
+def on_main_thread():
+    current = Looper.myLooper()
+    return current is not None and current.equals(Looper.getMainLooper())
+
+
+def foreground_value(color):
+    value = int(color) & 0xFFFFFFFF
+    channels = [((value >> shift) & 255) / 255.0 for shift in (16, 8, 0)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    luminance = sum(c * w for c, w in zip(linear, (0.2126, 0.7152, 0.0722)))
+    return -16777216 if luminance > 0.179 else -1
+
+
+def connected_background(index, count, selected, rtl, color, ripple):
+    # M3 Expressive connected group: внутренние углы 8 dp, внешние и выбранный — полностью круглые.
+    left = 24 if selected or (index == count - 1 if rtl else index == 0) else 8
+    right = 24 if selected or (index == 0 if rtl else index == count - 1) else 8
+    radii = jarray(jfloat)([float(dp(r)) for r in (left, left, right, right, right, right, left, left)])
+    shape, mask = GradientDrawable(), GradientDrawable()
+    for drawable in (shape, mask):
+        drawable.setCornerRadii(radii)
+    shape.setColor(jint(color))
+    mask.setColor(jint(Color.WHITE))
+    return RippleDrawable(ColorStateList.valueOf(jint(ripple)), shape, mask)
+
+
+def tonal(color, radius):
+    shape = GradientDrawable()
+    shape.setCornerRadius(float(radius))
+    shape.setColor(jint(color))
+    return shape
+
+
+def soft_haptic(view):
+    effect_id = HapticFeedbackConstants.SEGMENT_FREQUENT_TICK if Build.VERSION.SDK_INT >= 34 else HapticFeedbackConstants.CLOCK_TICK
+    return view.performHapticFeedback(effect_id)
+
+
+def use_mvel_reflective(plugin):
+    """MVEL через несколько сотен вызовов переключается на ASM-ускоритель, байткод которого
+    ART не загружает, и фильтр молча отклоняет вызовы. Отражающий оптимизатор работает всегда."""
+    try:
+        System.setProperty("mvel2.disable.jit", "true")
+        jclass("org.mvel2.optimizers.OptimizerFactory").setDefaultOptimizer("reflective")
+        return True
+    except Exception as error:
+        plugin.report("MVEL", error)
+        return False
+
+
+def input_signature():
+    """Набор входов звука: при подключении гарнитуры стерео проверяется заново."""
+    try:
+        manager = ApplicationLoader.applicationContext.getSystemService("audio")
+        devices = manager.getDevices(1)   # AudioManager.GET_DEVICES_INPUTS
+        return tuple(sorted(int(d.getType()) for d in devices))
+    except Exception:
+        return None
+
+
+def thread_id():
+    return int(Thread.currentThread().getId())
+
+
+# ----- Hooks -------------------------------------------------------------------------
+
+class CreateHook(MethodHook):
+    """AudioRecord(source, rate, channels, format, size): запись кружка или голосового — в стерео."""
+    def __init__(self, plugin): self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.before_create(param)
+        except Exception as error:
+            self.plugin.report("Создание записи", error)
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.after_create(param)
+        except Exception as error:
+            self.plugin.report("После создания записи", error)
+
+
+class ReadHook(MethodHook):
+    """read(byte[], int, int) и read(ByteBuffer, int) стереозаписи: плагин сам читает вдвое больше
+    стерео и отдаёт ровно запрошенное число байт моно — размеры кусков и время у Telegram прежние."""
+    def __init__(self, plugin, into_buffer):
+        self.plugin, self.into_buffer = plugin, into_buffer
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.before_read(param, self.into_buffer)
+        except Exception as error:
+            self.plugin.report("Чтение звука", error)
+
+
+class ReleaseHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.finish(param.thisObject)
+        except Exception as error:
+            self.plugin.report("Конец записи", error)
+
+
+class LanguageHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin.alive:
+            run_on_ui_thread(self.plugin.sync_language)
+
+
+class Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+    def __init__(self, plugin, value):
+        super().__init__()
+        self.plugin, self.value = plugin, value
+
+    def onClick(self, *args):
+        plugin = self.plugin
+        try:
+            if plugin is None or not plugin.alive:
+                return
+            soft_haptic(args[0])
+            if plugin.mode != self.value:
+                plugin.set_setting("mode", self.value)
+                plugin.settings_changed()
+        except Exception as error:
+            if plugin is not None:
+                plugin.report("Нажатие", error)
+
+
+# ----- Plugin ---------------------------------------------------------------------------
+
+LYU_GROUP_URL = "https://t.me/LyuPlugins"
+LYU_AUTHOR_URL = "https://t.me/lyuto_bor"
+
+
+def open_lyu_url(view, url):
+    # Ссылки на группу и автора; Telegram сам откроет t.me внутри клиента.
+    try:
+        from org.telegram.messenger.browser import Browser
+        context = view.getContext() if view is not None else None
+        if context is None:
+            from client_utils import get_last_fragment
+            fragment = get_last_fragment()
+            context = fragment.getParentActivity() if fragment is not None else None
+        if context is not None:
+            Browser.openUrl(context, url)
+    except Exception:
+        pass
+
+
+def open_lyu_group(view=None, *args):
+    open_lyu_url(view, LYU_GROUP_URL)
+
+
+def open_lyu_author(view=None, *args):
+    open_lyu_url(view, LYU_AUTHOR_URL)
+
+
+class MicSwitchPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.alive = True
+        self.plugin_avatar = _install_plugin_avatar(self)
+        self.errors = set()
+        self.pickers = {}        # identityHashCode записи → MicPicker
+        self.pending = {}        # id потока → (вид записи, источник), пока идёт конструктор
+        self.testing = set()     # потоки, в которых плагин сам проверяет стерео
+        self.kinds = {}          # identityHashCode записи → (вид, источник, частота)
+        self.stereo_ok = set()   # (источник, частота, входы), для которых стерео уже получалось
+        self.norms = parse_norms(self.get_setting("norms", ""))   # (вид, источник) → норма микрофонов
+        self.last = None
+        self.controls = None
+        self.native_plugin, self.ui_language = None, None
+        # Записи, которые плагин перевёл в стерео: Java-набор для фильтра чтения.
+        self.targets = Collections.newSetFromMap(Collections.synchronizedMap(WeakHashMap()))
+        self.load_settings()
+        self.settings_factory = SimpleSettingFactory(self.create_controls, self.bind_controls,
+                                                     is_clickable=False, is_shadow=False)
+        ours = None
+        if use_mvel_reflective(self):
+            ours = HookFilter.Condition("object.contains(param.thisObject)", object=self.targets)
+        self.hook_audio(ours)
+        self.hook_class("org.telegram.messenger.LocaleController", "applyLanguage", LanguageHook(self))
+        run_on_ui_thread(self.sync_language)
+
+    def on_plugin_unload(self):
+        # Состояние записей не трогаем: идущая запись должна дочитаться в моно, пока SDK не снял хуки.
+        self.alive = False
+        _release_plugin_avatar(self)
+
+        def clean():
+            self.release_controls()
+            if self.native_plugin is not None:
+                set_private_field(self.native_plugin, "name", __name__)
+                self.native_plugin.setDescription(__description__)
+        if on_main_thread():
+            clean()
+        else:
+            run_on_ui_thread(clean)
+
+    def hook_audio(self, ours):
+        try:
+            target = JavaClass.forName(AUDIO_RECORD)
+            ints = ["int"] * 5
+            for constructor in target.getDeclaredConstructors():
+                if [str(t.getName()) for t in constructor.getParameterTypes()] == ints:
+                    self.hook_method(constructor, CreateHook(self))
+            for method in target.getDeclaredMethods():
+                name = str(method.getName())
+                types = [str(t.getName()) for t in method.getParameterTypes()]
+                if name == "read" and types in (["[B", "int", "int"], ["java.nio.ByteBuffer", "int"]):
+                    hook = ReadHook(self, types[0] == "java.nio.ByteBuffer")
+                elif name == "release" and not types:
+                    hook = ReleaseHook(self)
+                else:
+                    continue
+                if ours is None:
+                    self.hook_method(method, hook)
+                else:
+                    self.hook_method(method, before=hook.before_hooked_method, before_filters=[ours])
+        except Exception as error:
+            self.report("Подключение AudioRecord", error)
+
+    def hook_class(self, class_name, name, hook):
+        try:
+            loader = ApplicationLoader.applicationContext.getClassLoader()
+            for method in JavaClass.forName(class_name, False, loader).getDeclaredMethods():
+                if str(method.getName()) == name:
+                    self.hook_method(method, hook)
+        except Exception as error:
+            self.report("Подключение " + name, error)
+
+    def report(self, action, error):
+        message = action + ": " + str(error)
+        if message not in self.errors:
+            self.errors.add(message)
+            Log.e(TAG, message)
+
+    def load_settings(self):
+        self.mode = max(0, min(len(MODES) - 1, int(self.get_setting("mode", NORMAL) or 0)))
+        self.switches = {key: bool(self.get_setting(key, default)) for key, default in SWITCHES}
+
+    # --- recording ---------------------------------------------------------------
+
+    def before_create(self, param):
+        tid = thread_id()
+        self.pending.pop(tid, None)
+        if not self.alive or tid in self.testing:
+            return
+        args = param.args
+        source, rate, channels, encoding, size = (int(args[i]) for i in range(5))
+        if channels != MONO or encoding != PCM_16:
+            return
+        names = [str(e.getClassName()) for e in Thread.currentThread().getStackTrace()]
+        kind = caller_kind(names)
+        if kind is None or not self.switches.get(kind, False):
+            return
+        AudioRecord = jclass(AUDIO_RECORD)
+        minimum = int(AudioRecord.getMinBufferSize(rate, STEREO, PCM_16))
+        if minimum <= 0:
+            self.remember_mono(kind)
+            return
+        # Запас на заминки: у голосовых свой буфер всего ~40 мс. Больший буфер не добавляет
+        # задержки — чтение отдаёт звук, как только он есть.
+        stereo_size = max(size * 2, minimum, int(rate * 4 * STALL_SECONDS))
+        key = (source, rate, input_signature())
+        if key[2] is None or key not in self.stereo_ok:
+            # Пробная стереозапись с теми же параметрами (один раз, 15–60 мс, в фоновом потоке
+            # записи): если телефон её не даёт, Telegram получает свою моно-запись без изменений.
+            started = time.perf_counter()
+            self.testing.add(tid)
+            try:
+                probe = AudioRecord(source, rate, STEREO, PCM_16, stereo_size)
+                ok = int(probe.getState()) == 1 and int(probe.getChannelCount()) == 2
+                probe.release()
+            except Exception as error:
+                self.report("Проверка стерео", error)
+                ok = False
+            finally:
+                self.testing.discard(tid)
+            Log.i(TAG, "%s: source=%d stereo=%s check=%.1f ms" % (kind, source, ok, (time.perf_counter() - started) * 1000))
+            if not ok:
+                self.remember_mono(kind)
+                return
+            self.stereo_ok.add(key)
+        self.pending[tid] = (kind, source, rate, key)
+        args[4] = jint(stereo_size)
+        args[2] = jint(STEREO)            # последним: до этого запись остаётся обычной моно
+
+    def after_create(self, param):
+        info = self.pending.pop(thread_id(), None)
+        if info is None:
+            return
+        record = param.thisObject
+        kind, source, rate, key = info
+        if param.getThrowable() is not None or int(record.getState()) != 1 or int(record.getChannelCount()) != 2:
+            self.stereo_ok.discard(key)   # в следующий раз снова проверить заранее
+            self.remember_mono(kind)
+            return
+        # Сначала — в набор: даже если дальше что-то сломается, чтение этой записи сведёт стерео в моно.
+        self.targets.add(record)
+        self.kinds[int(System.identityHashCode(record))] = (kind, source, rate)
+        picker = self.picker_for(record)
+        Log.i(TAG, "%s: stereo capture, source=%d main=%s" % (
+            kind, source, "?" if picker.norm is None else "LR"[picker.preferred]))
+
+    def picker_for(self, record):
+        """Состояние записи; если его нет (сбой, переполнение), создаётся заново — звук важнее нормы."""
+        ident = int(System.identityHashCode(record))
+        picker = self.pickers.get(ident)
+        if picker is None:
+            kind, source, rate = self.kinds.get(ident, ("round", 0, int(record.getSampleRate())))
+            picker = MicPicker(kind, self.mode, self.switches.get("level", True), self.norms.get((kind, source)), rate, source)
+            while len(self.pickers) >= 8:
+                # Записи без release: не копить, выбрасывать самые старые.
+                self.pickers.pop(next(iter(self.pickers)))
+            self.pickers[ident] = picker
+        return picker
+
+    def before_read(self, param, into_buffer):
+        record = param.thisObject
+        if not self.targets.contains(record):
+            return                       # без Java-фильтра сюда приходят и чужие записи
+        target = param.args[0]
+        if into_buffer:
+            offset, wanted = int(target.position()), int(param.args[1])
+        else:
+            offset, wanted = int(param.args[1]), int(param.args[2])
+        wanted -= wanted % 2
+        if wanted <= 0:
+            return
+        picker = self.picker_for(record)
+        scratch = picker.scratch
+        if scratch is None or len(scratch) < wanted * 2:
+            scratch = picker.scratch = jarray(jbyte)(wanted * 2)
+        # Четырёхаргументный read(…, READ_BLOCKING) плагин не перехватывает. Сам вызов Java
+        # отпускает GIL: пока ждём микрофон, Python остальных плагинов работает.
+        count = int(record.read(scratch, jint(0), jint(wanted * 2), jint(0)))
+        if count <= 0:
+            param.setResult(jint(count))  # 0 или код ошибки — как вернула бы система
+            return
+        count -= count % 4
+        started = time.perf_counter()
+        # С этого места стерео уже прочитано: Telegram обязан получить моно при любой ошибке.
+        try:
+            raw = bytes(scratch)[:count]
+            try:
+                mono = picker.process(raw)
+            except Exception as error:
+                picker.fail()
+                self.report("Обработка звука", error)
+                mono = left_only(raw)
+            out = jarray(jbyte)(mono)
+        except Exception as error:
+            self.report("Сведение в моно", error)
+            out = jarray(jbyte)(count // 2)  # тишина нужной длины лучше стерео-каши
+            mono = bytes(count // 2)
+        if into_buffer:
+            # Система пишет в буфер, не глядя на limit; Telegram голосовых может оставить его
+            # от прошлого куска. Пишем так же и возвращаем позицию и limit как были.
+            limit = int(target.limit())
+            target.limit(target.capacity())
+            target.put(out, 0, len(mono))
+            target.position(offset)
+            target.limit(limit)
+        else:
+            System.arraycopy(out, 0, target, offset, len(mono))
+        param.setResult(jint(len(mono)))
+        picker.note_time(time.perf_counter() - started, count / 4.0 / picker.rate)
+        if picker.light and not picker.light_logged:
+            picker.light_logged = True
+            Log.w(TAG, "%s: light mode (slow phone or errors) at t=%.1f" % (picker.kind, picker.seconds))
+        self.trace(picker)
+
+    def trace(self, picker):
+        if picker.seconds - picker.log_at >= 0.5:
+            picker.log_at = picker.seconds
+            if picker.fast is None:
+                Log.d(TAG, "%s t=%.1f mic=%s learning" % (picker.kind, picker.seconds, "LR"[picker.current]))
+                return
+            Log.d(TAG, "%s t=%.1f mic=%s dev=%+.1f dull=%+.1f/%+.1f norm=%+.1f/%+.1f switches=%d" % (
+                picker.kind, picker.seconds, "LR"[picker.current], picker.last_dev, -picker.fast[1],
+                -picker.fast[2], picker.norm[0], picker.norm[1], picker.switches))
+
+    def finish(self, record):
+        ident = int(System.identityHashCode(record))
+        picker = self.pickers.pop(ident, None)
+        self.kinds.pop(ident, None)
+        self.targets.remove(record)
+        if picker is None or picker.seconds < 0.3:
+            return
+        norm = picker.norm
+        if norm is not None and all(abs(v) < NORM_LIMIT for v in norm):
+            self.norms[(picker.kind, picker.source)] = list(norm)
+            run_on_ui_thread(self.save_norms)
+        self.last = {"kind": picker.kind, "stereo": True, "seconds": picker.seconds,
+                     "switches": picker.switches, "backup": picker.backup_seconds}
+        Log.i(TAG, "%s finished: %.1f s, switches=%d, backup=%.1f s, norm=%s" % (
+            picker.kind, picker.seconds, picker.switches, picker.backup_seconds,
+            "none" if norm is None else "/".join("%+.1f" % v for v in norm)))
+        run_on_ui_thread(self.refresh_controls)
+
+    def save_norms(self):
+        # Норма — свойство микрофонов телефона: переживает перезапуск, первая запись сразу знает её.
+        if self.alive:
+            try:
+                self.set_setting("norms", format_norms(self.norms))
+            except Exception as error:
+                self.report("Сохранение нормы", error)
+
+    def remember_mono(self, kind):
+        self.last = {"kind": kind, "stereo": False}
+        run_on_ui_thread(self.refresh_controls)
+
+    # --- language ------------------------------------------------------------------
+
+    def tr(self, key):
+        return STRINGS[key][1 if language() == "en" else 0]
+
+    def sync_language(self):
+        if not self.alive:
+            return
+        current = language()
+        if current == self.ui_language:
+            return
+        self.ui_language = current
+        try:
+            from com.exteragram.messenger.plugins import PluginsController
+            controller = PluginsController.getInstance()
+            self.native_plugin = controller.plugins.get(__id__)
+            if self.native_plugin is not None:
+                set_private_field(self.native_plugin, "name", self.tr("title"))
+                self.native_plugin.setDescription(self.tr("description"))
+            controller.invalidatePluginSettings(__id__)
+            controller.loadPluginSettings(__id__)
+        except Exception as error:
+            self.report("Язык", error)
+
+    # --- settings ---------------------------------------------------------------------
+
+    def create_settings(self):
+        items = [Header(text=self.tr("where"))]
+        for key, default in KINDS:
+            items.append(Switch(key=key, text=self.tr(key), default=default,
+                                subtext=self.tr(key + "_hint"), on_change=self.settings_changed))
+        items += [Header(text=self.tr("switching")), Custom(factory=self.settings_factory.instance.java),
+                  Switch(key="level", text=self.tr("level"), default=True,
+                         subtext=self.tr("level_hint"), on_change=self.settings_changed),
+                  Divider(text=self.tr("hint")),
+                  Text(text="LyuPlugins", subtext=self.tr("group"), icon="msg_channel", on_click=open_lyu_group),
+                  Text(text=self.tr("author"), subtext=self.tr("title") + " · " + __version__, icon="msg_openprofile", on_click=open_lyu_author)]
+        return items
+
+    def settings_changed(self, *args):
+        self.load_settings()
+        self.refresh_controls()
+
+    def create_controls(self, context, *args):
+        root = LinearLayout(context)
+        try:
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(dp(16), dp(4), dp(16), dp(10))
+            root.setLayoutParams(jclass("androidx.recyclerview.widget.RecyclerView$LayoutParams")(-1, -2))
+            self.release_controls()
+            views = []
+            row = LinearLayout(context)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setBaselineAligned(False)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            for index in range(len(MODES)):
+                button = TextView(context)
+                button.setTextSize(14.0)
+                button.setGravity(Gravity.CENTER)
+                button.setIncludeFontPadding(False)
+                button.setMaxLines(1)
+                button.setMinHeight(dp(48))
+                button.setFocusable(True)
+                button.setOnClickListener(Click(self, index))
+                params = LinearLayout.LayoutParams(0, dp(48), 1.0)
+                params.gravity = Gravity.CENTER_VERTICAL
+                if index > 0:
+                    params.setMarginStart(dp(2))
+                row.addView(button, params)
+                views.append(("mode:%d" % index, button))
+            root.addView(row, LinearLayout.LayoutParams(-1, dp(52)))
+            mode_hint = TextView(context)
+            mode_hint.setTextSize(13.0)
+            mode_hint.setPadding(dp(4), dp(6), dp(4), 0)
+            root.addView(mode_hint, LinearLayout.LayoutParams(-1, -2))
+
+            card = LinearLayout(context)
+            card.setOrientation(LinearLayout.VERTICAL)
+            card.setPadding(dp(16), dp(12), dp(16), dp(12))
+            card_params = LinearLayout.LayoutParams(-1, -2)
+            card_params.topMargin = dp(14)
+            root.addView(card, card_params)
+            title = TextView(context)
+            title.setTextSize(14.0)
+            title.setTypeface(AndroidUtilities.bold())
+            card.addView(title, LinearLayout.LayoutParams(-1, -2))
+            status = TextView(context)
+            status.setTextSize(14.0)
+            status.setPadding(0, dp(4), 0, 0)
+            card.addView(status, LinearLayout.LayoutParams(-1, -2))
+            views += [("row", row), ("mode_hint", mode_hint), ("card", card), ("title", title), ("status", status)]
+            self.controls = {key: WeakReference(view) for key, view in views}
+            self.refresh_controls()
+        except Exception as error:
+            self.report("Настройки", error)
+        return root
+
+    def bind_controls(self, view, *args):
+        self.refresh_controls()
+
+    def control(self, name):
+        ref = self.controls.get(name) if self.controls else None
+        return ref.get() if ref is not None else None
+
+    def release_controls(self):
+        if self.controls:
+            for index in range(len(MODES)):
+                view = self.control("mode:%d" % index)
+                if view is not None:
+                    view.setOnClickListener(None)
+        self.controls = None
+
+    def status_text(self):
+        last = self.last
+        if not last:
+            return self.tr("last_none")
+        if not last.get("stereo"):
+            return self.tr("last_mono")
+        text = self.tr("last_stats") % (self.tr("last_" + last["kind"]), int(round(last["seconds"])), last["switches"])
+        if last["backup"] >= 0.5:
+            text += self.tr("last_backup") % int(round(last["backup"]))
+        return text
+
+    def refresh_controls(self):
+        if not self.controls:
+            return
+        try:
+            accent_value = int(Theme.getColor(Theme.key_switchTrackChecked))
+            accent = jint(accent_value)
+            normal = jint(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            gray = jint(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2))
+            for index, key in enumerate(MODES):
+                button = self.control("mode:%d" % index)
+                if button is None:
+                    continue
+                chosen = self.mode == index
+                button.setText(self.tr(key))
+                button.setContentDescription(self.tr("switching") + ": " + self.tr(key))
+                button.setSelected(chosen)
+                button.setTypeface(AndroidUtilities.bold() if chosen else None)
+                button.setTextColor(jint(foreground_value(accent_value)) if chosen else normal)
+                rtl = button.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL
+                button.setBackground(connected_background(index, len(MODES), chosen, rtl,
+                                                          accent_value if chosen else Theme.multAlpha(accent, 0.16),
+                                                          Theme.multAlpha(accent, 0.24)))
+            hint = self.control("mode_hint")
+            if hint is not None:
+                hint.setText(self.tr(MODES[self.mode] + "_hint"))
+                hint.setTextColor(gray)
+            card = self.control("card")
+            if card is not None:
+                card.setBackground(tonal(Theme.multAlpha(accent, 0.10), dp(24)))
+            title = self.control("title")
+            if title is not None:
+                title.setText(self.tr("last"))
+                title.setTextColor(normal)
+            status = self.control("status")
+            if status is not None:
+                status.setText(self.status_text())
+                status.setTextColor(gray)
+        except Exception as error:
+            self.report("Настройки", error)
+
+# BEGIN EMBEDDED LYU PLUGIN AVATAR
+_LYU_AVATAR_PNG = (
+    "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"
+)
+
+"""Embedded offline artwork for enabled plugins; no frame or network callbacks.
+
+Bundled verbatim by build_plugin_avatars.py so each .plugin stays standalone.
+The public SDK metadata still contains a valid fallback sticker reference.
+"""
+
+class _LyuAvatarHook(MethodHook):
+    def __init__(self, avatar):
+        self.avatar = avatar
+
+    def before_hooked_method(self, param):
+        avatar = self.avatar
+        if not avatar.active or str(param.args[1]) != avatar.pack:
+            return
+        try:
+            from java.lang.ref import WeakReference
+            view = param.args[0]
+            view.setImageBitmap(avatar.bitmap)
+            key = int(view.hashCode())
+            # List holders are recycled. Retain only weak references, once each.
+            avatar.views = {k: ref for k, ref in avatar.views.items() if ref.get() is not None}
+            avatar.views[key] = WeakReference(view)
+            param.setResult(None)
+        except Exception:
+            # Suppress a request for this private local alias even on failure.
+            param.setResult(None)
+            avatar.plugin.logger.exception("Unable to bind embedded plugin avatar")
+
+
+class _LyuPluginAvatar:
+    def __init__(self, plugin):
+        from android.graphics import BitmapFactory
+        from android.util import Base64
+        from java.lang import Class
+        from base_plugin import HookFilter
+        self.plugin = plugin
+        self.active = True
+        self.views = {}
+        self.native = None
+        self.original = None
+        self.pack = "LyuLocalAvatar_" + __id__
+        raw = Base64.decode(_LYU_AVATAR_PNG, 0)
+        self.bitmap = BitmapFactory.decodeByteArray(raw, 0, len(raw))
+        if self.bitmap is None:
+            raise ValueError("Invalid embedded avatar PNG")
+        cls = Class.forName("org.telegram.messenger.MediaDataController", False,
+                            ApplicationLoader.applicationContext.getClassLoader())
+        method = next(m for m in cls.getDeclaredMethods()
+                      if str(m.getName()) == "setPlaceholderImageByIndex"
+                      and len(m.getParameterTypes()) == 4)
+        method.setAccessible(True)
+        hook = _LyuAvatarHook(self)
+        plugin.hook_method(method, before=hook.before_hooked_method,
+                           before_filters=[HookFilter.ArgumentEqual(1, self.pack)])
+        run_on_ui_thread(self.apply)
+
+    def apply(self):
+        if not self.active or not self.plugin.alive:
+            return
+        from com.exteragram.messenger.plugins import PluginsController
+        self.native = PluginsController.getInstance().plugins.get(__id__)
+        if self.native is not None:
+            self.original = str(self.native.getIcon() or __icon__)
+            self.native.setIcon(self.pack + "/0")
+
+    def close(self):
+        self.active = False
+        def restore():
+            from org.telegram.messenger import MediaDataController, UserConfig
+            if self.native is not None and str(self.native.getIcon()) == self.pack + "/0":
+                self.native.setIcon(self.original or __icon__)
+                pack, index = (self.original or __icon__).rsplit("/", 1)
+                for ref in self.views.values():
+                    view = ref.get()
+                    if view is None:
+                        continue
+                    # A recycled holder may now belong to another plugin.
+                    parent = view.getParent()
+                    while parent is not None:
+                        if str(parent.getClass().getName()) == "com.exteragram.messenger.plugins.ui.components.PluginCell":
+                            native = get_private_field(parent, "plugin")
+                            if native is not None and str(native.getId()) == __id__:
+                                MediaDataController.getInstance(UserConfig.selectedAccount).setPlaceholderImageByIndex(
+                                    view, pack, int(index), "100_100")
+                            break
+                        parent = parent.getParent() if hasattr(parent, "getParent") else None
+            self.views.clear()
+            # Do not recycle a bitmap still referenced by an Android ImageReceiver.
+            self.bitmap = None
+            self.native = None
+        run_on_ui_thread(restore)
+
+
+def _install_plugin_avatar(plugin):
+    try:
+        return _LyuPluginAvatar(plugin)
+    except Exception:
+        plugin.logger.exception("Embedded plugin avatar is unavailable; keeping SDK fallback")
+        return None
+
+
+def _release_plugin_avatar(plugin):
+    avatar = getattr(plugin, "plugin_avatar", None)
+    if avatar is not None:
+        avatar.close()
+        plugin.plugin_avatar = None
+
+# END EMBEDDED LYU PLUGIN AVATAR
