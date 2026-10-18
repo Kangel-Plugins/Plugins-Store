@@ -1,0 +1,621 @@
+from typing import Any, Dict, List, Optional
+
+from java.lang import Integer
+from org.telegram.tgnet import TLRPC
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import (
+    get_last_fragment,
+    get_messages_controller,
+    run_on_queue,
+    send_request,
+)
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+# --- Метаданные (обязательные верхние константы, парсятся через AST) ---
+
+__id__ = "service_cleaner"
+__name__ = "Service Cleaner"
+__description__ = "Массовое удаление служебных сообщений: «вошёл в чат», «добавил вариант в опрос» и других.\n\nМеню чата (⋮) → **Удалить служебные…**, либо долгое нажатие на служебное сообщение → **Удалить все такие же**."
+__author__ = "Автор: @PLOXOI_RRO"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+
+# --- Константы логики ---
+
+PAGE_SIZE = 100          # сколько сообщений запрашивать за раз
+DELETE_BATCH = 100       # сколько id отправлять в одном delete-запросе
+SCAN_DEPTHS = [100, 300, 600, 1200]
+
+CATEGORY_JOIN = "join"
+CATEGORY_POLL = "poll"
+CATEGORY_OTHER = "other"
+
+# Классы action'ов, относимых к «вход/выход участников».
+JOIN_ACTION_NAMES = [
+    "TL_messageActionChatAddUser",
+    "TL_messageActionChatDeleteUser",
+    "TL_messageActionChatJoinedByLink",
+    "TL_messageActionChatJoinedByRequest",
+    "TL_messageActionChatJoinedByInvite",
+    "TL_messageActionPeerJoined",
+]
+
+# Классы action'ов, относимых к «варианты в опросах».
+POLL_ACTION_NAMES = [
+    "TL_messageActionPollVote",
+]
+
+# Служебные сообщения, которые сервер не позволяет удалять,
+# поэтому они не считаются и не попадают в список на удаление.
+UNDELETABLE_ACTION_NAMES = [
+    "TL_messageActionChannelCreate",  # «канал создан»
+    "TL_messageActionChatCreate",     # «группа создана»
+]
+
+
+def _existing_classes(names):
+    """Собрать существующие в текущем билде Java-классы TLRPC."""
+    result = []
+    for name in names:
+        cls = getattr(TLRPC, name, None)
+        if cls is not None:
+            result.append(cls)
+    return result
+
+
+JOIN_CLASSES = _existing_classes(JOIN_ACTION_NAMES)
+POLL_CLASSES = _existing_classes(POLL_ACTION_NAMES)
+UNDELETABLE_CLASSES = _existing_classes(UNDELETABLE_ACTION_NAMES)
+
+
+class ServiceCleanerPlugin(BasePlugin):
+    """Находит и массово удаляет служебные сообщения в текущем чате."""
+
+    # ------------------------------------------------------------------
+    # Инициализация
+    # ------------------------------------------------------------------
+
+    def on_plugin_load(self):
+        self._scan_dialog = None
+        self._delete_dialog = None
+        self._delete_total = 0
+        self._scan_depth = SCAN_DEPTHS[0]
+        self._scan_filter = None  # None или имя класса action для фильтра
+        self._scan_range = None   # None или (режим, id сообщения)
+
+        # Пункт в меню чата (три точки внутри чата)
+        self._chat_menu_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Удалить служебные…",
+                subtext="Массовое удаление служебных сообщений",
+                icon="msg_info",
+                on_click=self._on_chat_menu_click,
+                priority=20,
+            )
+        )
+
+        # Пункт в контекстном меню сообщения (долгое нажатие)
+        self._msg_menu_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Удалить все такие же",
+                subtext="Служебные сообщения этого типа",
+                icon="msg_list",
+                on_click=self._on_same_type_click,
+                priority=20,
+            )
+        )
+        # «Потянуть вверх/вниз»: все служебные старее/новее выбранного
+        self._above_menu_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Удалить служебные выше",
+                subtext="Это сообщение и выше",
+                icon="msg_info",
+                on_click=self._on_above_click,
+                priority=19,
+            )
+        )
+        self._below_menu_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Удалить служебные ниже",
+                subtext="Это сообщение и ниже",
+                icon="msg_info",
+                on_click=self._on_below_click,
+                priority=18,
+            )
+        )
+        self.logger.info("Service Cleaner loaded")
+
+    def on_plugin_unload(self):
+        for item_id in (getattr(self, "_chat_menu_id", None),
+                        getattr(self, "_msg_menu_id", None),
+                        getattr(self, "_above_menu_id", None),
+                        getattr(self, "_below_menu_id", None)):
+            if item_id:
+                try:
+                    self.remove_menu_item(item_id)
+                except Exception:
+                    pass
+
+    def create_settings(self):
+        return [
+            Header(text="Какие сообщения удалять"),
+            Switch(
+                key="delete_joins",
+                text="Вход/выход участников",
+                subtext="«вошёл в чат», «покинул чат», приглашения",
+                default=True,
+                icon="msg_info",
+            ),
+            Switch(
+                key="delete_poll_votes",
+                text="Варианты в опросах",
+                subtext="«добавил вариант в опрос», голоса",
+                default=True,
+                icon="msg_list",
+            ),
+            Switch(
+                key="delete_other",
+                text="Прочие служебные",
+                subtext="закрепления, смена названия/фото и т.п.",
+                default=False,
+                icon="msg_settings",
+            ),
+            Divider(),
+            Header(text="Глубина сканирования"),
+            Selector(
+                key="scan_depth",
+                text="Сколько последних сообщений проверять",
+                default=0,
+                items=["100 сообщений", "300 сообщений", "600 сообщений",
+                       "1200 сообщений"],
+                icon="msg_list",
+            ),
+            Divider(),
+            Text(
+                text="Как пользоваться",
+                subtext="Меню чата (⋮) → «Удалить служебные…», или долгое "
+                        "нажатие на служебное сообщение → «Удалить все "
+                        "такие же» / «выше» / «ниже». Для удаления чужих "
+                        "сообщений нужны права администратора.",
+                icon="msg_info",
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Обработчики пунктов меню
+    # ------------------------------------------------------------------
+
+    def _on_chat_menu_click(self, context: Dict[str, Any]):
+        dialog_id = self._resolve_dialog_id(context)
+        if not dialog_id:
+            self._bulletin("Не удалось определить чат")
+            return
+        self._run_scan(self._account_of(context), dialog_id, None)
+
+    def _on_same_type_click(self, context: Dict[str, Any]):
+        owner, dialog_id = self._service_owner_or_hint(context)
+        if owner is None:
+            return
+        action = getattr(owner, "action", None)
+        if action is None:
+            self._bulletin("Это не служебное сообщение")
+            return
+        action_name = str(action.getClass().getSimpleName())
+        if action_name in UNDELETABLE_ACTION_NAMES:
+            self._bulletin("Сообщение «канал/чат создан» удалить нельзя")
+            return
+        self._run_scan(self._account_of(context), dialog_id, action_name)
+
+    def _on_above_click(self, context: Dict[str, Any]):
+        owner, dialog_id = self._service_owner_or_hint(context)
+        if owner is None:
+            return
+        self._run_scan(self._account_of(context), dialog_id, None,
+                       "above", int(owner.id))
+
+    def _on_below_click(self, context: Dict[str, Any]):
+        owner, dialog_id = self._service_owner_or_hint(context)
+        if owner is None:
+            return
+        self._run_scan(self._account_of(context), dialog_id, None,
+                       "below", int(owner.id))
+
+    def _service_owner_or_hint(self, context: Dict[str, Any]):
+        """Диалог id и TLRPC.Message нажатого служебного сообщения.
+
+        Возвращает (None, 0) с подсказкой, если нажато не служебное
+        сообщение или чат определить не удалось.
+        """
+        dialog_id = self._resolve_dialog_id(context)
+        if not dialog_id:
+            self._bulletin("Не удалось определить чат")
+            return None, 0
+        message = context.get("message")
+        owner = getattr(message, "messageOwner", None) if message is not None else None
+        if owner is None or not isinstance(owner, TLRPC.TL_messageService):
+            self._bulletin("Это не служебное сообщение")
+            return None, 0
+        return owner, dialog_id
+
+    # ------------------------------------------------------------------
+    # Сканирование истории
+    # ------------------------------------------------------------------
+
+    def _run_scan(self, account: int, dialog_id: int,
+                  type_filter: Optional[str] = None,
+                  range_mode: Optional[str] = None,
+                  range_ref_id: int = 0):
+        try:
+            depth_index = int(self.get_setting("scan_depth", 0))
+        except Exception:
+            depth_index = 0
+        if depth_index < 0 or depth_index >= len(SCAN_DEPTHS):
+            depth_index = 0
+        self._scan_depth = SCAN_DEPTHS[depth_index]
+        self._scan_filter = type_filter
+        # None, ("above", id) — только это сообщение и старее,
+        # ("below", id) — только это сообщение и новее.
+        if range_mode in ("above", "below") and range_ref_id:
+            self._scan_range = (range_mode, int(range_ref_id))
+        else:
+            self._scan_range = None
+
+        run_on_ui_thread(lambda: self._show_scan_dialog())
+        run_on_queue(
+            lambda: self._scan_page(account, dialog_id, 0, 0, 0, []))
+
+    def _show_scan_dialog(self):
+        activity = self._activity()
+        if activity is None:
+            return
+        builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        builder.set_title("Служебные сообщения")
+        builder.set_message("Сканирую историю чата…")
+        builder.set_cancelable(False)
+        builder.show()
+        self._scan_dialog = builder
+
+    def _scan_page(self, account: int, dialog_id: int, offset_id: int,
+                   offset_date: int, scanned: int, found: List):
+        """Запрашивает очередную страницу истории (выполняется не в UI)."""
+        if scanned >= self._scan_depth:
+            self._finish_scan(account, dialog_id, found)
+            return
+        try:
+            mc = get_messages_controller(account)
+            peer = mc.getInputPeer(dialog_id)
+            if peer is None:
+                run_on_ui_thread(
+                    lambda: self._scan_failed("Не удалось открыть чат"))
+                return
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = peer
+            req.offset_id = offset_id
+            req.offset_date = offset_date
+            req.add_offset = 0
+            req.limit = min(PAGE_SIZE, self._scan_depth - scanned)
+            req.max_id = 0
+            req.min_id = 0
+            if hasattr(req, "hash"):
+                req.hash = 0
+            send_request(
+                req,
+                lambda response, error: self._on_history(
+                    account, dialog_id, offset_id, scanned, found,
+                    response, error),
+                account=account,
+            )
+        except Exception:
+            self.logger.exception("scan failed")
+            run_on_ui_thread(
+                lambda: self._scan_failed("Ошибка сканирования (см. лог)"))
+
+    def _on_history(self, account: int, dialog_id: int, prev_offset_id: int,
+                    scanned: int, found: List, response, error):
+        if error is not None:
+            text = getattr(error, "text", None) or error
+            run_on_ui_thread(
+                lambda: self._scan_failed("Не удалось прочитать историю: "
+                                          + str(text)))
+            return
+        messages = getattr(response, "messages", None)
+        if messages is None or messages.isEmpty():
+            self._finish_scan(account, dialog_id, found)
+            return
+        size = messages.size()
+        scanned += size
+        last = messages.get(size - 1)
+        for i in range(size):
+            msg = messages.get(i)
+            if isinstance(msg, TLRPC.TL_messageService):
+                self._collect_if_needed(msg, found)
+        # Конец истории или страница меньше запрошенного — стоп.
+        if size < PAGE_SIZE:
+            self._finish_scan(account, dialog_id, found)
+            return
+        if scanned >= self._scan_depth:
+            self._finish_scan(account, dialog_id, found)
+            return
+        # Защита от зацикливания, если сервер не двигает offset.
+        if prev_offset_id != 0 and last.id >= prev_offset_id:
+            self._finish_scan(account, dialog_id, found)
+            return
+        self._scan_page(account, dialog_id, last.id, last.date, scanned,
+                        found)
+
+    def _collect_if_needed(self, msg, found: List):
+        # «Канал/чат создан» удалить невозможно — не считаем его.
+        action = getattr(msg, "action", None)
+        for cls in UNDELETABLE_CLASSES:
+            if action is not None and isinstance(action, cls):
+                return
+        # Фильтр «выше/ниже» от выбранного сообщения (включая его).
+        if self._scan_range is not None:
+            mode, ref_id = self._scan_range
+            mid = int(msg.id)
+            if mode == "above" and mid > ref_id:
+                return
+            if mode == "below" and mid < ref_id:
+                return
+        category = self._category_of(msg)
+        if not self._category_enabled(category):
+            return
+        if self._scan_filter is not None \
+                and self._action_name(msg) != self._scan_filter:
+            return
+        found.append((int(msg.id), category))
+
+    def _category_of(self, msg) -> str:
+        action = getattr(msg, "action", None)
+        if action is None:
+            return CATEGORY_OTHER
+        for cls in JOIN_CLASSES:
+            if isinstance(action, cls):
+                return CATEGORY_JOIN
+        for cls in POLL_CLASSES:
+            if isinstance(action, cls):
+                return CATEGORY_POLL
+        return CATEGORY_OTHER
+
+    def _category_enabled(self, category: str) -> bool:
+        if category == CATEGORY_JOIN:
+            return bool(self.get_setting("delete_joins", True))
+        if category == CATEGORY_POLL:
+            return bool(self.get_setting("delete_poll_votes", True))
+        return bool(self.get_setting("delete_other", False))
+
+    def _action_name(self, msg) -> str:
+        action = getattr(msg, "action", None)
+        if action is None:
+            return ""
+        return str(action.getClass().getSimpleName())
+
+    def _finish_scan(self, account: int, dialog_id: int, found: List):
+        entries = list(found)
+        run_on_ui_thread(
+            lambda: self._show_confirm(account, dialog_id, entries))
+
+    # ------------------------------------------------------------------
+    # Подтверждение
+    # ------------------------------------------------------------------
+
+    def _show_confirm(self, account: int, dialog_id: int, entries: List):
+        self._dismiss_scan_dialog()
+        if not entries:
+            self._bulletin("Служебные сообщения не найдены")
+            return
+        joins = sum(1 for _mid, c in entries if c == CATEGORY_JOIN)
+        polls = sum(1 for _mid, c in entries if c == CATEGORY_POLL)
+        others = len(entries) - joins - polls
+        lines = ["Найдено служебных сообщений: %d" % len(entries)]
+        if joins:
+            lines.append("• вход/выход: %d" % joins)
+        if polls:
+            lines.append("• варианты в опросах: %d" % polls)
+        if others:
+            lines.append("• прочие: %d" % others)
+        lines.append("")
+        lines.append("Удалить их для всех?")
+
+        activity = self._activity()
+        if activity is None:
+            self._bulletin("Не удалось показать диалог подтверждения")
+            return
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить служебные?")
+        builder.set_message("\n".join(lines))
+
+        ids = [mid for mid, _c in entries]
+
+        def on_positive(bld, which):
+            bld.dismiss()
+            self._start_delete(account, dialog_id, ids)
+
+        def on_negative(bld, which):
+            bld.dismiss()
+
+        builder.set_positive_button("Удалить", on_positive)
+        builder.set_negative_button("Отмена", on_negative)
+        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        builder.show()
+
+    # ------------------------------------------------------------------
+    # Удаление
+    # ------------------------------------------------------------------
+
+    def _start_delete(self, account: int, dialog_id: int, ids: List):
+        if not ids:
+            return
+        use_channels = False
+        channel = None
+        try:
+            if dialog_id < 0:
+                mc = get_messages_controller(account)
+                chat = mc.getChat(-dialog_id)
+                if chat is not None and (chat.megagroup or chat.broadcast):
+                    use_channels = True
+                    channel = TLRPC.TL_inputChannel()
+                    channel.channel_id = chat.id
+                    channel.access_hash = chat.access_hash
+        except Exception:
+            self.logger.exception("cannot resolve chat for delete")
+        run_on_ui_thread(lambda: self._show_delete_dialog(len(ids)))
+        run_on_queue(
+            lambda: self._delete_batch(
+                account, use_channels, channel, ids, 0, 0, 0))
+
+    def _show_delete_dialog(self, total: int):
+        activity = self._activity()
+        if activity is None:
+            return
+        builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_LOADING)
+        builder.set_title("Удаление…")
+        builder.set_message("0 / %d" % total)
+        builder.set_progress(0)
+        builder.set_cancelable(False)
+        builder.show()
+        self._delete_dialog = builder
+        self._delete_total = total
+
+    def _delete_batch(self, account: int, use_channels: bool, channel,
+                      ids: List, index: int, deleted: int, failed: int):
+        if index >= len(ids):
+            run_on_ui_thread(
+                lambda: self._finish_delete(deleted, failed))
+            return
+        batch = ids[index:index + DELETE_BATCH]
+        try:
+            if use_channels:
+                req = TLRPC.TL_channels_deleteMessages()
+                req.channel = channel
+            else:
+                req = TLRPC.TL_messages_deleteMessages()
+            for mid in batch:
+                req.id.add(Integer(mid))
+            send_request(
+                req,
+                lambda response, error: self._on_delete(
+                    account, use_channels, channel, ids, index, deleted,
+                    failed, len(batch), error),
+                account=account,
+            )
+        except Exception:
+            self.logger.exception("delete request failed")
+            run_on_ui_thread(
+                lambda: self._finish_delete(deleted, failed + len(batch)))
+
+    def _on_delete(self, account: int, use_channels: bool, channel,
+                   ids: List, index: int, deleted: int, failed: int,
+                   batch_len: int, error):
+        if error is not None:
+            failed += batch_len
+            self.logger.warning("delete error: %s",
+                                getattr(error, "text", error))
+        else:
+            deleted += batch_len
+        done = min(index + batch_len, len(ids))
+        run_on_ui_thread(lambda: self._update_delete_progress(done))
+        self._delete_batch(account, use_channels, channel, ids,
+                           index + batch_len, deleted, failed)
+
+    def _update_delete_progress(self, done: int):
+        if self._delete_dialog is None:
+            return
+        try:
+            total = self._delete_total or 1
+            self._delete_dialog.set_message(
+                "%d / %d" % (done, self._delete_total))
+            self._delete_dialog.set_progress(int(done * 100 / total))
+        except Exception:
+            self.logger.exception("progress update failed")
+
+    def _finish_delete(self, deleted: int, failed: int):
+        self._dismiss_delete_dialog()
+        message = "Удалено служебных сообщений: %d" % deleted
+        if failed:
+            message += ", не удалось: %d (нужны права администратора?)" % failed
+        self._bulletin(message)
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------------
+
+    def _account_of(self, context: Dict[str, Any]) -> int:
+        account = context.get("account")
+        try:
+            return int(account) if account is not None else 0
+        except Exception:
+            return 0
+
+    def _resolve_dialog_id(self, context: Dict[str, Any]) -> int:
+        dialog_id = context.get("dialog_id")
+        if dialog_id:
+            try:
+                return int(dialog_id)
+            except Exception:
+                pass
+        fragment = context.get("fragment") or get_last_fragment()
+        get_dialog_id = getattr(fragment, "getDialogId", None)
+        if get_dialog_id is not None:
+            try:
+                return int(get_dialog_id())
+            except Exception:
+                pass
+        chat_id = context.get("chatId") or context.get("chat_id")
+        if chat_id:
+            try:
+                return -int(chat_id)
+            except Exception:
+                pass
+        user_id = context.get("userId") or context.get("user_id")
+        if user_id:
+            try:
+                return int(user_id)
+            except Exception:
+                pass
+        return 0
+
+    def _activity(self):
+        fragment = get_last_fragment()
+        if fragment is None:
+            return None
+        return fragment.getParentActivity()
+
+    def _dismiss_scan_dialog(self):
+        if self._scan_dialog is not None:
+            try:
+                self._scan_dialog.dismiss()
+            except Exception:
+                pass
+            self._scan_dialog = None
+
+    def _dismiss_delete_dialog(self):
+        if self._delete_dialog is not None:
+            try:
+                self._delete_dialog.dismiss()
+            except Exception:
+                pass
+            self._delete_dialog = None
+
+    def _scan_failed(self, message: str):
+        self._dismiss_scan_dialog()
+        self._bulletin(message)
+
+    def _bulletin(self, message: str):
+        def show():
+            try:
+                BulletinHelper.show_info(message)
+            except Exception:
+                self.logger.exception("bulletin failed: %s", message)
+        run_on_ui_thread(show)
+
