@@ -1,0 +1,594 @@
+__id__ = "leet_speak"
+__name__ = "LeetSpeak"
+__description__ = "Переводит исходящие сообщения в стиль 1337 (leet speak). Поддерживает русский и английский язык. Настраиваемая интенсивность."
+__author__ = "@LuPlugins (@optimist_opti)"
+__version__ = "1.0"
+__icon__ = "formyetgplugins_by_fStikBot/8"
+__min_version__ = "12.5.1"
+
+import random
+import re
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from hook_utils import find_class, get_private_field
+from ui.settings import Header, Input, Switch, Selector, Divider, Text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread, OnClickListener, log
+from client_utils import get_last_fragment
+from java import jclass, dynamic_proxy
+from typing import Any, List
+
+from android.graphics import Color
+from android.widget import LinearLayout, ImageView, TextView
+from android.view import Gravity
+from android.util import TypedValue
+from org.telegram.messenger import AndroidUtilities, R
+from org.telegram.ui.ActionBar import Theme
+
+# ─────────────────────────────────────────
+#  Константы цветов
+# ─────────────────────────────────────────
+_COLOR_GREEN = Color.parseColor("#4CAF50")
+_COLOR_RED   = Color.parseColor("#F44336")
+_COLOR_GRAY  = Color.parseColor("#9E9E9E")
+
+# ─────────────────────────────────────────
+#  Какие буквы затрагивает каждый уровень интенсивности
+#  (сами замены берутся из CUSTOM_CHARS / настроек пользователя)
+# ─────────────────────────────────────────
+_EN_LIGHT  = "aeos"
+_EN_MEDIUM = _EN_LIGHT + "itbg"
+_EN_FULL   = _EN_MEDIUM + "lzq"
+_RU_LIGHT  = "аеёос"
+_RU_MEDIUM = _RU_LIGHT + "ийзтб"
+_RU_FULL   = _RU_MEDIUM + "гчшэ"
+_LEVEL_CHARS = [
+    set(_EN_LIGHT + _RU_LIGHT),
+    set(_EN_MEDIUM + _RU_MEDIUM),
+    set(_EN_FULL + _RU_FULL),
+]
+_LEVEL_NAMES = ["Лёгкий", "Средний", "Полный"]
+
+# ─────────────────────────────────────────
+#  Полная таблица настраиваемых символов
+# ─────────────────────────────────────────
+CUSTOM_CHARS = [
+    # English — все 26 букв
+    ("sub_a","a","4"), ("sub_b","b","8"), ("sub_c","c","c"), ("sub_d","d","d"),
+    ("sub_e","e","3"), ("sub_f","f","f"), ("sub_g","g","9"), ("sub_h","h","h"),
+    ("sub_i","i","1"), ("sub_j","j","j"), ("sub_k","k","k"), ("sub_l","l","|"),
+    ("sub_m","m","m"), ("sub_n","n","n"), ("sub_o","o","0"), ("sub_p","p","p"),
+    ("sub_q","q","0"), ("sub_r","r","r"), ("sub_s","s","5"), ("sub_t","t","7"),
+    ("sub_u","u","u"), ("sub_v","v","v"), ("sub_w","w","w"), ("sub_x","x","x"),
+    ("sub_y","y","y"), ("sub_z","z","2"),
+    # Русский — все 33 буквы
+    ("sub_а","а","@"), ("sub_б","б","6"), ("sub_в","в","в"), ("sub_г","г","9"),
+    ("sub_д","д","д"), ("sub_е","е","3"), ("sub_ё","ё","3"), ("sub_ж","ж","ж"),
+    ("sub_з","з","2"), ("sub_и","и","1"), ("sub_й","й","1"), ("sub_к","к","к"),
+    ("sub_л","л","л"), ("sub_м","м","м"), ("sub_н","н","н"), ("sub_о","о","0"),
+    ("sub_п","п","п"), ("sub_р","р","р"), ("sub_с","с","$"), ("sub_т","т","7"),
+    ("sub_у","у","у"), ("sub_ф","ф","ф"), ("sub_х","х","х"), ("sub_ц","ц","ц"),
+    ("sub_ч","ч","4"), ("sub_ш","ш","w"), ("sub_щ","щ","щ"), ("sub_ъ","ъ","ъ"),
+    ("sub_ы","ы","ы"), ("sub_ь","ь","ь"), ("sub_э","э","3"), ("sub_ю","ю","ю"),
+    ("sub_я","я","я"),
+]
+
+# Уникальный тег для attachLayout — не конфликтует с другими плагинами
+_BTN_TAG_KEY = 0x13371337
+
+# Фрагменты текста, которые нельзя портить: ссылки и @упоминания
+_PROTECTED_RE = re.compile(
+    r'(https?://\S+|www\.\S+|t\.me/\S+|tg://\S+|@\w+)', re.IGNORECASE
+)
+# Команды: ".ping", "/start" (но не "..." и не "/ ")
+_COMMAND_RE = re.compile(r'^[./]\w')
+
+
+# ─────────────────────────────────────────
+#  Ядро преобразования
+# ─────────────────────────────────────────
+
+def _convert(text: str, tbl: dict, freq: int) -> str:
+    """Один проход по тексту. Каждая буква из таблицы заменяется с вероятностью freq %.
+    Работает и с многосимвольными заменами (раньше они обрезали конец сообщения)."""
+    if not tbl or freq <= 0:
+        return text
+    if freq >= 100:
+        return ''.join(tbl.get(c, c) for c in text)
+    rnd = random.random
+    p = freq / 100.0
+    out = []
+    for c in text:
+        r = tbl.get(c)
+        out.append(r if (r is not None and rnd() < p) else c)
+    return ''.join(out)
+
+
+def _convert_message(msg: str, tbl: dict, freq: int, skip_urls: bool) -> str:
+    if not skip_urls:
+        return _convert(msg, tbl, freq)
+    # split с группой: чётные элементы — обычный текст, нечётные — защищённые куски.
+    # Пробелы и переносы строк сохраняются как есть.
+    parts = _PROTECTED_RE.split(msg)
+    return ''.join(
+        p if i % 2 else _convert(p, tbl, freq)
+        for i, p in enumerate(parts)
+    )
+
+
+# ─────────────────────────────────────────
+#  Hook: кнопка в строке ввода
+# ─────────────────────────────────────────
+
+class _AttachButtonHook(MethodHook):
+    def __init__(self, plugin: 'LeetSpeakPlugin'):
+        self._p = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            ev = param.thisObject
+            if not ev:
+                return
+            if not self._p._show_button:
+                return
+            if get_private_field(ev, "recordingAudioVideo"):
+                return
+            if get_private_field(ev, "editingMessageObject") is not None:
+                return
+            al = get_private_field(ev, "attachLayout")
+            if al is None:
+                return
+            if al.getTag(_BTN_TAG_KEY) is not None:
+                return
+            al.setTag(_BTN_TAG_KEY, True)
+            run_on_ui_thread(lambda: self._inject(al))
+        except Exception as e:
+            log(f"[1337] hook: {e}")
+
+    def _inject(self, al):
+        try:
+            ctx = al.getContext()
+            if not ctx:
+                return
+
+            p = self._p
+            icon_res = p._icon_res
+            size = AndroidUtilities.dp(48)
+            pad  = AndroidUtilities.dp(10)
+            tint = _COLOR_GREEN if p._enabled else _COLOR_RED
+
+            if icon_res:
+                btn = ImageView(ctx)
+                btn.setImageResource(icon_res)
+                btn.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+                btn.setPadding(pad, pad, pad, pad)
+                btn.setColorFilter(tint)
+            else:
+                btn = TextView(ctx)
+                btn.setText("i")
+                btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+                btn.setGravity(Gravity.CENTER)
+                btn.setTextColor(tint)
+
+            lp = LinearLayout.LayoutParams(size, size)
+            btn.setLayoutParams(lp)
+            btn.setClickable(True)
+            btn.setFocusable(True)
+            btn.setOnClickListener(OnClickListener(
+                lambda v: run_on_ui_thread(lambda: p._show_quick_toggle())
+            ))
+
+            try:
+                al.addView(btn, 0, lp)
+            except Exception:
+                al.addView(btn)
+
+            p._btn = btn  # чтобы менять цвет при переключении из настроек
+        except Exception as e:
+            log(f"[1337] inject: {e}")
+
+
+# ─────────────────────────────────────────
+#  Главный класс
+# ─────────────────────────────────────────
+
+class LeetSpeakPlugin(BasePlugin):
+
+    DEFAULT_ENABLED       = True
+    DEFAULT_LEVEL         = 1
+    DEFAULT_FREQUENCY     = 100
+    DEFAULT_SKIP_COMMANDS = True
+    DEFAULT_SKIP_URLS     = True
+    DEFAULT_SHOW_BUTTON   = True
+
+    def __init__(self):
+        super().__init__()
+        self._hook_btn = None
+        self._btn = None
+
+        # ── Кэш настроек ──
+        self._enabled       = self.DEFAULT_ENABLED
+        self._level         = self.DEFAULT_LEVEL
+        self._frequency     = self.DEFAULT_FREQUENCY
+        self._skip_commands = self.DEFAULT_SKIP_COMMANDS
+        self._skip_urls     = self.DEFAULT_SKIP_URLS
+        self._show_button   = self.DEFAULT_SHOW_BUTTON
+
+        # ── Кэш таблицы замен ──
+        self._leet_table: dict = {}
+        self._table_dirty: bool = True
+
+        # ── Кэш drawable ──
+        self._icon_res = None
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def on_plugin_load(self):
+        self._init_defaults()
+        self._reload_cache()
+        self._icon_res = self._get_drawable("filled_info")
+        self.add_on_send_message_hook()
+        self._hook_btn = self._install_btn_hook()
+
+    def on_plugin_unload(self):
+        if self._hook_btn:
+            try:
+                self.unhook_method(self._hook_btn)
+            except Exception:
+                pass
+        self._hook_btn = None
+        self._btn = None
+
+    # ── инициализация и кэш ───────────────────────────────────────────────────
+
+    def _init_defaults(self):
+        for key, val in [
+            ("enabled",       self.DEFAULT_ENABLED),
+            ("level",         self.DEFAULT_LEVEL),
+            ("frequency",     self.DEFAULT_FREQUENCY),
+            ("skip_commands", self.DEFAULT_SKIP_COMMANDS),
+            ("skip_urls",     self.DEFAULT_SKIP_URLS),
+            ("show_button",   self.DEFAULT_SHOW_BUTTON),
+        ]:
+            if self.get_setting(key, None) is None:
+                self.set_setting(key, val)
+        for key, orig, default in CUSTOM_CHARS:
+            if self.get_setting(key, None) is None:
+                self.set_setting(key, default)
+
+    def _get_int(self, key: str, default: int, lo: int, hi: int) -> int:
+        try:
+            v = int(str(self.get_setting(key, default)).strip())
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    def _reload_cache(self):
+        """Перечитывает все настройки в быстрые поля."""
+        self._enabled       = bool(self.get_setting("enabled",       self.DEFAULT_ENABLED))
+        self._level         = self._get_int("level", self.DEFAULT_LEVEL, 0, 2)
+        self._frequency     = self._get_int("frequency", self.DEFAULT_FREQUENCY, 1, 100)
+        self._skip_commands = bool(self.get_setting("skip_commands", self.DEFAULT_SKIP_COMMANDS))
+        self._skip_urls     = bool(self.get_setting("skip_urls",     self.DEFAULT_SKIP_URLS))
+        self._show_button   = bool(self.get_setting("show_button",   self.DEFAULT_SHOW_BUTTON))
+        self._table_dirty   = True
+
+    def _get_leet_table(self) -> dict:
+        """Кэшированная таблица замен с учётом уровня интенсивности.
+        Буква активна, если она входит в выбранный уровень ИЛИ пользователь
+        сам изменил для неё замену (тогда уровень её не отключает)."""
+        if not self._table_dirty:
+            return self._leet_table
+        active = _LEVEL_CHARS[self._level]
+        tbl = {}
+        for key, orig, default in CUSTOM_CHARS:
+            val = str(self.get_setting(key, default)).strip() or orig
+            if val == orig:
+                continue
+            if orig not in active and val == default:
+                continue
+            tbl[orig] = val
+            tbl[orig.upper()] = val.upper() if (len(val) == 1 and val.isalpha()) else val
+        self._leet_table  = tbl
+        self._table_dirty = False
+        return tbl
+
+    @staticmethod
+    def _get_drawable(name: str):
+        try:
+            return getattr(R.drawable, name)
+        except Exception:
+            return None
+
+    def _refresh_btn(self):
+        """Обновляет цвет кнопки в строке ввода (зелёный — вкл, красный — выкл)."""
+        btn = self._btn
+        if btn is None:
+            return
+        tint = _COLOR_GREEN if self._enabled else _COLOR_RED
+
+        def _apply():
+            try:
+                try:
+                    btn.setColorFilter(tint)
+                except Exception:
+                    btn.setTextColor(tint)
+            except Exception:
+                pass
+        run_on_ui_thread(_apply)
+
+    # ── установка хука ───────────────────────────────────────────────────────
+
+    def _install_btn_hook(self):
+        try:
+            cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            if not cls:
+                return None
+            m = cls.getClass().getDeclaredMethod(
+                "checkSendButton", jclass("java.lang.Boolean").TYPE
+            )
+            m.setAccessible(True)
+            return self.hook_method(m, _AttachButtonHook(self))
+        except Exception as e:
+            self.log(f"[1337] install hook: {e}")
+            return None
+
+    # ── быстрый тоггл ────────────────────────────────────────────────────────
+
+    def _show_quick_toggle(self):
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                return
+
+            SwitchCompat   = jclass("androidx.appcompat.widget.SwitchCompat")
+            LinearLayoutLP = jclass("android.widget.LinearLayout$LayoutParams")
+            dp = AndroidUtilities.dp
+
+            try:
+                is_dark = Theme.isCurrentThemeDark()
+            except Exception:
+                is_dark = True
+            text_color = Color.WHITE if is_dark else Color.parseColor("#FF212121")
+
+            root = LinearLayout(activity)
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(dp(20), dp(12), dp(20), dp(20))
+
+            # Заголовок
+            header_row = LinearLayout(activity)
+            header_row.setOrientation(LinearLayout.HORIZONTAL)
+            header_row.setGravity(Gravity.CENTER_VERTICAL)
+
+            if self._icon_res:
+                ico = ImageView(activity)
+                ico.setImageResource(self._icon_res)
+                try:
+                    ico.setColorFilter(Theme.getColor(Theme.key_chat_messagePanelIcons))
+                except Exception:
+                    pass
+                ico_lp = LinearLayoutLP(dp(24), dp(24))
+                ico_lp.rightMargin = dp(10)
+                header_row.addView(ico, ico_lp)
+
+            title = TextView(activity)
+            title.setText("1337 5p34k")
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18)
+            title.setTextColor(text_color)
+            try:
+                title.setTypeface(AndroidUtilities.getTypeface(AndroidUtilities.TYPEFACE_ROBOTO_MEDIUM))
+            except Exception:
+                pass
+            header_row.addView(title, LinearLayoutLP(
+                LinearLayoutLP.WRAP_CONTENT, LinearLayoutLP.WRAP_CONTENT
+            ))
+            title_lp = LinearLayoutLP(LinearLayoutLP.MATCH_PARENT, LinearLayoutLP.WRAP_CONTENT)
+            title_lp.bottomMargin = dp(16)
+            root.addView(header_row, title_lp)
+
+            # Строка Switch
+            row = LinearLayout(activity)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+
+            label = TextView(activity)
+            label.setText("Замена символов")
+            label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16)
+            label.setTextColor(text_color)
+            lp_label = LinearLayoutLP(0, LinearLayoutLP.WRAP_CONTENT)
+            lp_label.weight = 1.0
+            row.addView(label, lp_label)
+
+            sw = SwitchCompat(activity)
+            sw.setChecked(self._enabled)
+            row.addView(sw, LinearLayoutLP(LinearLayoutLP.WRAP_CONTENT, LinearLayoutLP.WRAP_CONTENT))
+            root.addView(row, LinearLayoutLP(LinearLayoutLP.MATCH_PARENT, dp(48)))
+
+            # Уровень — по нажатию переключается по кругу
+            plugin_ref = self
+            hint_tv = TextView(activity)
+            hint_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+            hint_tv.setTextColor(_COLOR_GRAY)
+            hint_tv.setPadding(0, dp(8), 0, dp(8))
+
+            def _update_hint():
+                hint_tv.setText(
+                    f"Уровень: {_LEVEL_NAMES[plugin_ref._level]} · нажмите, чтобы сменить"
+                )
+
+            def _cycle_level(_v):
+                plugin_ref._on_level_change((plugin_ref._level + 1) % 3)
+                _update_hint()
+
+            _update_hint()
+            hint_tv.setClickable(True)
+            hint_tv.setOnClickListener(OnClickListener(_cycle_level))
+            root.addView(hint_tv, LinearLayoutLP(
+                LinearLayoutLP.MATCH_PARENT, LinearLayoutLP.WRAP_CONTENT
+            ))
+
+            # Switch listener
+            OnChecked = jclass("android.widget.CompoundButton$OnCheckedChangeListener")
+
+            class _CheckedProxy(dynamic_proxy(OnChecked)):
+                def onCheckedChanged(self_i, cb, checked):
+                    try:
+                        plugin_ref._on_enabled_change(bool(checked))
+                    except Exception as ex:
+                        log(f"[1337] switch: {ex}")
+
+            sw.setOnCheckedChangeListener(_CheckedProxy())
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_view(root, -2)  # -2 = WRAP_CONTENT (раньше было dp(0) — высота 0)
+            builder.set_positive_button("Готово")
+            builder.show()
+
+        except Exception as e:
+            self.log(f"[1337] toggle: {e}")
+            # Fallback: просто переключаем
+            self._on_enabled_change(not self._enabled)
+
+    # ── хук отправки ─────────────────────────────────────────────────────────
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not self._enabled:
+                return HookResult()
+            msg = params.message
+            if not isinstance(msg, str) or not msg.strip():
+                return HookResult()
+            if self._skip_commands and _COMMAND_RE.match(msg):
+                return HookResult()
+
+            tbl = self._get_leet_table()
+            new_msg = _convert_message(msg, tbl, self._frequency, self._skip_urls)
+            if new_msg == msg:
+                return HookResult()
+
+            params.message = new_msg
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        except Exception as e:
+            self.log(f"[1337] send: {e}")
+            return HookResult()
+
+    # ── настройки ────────────────────────────────────────────────────────────
+
+    def _on_enabled_change(self, v):
+        v = bool(v)
+        self.set_setting("enabled", v)
+        self._reload_cache()
+        self._refresh_btn()
+        BulletinHelper.show_info("1337 включён ✅" if v else "1337 выключен ⛔")
+
+    def _on_flag_change(self, key: str, v):
+        """Общий обработчик для переключателей — раньше кэш для них не обновлялся
+        до перезагрузки плагина."""
+        self.set_setting(key, bool(v))
+        self._reload_cache()
+
+    def _on_level_change(self, idx):
+        idx = max(0, min(2, int(idx)))
+        self.set_setting("level", idx)
+        self._reload_cache()
+        BulletinHelper.show_success(f"Уровень: {_LEVEL_NAMES[idx]}")
+
+    def _on_frequency_change(self, v):
+        try:
+            val = max(1, min(100, int(str(v).strip())))
+            self.set_setting("frequency", val)
+            self._frequency = val
+            BulletinHelper.show_success(f"Частота замен: {val}%")
+        except Exception:
+            BulletinHelper.show_error("Введите число от 1 до 100")
+
+    def _on_char_change(self, key: str, orig: str, val: str):
+        val = str(val).strip() or orig
+        self.set_setting(key, val, reload_settings=True)
+        self._table_dirty = True
+        BulletinHelper.show_success(f"{orig} -> {val}")
+
+    def _reset_chars(self, lang: str):
+        for key, orig, default in CUSTOM_CHARS:
+            is_ru = ord(orig) >= 128
+            if (lang == "ru" and is_ru) or (lang == "en" and not is_ru):
+                self.set_setting(key, default)
+        self._table_dirty = True
+        self.set_setting("enabled", self._enabled, reload_settings=True)
+        BulletinHelper.show_success("Символы сброшены ✅")
+
+    def _create_chars_page(self, lang: str) -> List[Any]:
+        is_ru_page = lang == "ru"
+        chars = [c for c in CUSTOM_CHARS if (ord(c[1]) >= 128) == is_ru_page]
+        items = [Header(text="Русские символы" if is_ru_page else "Английские символы")]
+        for key, orig, default in chars:
+            cur = str(self.get_setting(key, default))
+            items.append(Input(
+                key=key,
+                text=f"{orig}: {cur}",
+                default=default,
+                icon="msg_edit",
+                subtext=f"Замена для '{orig}' (сейчас: '{cur}')",
+                on_change=lambda v, k=key, o=orig: self._on_char_change(k, o, v),
+            ))
+        items.append(Divider())
+        items.append(Text(
+            text="Сбросить RU к стандарту" if is_ru_page else "Сбросить EN к стандарту",
+            icon="menu_delete", red=True,
+            on_click=lambda v, l=lang: self._reset_chars(l),
+        ))
+        return items
+
+    def _create_en_chars_page(self) -> List[Any]:
+        return self._create_chars_page("en")
+
+    def _create_ru_chars_page(self) -> List[Any]:
+        return self._create_chars_page("ru")
+
+    def create_settings(self) -> List[Any]:
+        try:
+            return [
+                Header(text="Основные"),
+                Switch(key="enabled", text="Включить leet speak",
+                       default=self.DEFAULT_ENABLED, icon="msg_edit",
+                       on_change=self._on_enabled_change),
+                Switch(key="show_button", text="Кнопка в строке ввода",
+                       default=self.DEFAULT_SHOW_BUTTON, icon="filled_info",
+                       subtext="Требуется перезайти в чат",
+                       on_change=lambda v: self._on_flag_change("show_button", v)),
+                Divider(),
+                Header(text="Преобразование"),
+                Selector(key="level", text="Интенсивность замен",
+                         default=self.DEFAULT_LEVEL, icon="msg_list",
+                         items=["Лёгкий (4,3,0,5)", "Средний (+1,7,8,9)", "Полный (+|,2,w)"],
+                         on_change=self._on_level_change),
+                Input(key="frequency", text="Частота замены букв (%)",
+                      default=self.DEFAULT_FREQUENCY, icon="msg_stats",
+                      subtext="От 1 до 100 — какой % символов будет заменён",
+                      on_change=self._on_frequency_change),
+                Divider(),
+                Header(text="Исключения"),
+                Switch(key="skip_commands", text="Пропускать команды (. и /)",
+                       default=self.DEFAULT_SKIP_COMMANDS, icon="msg_bot",
+                       on_change=lambda v: self._on_flag_change("skip_commands", v)),
+                Switch(key="skip_urls", text="Не трогать ссылки и @упоминания",
+                       default=self.DEFAULT_SKIP_URLS, icon="msg_link",
+                       on_change=lambda v: self._on_flag_change("skip_urls", v)),
+                Divider(),
+                Header(text="Таблица символов"),
+                Text(text="Английские символы", icon="msg_language",
+                     create_sub_fragment=self._create_en_chars_page),
+                Text(text="Русские символы", icon="msg_language",
+                     create_sub_fragment=self._create_ru_chars_page),
+                Divider(),
+                Text(text="Кнопка (i) в строке ввода — быстрый переключатель.",
+                     icon="filled_info"),
+            ]
+        except Exception as e:
+            self.log(f"[1337] settings: {e}")
+            return [Header(text="Ошибка загрузки настроек")]
+
+
+plugin = LeetSpeakPlugin()
