@@ -1,0 +1,1052 @@
+__id__ = "temporary_messages"
+__name__ = "TemporaryMessages"
+__description__ = "Автоудаление сообщений по таймеру."
+__author__ = "@LuPlugins (@optimist_opti)"
+__version__ = "1.0"
+__icon__ = "formyetgplugins_by_fStikBot/45"
+__min_version__ = "12.5.1"
+
+import json
+import os
+import threading
+import time
+import weakref
+from typing import Any, Callable, Optional
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Selector, Switch
+
+from java import dynamic_proxy, jclass
+from java.lang import Boolean, Integer, Long, Runnable
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+from org.telegram.ui.Components import AlertsCreator
+
+
+JOBS_FILE = "sdt_jobs.json"
+SLOT_TTL = 60
+ARMED_TTL = 10
+FATAL_DELETE_ERRORS = (
+    "MESSAGE_ID_INVALID", "MESSAGE_DELETE_FORBIDDEN",
+    "CHANNEL_INVALID", "CHANNEL_PRIVATE", "CHAT_ADMIN_REQUIRED",
+)
+
+
+class _Reflect:
+    _cache: dict = {}
+
+    @classmethod
+    def _field(cls, obj, name):
+        jc = obj.getClass()
+        key = (jc.getName(), name)
+        if key in cls._cache:
+            return cls._cache[key]
+        field = None
+        c = jc
+        while c is not None:
+            try:
+                field = c.getDeclaredField(name)
+                field.setAccessible(True)
+                break
+            except Exception:
+                field = None
+                try:
+                    c = c.getSuperclass()
+                except Exception:
+                    c = None
+        cls._cache[key] = field
+        return field
+
+    @classmethod
+    def get(cls, obj, name, default=None):
+        if obj is None:
+            return default
+        try:
+            f = cls._field(obj, name)
+            if f is None:
+                return default
+            v = f.get(obj)
+            return default if v is None else v
+        except Exception:
+            return default
+
+    @classmethod
+    def set(cls, obj, name, value) -> bool:
+        try:
+            f = cls._field(obj, name)
+            if f is None:
+                return False
+            f.set(obj, value)
+            return True
+        except Exception:
+            return False
+
+
+def _int_field(obj, name: str, default: int) -> int:
+    try:
+        return int(_Reflect.get(obj, name, default))
+    except Exception:
+        return default
+
+
+_runnable_base = None
+
+
+def _prepare_runnable_base():
+    global _runnable_base
+    if _runnable_base is None:
+        _runnable_base = dynamic_proxy(Runnable)
+    return _runnable_base
+
+
+def _runnable(fn: Callable):
+    base = _prepare_runnable_base()
+
+    class _R(base):
+        def run(self_r):
+            try:
+                fn()
+            except Exception:
+                pass
+    return _R()
+
+
+def _post(fn: Callable, delay_ms: int = 0):
+    try:
+        if delay_ms > 0:
+            run_on_ui_thread(fn, delay_ms)
+        else:
+            run_on_ui_thread(fn)
+    except TypeError:
+        from android.os import Handler, Looper
+        Handler(Looper.getMainLooper()).postDelayed(_runnable(fn), int(delay_ms))
+
+
+def _cache_dir() -> str:
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        base = str(ApplicationLoader.getFilesDirFixed()) + "/plugins/cache"
+    except Exception:
+        base = "."
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
+def _job_key(account: int, dialog_id: int, msg_id: int) -> str:
+    return f"{account}:{dialog_id}:{msg_id}"
+
+
+def _fmt_left(delete_at: float) -> str:
+    diff = int(delete_at - time.time() + 0.999)
+    if diff <= 0:
+        return "0:00"
+    if diff < 3600:
+        return f"{diff // 60}:{diff % 60:02d}"
+    if diff < 86400:
+        h, r = divmod(diff, 3600)
+        return f"{h}:{r // 60:02d}:{r % 60:02d}"
+    d, r = divmod(diff, 86400)
+    return f"{d}д {r // 3600}ч"
+
+
+def _text_height(msg) -> Optional[float]:
+    h = _Reflect.get(msg, "textHeight")
+    if h is not None:
+        return float(h)
+    try:
+        return float(msg.textHeight())
+    except Exception:
+        pass
+    blocks = _Reflect.get(msg, "textLayoutBlocks")
+    h = _Reflect.get(blocks, "textHeight") if blocks is not None else None
+    return float(h) if h is not None else None
+
+
+def _simple_text_blocker(cell, msg) -> Optional[str]:
+    try:
+        if cell.getCurrentMessagesGroup() is not None:
+            return "group"
+        if msg.hasValidReplyMessageObject():
+            return "reply"
+        if msg.isForwarded():
+            return "forward"
+        media = msg.messageOwner.media
+        if media is not None and media.getClass().getSimpleName() != "TL_messageMediaEmpty":
+            return "media"
+        if bool(_Reflect.get(cell, "hasLinkPreview", False)):
+            return "preview"
+        entities = msg.messageOwner.entities
+        if entities is not None and int(entities.size()) > 0:
+            return "entities"
+        from org.telegram.ui.ActionBar import Theme
+        height = _text_height(msg)
+        if height is not None:
+            if height > float(Theme.chat_msgTextPaint.getTextSize()) * 2.0:
+                return "multiline"
+            return None
+        total = _Reflect.get(cell, "totalHeight")
+        if total is None:
+            return "unknown text height"
+        if float(total) > AndroidUtilities.dpf2(52):
+            return "multiline"
+        return None
+    except Exception as e:
+        return f"error: {e}"
+
+
+class _Storage:
+    def __init__(self, path: str):
+        self._path = path
+        self._lock = threading.Lock()
+        self._jobs: dict = self._load()
+
+    def _load(self) -> dict:
+        try:
+            if not os.path.exists(self._path):
+                return {}
+            with open(self._path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            return {}
+        jobs = {}
+        for k, v in raw.items():
+            try:
+                msg_id = int(str(k).rsplit(":", 1)[-1])
+                account, dialog_id = int(v["account"]), int(v["dialog_id"])
+                jobs[_job_key(account, dialog_id, msg_id)] = {
+                    "account": account,
+                    "dialog_id": dialog_id,
+                    "msg_id": msg_id,
+                    "delete_at": float(v["delete_at"]),
+                }
+            except Exception:
+                continue
+        return jobs
+
+    def _flush(self):
+        try:
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._jobs, f)
+            os.replace(tmp, self._path)
+        except Exception:
+            pass
+
+    def add(self, account: int, dialog_id: int, msg_id: int, delete_at: float):
+        with self._lock:
+            self._jobs[_job_key(account, dialog_id, msg_id)] = {
+                "account": account,
+                "dialog_id": dialog_id,
+                "msg_id": msg_id,
+                "delete_at": delete_at,
+            }
+            self._flush()
+
+    def remove(self, key: str):
+        with self._lock:
+            if self._jobs.pop(key, None) is not None:
+                self._flush()
+
+    def get(self, key: str) -> Optional[dict]:
+        return self._jobs.get(key)
+
+    def items(self) -> list:
+        with self._lock:
+            return list(self._jobs.items())
+
+    def empty(self) -> bool:
+        return not self._jobs
+
+
+class _Scheduler:
+    def __init__(self, plugin):
+        self._plugin = plugin
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._inflight: set = set()
+        self._retry_at: dict = {}
+        self._tries: dict = {}
+
+    def start(self):
+        self._stop.clear()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def wake(self):
+        self._wake.set()
+
+    def done(self, key: str):
+        self._inflight.discard(key)
+        self._retry_at.pop(key, None)
+        self._tries.pop(key, None)
+        self._plugin.storage.remove(key)
+
+    def retry_later(self, key: str):
+        tries = self._tries.get(key, 0) + 1
+        self._tries[key] = tries
+        self._inflight.discard(key)
+        self._retry_at[key] = time.time() + min(30 * tries, 300)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            wait = 5.0
+            try:
+                wait = self._step()
+            except Exception as e:
+                self._plugin.log(f"[TM] scheduler error: {e}")
+            self._wake.wait(timeout=wait)
+            self._wake.clear()
+
+    def _step(self) -> float:
+        now = time.time()
+        wait = 5.0
+        for key, job in self._plugin.storage.items():
+            due = max(job["delete_at"], self._retry_at.get(key, 0.0))
+            if due <= now:
+                if key not in self._inflight:
+                    self._inflight.add(key)
+                    self._plugin.delete_job(key, job)
+            else:
+                wait = min(wait, due - now)
+        return max(0.25, wait)
+
+
+class _DrawHook(MethodHook):
+    ICON_NAMES = ("msg_delete_auto", "msg_timer", "settings_delete", "msg_delete_filled")
+
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+        self._paint = None
+        self._icon = None
+        self._icon_tried = False
+
+    def _get_paint(self):
+        if self._paint is None:
+            p = jclass("android.graphics.Paint")()
+            p.setAntiAlias(True)
+            self._paint = p
+        return self._paint
+
+    def _get_icon(self):
+        if self._icon is None and not self._icon_tried:
+            self._icon_tried = True
+            try:
+                from org.telegram.messenger import ApplicationLoader
+                R = jclass("org.telegram.messenger.R")
+                for name in self.ICON_NAMES:
+                    try:
+                        res = getattr(R.drawable, name)
+                    except Exception:
+                        continue
+                    self._icon = ApplicationLoader.applicationContext.getResources() \
+                        .getDrawable(res, None).mutate()
+                    break
+            except Exception:
+                self._icon = None
+        return self._icon
+
+    @staticmethod
+    def _time_color() -> int:
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            return int(Theme.getColor(Theme.key_chat_outTimeText))
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _accent_color(msg) -> int:
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            try:
+                read = not bool(msg.isUnread())
+            except Exception:
+                read = False
+            key = Theme.key_chat_outSentCheckRead if read else Theme.key_chat_outSentCheck
+            return int(Theme.getColor(key))
+        except Exception:
+            return _DrawHook._time_color()
+
+    def after_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None or plugin.storage.empty():
+            return
+        try:
+            cell, canvas = param.thisObject, param.args[0]
+            msg = cell.getMessageObject()
+            if msg is None:
+                return
+            job = plugin.job_for(msg)
+            if job is None:
+                return
+            self._draw(plugin, cell, canvas, _fmt_left(job["delete_at"]), self._accent_color(msg))
+        except Exception as e:
+            plugin.log(f"[TM] draw error: {e}")
+
+    def _draw(self, plugin, cell, canvas, label: str, accent: int):
+        time_layout = _Reflect.get(cell, "timeLayout")
+        tx = _Reflect.get(cell, "drawTimeX")
+        ty = _Reflect.get(cell, "drawTimeY")
+        if time_layout is None or tx is None or ty is None:
+            return
+        tx, ty = float(tx), float(ty)
+
+        from org.telegram.ui.ActionBar import Theme
+        dp = AndroidUtilities.dpf2
+
+        paint = self._get_paint()
+        paint.setColor(self._time_color())
+        paint.setTextSize(float(Theme.chat_timePaint.getTextSize()) * 0.92)
+        fm = paint.getFontMetrics()
+        text_h = float(fm.descent - fm.ascent)
+        text_w = float(paint.measureText(label))
+
+        try:
+            time_w = float(time_layout.getLineWidth(0))
+        except Exception:
+            time_w = float(_Reflect.get(cell, "timeWidth", 0) or 0)
+
+        if int(cell.hashCode()) in plugin.shifted:
+            baseline = dp(6.5) - float(fm.ascent)
+        else:
+            baseline = ty - dp(1) - float(fm.descent)
+
+        text_left = tx + time_w - text_w
+        if text_left < dp(6):
+            return
+
+        icon = self._get_icon()
+        if icon is not None:
+            icon_sz = int(text_h * 0.95)
+            cy = baseline + (float(fm.ascent) + float(fm.descent)) / 2.0
+            ix = int(tx + time_w + dp(13) - icon_sz / 2.0)
+            iy = int(cy - icon_sz / 2.0)
+            icon.setTint(accent)
+            icon.setBounds(ix, iy, ix + icon_sz, iy + icon_sz)
+            icon.draw(canvas)
+        canvas.drawText(label, text_left, baseline, paint)
+
+
+class _MeasureHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+        self._set_dim = None
+
+    def _setter(self):
+        if self._set_dim is None:
+            view = jclass("java.lang.Class").forName("android.view.View")
+            int_t = jclass("java.lang.Integer").TYPE
+            m = view.getDeclaredMethod("setMeasuredDimension", int_t, int_t)
+            m.setAccessible(True)
+            self._set_dim = m
+        return self._set_dim
+
+    def before_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None:
+            return
+        try:
+            plugin.sync_shift(param.thisObject)
+        except Exception as e:
+            plugin.log(f"[TM] shift sync error: {e}")
+
+    def after_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None or plugin.storage.empty():
+            return
+        try:
+            cell = param.thisObject
+            msg = cell.getMessageObject()
+            if msg is None or cell.getCurrentMessagesGroup() is not None:
+                return
+            if _Reflect.get(cell, "timeLayout") is None or plugin.job_for(msg) is None:
+                return
+            self._setter().invoke(cell, Integer(int(cell.getMeasuredWidth())),
+                                  Integer(int(cell.getMeasuredHeight())
+                                  + plugin.extra_height(int(cell.hashCode()) in plugin.shifted)))
+        except Exception as e:
+            plugin.log(f"[TM] measure error: {e}")
+
+
+class _TextShiftHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+        self._saved = []
+
+    def before_hooked_method(self, param):
+        saved = False
+        try:
+            plugin = self._ref()
+            if plugin is not None and int(param.thisObject.hashCode()) in plugin.shifted:
+                canvas = param.args[0]
+                canvas.save()
+                canvas.translate(0.0, float(plugin.extra_height(True)) - AndroidUtilities.dpf2(1.0))
+                saved = True
+        except Exception:
+            saved = False
+        self._saved.append(saved)
+
+    def after_hooked_method(self, param):
+        if self._saved and self._saved.pop():
+            try:
+                param.args[0].restore()
+            except Exception:
+                pass
+
+
+class _BindHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+
+    def after_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None:
+            return
+        try:
+            plugin.sync_shift(param.thisObject)
+        except Exception as e:
+            plugin.log(f"[TM] bind error: {e}")
+
+
+class _AckHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None:
+            return
+        try:
+            if int(param.args[0]) != plugin.ack_id:
+                return
+            a = param.args[1]
+            if a is None or len(a) < 4:
+                return
+            old_id, new_id = int(a[0]), int(a[1])
+            if new_id <= 0 or old_id == new_id:
+                return
+            account = _Reflect.get(param.thisObject, "currentAccount")
+            plugin.on_acked(None if account is None else int(account), int(a[3]), new_id, a[2])
+        except Exception as e:
+            plugin.log(f"[TM] ack hook error: {e}")
+
+
+class _MenuHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        plugin = self._ref()
+        if plugin is None:
+            return
+        try:
+            options = param.args[0]
+            fragment = get_last_fragment()
+            if options is None or fragment is None:
+                return
+            dialog_id, account = plugin.fragment_peer(fragment)
+            if not dialog_id:
+                return
+
+            preview = param.thisObject
+
+            def on_click():
+                for obj in (preview, options):
+                    for attr in ("dismiss", "dismissInternal"):
+                        try:
+                            getattr(obj, attr)()
+                            break
+                        except Exception:
+                            continue
+                _post(lambda: plugin.show_date_picker(fragment, dialog_id, account), 50)
+
+            R = jclass("org.telegram.messenger.R")
+            icon = 0
+            for name in ("menu_premium_clock", "msg_calendar2"):
+                try:
+                    icon = getattr(R.drawable, name)
+                    break
+                except Exception:
+                    continue
+            options.add(icon, "Отправить с таймером", _runnable(on_click))
+        except Exception as e:
+            plugin.log(f"[TM] menu hook error: {e}")
+
+
+class TemporaryMessagesPlugin(BasePlugin):
+
+    TIME_UNITS = [("секунды", 1), ("минуты", 60), ("часы", 3600), ("дни", 86400)]
+
+    def on_plugin_load(self):
+        self._alive = True
+        self._lock = threading.Lock()
+        self._slots: list = []
+        self._armed: Optional[dict] = None
+        self.shifted: dict = {}
+        self._logged: set = set()
+        self.ack_id = None
+        self._date_delegate_base = None
+        self._request_delegate_base = None
+
+        self.storage = _Storage(os.path.join(_cache_dir(), JOBS_FILE))
+        self._scheduler = _Scheduler(self)
+
+        run_on_ui_thread(self._prepare_proxies)
+
+        self.add_on_send_message_hook()
+        self._hook_menu()
+        self._hook_ack()
+        self._hook_cell()
+
+        self._scheduler.start()
+        _post(self._ui_tick, 1000)
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._scheduler.stop()
+
+    def _prepare_proxies(self):
+        try:
+            _prepare_runnable_base()
+        except Exception as e:
+            self.log(f"[TM] runnable proxy error: {e}")
+        try:
+            cls = find_class("org.telegram.ui.Components.AlertsCreator$ScheduleDatePickerDelegate")
+            if cls:
+                self._date_delegate_base = dynamic_proxy(cls)
+        except Exception as e:
+            self.log(f"[TM] date delegate proxy error: {e}")
+        try:
+            self._request_delegate_base = dynamic_proxy(jclass("org.telegram.tgnet.RequestDelegate"))
+        except Exception as e:
+            self.log(f"[TM] request delegate proxy error: {e}")
+
+    def create_settings(self):
+        return [
+            Header(text="Пассивный режим"),
+            Switch(
+                key="passive_enabled",
+                text="Автоудалять исходящие",
+                default=False,
+                icon="msg_delete_auto",
+            ),
+            Input(
+                key="passive_delay_amount",
+                text="Через сколько удалять",
+                default="5",
+                icon="msg_schedule",
+            ),
+            Selector(
+                key="passive_delay_unit_idx",
+                text="Единица времени",
+                default=1,
+                items=[label for label, _ in self.TIME_UNITS],
+                icon="msg_calendar2",
+            ),
+        ]
+
+    def _passive_delay_seconds(self) -> int:
+        try:
+            amount = int(str(self.get_setting("passive_delay_amount", "5")).strip())
+        except Exception:
+            amount = 5
+        try:
+            unit = self.TIME_UNITS[int(self.get_setting("passive_delay_unit_idx", 1))][1]
+        except Exception:
+            unit = 60
+        return max(5, amount * unit)
+
+    def _hook_menu(self):
+        try:
+            cls = jclass("java.lang.Class").forName("org.telegram.ui.MessageSendPreview")
+            for m in cls.getDeclaredMethods():
+                if m.getName() == "setItemOptions":
+                    m.setAccessible(True)
+                    self.hook_method(m, _MenuHook(self))
+                    return
+            self.log("[TM] setItemOptions not found")
+        except Exception as e:
+            self.log(f"[TM] menu hook failed: {e}")
+
+    def _hook_ack(self):
+        try:
+            nc = jclass("org.telegram.messenger.NotificationCenter")
+            self.ack_id = int(nc.messageReceivedByServer)
+            cls = jclass("java.lang.Class").forName("org.telegram.messenger.NotificationCenter")
+            for m in cls.getDeclaredMethods():
+                if m.getName() != "postNotificationName":
+                    continue
+                pt = m.getParameterTypes()
+                if len(pt) == 2 and pt[0].getName() == "int" and pt[1].isArray():
+                    m.setAccessible(True)
+                    self.hook_method(m, _AckHook(self))
+                    return
+            self.log("[TM] postNotificationName not found")
+        except Exception as e:
+            self.log(f"[TM] ack hook failed: {e}")
+
+    def _hook_cell(self):
+        try:
+            cls = jclass("java.lang.Class").forName("org.telegram.ui.Cells.ChatMessageCell")
+            canvas = jclass("java.lang.Class").forName("android.graphics.Canvas")
+            int_t = jclass("java.lang.Integer").TYPE
+
+            m = cls.getDeclaredMethod("onDraw", canvas)
+            m.setAccessible(True)
+            self.hook_method(m, _DrawHook(self))
+
+            m = cls.getDeclaredMethod("onMeasure", int_t, int_t)
+            m.setAccessible(True)
+            self.hook_method(m, _MeasureHook(self))
+
+            for m in cls.getDeclaredMethods():
+                if m.getName() == "setMessageContent":
+                    m.setAccessible(True)
+                    self.hook_method(m, _BindHook(self))
+
+            shift_hook = _TextShiftHook(self)
+            for name in ("drawMessageText",):
+                found = False
+                for m in cls.getDeclaredMethods():
+                    pt = m.getParameterTypes()
+                    if m.getName() == name and len(pt) > 0 and pt[0].getName() == "android.graphics.Canvas":
+                        m.setAccessible(True)
+                        self.hook_method(m, shift_hook)
+                        found = True
+                if not found:
+                    self.log(f"[TM] {name} not found")
+        except Exception as e:
+            self.log(f"[TM] cell hook failed: {e}")
+
+    def job_for(self, msg) -> Optional[dict]:
+        return self.storage.get(_job_key(_int_field(msg, "currentAccount", -1),
+                                         int(msg.getDialogId()), int(msg.getId())))
+
+    def extra_height(self, band: bool = False) -> int:
+        from org.telegram.ui.ActionBar import Theme
+        size = float(Theme.chat_timePaint.getTextSize())
+        if band:
+            return int(size * 0.6)
+        return int(AndroidUtilities.dpf2(2) + size * 1.15)
+
+    def _log_once(self, text: str):
+        if text not in self._logged:
+            self._logged.add(text)
+            self.log(f"[TM] {text}")
+
+    def sync_shift(self, cell):
+        key = int(cell.hashCode())
+        msg = cell.getMessageObject()
+        want = False
+        if msg is not None and not self.storage.empty() and self.job_for(msg) is not None:
+            blocker = _simple_text_blocker(cell, msg)
+            want = blocker is None
+            if not want:
+                self._log_once(f"no text shift: {blocker}")
+        if want:
+            self.shifted[key] = True
+        else:
+            self.shifted.pop(key, None)
+
+    def _ui_tick(self):
+        if not self._alive:
+            return
+        try:
+            if not self.storage.empty():
+                fragment = get_last_fragment()
+                if fragment is not None and fragment.getClass().getSimpleName() == "ChatActivity":
+                    rv = _Reflect.get(fragment, "chatListView")
+                    if rv is not None:
+                        for i in range(int(rv.getChildCount())):
+                            child = rv.getChildAt(i)
+                            if child.getClass().getSimpleName() != "ChatMessageCell":
+                                continue
+                            msg = child.getMessageObject()
+                            if msg is not None and self.job_for(msg) is not None:
+                                child.invalidate()
+        except Exception as e:
+            self.log(f"[TM] tick error: {e}")
+        _post(self._ui_tick, 1000)
+
+    @staticmethod
+    def fragment_peer(fragment):
+        try:
+            dialog_id = int(fragment.getDialogId())
+        except Exception:
+            dialog_id = int(_Reflect.get(fragment, "dialog_id", 0) or 0)
+        try:
+            account = int(fragment.getCurrentAccount())
+        except Exception:
+            account = int(_Reflect.get(fragment, "currentAccount", 0) or 0)
+        return dialog_id, account
+
+    def _arm(self, delete_at: float, dialog_id: int, account: int):
+        with self._lock:
+            self._armed = {"delete_at": delete_at, "dialog_id": dialog_id,
+                           "account": account, "created": time.time()}
+
+    def _take_armed(self) -> Optional[dict]:
+        with self._lock:
+            armed, self._armed = self._armed, None
+        if armed and time.time() - armed["created"] <= ARMED_TTL:
+            return armed
+        return None
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if int(_Reflect.get(params, "scheduleDate", 0) or 0) > 0:
+                return HookResult()
+
+            armed = self._take_armed()
+            if armed is not None:
+                delete_at = armed["delete_at"]
+            elif self.get_setting("passive_enabled", False):
+                delete_at = time.time() + self._passive_delay_seconds()
+            else:
+                return HookResult()
+
+            dialog_id = int(_Reflect.get(params, "peer", 0) or 0)
+            if not dialog_id:
+                fragment = get_last_fragment()
+                dialog_id = self.fragment_peer(fragment)[0] if fragment else 0
+            if not dialog_id:
+                return HookResult()
+
+            text = _Reflect.get(params, "message", None)
+            with self._lock:
+                self._slots.append({
+                    "account": int(account),
+                    "dialog_id": dialog_id,
+                    "delete_at": delete_at,
+                    "text": str(text) if text is not None else "",
+                    "created": time.time(),
+                })
+        except Exception as e:
+            self.log(f"[TM] send hook error: {e}")
+        return HookResult()
+
+    def on_acked(self, account: Optional[int], dialog_id: int, msg_id: int, msg):
+        try:
+            text = str(getattr(msg, "message", "") or "")
+        except Exception:
+            text = ""
+        now = time.time()
+        with self._lock:
+            self._slots = [s for s in self._slots if now - s["created"] <= SLOT_TTL]
+            slot = None
+            for s in self._slots:
+                if s["dialog_id"] != dialog_id:
+                    continue
+                if account is not None and s["account"] != account:
+                    continue
+                if s["text"] and text and s["text"] != text:
+                    continue
+                slot = s
+                break
+            if slot is None:
+                return
+            self._slots.remove(slot)
+        self.storage.add(slot["account"], dialog_id, msg_id, slot["delete_at"])
+        self._scheduler.wake()
+
+    def show_date_picker(self, fragment, dialog_id: int, account: int):
+        try:
+            context = fragment.getParentActivity()
+            base = self._date_delegate_base
+            if context is None or base is None:
+                return
+            server_now = int(ConnectionsManager.getInstance(account).getCurrentTime())
+            clock_offset = server_now - int(time.time())
+            plugin = self
+
+            send_runnable = _runnable(lambda: plugin._send_from_field(fragment, dialog_id, account))
+
+            class _Delegate(base):
+                def didSelectDate(self_d, notify, schedule_date, *args):
+                    plugin._arm(float(int(schedule_date) - clock_offset), dialog_id, account)
+                    from android.os import Handler, Looper
+                    Handler(Looper.getMainLooper()).postDelayed(send_runnable, 50)
+
+            dialog = AlertsCreator.createDatePickerDialog(
+                context, "Удалить сообщение", "Установить", server_now, _Delegate()
+            )
+            if dialog:
+                dialog.show()
+        except Exception as e:
+            self.log(f"[TM] date picker error: {e}")
+
+    def _send_from_field(self, fragment, dialog_id: int, account: int):
+        try:
+            ev = _Reflect.get(fragment, "chatActivityEnterView")
+            text = ev.getFieldText() if ev is not None else None
+            if ev is None or text is None or int(text.length()) == 0:
+                self._take_armed()
+                try:
+                    BulletinHelper.show_error("Сначала введите текст сообщения")
+                except Exception:
+                    pass
+                return
+
+            methods = {(m.getName(), len(m.getParameterTypes())): m
+                       for m in ev.getClass().getDeclaredMethods()}
+            m = methods.get(("sendMessage", 0))
+            if m is not None:
+                m.setAccessible(True)
+                m.invoke(ev)
+                return
+            m = methods.get(("sendMessageInternal", 3))
+            if m is not None:
+                m.setAccessible(True)
+                m.invoke(ev, Boolean.valueOf(True), Integer(0), Boolean.valueOf(True))
+                return
+            self._send_manually(fragment, ev, text, dialog_id, account)
+        except Exception as e:
+            self._take_armed()
+            self.log(f"[TM] send error: {e}")
+
+    def _send_manually(self, fragment, ev, text, dialog_id: int, account: int):
+        smh = jclass("java.lang.Class").forName("org.telegram.messenger.SendMessagesHelper")
+        params_cls = next((c for c in smh.getDeclaredClasses()
+                           if c.getSimpleName() == "SendMessageParams"), None)
+        if params_cls is None:
+            raise RuntimeError("SendMessageParams not found")
+        of = next((m for m in params_cls.getDeclaredMethods()
+                   if m.getName() == "of" and len(m.getParameterTypes()) >= 2
+                   and m.getParameterTypes()[0].getName() == "java.lang.String"), None)
+        if of is None:
+            raise RuntimeError("SendMessageParams.of not found")
+        of.setAccessible(True)
+        params = of.invoke(None, str(text), Long.valueOf(dialog_id))
+
+        try:
+            entities = jclass("java.util.ArrayList")()
+            jclass("org.telegram.messenger.MediaDataController").addTextStyleRuns(
+                entities, text, ev.getEditText())
+            if entities.size() > 0:
+                _Reflect.set(params, "entities", entities)
+        except Exception:
+            pass
+        try:
+            reply = ev.getReplyingMessageObject()
+            if reply is not None:
+                _Reflect.set(params, "replyToMsg", reply)
+        except Exception:
+            pass
+
+        jclass("org.telegram.messenger.SendMessagesHelper").getInstance(account).sendMessage(params)
+        ev.setFieldText("")
+        try:
+            fragment.hideFieldPanel(True)
+        except Exception:
+            pass
+
+    def delete_job(self, key: str, job: dict):
+        plugin = self
+        cb = None
+        base = self._request_delegate_base
+        if base is not None:
+            class _Callback(base):
+                def run(self_cb, response, error, *args):
+                    try:
+                        if error is None:
+                            plugin._after_request_delete(job)
+                            plugin._scheduler.done(key)
+                        elif any(code in str(error.text) for code in FATAL_DELETE_ERRORS):
+                            plugin._scheduler.done(key)
+                        else:
+                            plugin.log(f"[TM] delete error: {error.text}")
+                            plugin._scheduler.retry_later(key)
+                    except Exception:
+                        plugin._scheduler.retry_later(key)
+            cb = _Callback()
+
+        def work():
+            try:
+                if self._delete_via_controller(job):
+                    self._scheduler.done(key)
+                elif cb is not None:
+                    self._delete_via_request(job, cb)
+                else:
+                    self._scheduler.retry_later(key)
+            except Exception as e:
+                self.log(f"[TM] delete failed: {e}")
+                self._scheduler.retry_later(key)
+
+        run_on_ui_thread(work)
+
+    def _delete_via_controller(self, job: dict) -> bool:
+        from org.telegram.messenger import MessagesController
+        mc = MessagesController.getInstance(job["account"])
+        cls = jclass("java.lang.Class").forName("org.telegram.messenger.MessagesController")
+        candidates = []
+        for m in cls.getDeclaredMethods():
+            pt = m.getParameterTypes()
+            if (m.getName() == "deleteMessages" and len(pt) >= 5
+                    and pt[0].getName() == "java.util.ArrayList" and pt[3].getName() == "long"):
+                candidates.append((len(pt), m, pt))
+        if not candidates:
+            return False
+        _, m, pt = min(candidates, key=lambda c: c[0])
+
+        ids = jclass("java.util.ArrayList")()
+        ids.add(Integer(job["msg_id"]))
+        args = [ids, None, None, Long.valueOf(job["dialog_id"])]
+        first_bool = True
+        for t in pt[4:]:
+            n = t.getName()
+            if n == "boolean":
+                args.append(Boolean.valueOf(first_bool))
+                first_bool = False
+            elif n == "int":
+                args.append(Integer(0))
+            elif n == "long":
+                args.append(Long.valueOf(0))
+            else:
+                args.append(None)
+        m.setAccessible(True)
+        m.invoke(mc, *args)
+        return True
+
+    def _delete_via_request(self, job: dict, cb):
+        from org.telegram.messenger import ChatObject, MessagesController
+        account, dialog_id, msg_id = job["account"], job["dialog_id"], job["msg_id"]
+        chat = None
+        if dialog_id < 0:
+            chat = MessagesController.getInstance(account).getChat(Long.valueOf(-dialog_id))
+        if chat is not None and ChatObject.isChannel(chat):
+            req = TLRPC.TL_channels_deleteMessages()
+            req.channel = MessagesController.getInputChannel(chat)
+        else:
+            req = TLRPC.TL_messages_deleteMessages()
+            req.revoke = True
+        req.id.add(Integer(msg_id))
+        ConnectionsManager.getInstance(account).sendRequest(req, cb)
+
+    def _after_request_delete(self, job: dict):
+        def notify():
+            try:
+                from org.telegram.messenger import NotificationCenter
+                ids = jclass("java.util.ArrayList")()
+                ids.add(Integer(job["msg_id"]))
+                channel_id = -job["dialog_id"] if job["dialog_id"] < 0 else 0
+                NotificationCenter.getInstance(job["account"]).postNotificationName(
+                    NotificationCenter.messagesDeleted, ids, Long.valueOf(channel_id),
+                    Boolean.valueOf(False))
+            except Exception as e:
+                self.log(f"[TM] notify error: {e}")
+        run_on_ui_thread(notify)
