@@ -1,0 +1,211 @@
+import threading
+import time
+from datetime import datetime
+from typing import Any, Dict, List
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, get_messages_controller, get_user_config, send_request
+from java.lang import Integer, Long
+from java.util import ArrayList
+from org.telegram.messenger import ChatObject, LocaleController, UserConfig
+from org.telegram.tgnet import TLRPC
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "del_my_msgs"
+__name__ = "Delete My Messages"
+__description__ = "Добавляет в меню чата кнопку, которая удаляет все ваши сообщения в текущем чате (с запросом подтверждения)."
+__author__ = "@akresik"
+__version__ = "1.1.0"
+__icon__ = "SpottyAndPersikAnimated/6"
+__min_version__ = "12.10.6"
+
+BATCH_SIZE = 100
+NOTIFY_EVERY = 2500
+
+STRINGS = {
+    "ru": {
+        "menu": "Удалить свои сообщения",
+        "title": "Удаление сообщений",
+        "confirm_text": "Вы точно хотите удалить свои сообщения ({count})? Это действие необратимо.",
+        "yes": "Да",
+        "no": "Нет",
+        "started": "Началось удаление сообщений…",
+        "nothing": "В этом чате нет ваших сообщений",
+        "progress": "Удалено сообщений: {count}",
+        "done": "Все сообщения удалены: {count}\nПериод: {start} — {end}",
+        "error": "Не удалось выполнить операцию. Подробности в логе",
+    },
+    "en": {
+        "menu": "Delete my messages",
+        "title": "Delete messages",
+        "confirm_text": "Are you sure you want to delete your messages ({count})? This cannot be undone.",
+        "yes": "Yes",
+        "no": "No",
+        "started": "Message deletion started…",
+        "nothing": "You have no messages in this chat",
+        "progress": "Messages deleted: {count}",
+        "done": "All messages deleted: {count}\nPeriod: {start} — {end}",
+        "error": "The operation failed. See the log for details",
+    },
+}
+
+def tr(key: str, **kwargs: Any) -> str:
+    language = LocaleController.getInstance().getCurrentLocale().getLanguage()
+    return STRINGS["ru" if language == "ru" else "en"][key].format(**kwargs)
+
+class DeleteMyMessagesPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(menu_type=MenuItemType.CHAT_ACTION_MENU, text=tr("menu"), on_click=self.on_menu_click, icon="msg_delete"))
+
+    def on_menu_click(self, context: Dict[str, Any]):
+        try:
+            dialog_id = context.get("dialog_id") or get_last_fragment().getDialogId()
+            if not dialog_id:
+                log(f"[DMM] on_menu_click error: dialog_id not found, keys: {context.keySet().toString()}")
+                return
+            account = context.get("account")
+            if account is None:
+                account = UserConfig.selectedAccount
+            threading.Thread(target=self.fetch_count, args=(account, dialog_id), daemon=True).start()
+        except Exception as e:
+            log(f"[DMM] on_menu_click error: {e}")
+
+    def request(self, req: Any, account: int) -> Any:
+        while True:
+            done = threading.Event()
+            result = {}
+
+            def callback(response, error):
+                result["response"], result["error"] = response, error
+                done.set()
+            send_request(req, callback, account=account)
+            done.wait()
+            error = result["error"]
+            if not error:
+                return result["response"]
+            if error.text.startswith("FLOOD_WAIT_"):
+                time.sleep(int(error.text.rsplit("_", 1)[1]))
+                continue
+            raise RuntimeError(error.text)
+
+    def build_search(self, account: int, dialog_id: int, limit: int, offset_id: int = 0, max_date: int = 0) -> Any:
+        controller = get_messages_controller(account)
+        use_sender_filter = not (dialog_id < 0 and ChatObject.isChannelAndNotMegaGroup(controller.getChat(Long(-dialog_id))))
+        req = TLRPC.TL_messages_search()
+        req.peer = controller.getInputPeer(dialog_id)
+        req.q = ""
+        req.filter = TLRPC.TL_inputMessagesFilterEmpty()
+        req.limit = limit
+        req.offset_id = offset_id
+        req.max_date = max_date
+        if use_sender_filter:
+            req.from_id = controller.getInputPeer(get_user_config(account).getClientUserId())
+            req.flags |= 1
+        return req, use_sender_filter
+
+    def fetch_count(self, account: int, dialog_id: int):
+        try:
+            req, _ = self.build_search(account, dialog_id, 1)
+            response = self.request(req, account)
+            count = getattr(response, "count", 0) or response.messages.size()
+        except Exception as e:
+            log(f"[DMM] fetch_count error: {e}")
+            BulletinHelper.show_error(tr("error"))
+            return
+        if not count:
+            BulletinHelper.show_info(tr("nothing"))
+            return
+        run_on_ui_thread(lambda: self.show_confirm(account, dialog_id, count))
+
+    def show_confirm(self, account: int, dialog_id: int, count: int):
+        try:
+            builder = AlertDialogBuilder(get_last_fragment().getParentActivity())
+            builder.set_title(tr("title"))
+            builder.set_message(tr("confirm_text", count=count))
+            def on_yes(bld, which):
+                bld.dismiss()
+                BulletinHelper.show_info(tr("started"))
+                threading.Thread(target=self.delete_all, args=(account, dialog_id), daemon=True).start()
+            builder.set_positive_button(tr("yes"), on_yes)
+            builder.set_negative_button(tr("no"), lambda bld, which: bld.dismiss())
+            builder.show()
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception as e:
+            log(f"[DMM] show_confirm error: {e}")
+
+    def delete_batch(self, account: int, dialog_id: int, ids_list: List[int]):
+        controller = get_messages_controller(account)
+        ids = ArrayList()
+        for message_id in ids_list:
+            ids.add(Integer(message_id))
+        done = threading.Event()
+        errors = []
+
+        def task():
+            try:
+                controller.deleteMessages(ids, None, None, dialog_id, 0, True, 0)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                done.set()
+        run_on_ui_thread(task)
+        done.wait()
+        if errors:
+            raise errors[0]
+
+    def delete_all(self, account: int, dialog_id: int):
+        seen = set()
+        deleted = 0
+        notified = 0
+        min_date = None
+        max_date_seen = None
+        max_date = 0
+        try:
+            while True:
+                before = len(seen)
+                window_min_date = None
+                offset_id = 0
+                while True:
+                    req, use_sender_filter = self.build_search(account, dialog_id, BATCH_SIZE, offset_id, max_date)
+                    response = self.request(req, account)
+                    batch = [response.messages.get(i) for i in range(response.messages.size())]
+                    if not batch:
+                        break
+                    ids = []
+                    for m in batch:
+                        if isinstance(m, TLRPC.TL_messageEmpty) or m.id <= 0:
+                            continue
+                        if window_min_date is None or m.date < window_min_date:
+                            window_min_date = m.date
+                        if m.id in seen:
+                            continue
+                        seen.add(m.id)
+                        if use_sender_filter or m.out:
+                            ids.append(m.id)
+                            min_date = m.date if min_date is None else min(min_date, m.date)
+                            max_date_seen = m.date if max_date_seen is None else max(max_date_seen, m.date)
+                    if ids:
+                        self.delete_batch(account, dialog_id, ids)
+                        deleted += len(ids)
+                        if deleted // NOTIFY_EVERY > notified // NOTIFY_EVERY:
+                            notified = deleted
+                            BulletinHelper.show_info(tr("progress", count=deleted))
+                        time.sleep(1)
+                    new_offset = min(m.id for m in batch)
+                    if offset_id != 0 and new_offset >= offset_id:
+                        break
+                    offset_id = new_offset
+                if len(seen) == before or window_min_date is None:
+                    break
+                max_date = window_min_date
+        except Exception as e:
+            log(f"[DMM] delete_all error: {e}")
+            BulletinHelper.show_error(tr("error"))
+            return
+        if not deleted:
+            BulletinHelper.show_info(tr("nothing"))
+            return
+        fmt = "%d.%m.%Y"
+        BulletinHelper.show_success(tr("done", count=deleted, start=datetime.fromtimestamp(min_date).strftime(fmt), end=datetime.fromtimestamp(max_date_seen).strftime(fmt)))
