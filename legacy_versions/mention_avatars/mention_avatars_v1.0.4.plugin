@@ -1,0 +1,838 @@
+from typing import Any, List
+
+from android.text import SpannableStringBuilder, Spanned
+from android.text.style import URLSpan
+from java import jfloat, jint, jlong
+from java.lang import Long, System
+
+from android_utils import log
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from org.telegram.messenger import (
+    LocaleController,
+    MessagesController,
+    NotificationCenter,
+    UserConfig,
+    UserObject,
+)
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui import AvatarSpan
+from org.telegram.ui.Components import URLSpanUserMention
+from ui.settings import Divider, Header, Selector, Switch
+
+__id__ = "mention_avatars"
+__name__ = "MentionAvatars"
+__description__ = (
+    "Shows the user's avatar next to an `@mention` in messages. "
+)
+__author__ = "@limeplug"
+__version__ = "1.0.4"
+__icon__ = "masquernya/13"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+MAX_MENTIONS_PER_TEXT = 40
+MAX_OWNER_CACHE = 256
+SIZE_DP = (14.0, 16.0, 18.0)
+PLACEHOLDER = "\u00a0"
+GAP = " "
+RUSSIAN_FALLBACK_LANGUAGES = frozenset("ru be kk ky uz tg tt ba".split())
+TME_PREFIXES = (
+    "https://t.me/",
+    "http://t.me/",
+    "https://telegram.me/",
+    "http://telegram.me/",
+    "tg://resolve?domain=",
+)
+
+PLUGIN_STRINGS = {
+    "ru": {
+        "header": "MentionAvatars",
+        "enabled": "Показывать аватары",
+        "enabled_sub": "Рядом с @упоминаниями в сообщениях",
+        "position": "Расположение аватара",
+        "position_before": "Перед ником",
+        "position_after": "После ника",
+        "size": "Размер аватара",
+        "size_small": "Маленький",
+        "size_medium": "Обычный",
+        "size_large": "Большой",
+        "include_chats": "Каналы и группы",
+        "include_chats_sub": "Показывать аватар для @channel и @group",
+        "include_bots": "Боты",
+        "include_bots_sub": "Показывать аватар у упоминаний ботов",
+    },
+    "en": {
+        "header": "MentionAvatars",
+        "enabled": "Show avatars",
+        "enabled_sub": "Next to @mentions in messages",
+        "position": "Avatar position",
+        "position_before": "Before username",
+        "position_after": "After username",
+        "size": "Avatar size",
+        "size_small": "Small",
+        "size_medium": "Medium",
+        "size_large": "Large",
+        "include_chats": "Channels and groups",
+        "include_chats_sub": "Show avatars for @channel and @group mentions",
+        "include_bots": "Bots",
+        "include_bots_sub": "Show avatars for bot mentions",
+    },
+}
+
+_PLUGIN = None
+_OWNER_CACHE = {}
+_AVATAR_SPAN_CLASS = AvatarSpan
+_URL_SPAN_CLASS = URLSpan
+_STYLE_SPAN_CLASS = None
+_SPOILER_FLAG = 0
+_ENTITIES_DEPTH = 0
+
+
+class RuntimeSettings:
+    enabled = True
+    before = True
+    size_dp = 16.0
+
+
+SETTINGS = RuntimeSettings()
+
+
+def locale_code():
+    try:
+        controller = LocaleController.getInstance()
+        locale_info = controller.getCurrentLocaleInfo()
+        language_code = str(getattr(locale_info, "shortName", "") or "")
+        if not language_code:
+            language_code = str(controller.getCurrentLocale().getLanguage() or "")
+    except Exception:
+        language_code = ""
+    primary = str(language_code or "").strip().lower().replace("_", "-").split("-", 1)[0]
+    if primary in RUSSIAN_FALLBACK_LANGUAGES:
+        return "ru"
+    return "en"
+
+
+def tr(key):
+    language = locale_code()
+    return PLUGIN_STRINGS.get(language, PLUGIN_STRINGS["en"]).get(
+        key, PLUGIN_STRINGS["en"][key]
+    )
+
+
+def _style_span_class():
+    global _STYLE_SPAN_CLASS
+    if _STYLE_SPAN_CLASS is None:
+        _STYLE_SPAN_CLASS = find_class("org.telegram.ui.Components.TextStyleSpan")
+    return _STYLE_SPAN_CLASS
+
+
+def _spoiler_flag():
+    global _SPOILER_FLAG
+    if _SPOILER_FLAG:
+        return _SPOILER_FLAG
+    try:
+        style_cls = _style_span_class()
+        if style_cls is not None:
+            _SPOILER_FLAG = int(style_cls.FLAG_STYLE_SPOILER)
+    except Exception:
+        _SPOILER_FLAG = 256
+    return _SPOILER_FLAG
+
+
+def _java_is(left, right):
+    if left is right:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        return int(System.identityHashCode(left)) == int(System.identityHashCode(right))
+    except Exception:
+        return False
+
+
+def _char_at(text, index):
+    try:
+        value = text.charAt(int(index))
+    except Exception:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return chr(int(value))
+    except Exception:
+        return str(value)
+
+
+def _as_builder(text):
+    if text is None:
+        return None, False
+    try:
+        if isinstance(text, SpannableStringBuilder):
+            return text, False
+    except Exception:
+        pass
+    try:
+        return SpannableStringBuilder(text), True
+    except Exception:
+        return None, False
+
+
+def _lookup_owner(account, user_id, username):
+    try:
+        controller = MessagesController.getInstance(int(account))
+    except Exception:
+        return None
+    if user_id:
+        try:
+            owner = controller.getUser(Long.valueOf(jlong(int(user_id))))
+        except Exception:
+            try:
+                owner = controller.getUser(int(user_id))
+            except Exception:
+                owner = None
+        if owner is not None:
+            return owner
+    if username:
+        try:
+            return controller.getUserOrChat(username)
+        except Exception:
+            return None
+    return None
+
+
+def resolve_owner(user_id=None, username=None, account=None):
+    username = (username or "").strip().lstrip("@").lstrip("\u200b").strip().lower()
+    if not username and not user_id:
+        return None, None
+    preferred = int(account) if account is not None else int(UserConfig.selectedAccount)
+    cache_key = (preferred, user_id or 0, username)
+    cached = _OWNER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    owner = _lookup_owner(preferred, user_id, username)
+    found_account = preferred
+    if owner is None:
+        max_count = int(getattr(UserConfig, "MAX_ACCOUNT_COUNT", 3) or 3)
+        for acc in range(max_count):
+            if acc == preferred:
+                continue
+            try:
+                if not UserConfig.getInstance(acc).isClientActivated():
+                    continue
+            except Exception:
+                continue
+            owner = _lookup_owner(acc, user_id, username)
+            if owner is not None:
+                found_account = acc
+                break
+    if owner is None:
+        return None, None
+    result = (found_account, owner)
+    if len(_OWNER_CACHE) >= MAX_OWNER_CACHE:
+        _OWNER_CACHE.clear()
+    _OWNER_CACHE[cache_key] = result
+    return result
+
+
+def _owner_allowed(owner):
+    plugin = _PLUGIN
+    if plugin is None or owner is None:
+        return False
+    try:
+        is_user = isinstance(owner, TLRPC.User)
+    except Exception:
+        is_user = hasattr(owner, "first_name")
+    if is_user:
+        if not plugin.include_bots:
+            try:
+                if bool(getattr(owner, "bot", False)) or UserObject.isBot(owner):
+                    return False
+            except Exception:
+                if bool(getattr(owner, "bot", False)):
+                    return False
+        return True
+    try:
+        is_chat = isinstance(owner, TLRPC.Chat)
+    except Exception:
+        is_chat = hasattr(owner, "title")
+    return bool(is_chat and plugin.include_chats)
+
+
+def _make_avatar_span(account, owner):
+    try:
+        span = AvatarSpan(None, jint(int(account)), jfloat(float(SETTINGS.size_dp)))
+    except Exception:
+        span = AvatarSpan(None, int(account), float(SETTINGS.size_dp))
+    try:
+        span.needDrawShadow = False
+    except Exception:
+        pass
+    span.setObject(owner)
+    return span
+
+
+def _our_avatar_spans(spannable, length=None):
+    if spannable is None or _AVATAR_SPAN_CLASS is None:
+        return None
+    try:
+        if length is None:
+            length = spannable.length()
+        spans = spannable.getSpans(0, int(length), _AVATAR_SPAN_CLASS)
+    except Exception:
+        return None
+    if not spans:
+        return None
+    ours = []
+    for span in spans:
+        try:
+            start = int(spannable.getSpanStart(span))
+            end = int(spannable.getSpanEnd(span))
+        except Exception:
+            continue
+        if end - start != 1:
+            continue
+        if _char_at(spannable, start) != PLACEHOLDER:
+            continue
+        ours.append((start, span))
+    return ours or None
+
+
+def _has_our_avatars(text):
+    return bool(_our_avatar_spans(text))
+
+
+def _spoiler_ranges(spannable, length):
+    style_cls = _style_span_class()
+    if style_cls is None:
+        return None
+    try:
+        spans = spannable.getSpans(0, length, style_cls)
+    except Exception:
+        return None
+    if not spans:
+        return None
+    flag = _spoiler_flag()
+    ranges = []
+    for span in spans:
+        try:
+            style = span.getStyle() if hasattr(span, "getStyle") else getattr(span, "style", None)
+            if style is None or (int(style.flags) & flag) == 0:
+                continue
+            ranges.append((int(spannable.getSpanStart(span)), int(spannable.getSpanEnd(span))))
+        except Exception:
+            continue
+    return ranges or None
+
+
+def _in_spoiler(start, end, ranges):
+    for left, right in ranges:
+        if start >= left and end <= right:
+            return True
+    return False
+
+
+def _username_from_url(url):
+    if not url:
+        return None
+    if url[0] == "@":
+        return url[1:]
+    lowered = url.lower()
+    for prefix in TME_PREFIXES:
+        if lowered.startswith(prefix):
+            rest = url[len(prefix):]
+            rest = rest.split("?", 1)[0].split("/", 1)[0].strip()
+            return rest or None
+    return None
+
+
+def _owner_from_span(span, account):
+    try:
+        attached = span.getObject()
+    except Exception:
+        attached = None
+    if attached is not None:
+        return int(account) if account is not None else int(UserConfig.selectedAccount), attached
+    try:
+        url = span.getURL()
+    except Exception:
+        return None, None
+    if url is None:
+        return None, None
+    url = url if isinstance(url, str) else str(url)
+    if not url:
+        return None, None
+    try:
+        is_user_mention = isinstance(span, URLSpanUserMention)
+    except Exception:
+        is_user_mention = False
+    user_id = None
+    username = None
+    if is_user_mention:
+        digits = url.strip()
+        if digits.lstrip("-").isdigit():
+            user_id = int(digits)
+        else:
+            username = _username_from_url(url)
+    else:
+        username = _username_from_url(url)
+    if user_id is None and not username:
+        return None, None
+    return resolve_owner(user_id=user_id, username=username, account=account)
+
+
+def _collect_mentions(spannable, account):
+    try:
+        length = spannable.length()
+    except Exception:
+        return None, 0
+    if length <= 0:
+        return None, 0
+    try:
+        url_spans = spannable.getSpans(0, length, _URL_SPAN_CLASS)
+    except Exception:
+        return None, length
+    if not url_spans:
+        return None, length
+    spoiler_ranges = _spoiler_ranges(spannable, length)
+    mentions = []
+    for span in url_spans:
+        if len(mentions) >= MAX_MENTIONS_PER_TEXT:
+            break
+        try:
+            start = int(spannable.getSpanStart(span))
+            end = int(spannable.getSpanEnd(span))
+        except Exception:
+            continue
+        if end <= start or start < 0 or end > length:
+            continue
+        if spoiler_ranges and _in_spoiler(start, end, spoiler_ranges):
+            continue
+        owner_account, owner = _owner_from_span(span, account)
+        if owner is None or not _owner_allowed(owner):
+            continue
+        mentions.append((start, end, owner_account, owner))
+    return mentions or None, length
+
+
+def _avatar_near(spannable, start, end, length):
+    try:
+        if SETTINGS.before:
+            left = max(0, start - 2)
+            spans = spannable.getSpans(left, start, _AVATAR_SPAN_CLASS)
+        else:
+            right = min(length, end + 2)
+            spans = spannable.getSpans(end, right, _AVATAR_SPAN_CLASS)
+    except Exception:
+        return False
+    if not spans:
+        return False
+    for span in spans:
+        try:
+            span_start = int(spannable.getSpanStart(span))
+        except Exception:
+            continue
+        if _char_at(spannable, span_start) == PLACEHOLDER:
+            return True
+    return False
+
+
+def strip_placeholders(text):
+    builder, wrapped = _as_builder(text)
+    if builder is None:
+        return text, False
+    ours = _our_avatar_spans(builder)
+    if not ours:
+        return builder if wrapped else text, wrapped
+    ours.sort(key=lambda item: item[0], reverse=True)
+    changed = False
+    for start, _span in ours:
+        try:
+            length = builder.length()
+            if start + 1 < length and _char_at(builder, start + 1) == GAP:
+                builder.delete(int(start), int(start + 2))
+            elif start > 0 and _char_at(builder, start - 1) == GAP:
+                builder.delete(int(start - 1), int(start + 1))
+            else:
+                builder.delete(int(start), int(start + 1))
+            changed = True
+        except Exception:
+            continue
+    return builder, changed or wrapped
+
+
+def inject_placeholders(text, account):
+    if not SETTINGS.enabled or text is None:
+        return text, False
+    builder, wrapped = _as_builder(text)
+    if builder is None:
+        return text, False
+    mentions, length = _collect_mentions(builder, account)
+    if not mentions:
+        return builder if wrapped else text, wrapped
+    mentions.sort(key=lambda item: item[0], reverse=True)
+    changed = wrapped
+    flags = int(Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    for start, end, owner_account, owner in mentions:
+        try:
+            length = builder.length()
+            if _avatar_near(builder, start, end, length):
+                continue
+            span = _make_avatar_span(owner_account, owner)
+            if SETTINGS.before:
+                builder.insert(int(start), PLACEHOLDER + GAP)
+                builder.setSpan(span, int(start), int(start + 1), flags)
+            else:
+                builder.insert(int(end), GAP + PLACEHOLDER)
+                builder.setSpan(span, int(end + 1), int(end + 2), flags)
+            changed = True
+        except Exception as error:
+            log(f"MentionAvatars: insert failed: {error}")
+    return builder, changed
+
+
+def _rebind_message_field(message, original, new_value):
+    if message is None or new_value is None:
+        return
+    try:
+        if _java_is(message.messageText, original):
+            message.messageText = new_value
+    except Exception:
+        pass
+    try:
+        if _java_is(message.caption, original):
+            message.caption = new_value
+    except Exception:
+        pass
+
+
+def _account_of(message):
+    if message is None:
+        return int(UserConfig.selectedAccount)
+    try:
+        return int(message.currentAccount)
+    except Exception:
+        return int(UserConfig.selectedAccount)
+
+
+def _has_mention_urls(text):
+    try:
+        length = text.length()
+        url_spans = text.getSpans(0, int(length), _URL_SPAN_CLASS)
+    except Exception:
+        return False
+    if not url_spans:
+        return False
+    for span in url_spans:
+        try:
+            if isinstance(span, URLSpanUserMention):
+                return True
+            url = span.getURL()
+        except Exception:
+            continue
+        if url is None:
+            continue
+        url = url if isinstance(url, str) else str(url)
+        if _username_from_url(url):
+            return True
+    return False
+
+
+def ensure_message_layouts(message):
+    if message is None or not SETTINGS.enabled:
+        return
+    try:
+        text = message.messageText
+    except Exception:
+        text = None
+    if text is not None and not _has_our_avatars(text) and _has_mention_urls(text):
+        try:
+            message.generateLayout(None)
+        except Exception as error:
+            log(f"MentionAvatars: generateLayout failed: {error}")
+    try:
+        caption = message.caption
+    except Exception:
+        caption = None
+    if caption is not None and not _has_our_avatars(caption):
+        new_caption, changed = inject_placeholders(caption, _account_of(message))
+        if changed:
+            try:
+                message.caption = new_caption
+            except Exception:
+                pass
+
+
+def bind_cell(cell, message):
+    if cell is None or message is None:
+        return
+    try:
+        AvatarSpan.checkSpansParent(message.messageText, cell)
+    except Exception:
+        pass
+    try:
+        AvatarSpan.checkSpansParent(message.caption, cell)
+    except Exception:
+        pass
+
+
+def _prepare_entities_arg(param):
+    args = param.args
+    if not args:
+        return
+    original = args[0]
+    builder, wrapped = _as_builder(original)
+    if builder is None:
+        return
+    builder, stripped = strip_placeholders(builder)
+    if wrapped or stripped:
+        args[0] = builder
+        _rebind_message_field(param.thisObject, original, builder)
+
+
+def _inject_entities_arg(param):
+    args = param.args
+    if not args:
+        return
+    original = args[0]
+    new_text, changed = inject_placeholders(original, _account_of(param.thisObject))
+    if changed and not _java_is(new_text, original):
+        args[0] = new_text
+        _rebind_message_field(param.thisObject, original, new_text)
+
+
+class AddEntitiesToTextHook(MethodHook):
+    def before_hooked_method(self, param):
+        global _ENTITIES_DEPTH
+        if not SETTINGS.enabled:
+            return
+        try:
+            if _ENTITIES_DEPTH == 0:
+                _prepare_entities_arg(param)
+        finally:
+            _ENTITIES_DEPTH += 1
+
+    def after_hooked_method(self, param):
+        global _ENTITIES_DEPTH
+        if _ENTITIES_DEPTH <= 0:
+            return
+        _ENTITIES_DEPTH -= 1
+        if SETTINGS.enabled and _ENTITIES_DEPTH == 0:
+            _inject_entities_arg(param)
+
+
+class CellBindHook(MethodHook):
+    def before_hooked_method(self, param):
+        if not SETTINGS.enabled:
+            return
+        args = param.args
+        if not args:
+            return
+        ensure_message_layouts(args[0])
+
+    def after_hooked_method(self, param):
+        if not SETTINGS.enabled:
+            return
+        args = param.args
+        if not args:
+            return
+        bind_cell(param.thisObject, args[0])
+
+
+class AttachHook(MethodHook):
+    def after_hooked_method(self, param):
+        if not SETTINGS.enabled:
+            return
+        cell = param.thisObject
+        try:
+            message = cell.currentMessageObject
+        except Exception:
+            message = None
+        bind_cell(cell, message)
+
+
+class MentionAvatarsPlugin(BasePlugin):
+    enabled = True
+    position = 0
+    size_index = 1
+    include_chats = True
+    include_bots = True
+
+    def on_plugin_load(self):
+        global _PLUGIN, _AVATAR_SPAN_CLASS
+        _PLUGIN = self
+        self._unhooks = []
+        found = find_class("org.telegram.ui.AvatarSpan")
+        if found is not None:
+            _AVATAR_SPAN_CLASS = found
+        self._refresh_settings()
+        self._register_hooks()
+        self.log("MentionAvatars loaded")
+
+    def on_plugin_unload(self):
+        global _PLUGIN, _ENTITIES_DEPTH
+        self._unhook_all()
+        _OWNER_CACHE.clear()
+        _ENTITIES_DEPTH = 0
+        _PLUGIN = None
+        self.log("MentionAvatars unloaded")
+
+    def _refresh_settings(self):
+        self.enabled = bool(self.get_setting("enabled", True))
+        self.position = int(self.get_setting("position", 0) or 0)
+        self.size_index = int(self.get_setting("size", 1) or 1)
+        if self.size_index < 0 or self.size_index >= len(SIZE_DP):
+            self.size_index = 1
+        self.include_chats = bool(self.get_setting("include_chats", True))
+        self.include_bots = bool(self.get_setting("include_bots", True))
+        SETTINGS.enabled = self.enabled
+        SETTINGS.before = self.position == 0
+        SETTINGS.size_dp = float(SIZE_DP[self.size_index])
+
+    def _on_setting_changed(self, *_args):
+        self._refresh_settings()
+        try:
+            NotificationCenter.getInstance(UserConfig.selectedAccount).postNotificationName(
+                NotificationCenter.emojiLoaded
+            )
+        except Exception:
+            pass
+
+    def _register_hooks(self):
+        message_object = find_class("org.telegram.messenger.MessageObject")
+        if message_object is None:
+            log("MentionAvatars: MessageObject not found")
+            return
+        self._hook_all(message_object, "addEntitiesToText", AddEntitiesToTextHook())
+        cell = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        if cell is None:
+            log("MentionAvatars: ChatMessageCell not found")
+            return
+        grouped = find_class("org.telegram.messenger.MessageObject$GroupedMessages")
+        bind = CellBindHook()
+        if not self._hook_six(cell, "setMessageContent", message_object, grouped, bind):
+            self._hook_all(cell, "setMessageObject", bind)
+        self._hook_declared(cell, "onAttachedToWindow", AttachHook())
+
+    def _hook_six(self, target, method_name, message_object, grouped, handler):
+        if grouped is None:
+            return False
+        try:
+            from java.lang import Boolean
+            method = target.getDeclaredMethod(
+                method_name,
+                message_object,
+                grouped,
+                Boolean.TYPE,
+                Boolean.TYPE,
+                Boolean.TYPE,
+                Boolean.TYPE,
+            )
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            hooked = self.hook_method(method, handler, priority=10)
+        except Exception as error:
+            log(f"MentionAvatars: {method_name} 6-arg hook failed: {error}")
+            return False
+        if hooked:
+            self._unhooks.append(hooked)
+            log(f"MentionAvatars: hooked {method_name}(6)")
+            return True
+        return False
+
+    def _hook_declared(self, target, method_name, handler):
+        try:
+            method = target.getDeclaredMethod(method_name)
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            hooked = self.hook_method(method, handler, priority=10)
+        except TypeError:
+            try:
+                method = target.getDeclaredMethod(method_name)
+                hooked = self.hook_method(method, handler)
+            except Exception as error:
+                log(f"MentionAvatars: hook {method_name} failed: {error}")
+                return
+        except Exception as error:
+            log(f"MentionAvatars: hook {method_name} failed: {error}")
+            return
+        if hooked:
+            self._unhooks.append(hooked)
+            log(f"MentionAvatars: hooked {method_name}")
+
+    def _hook_all(self, target, method_name, handler):
+        try:
+            hooked = self.hook_all_methods(target, method_name, handler, priority=10)
+        except TypeError:
+            try:
+                hooked = self.hook_all_methods(target, method_name, handler)
+            except Exception as error:
+                log(f"MentionAvatars: hook_all {method_name} failed: {error}")
+                return
+        except Exception as error:
+            log(f"MentionAvatars: hook_all {method_name} failed: {error}")
+            return
+        if hooked:
+            if isinstance(hooked, (list, tuple)):
+                self._unhooks.extend(hooked)
+            else:
+                self._unhooks.append(hooked)
+            log(f"MentionAvatars: hooked {method_name}")
+
+    def _unhook_all(self):
+        for hook in getattr(self, "_unhooks", []) or []:
+            try:
+                self.unhook_method(hook)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text=tr("header")),
+            Switch(
+                key="enabled",
+                text=tr("enabled"),
+                default=True,
+                subtext=tr("enabled_sub"),
+                icon="msg_settings",
+                on_change=self._on_setting_changed,
+            ),
+            Selector(
+                key="position",
+                text=tr("position"),
+                default=0,
+                items=[tr("position_before"), tr("position_after")],
+                icon="msg_customize",
+                on_change=self._on_setting_changed,
+            ),
+            Selector(
+                key="size",
+                text=tr("size"),
+                default=1,
+                items=[tr("size_small"), tr("size_medium"), tr("size_large")],
+                icon="msg_info",
+                on_change=self._on_setting_changed,
+            ),
+            Divider(),
+            Switch(
+                key="include_chats",
+                text=tr("include_chats"),
+                default=True,
+                subtext=tr("include_chats_sub"),
+                icon="msg_groups",
+                on_change=self._on_setting_changed,
+            ),
+            Switch(
+                key="include_bots",
+                text=tr("include_bots"),
+                default=True,
+                subtext=tr("include_bots_sub"),
+                icon="msg_bot",
+                on_change=self._on_setting_changed,
+            ),
+        ]
