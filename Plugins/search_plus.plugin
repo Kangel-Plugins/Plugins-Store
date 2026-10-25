@@ -29,10 +29,11 @@ __name__ = "Search+"
 __author__ = "@SearchPlusss"
 __icon__ = "UtyaDuckFull/17"
 __min_version__ = "12.10.6"
-__version__ = "2.6.1"
+__version__ = "2.7"
 __description__ = """Мультипоиск по нескольким словам через |, фильтр по типу сообщений, фильтры поиска по человеку, периоду и типу, поиск людей по ID, телефону или @username там, где Telegram это не умеет. Подробное описание всех функций — в настройках плагина.
 
 Multi-search for several words with |, message type filter, search filters by person, period and type, finding people by ID, phone or @username where Telegram can't. Full feature description is in the plugin settings."""
+__category__ = ["chats"]
 
 
 global plugin_instance
@@ -500,11 +501,11 @@ class MediaTypeFilter:
         ("Фотографии", "TL_inputMessagesFilterPhotos",
          ("msg_photos", "search_media", "msg_media", "msg_gallery")),
         ("Видео", "TL_inputMessagesFilterVideo",
-         ("msg_video", "msg_videocall", "search_media", "msg_media")),
+         ("msg_round", "msg_videocall", "msg_video")),
         ("Голосовые сообщения", "TL_inputMessagesFilterVoice",
          ("msg_voice", "search_voice", "msg_micro", "msg_voicechat")),
         ("Видео сообщения", "TL_inputMessagesFilterRoundVideo",
-         ("msg_round", "msg_videocall", "msg_video")),
+         ("msg_video", "msg_videocall", "search_media", "msg_media")),
         ("Файлы", "TL_inputMessagesFilterDocument",
          ("msg_files", "search_files", "msg_folders")),
         ("Музыка", "TL_inputMessagesFilterMusic",
@@ -1673,6 +1674,7 @@ def _weak_attr(name):
 
 
 class SearchPlusPlugin(BasePlugin):
+    _chat_filter_fragment_ref = _weak_attr("_chat_filter_fragment_ref")
     _type_button = _weak_attr("_type_button")
     _g_filter_button = _weak_attr("_g_filter_button")
     _g_person_btn = _weak_attr("_g_person_btn")
@@ -1735,6 +1737,13 @@ class SearchPlusPlugin(BasePlugin):
 
 
     def reset_filter_counters(self):
+        self.client_filter_done = 0
+        self.client_filter_head = 0
+        self.client_filter_batch = 0
+        self._cf_state = {}
+        self._cf_cursor = None
+        self._filtered_search_finished = False
+        self._filtered_end_token = int(getattr(self, "_filtered_end_token", 0)) + 1
         self.client_filter_matched = 0
         self.client_filter_scanned = 0
         self.client_extra_matched = 0
@@ -1910,6 +1919,8 @@ class SearchPlusPlugin(BasePlugin):
             self._hook_server_search()
             self._hook_search_count()
             self._hook_search_navigation()
+            self._hook_chat_search_lifecycle()
+            self._hook_filtered_load_more()
             self._hook_trim()
         except Exception as e:
             slog("install hooks failed", e)
@@ -2442,6 +2453,11 @@ class SearchPlusPlugin(BasePlugin):
         try:
             if tok != self._notif_hook_token or self._notif_hook is None:
                 return
+            if _chat_filter_fragment(self) is not None and int(self._current_media_filter_idx) > 0:
+                self._notif_hook_token += 1
+                t2 = self._notif_hook_token
+                run_on_ui_thread(lambda: self._expire_notification_hook(t2), NOTIF_HOOK_IDLE_MS)
+                return
             if self.client_filter_pending and self._notif_ext < 3:
                 self._notif_ext += 1
                 self._notif_hook_token += 1
@@ -2476,6 +2492,32 @@ class SearchPlusPlugin(BasePlugin):
                 return
         except Exception as e:
             slog("_hook_search_count failed", e)
+
+
+    def _hook_chat_search_lifecycle(self):
+        for class_name, names in (
+            ("org.telegram.ui.ChatActivity$SearchItemListener", ("onSearchCollapse",)),
+            ("org.telegram.ui.ChatActivity", ("clearSearch", "onFragmentDestroy")),
+        ):
+            try:
+                cls = JClass.forName(class_name)
+                for method in cls.getDeclaredMethods():
+                    if method.getName() in names and len(method.getParameterTypes()) == 0:
+                        method.setAccessible(True)
+                        self._hooks.append(self.hook_method(method, ChatSearchLifecycleHook(self)))
+            except Exception as e:
+                slog("chat search lifecycle hook unavailable", e)
+
+
+    def _hook_filtered_load_more(self):
+        try:
+            cls = JClass.forName("org.telegram.messenger.MediaDataController")
+            for method in cls.getDeclaredMethods():
+                if method.getName() == "loadMoreSearchMessages" and len(method.getParameterTypes()) <= 1:
+                    method.setAccessible(True)
+                    self._hooks.append(self.hook_method(method, FilteredLoadMoreHook(self)))
+        except Exception as e:
+            slog("filtered pagination guard unavailable", e)
 
 
     def _hook_search_navigation(self):
@@ -2613,6 +2655,14 @@ class SearchPlusPlugin(BasePlugin):
 
     def _set_media_filter(self, idx):
         try:
+            if not _bind_chat_filter(self):
+                return
+            self.client_filter_type = None
+            self.client_filter_patterns = None
+            self._cf_state = {}
+            self.client_filter_done = 0
+            self.client_filter_head = 0
+            self.client_filter_batch = 0
             self._current_media_filter_idx = int(idx)
             name = _t(MediaTypeFilter.TYPES[idx][0])
             if self._type_button is not None:
@@ -2676,6 +2726,16 @@ class SearchPlusPlugin(BasePlugin):
                         srm = srm_field.get(mdc)
                         if srm is not None:
                             srm.clear()
+
+                        for source_name in _CF_SOURCE_FIELDS:
+                            source = _find_field_value(mdc, source_name)
+                            if source is not None:
+                                source.clear()
+                        for map_name in ("searchServerResultMessagesMap",):
+                            maps = _find_field_value(mdc, map_name)
+                            if maps is not None:
+                                for j in range(JArray.getLength(maps)):
+                                    JArray.get(maps, j).clear()
                     except Exception as e:
                         slog("clear searchResultMessages failed", e)
                     try:
@@ -3557,6 +3617,9 @@ class InjectTypeButtonHook(MethodHook):
             this = param.thisObject
             if this is None:
                 return
+            active = getattr(self.plugin, "_chat_filter_fragment_ref", None)
+            if active is not None and int(active.getClassGuid()) != int(this.getClassGuid()):
+                _reset_chat_media_filter(self.plugin)
             sc_field = this.getClass().getDeclaredField("searchContainer")
             sc_field.setAccessible(True)
             search_container = sc_field.get(this)
@@ -3656,7 +3719,12 @@ def _update_type_button_count(plugin, matched):
         if idx == 0:
             return
         name = _t(MediaTypeFilter.TYPES[idx][0])
-        btn.setText(JString(f"{name} {matched}+ ▾"))
+        if getattr(plugin, "_filtered_search_finished", False):
+            btn.setText(JString("Конец списка ▾" if _LANG == "ru" else "End of list ▾"))
+        elif matched == 0:
+            btn.setText(JString("Поиск… ▾" if _LANG == "ru" else "Searching… ▾"))
+        else:
+            btn.setText(JString(f"{name} {matched}+ ▾"))
     except Exception as e:
         slog("update type button count failed", e)
 
@@ -3667,6 +3735,9 @@ def _patch_pagination_anchor(plugin, req):
     cur_off = int(off_f.getInt(req))
     anchor = int(plugin.client_filter_anchor_id)
     if cur_off == 0:
+        plugin._cf_cursor = None
+        plugin._filtered_search_finished = False
+        plugin._filtered_end_token = int(getattr(plugin, "_filtered_end_token", 0)) + 1
         plugin.client_filter_anchor_id = 0
         plugin.client_filter_done = 0
         plugin.client_filter_head = 0
@@ -4177,6 +4248,11 @@ class SendRequestHook(MethodHook):
             active_filter = self.plugin.get_active_media_filter()
             if active_filter is None:
                 return
+            if not _bind_chat_filter(self.plugin):
+                return
+            self.plugin.client_filter_type = active_filter
+            self.plugin.client_filter_pending = True
+            run_on_ui_thread(self.plugin._touch_notification_hook)
             try:
                 fid = req.getClass().getDeclaredField("from_id")
                 fid.setAccessible(True)
@@ -4199,8 +4275,11 @@ class SendRequestHook(MethodHook):
                 except Exception as e:
                     slog("sendRequest: anchor patch failed", e)
                 slog("sendRequest: person+type -> client type filter")
-                _log_search_request(req)
+                _schedule_filtered_end_check(self.plugin)
                 return
+            if int(_find_field_value(req, "offset_id") or 0) == 0:
+                self.plugin.reset_filter_counters()
+            _schedule_filtered_end_check(self.plugin)
             try:
                 f = req.getClass().getDeclaredField("filter")
                 f.setAccessible(True)
@@ -4254,6 +4333,11 @@ class PostNotificationHook(MethodHook):
                 return
             target_id = self._get_notif_id()
             if nid != target_id:
+                return
+            if self.plugin.client_filter_type is not None and self.plugin.client_filter_patterns is None:
+                if not _chat_filter_notification_matches(self.plugin, args[1]):
+                    return
+                _do_client_filter(self.plugin, args[1], not self.plugin.client_filter_pending)
                 return
             if self.plugin.client_filter_pending:
                 obj_arr = args[1]
@@ -4473,6 +4557,20 @@ class SearchNavigationHook(MethodHook):
     def before_hooked_method(self, param):
         try:
             patterns = getattr(self.plugin, "client_filter_patterns", None)
+            if self.plugin.client_filter_type is not None and patterns is None:
+                frag = _chat_filter_fragment(self.plugin)
+                if frag is not None and int(frag.getClassGuid()) == int(param.thisObject.getClassGuid()):
+                    mdc = frag.getMediaDataController()
+                    srm = _find_field_value(mdc, "searchResultMessages")
+                    size = srm.size() if srm is not None else 0
+                    position = int(mdc.getSearchPosition())
+                    reversed_mode = bool(_find_field_value(frag, "reversed") or False)
+                    step = 1 if (bool(param.args[0]) != reversed_mode) else -1
+                    if size == 0 or position + step < 0 or position + step >= size and _search_all_end_reached(mdc):
+                        if size == 0 and not _search_all_end_reached(mdc):
+                            _load_more_search(mdc, self.plugin)
+                        param.setResult(None)
+                        return
             if not patterns:
                 return
             search_up = bool(param.args[0])
@@ -4567,6 +4665,8 @@ def _clear_end_reached(mdc, mdc_cls):
 
 
 def _unstick_user_search(plugin):
+    if plugin.client_filter_type is not None and plugin.client_filter_patterns is None:
+        return
     try:
         frag = get_last_fragment()
         if frag is None:
@@ -4683,13 +4783,15 @@ def _msg_sender_id(msg):
         return 0
 
 
+_CF_MESSAGE_TYPES = {"isPhoto": 1, "isVoice": 2, "isVideo": 3, "isLocation": 4, "isRoundVideo": 5, "isGif": 8, "isDocument": 9, "isContact": 12, "isMusic": 14}
+
 _CF_SOURCE_FIELDS = ("searchServerResultMessages", "searchLocalResultMessages")
 
 
 def _cf_keep(msg, sender, filter_type, names):
-    if sender:
-        return _msg_sender_id(msg) == sender
-    return _msg_matches_filter(msg, filter_type, names)
+    if sender and _msg_sender_id(msg) != sender:
+        return False
+    return filter_type is None or _msg_matches_filter(msg, filter_type, names)
 
 
 def _cf_filter_sources(plugin, mdc, mdc_cls, sender, filter_type, names):
@@ -4711,7 +4813,6 @@ def _cf_filter_sources(plugin, mdc, mdc_cls, sender, filter_type, names):
             if size == 0:
                 state.pop(name, None)
                 continue
-            tail = lst.get(size - 1)
             start = 0
             st = state.get(name)
             if st and 0 < st[0] <= size and _msg_id(lst.get(0)) == st[1]:
@@ -4725,7 +4826,6 @@ def _cf_filter_sources(plugin, mdc, mdc_cls, sender, filter_type, names):
                 i -= 1
             n = lst.size()
             if n == 0:
-                lst.add(tail)
                 state[name] = (0, 0)
             else:
                 state[name] = (n, _msg_id(lst.get(0)))
@@ -4769,41 +4869,56 @@ def _cf_kick_if_bottom(plugin, frag, mdc):
             return
         plugin.client_filter_pending = True
         slog("client filter: list bottom visible, loading more")
-        _load_more_search(mdc)
+        _load_more_search(mdc, plugin)
     except Exception as e:
         slog("client filter: bottom kick failed", e)
 
 
 def _filter_method_names(filter_type):
     try:
-        ft_name = filter_type.getClass().getName()
+        name = str(filter_type.getClass().getSimpleName())
     except Exception:
         return ()
-    if "PhotoVideo" in ft_name:
-        return ("isPhoto", "isVideo")
-    if "Photos" in ft_name:
-        return ("isPhoto",)
-    if "Video" in ft_name:
-        return ("isVideo",)
-    if "Document" in ft_name:
-        return ("isDocument",)
-    if "Music" in ft_name:
-        return ("isMusic",)
-    if "RoundVoice" in ft_name:
-        return ("isVoice", "isRoundVideo")
-    if "Gif" in ft_name:
-        return ("isGif",)
-    return ()
+    return {
+        "TL_inputMessagesFilterPhotoVideo": ("isPhoto", "isVideo"),
+        "TL_inputMessagesFilterPhotos": ("isPhoto",),
+        "TL_inputMessagesFilterRoundVideo": ("isRoundVideo",),
+        "TL_inputMessagesFilterRoundVoice": ("isVoice", "isRoundVideo"),
+        "TL_inputMessagesFilterVoice": ("isVoice",),
+        "TL_inputMessagesFilterVideo": ("isVideo",),
+        "TL_inputMessagesFilterDocument": ("isDocument",),
+        "TL_inputMessagesFilterMusic": ("isMusic",),
+        "TL_inputMessagesFilterGif": ("isGif",),
+        "TL_inputMessagesFilterGeo": ("isLocation",),
+        "TL_inputMessagesFilterContacts": ("isContact",),
+        "TL_inputMessagesFilterUrl": ("hasUrls",),
+    }.get(name, ())
 
 
 def _msg_matches_filter(msg, filter_type, names=None):
     try:
         if names is None:
             names = _filter_method_names(filter_type)
+        try:
+            msg_type = int(msg.type)
+        except Exception:
+            msg_type = -1
+        if names and names[0] != "hasUrls" and msg_type >= 0:
+            return any(msg_type == _CF_MESSAGE_TYPES.get(name, -2) for name in names)
+        if names == ("hasUrls",):
+            owner = getattr(msg, "messageOwner", None)
+            entities = getattr(owner, "entities", None)
+            if entities is not None:
+                for i in range(entities.size()):
+                    name = str(entities.get(i).getClass().getSimpleName())
+                    if name in ("TL_messageEntityUrl", "TL_messageEntityTextUrl"):
+                        return True
+            media = getattr(owner, "media", None)
+            return media is not None and "WebPage" in str(media.getClass().getSimpleName())
         methods = _get_mo_bool_methods()
-        for nm in names:
-            mm = methods.get(nm)
-            if mm is not None and bool(mm.invoke(msg, None)):
+        for name in names:
+            method = methods.get(name)
+            if method is not None and bool(method.invoke(msg, None)):
                 return True
         return False
     except Exception:
@@ -4832,6 +4947,232 @@ def _msg_id(msg):
     return 0
 
 
+def _chat_filter_fragment(plugin):
+    frag = getattr(plugin, "_chat_filter_fragment_ref", None)
+    if frag is None or getattr(plugin, "_unloaded", False):
+        return None
+    try:
+        if "ChatActivity" not in str(frag.getClass().getName()):
+            return None
+        searching_field = _find_field(frag, "searching")
+        if searching_field is not None and not searching_field.getBoolean(frag):
+            return None
+        return frag
+    except Exception:
+        return None
+
+
+def _bind_chat_filter(plugin):
+    frag = get_last_fragment()
+    if frag is None or "ChatActivity" not in str(frag.getClass().getName()):
+        return False
+    searching_field = _find_field(frag, "searching")
+    if searching_field is not None and not searching_field.getBoolean(frag):
+        return False
+    plugin._chat_filter_fragment_ref = frag
+    return True
+
+
+def _reset_chat_media_filter(plugin):
+    plugin._current_media_filter_idx = 0
+    plugin.client_filter_pending = False
+    plugin.client_filter_type = None
+    plugin.client_filter_patterns = None
+    plugin.client_filter_sender = 0
+    plugin.client_filter_anchor_id = 0
+    plugin.client_filter_autoload = 0
+    plugin.client_filter_done = 0
+    plugin.client_filter_head = 0
+    plugin.client_filter_batch = 0
+    plugin.client_extra_results = []
+    plugin.client_extra_server_counts = {}
+    plugin.client_extra_token = int(getattr(plugin, "client_extra_token", 0)) + 1
+    plugin.chat_highlight_patterns = None
+    plugin._cf_state = {}
+    plugin._cf_cursor = None
+    plugin._chat_filter_fragment_ref = None
+    plugin._nav_token = int(getattr(plugin, "_nav_token", 0)) + 1
+    plugin.reset_filter_counters()
+    btn = plugin._type_button
+    if btn is not None:
+        btn.setText(JString(_t("Тип ▾")))
+
+
+def _chat_filter_notification_matches(plugin, obj_arr):
+    frag = _chat_filter_fragment(plugin)
+    if frag is None:
+        return False
+    try:
+        from java.lang.reflect import Array as JArray
+        return int(JArray.get(obj_arr, 0)) == int(frag.getClassGuid())
+    except Exception:
+        return False
+
+
+def _fix_filtered_notification(plugin, frag, mdc, obj_arr=None):
+    try:
+        from java.lang.reflect import Array as JArray
+        srm = _find_field_value(mdc, "searchResultMessages")
+        if srm is None:
+            return
+        count = srm.size()
+        position_field = _find_field(mdc, "lastReturnedNum")
+        position = int(position_field.getInt(mdc)) if position_field is not None else 0
+        wanted_id = 0
+        wanted_dialog = 0
+        if obj_arr is not None and JArray.getLength(obj_arr) >= 6:
+            wanted_id = int(JArray.get(obj_arr, 1))
+            wanted_dialog = int(JArray.get(obj_arr, 3))
+            position = int(JArray.get(obj_arr, 4))
+        selected_matches = False
+        if wanted_id and 0 <= position < count:
+            selected = srm.get(position)
+            selected_matches = _msg_id(selected) == wanted_id and int(selected.getDialogId()) == wanted_dialog
+        if wanted_id and not selected_matches:
+            for i in range(count):
+                msg = srm.get(i)
+                if _msg_id(msg) == wanted_id and int(msg.getDialogId()) == wanted_dialog:
+                    position = i
+                    break
+        position = max(0, min(position, count - 1))
+        if position_field is not None:
+            position_field.setInt(mdc, position)
+        if obj_arr is not None and JArray.getLength(obj_arr) >= 6:
+            msg = srm.get(position) if count else None
+            JArray.set(obj_arr, 1, JInteger(_msg_id(msg) if msg is not None else 0))
+            JArray.set(obj_arr, 2, JInteger(int(mdc.getMask())))
+            JArray.set(obj_arr, 3, Long.valueOf(int(msg.getDialogId()) if msg is not None else 0))
+            JArray.set(obj_arr, 4, JInteger(position))
+            display_count = count if count or _search_all_end_reached(mdc) else -1
+            JArray.set(obj_arr, 5, JInteger(display_count))
+        else:
+            for method in frag.getClass().getDeclaredMethods():
+                if method.getName() == "updateSearchButtons" and len(method.getParameterTypes()) == 3:
+                    method.setAccessible(True)
+                    display_count = count if count or _search_all_end_reached(mdc) else -1
+                    method.invoke(frag, JInteger(int(mdc.getMask())), JInteger(position), JInteger(display_count))
+                    break
+    except Exception as e:
+        slog("filtered search position update failed", e)
+
+
+class FilteredLoadMoreHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            frag = _chat_filter_fragment(self.plugin)
+            if frag is None or self.plugin.client_filter_type is None or self.plugin.client_filter_patterns is not None:
+                return
+            mdc = param.thisObject
+            guid = _find_field_value(mdc, "lastGuid")
+            if guid is not None and int(guid) == int(frag.getClassGuid()) and _search_all_end_reached(mdc):
+                param.setResult(None)
+        except Exception as e:
+            slog("filtered pagination guard failed", e)
+
+
+class ChatSearchLifecycleHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            owner = param.thisObject
+            outer = _find_field_value(owner, "this$0")
+            if outer is not None:
+                owner = outer
+            active = getattr(self.plugin, "_chat_filter_fragment_ref", None)
+            if active is not None and int(active.getClassGuid()) == int(owner.getClassGuid()):
+                _reset_chat_media_filter(self.plugin)
+        except Exception as e:
+            slog("chat search filter reset failed", e)
+
+
+def _search_all_end_reached(mdc):
+    try:
+        from java.lang.reflect import Array as JArray
+        arr = _find_field_value(mdc, "messagesSearchEndReached")
+        n = JArray.getLength(arr) if arr is not None else 0
+        return n > 0 and all(bool(JArray.getBoolean(arr, i)) for i in range(n))
+    except Exception:
+        return False
+
+
+def _finish_filtered_search(plugin, frag, mdc, obj_arr=None):
+    if plugin.client_filter_type is None or plugin.client_filter_patterns is not None:
+        return
+    if not _search_all_end_reached(mdc):
+        return
+    try:
+        from java.lang.reflect import Array as JArray
+        filter_type = plugin.client_filter_type
+        names = _filter_method_names(filter_type)
+        sender = int(getattr(plugin, "client_filter_sender", 0) or 0)
+        if not getattr(plugin, "_filtered_search_finished", False):
+            for field_name in ("searchResultMessages",) + _CF_SOURCE_FIELDS:
+                lst = _find_field_value(mdc, field_name)
+                if lst is None:
+                    continue
+                for i in range(lst.size() - 1, -1, -1):
+                    if not _cf_keep(lst.get(i), sender, filter_type, names):
+                        lst.remove(i)
+        srm = _find_field_value(mdc, "searchResultMessages")
+        if srm is None:
+            return
+        count = srm.size()
+        plugin._filtered_search_finished = True
+        plugin.client_filter_matched = count
+        plugin.client_filter_done = count
+        plugin.client_filter_autoload = 0
+        plugin.client_filter_head = _msg_id(srm.get(0)) if count else 0
+        counts = _find_field_value(mdc, "messagesSearchCount")
+        if counts is not None:
+            for i in range(JArray.getLength(counts)):
+                JArray.setInt(counts, i, count if i == 0 else 0)
+        _fix_filtered_notification(plugin, frag, mdc, obj_arr)
+        _update_type_button_count(plugin, count)
+        adapter = _find_field_value(frag, "messagesSearchAdapter")
+        if adapter is not None:
+            adapter.notifyDataSetChanged()
+    except Exception as e:
+        slog("filtered search completion failed", e)
+
+
+def _schedule_filtered_end_check(plugin):
+    token = int(getattr(plugin, "_filtered_end_token", 0)) + 1
+    plugin._filtered_end_token = token
+    frag = _chat_filter_fragment(plugin)
+    if frag is None:
+        return
+    mdc = frag.getMediaDataController()
+    if mdc is None:
+        return
+
+    def check():
+        try:
+            if getattr(plugin, "_unloaded", False) or token != getattr(plugin, "_filtered_end_token", 0):
+                return
+            if _chat_filter_fragment(plugin) is not frag or get_last_fragment() is not frag:
+                return
+            if plugin.client_filter_type is None or plugin.client_filter_patterns is not None:
+                return
+            if int(_find_field_value(mdc, "reqId") or 0) != 0 or _cf_is_loading(mdc, mdc.getClass()):
+                run_on_ui_thread(check, 250)
+                return
+            if _search_all_end_reached(mdc):
+                if plugin.client_filter_pending:
+                    _do_client_filter(plugin)
+                _finish_filtered_search(plugin, frag, mdc)
+        except Exception as e:
+            slog("filtered search end check failed", e)
+
+    run_on_ui_thread(check, 120)
+
+
 def _search_end_reached(mdc, mdc_cls):
     try:
         from java.lang.reflect import Array as JArray
@@ -4846,8 +5187,22 @@ def _search_end_reached(mdc, mdc_cls):
         return False
 
 
-def _load_more_search(mdc):
+def _load_more_search(mdc, plugin=None):
+    if _search_all_end_reached(mdc):
+        return False
+    srm = None
+    cursor = None
     try:
+        if plugin is not None:
+            frag = _chat_filter_fragment(plugin)
+            if frag is None or get_last_fragment() is not frag:
+                return False
+            srm = _find_field_value(mdc, "searchResultMessages")
+            if srm is not None and srm.size() == 0:
+                cursor = getattr(plugin, "_cf_cursor", None)
+                if cursor is None:
+                    return False
+                srm.add(cursor)
         mdc_cls = mdc.getClass()
         for m in mdc_cls.getDeclaredMethods():
             if m.getName() != "loadMoreSearchMessages":
@@ -4864,15 +5219,21 @@ def _load_more_search(mdc):
             return True
     except Exception as e:
         slog("client filter: loadMore failed", e)
+    finally:
+        if cursor is not None and srm is not None:
+            for i in range(srm.size() - 1, -1, -1):
+                msg = srm.get(i)
+                if _msg_id(msg) == _msg_id(cursor) and int(msg.getDialogId()) == int(cursor.getDialogId()):
+                    srm.remove(i)
     return False
 
 
-def _do_client_filter(plugin, obj_arr=None):
+def _do_client_filter(plugin, obj_arr=None, refresh_only=False):
     try:
-        if not plugin.client_filter_pending:
+        if not plugin.client_filter_pending and not refresh_only:
             return
         plugin.client_filter_pending = False
-        frag = get_last_fragment()
+        frag = _chat_filter_fragment(plugin) if plugin.client_filter_type is not None else get_last_fragment()
         if frag is None:
             return
         mdc = frag.getMediaDataController()
@@ -4886,6 +5247,8 @@ def _do_client_filter(plugin, obj_arr=None):
             return
         size = srm.size()
         if size == 0:
+            _finish_filtered_search(plugin, frag, mdc, obj_arr)
+            _fix_filtered_notification(plugin, frag, mdc, obj_arr)
             return
         patterns = getattr(plugin, "client_filter_patterns", None)
         filter_type = plugin.client_filter_type
@@ -4893,6 +5256,8 @@ def _do_client_filter(plugin, obj_arr=None):
             return
         tail_msg = srm.get(size - 1)
         tail_id = _msg_id(tail_msg)
+        if not refresh_only:
+            plugin._cf_cursor = tail_msg
         prev_anchor = int(plugin.client_filter_anchor_id)
         if tail_id != 0 and (prev_anchor == 0 or tail_id < prev_anchor):
             plugin.client_filter_anchor_id = tail_id
@@ -4914,10 +5279,8 @@ def _do_client_filter(plugin, obj_arr=None):
                 keep = True
             elif patterns is not None:
                 keep = SearchPlusPlugin.msg_matches_patterns(msg, patterns)
-            elif sender:
-                keep = _msg_sender_id(msg) == sender
             else:
-                keep = _msg_matches_filter(msg, filter_type, names)
+                keep = _cf_keep(msg, sender, filter_type, names)
             if not keep:
                 srm.remove(i)
                 removed += 1
@@ -4925,18 +5288,12 @@ def _do_client_filter(plugin, obj_arr=None):
         remaining = srm.size()
         plugin.client_filter_done = remaining if patterns is None else 0
         plugin.client_filter_head = _msg_id(srm.get(0)) if remaining > 0 and patterns is None else 0
-        raw_total = _search_total_count(mdc, mdc_cls)
         end_reached = _search_end_reached(mdc, mdc_cls)
-        if end_reached:
-            if raw_total > size and _is_user_filtered_search(frag):
-                _clear_end_reached(mdc, mdc_cls)
-                _reset_load_flag(mdc, mdc_cls)
-                end_reached = False
         plugin.client_filter_matched = remaining
         plugin.client_filter_scanned = size
         _update_type_button_count(plugin, remaining)
-        if remaining == 0 and not end_reached:
-            srm.add(tail_msg)
+        if filter_type is not None and patterns is None:
+            _fix_filtered_notification(plugin, frag, mdc, obj_arr)
         try:
             adapter_f = frag.getClass().getDeclaredField("messagesSearchAdapter")
             adapter_f.setAccessible(True)
@@ -4945,9 +5302,14 @@ def _do_client_filter(plugin, obj_arr=None):
                 adapter.notifyDataSetChanged()
         except Exception as e:
             slog("client filter: adapter refresh failed", e)
+        if refresh_only:
+            _finish_filtered_search(plugin, frag, mdc, obj_arr)
+            return
+        token = int(getattr(plugin, "_filtered_end_token", 0))
         if patterns is None:
-            run_on_ui_thread(lambda: _cf_kick_if_bottom(plugin, frag, mdc), 600)
+            run_on_ui_thread(lambda: _cf_kick_if_bottom(plugin, frag, mdc) if token == getattr(plugin, "_filtered_end_token", 0) else None, 600)
         if end_reached:
+            _finish_filtered_search(plugin, frag, mdc, obj_arr)
             plugin.client_filter_autoload = 0
             return
         batch = int(getattr(plugin, "client_filter_batch", 0) or 0) + max(0, remaining - start)
@@ -4959,14 +5321,18 @@ def _do_client_filter(plugin, obj_arr=None):
         if tail_id != 0 and tail_id == prev_anchor:
             plugin.client_filter_autoload = 0
             return
-        if plugin.client_filter_autoload >= CLIENT_FILTER_MAX_AUTOLOAD:
+        if remaining > 0 and plugin.client_filter_autoload >= CLIENT_FILTER_MAX_AUTOLOAD:
             plugin.client_filter_autoload = 0
             return
         plugin.client_filter_autoload += 1
 
 
         def _autoload():
-            _load_more_search(mdc)
+            if token != getattr(plugin, "_filtered_end_token", 0) or getattr(plugin, "_unloaded", False):
+                return
+            if get_last_fragment() is not frag:
+                return
+            _load_more_search(mdc, plugin if patterns is None else None)
 
 
         run_on_ui_thread(_autoload, CLIENT_FILTER_AUTOLOAD_DELAY_MS)
