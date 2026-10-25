@@ -1,0 +1,1443 @@
+"""Smart Bookmark: single-file exteraGram plugin, Python 3.11, SDK 1.4.4.3.
+
+Storage/validation is platform-independent. Android imports are intentionally lazy.
+No hooks observe messages: only the explicit message-menu action reads a message.
+"""
+import contextlib
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
+__id__ = "smart_bookmark"
+__name__ = "Smart Bookmark"
+__description__ = "Локальный менеджер закладок Telegram"
+__version__ = "1.0.2"
+__app_version__ = ">=12.10.6"
+__category__ = ["chats", "tools"]
+__sdk_version__ = ">=1.4.4.3"
+__author__ = "@winrar738"
+__icon__ = "SmartBookmark/0"
+
+DEFAULT_CATEGORIES = ("Работа", "Личное", "Важное", "Документы", "Идеи",
+                      "Покупки", "Прочитать позже")
+MAX_BACKUP_BYTES = 32 * 1024 * 1024
+MAX_BOOKMARKS_IMPORT = 100000
+PAGE_SIZE = 30
+SORTS = ("Сначала новые", "Сначала старые", "По названию", "По категории")
+FIELD_NAMES = {"account_slot": "номер аккаунта", "account_user_id": "владелец аккаунта",
+               "dialog_id": "ID диалога", "message_id": "ID сообщения", "topic_id": "ID темы",
+               "saved_at": "дата сохранения", "updated_at": "дата изменения", "title": "название",
+               "text": "текст", "note": "заметка", "sender": "отправитель", "chat": "чат",
+               "category": "категория"}
+
+
+class BookmarkError(Exception):
+    """A safe, Russian, user-facing error without message contents."""
+
+
+def fold(value):
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
+def text_value(value, name, limit, empty=True):
+    name = FIELD_NAMES.get(name, name)
+    if not isinstance(value, str) or len(value) > limit or "\x00" in value:
+        raise BookmarkError("Некорректное поле: " + name)
+    value = value.strip()
+    if not empty and not value:
+        raise BookmarkError("Заполните поле: " + name)
+    return value
+
+
+def tags_value(value):
+    if isinstance(value, str):
+        value = re.split(r"[\s,;]+", value.strip())
+    if not isinstance(value, list) or len(value) > 100:
+        raise BookmarkError("Допустимо не более 100 тегов.")
+    result = []
+    for tag in value:
+        tag = fold(text_value(tag, "тег", 81)).lstrip("#")
+        if not tag:
+            continue
+        if len(tag) > 80 or re.search(r"[\s,;#]", tag):
+            raise BookmarkError("Тег не должен содержать пробелы, запятые или # внутри.")
+        if tag not in result:
+            result.append(tag)
+    return sorted(result)
+
+
+def integer(value, name, low, high):
+    if type(value) is not int or not low <= value <= high:
+        raise BookmarkError("Некорректное поле: " + FIELD_NAMES.get(name, name))
+    return value
+
+
+def validate_bookmark(data):
+    if not isinstance(data, dict):
+        raise BookmarkError("Закладка должна быть объектом JSON.")
+    out = {}
+    for key, low, high in (
+        ("account_slot", 0, 99), ("account_user_id", 1, 2**63 - 1),
+        ("dialog_id", -(2**63) + 1, 2**63 - 1),
+        ("message_id", -(2**31) + 1, 2**31 - 1),
+        ("topic_id", 0, 2**63 - 1), ("saved_at", 1, 253402300799),
+        ("updated_at", 1, 253402300799),
+    ):
+        out[key] = integer(data.get(key), key, low, high)
+    if not out["dialog_id"] or not out["message_id"]:
+        raise BookmarkError("Отсутствует идентификатор сообщения или диалога.")
+    for key, limit, empty in (
+        ("title", 300, False), ("text", 65536, True), ("note", 16384, True),
+        ("sender", 500, True), ("chat", 500, True), ("category", 100, False),
+    ):
+        out[key] = text_value(data.get(key), key, limit, empty)
+    if data.get("peer_kind") not in ("user", "group", "channel", "secret"):
+        raise BookmarkError("Неизвестный тип диалога.")
+    out["peer_kind"] = data["peer_kind"]
+    out["tags"] = tags_value(data.get("tags"))
+    return out
+
+
+def validate_backup(data):
+    if not isinstance(data, dict) or data.get("format") != "smart_bookmark":
+        raise BookmarkError("Это не резервная копия Smart Bookmark.")
+    if type(data.get("schema")) is not int or data["schema"] != 1:
+        raise BookmarkError("Версия резервной копии не поддерживается.")
+    cats, records = data.get("categories"), data.get("bookmarks")
+    if not isinstance(cats, list) or len(cats) > 10000:
+        raise BookmarkError("Некорректный список категорий.")
+    if not isinstance(records, list) or len(records) > MAX_BOOKMARKS_IMPORT:
+        raise BookmarkError("Некорректный или слишком большой список закладок.")
+    categories = []
+    for cat in cats:
+        if not isinstance(cat, dict) or type(cat.get("builtin")) is not bool:
+            raise BookmarkError("Некорректная категория.")
+        name = text_value(cat.get("name"), "категория", 100, False)
+        if name not in categories:
+            categories.append(name)
+    # Validate EVERYTHING before offering confirmation or starting a transaction.
+    bookmarks = [validate_bookmark(record) for record in records]
+    return {"categories": categories, "bookmarks": bookmarks}
+
+
+def read_backup(path):
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(MAX_BACKUP_BYTES + 1)
+        if len(raw) > MAX_BACKUP_BYTES:
+            raise BookmarkError("Файл превышает допустимые 32 МБ.")
+        return validate_backup(json.loads(raw.decode("utf-8-sig")))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise BookmarkError("Не удалось прочитать структуру JSON.") from exc
+
+
+def write_backup(path, data):
+    """Atomic local export; does not include settings or authorization data."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary = tempfile.mkstemp(prefix=".smart-bookmark-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.path.getsize(temporary) > MAX_BACKUP_BYTES:
+            raise BookmarkError("Экспорт превышает 32 МБ. Разделите коллекцию перед переносом.")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+class BookmarkStore:
+    """Short-lived SQLite connections, transactions, FK and unique identity.
+
+    Corrupt databases fail closed: never rename/delete/reinitialize user data.
+    The UI executes all these methods on a dedicated serial worker.
+    """
+    COLUMNS = ("account_slot", "account_user_id", "dialog_id", "message_id",
+               "topic_id", "saved_at", "updated_at", "title", "text", "note",
+               "sender", "chat", "category", "peer_kind")
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.skipped_records = 0
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        try:
+            with self.connection() as db:
+                if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise BookmarkError("База повреждена. Исходный файл сохранён; восстановите копию отдельно.")
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (0, 1):
+                    raise BookmarkError("База создана более новой версией плагина.")
+                db.execute("PRAGMA journal_mode=WAL")
+                db.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE IF NOT EXISTS categories (
+                        name TEXT PRIMARY KEY, builtin INTEGER NOT NULL DEFAULT 0);
+                    CREATE TABLE IF NOT EXISTS bookmarks (
+                        id INTEGER PRIMARY KEY,
+                        account_slot INTEGER NOT NULL, account_user_id INTEGER NOT NULL,
+                        dialog_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                        topic_id INTEGER NOT NULL, saved_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL, title TEXT NOT NULL,
+                        text TEXT NOT NULL, note TEXT NOT NULL, sender TEXT NOT NULL,
+                        chat TEXT NOT NULL,
+                        category TEXT NOT NULL REFERENCES categories(name) ON UPDATE CASCADE,
+                        peer_kind TEXT NOT NULL,
+                        UNIQUE(account_user_id, dialog_id, message_id));
+                    CREATE TABLE IF NOT EXISTS bookmark_tags (
+                        bookmark_id INTEGER NOT NULL REFERENCES bookmarks(id) ON DELETE CASCADE,
+                        tag TEXT NOT NULL, PRIMARY KEY(bookmark_id, tag));
+                    CREATE INDEX IF NOT EXISTS bookmarks_saved ON bookmarks(saved_at, id);
+                    CREATE INDEX IF NOT EXISTS bookmarks_category ON bookmarks(category);
+                    CREATE INDEX IF NOT EXISTS tags_lookup ON bookmark_tags(tag, bookmark_id);
+                    PRAGMA user_version=1;
+                    COMMIT;
+                """)
+                db.executemany("INSERT OR IGNORE INTO categories VALUES (?,1)",
+                               [(name,) for name in DEFAULT_CATEGORIES])
+        except sqlite3.DatabaseError as exc:
+            raise BookmarkError("Не удалось открыть базу. Файлы не удалены; проверьте память или восстановите копию отдельно.") from exc
+
+    @contextlib.contextmanager
+    def connection(self):
+        db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
+        db.create_function("sb_fold", 1, fold, deterministic=True)
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA synchronous=FULL")
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def categories(self):
+        with self.connection() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT name,builtin FROM categories ORDER BY builtin DESC,sb_fold(name)")]
+
+    def category_add(self, name):
+        name = text_value(name, "категория", 100, False)
+        with self.connection() as db:
+            if db.execute("SELECT 1 FROM categories WHERE sb_fold(name)=?", (fold(name),)).fetchone():
+                raise BookmarkError("Такая категория уже существует.")
+            db.execute("INSERT INTO categories VALUES (?,0)", (name,))
+
+    def category_rename(self, old, new):
+        new = text_value(new, "категория", 100, False)
+        with self.connection() as db:
+            if not db.execute("SELECT 1 FROM categories WHERE name=? AND builtin=0", (old,)).fetchone():
+                raise BookmarkError("Встроенную категорию нельзя переименовать.")
+            if db.execute("SELECT 1 FROM categories WHERE sb_fold(name)=? AND name<>?",
+                          (fold(new), old)).fetchone():
+                raise BookmarkError("Такая категория уже существует.")
+            db.execute("UPDATE categories SET name=? WHERE name=?", (new, old))
+
+    def category_delete(self, name, destination="Личное"):
+        with self.connection() as db:
+            if not db.execute("SELECT 1 FROM categories WHERE name=? AND builtin=0", (name,)).fetchone():
+                raise BookmarkError("Встроенную категорию нельзя удалить.")
+            if name == destination or not db.execute("SELECT 1 FROM categories WHERE name=?", (destination,)).fetchone():
+                raise BookmarkError("Выберите другую существующую категорию.")
+            db.execute("UPDATE bookmarks SET category=? WHERE category=?", (destination, name))
+            db.execute("DELETE FROM categories WHERE name=?", (name,))
+
+    def _row(self, db, row):
+        value = dict(row)
+        value["tags"] = [r[0] for r in db.execute(
+            "SELECT tag FROM bookmark_tags WHERE bookmark_id=? ORDER BY tag", (row["id"],))]
+        try:
+            clean = validate_bookmark(value)
+            clean["id"] = row["id"]
+            return clean
+        except BookmarkError:
+            self.skipped_records += 1
+            return None
+
+    def get(self, bookmark_id):
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM bookmarks WHERE id=?", (bookmark_id,)).fetchone()
+            return self._row(db, row) if row else None
+
+    def find(self, owner, dialog, message):
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM bookmarks WHERE account_user_id=? AND dialog_id=? AND message_id=?",
+                             (owner, dialog, message)).fetchone()
+            return self._row(db, row) if row else None
+
+    def _insert(self, db, data):
+        db.execute("INSERT OR IGNORE INTO categories VALUES (?,0)", (data["category"],))
+        cursor = db.execute("INSERT OR IGNORE INTO bookmarks (" + ",".join(self.COLUMNS) +
+                            ") VALUES (" + ",".join("?" for _ in self.COLUMNS) + ")",
+                            [data[key] for key in self.COLUMNS])
+        added = cursor.rowcount == 1
+        row = db.execute("SELECT id FROM bookmarks WHERE account_user_id=? AND dialog_id=? AND message_id=?",
+                         (data["account_user_id"], data["dialog_id"], data["message_id"])).fetchone()
+        if added:
+            db.executemany("INSERT INTO bookmark_tags VALUES (?,?)", [(row[0], tag) for tag in data["tags"]])
+        return row[0], added
+
+    def save(self, data):
+        data = validate_bookmark(data)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._insert(db, data)
+
+    def edit(self, bookmark_id, title, category, tags, note):
+        title = text_value(title, "название", 300, False)
+        category = text_value(category, "категория", 100, False)
+        note = text_value(note, "заметка", 16384)
+        tags = tags_value(tags)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM bookmarks WHERE id=?", (bookmark_id,)).fetchone():
+                raise BookmarkError("Закладка уже удалена.")
+            if not db.execute("SELECT 1 FROM categories WHERE name=?", (category,)).fetchone():
+                raise BookmarkError("Категория уже удалена. Выберите другую.")
+            db.execute("UPDATE bookmarks SET title=?,category=?,note=?,updated_at=? WHERE id=?",
+                       (title, category, note, int(time.time()), bookmark_id))
+            db.execute("DELETE FROM bookmark_tags WHERE bookmark_id=?", (bookmark_id,))
+            db.executemany("INSERT INTO bookmark_tags VALUES (?,?)", [(bookmark_id, tag) for tag in tags])
+
+    def delete(self, bookmark_id):
+        with self.connection() as db:
+            db.execute("DELETE FROM bookmarks WHERE id=?", (bookmark_id,))
+
+    def clear(self):
+        with self.connection() as db:
+            db.execute("DELETE FROM bookmarks")
+
+    def count(self):
+        with self.connection() as db:
+            return db.execute("SELECT count(*) FROM bookmarks").fetchone()[0]
+
+    def tags(self, prefix="", limit=100):
+        with self.connection() as db:
+            return [r[0] for r in db.execute(
+                "SELECT DISTINCT tag FROM bookmark_tags WHERE substr(tag,1,?)=? ORDER BY tag LIMIT ?",
+                (len(fold(prefix).lstrip("#")), fold(prefix).lstrip("#"), limit))]
+
+    def query(self, search="", category=None, tags=None, sort=0, offset=0, limit=PAGE_SIZE):
+        conditions, args = [], []
+        # All whitespace-separated words must match; each may match a different field.
+        for word in fold(search).split()[:30]:
+            conditions.append("(instr(sb_fold(b.title||' '||b.text||' '||b.note||' '||b.category||' '||b.chat),?)>0 "
+                              "OR EXISTS(SELECT 1 FROM bookmark_tags t WHERE t.bookmark_id=b.id AND instr(t.tag,?)>0))")
+            args.extend([word, word.lstrip("#")])
+        if category:
+            conditions.append("b.category=?")
+            args.append(category)
+        for tag in tags_value(tags or []):
+            conditions.append("EXISTS(SELECT 1 FROM bookmark_tags t WHERE t.bookmark_id=b.id AND t.tag=?)")
+            args.append(tag)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        orders = ("b.saved_at DESC,b.id DESC", "b.saved_at,b.id", "sb_fold(b.title),b.id",
+                  "sb_fold(b.category),sb_fold(b.title),b.id")
+        order = orders[sort] if type(sort) is int and 0 <= sort < len(orders) else orders[0]
+        with self.connection() as db:
+            count = db.execute("SELECT count(*) FROM bookmarks b" + where, args).fetchone()[0]
+            rows = db.execute("SELECT b.* FROM bookmarks b" + where + " ORDER BY " + order + " LIMIT ? OFFSET ?",
+                              args + [min(max(limit, 1), 100), max(offset, 0)]).fetchall()
+            result = [self._row(db, row) for row in rows]
+            return [row for row in result if row is not None], count
+
+    def export_data(self):
+        with self.connection() as db:
+            db.execute("BEGIN")  # One consistent snapshot, including categories/tags.
+            cats = [{"name": row[0], "builtin": bool(row[1])} for row in db.execute(
+                "SELECT name,builtin FROM categories ORDER BY name")]
+            records = []
+            for row in db.execute("SELECT * FROM bookmarks ORDER BY id"):
+                record = self._row(db, row)
+                if record is not None:
+                    record.pop("id", None)
+                    records.append(record)
+            return {"format": "smart_bookmark", "schema": 1, "version": __version__,
+                    "exported_at": int(time.time()), "categories": cats, "bookmarks": records}
+
+    def import_data(self, prepared):
+        # Revalidate even if called outside the normal preview flow.
+        data = validate_backup({"format": "smart_bookmark", "schema": 1,
+                                "categories": [{"name": n, "builtin": False} for n in prepared["categories"]],
+                                "bookmarks": prepared["bookmarks"]})
+        added = 0
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.executemany("INSERT OR IGNORE INTO categories VALUES (?,0)", [(n,) for n in data["categories"]])
+            for record in data["bookmarks"]:
+                added += int(self._insert(db, record)[1])
+        return added, len(data["bookmarks"]) - added
+
+
+def choose_account(record, accounts):
+    """Resolve stable Telegram owner ID, not a possibly reassigned slot number."""
+    for slot, owner in accounts:
+        if owner == record["account_user_id"]:
+            return slot
+    raise BookmarkError("Аккаунт этой закладки не подключён. Войдите в соответствующий аккаунт Telegram.")
+
+
+def original_available(messages, record):
+    """Shared, testable response policy. Empty/deleted messages aren't navigable."""
+    return any(mid == record["message_id"] and not empty for mid, empty in messages)
+
+
+def display_date(timestamp):
+    try:
+        return dt.datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M")
+    except (ValueError, OverflowError, OSError):
+        return "Дата неизвестна"
+
+
+# Only the official SDK is imported at module initialization.
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+
+
+class SmartBookmarkPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._alive = True
+        self._epoch = object()
+        self._navigation_epoch = object()
+        self._store = None
+        self._storage_error = None
+        self._count = 0
+        self._categories = list(DEFAULT_CATEGORIES)
+        self._menus = []
+        self._dialogs = []
+        self._requests = []
+        self._pending_document = None
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="smart-bookmark")
+        self._sync_menus()
+        self._setup_documents()
+        self._job(self._initialize, self._initialized, require_store=False)
+
+    def _initialize(self):
+        from file_utils import get_files_dir
+        path = os.path.join(str(get_files_dir()), "smart_bookmark", "bookmarks.sqlite3")
+        store = BookmarkStore(path)
+        return store, store.count(), [c["name"] for c in store.categories()]
+
+    def _initialized(self, result):
+        self._store, self._count, self._categories = result
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._pending_document = None
+        self._worker.shutdown(wait=False, cancel_futures=True)
+        self._cancel_requests()
+        dialogs = self._dialogs[:]
+        self._dialogs.clear()
+        def close_dialogs():
+            for dialog in dialogs:
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+        self._ui(close_dialogs)
+        # SDK removes menus and the single activity-result hook automatically.
+
+    def _cancel_requests(self):
+        for manager, request in self._requests:
+            try:
+                manager.cancelRequest(request, True)
+            except Exception:
+                pass
+        self._requests.clear()
+
+    def _enabled(self):
+        return self._alive and self.get_setting("feature_enabled", True)
+
+    def _sync_menus(self, *_):
+        for item in self._menus:
+            self.remove_menu_item(item)
+        self._menus = []
+        if not self._enabled():
+            return
+        for menu_type, text, callback, icon in (
+            (MenuItemType.MESSAGE_CONTEXT_MENU, "Добавить в закладки", self._message_click, "msg_saved"),
+            (MenuItemType.DRAWER_MENU, "Мои закладки", lambda c: self.open_manager(), "msg_saved"),
+        ):
+            # MAIN_MENU and DRAWER_MENU both feed the drawer on some builds.
+            # Register only DRAWER_MENU; settings provide a second entry point.
+            item = self.add_menu_item(MenuItemData(menu_type=menu_type, text=text, on_click=callback, icon=icon))
+            if item:
+                self._menus.append(item)
+
+    def _toggle(self, value):
+        self.set_setting("feature_enabled", bool(value))
+        self._sync_menus()
+        if not value:
+            self._navigation_epoch = object()
+            self._cancel_requests()
+            for dialog in self._dialogs[:]:
+                dialog.dismiss()
+            self._pending_document = None
+
+    def _job(self, work, done=None, require_store=True, on_error=None):
+        if not self._alive:
+            return
+        epoch = self._epoch
+
+        def run():
+            try:
+                if not self._alive or self._epoch is not epoch:
+                    return
+                if require_store and self._store is None:
+                    raise BookmarkError(self._storage_error or "База ещё загружается. Попробуйте через несколько секунд.")
+                result = work()
+                if self._store is not None:
+                    count = self._store.count()
+                    categories = [c["name"] for c in self._store.categories()]
+                else:
+                    count, categories = self._count, self._categories
+                def finish():
+                    if self._alive and self._epoch is epoch:
+                        self._count, self._categories = count, categories
+                        if done:
+                            self._guard(lambda: done(result))
+                self._ui(finish)
+            except Exception as exc:
+                message = str(exc) if isinstance(exc, BookmarkError) else "Ошибка чтения или записи. Проверьте свободное место и резервную копию."
+                if not require_store:
+                    self._storage_error = message
+                # Never log text, notes, filenames selected by the user or raw RPC errors.
+                self.log("Smart Bookmark: " + type(exc).__name__)
+                def failed():
+                    if self._alive and self._epoch is epoch:
+                        self._notice(message)
+                        if on_error:
+                            self._guard(on_error)
+                self._ui(failed)
+        self._worker.submit(run)
+
+    @staticmethod
+    def _ui(fn, delay=0):
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(fn, delay)
+
+    def _guard(self, fn):
+        try:
+            if self._alive:
+                return fn()
+        except Exception as exc:
+            self.log("Smart Bookmark UI: " + type(exc).__name__)
+            self._notice(str(exc) if isinstance(exc, BookmarkError) else "Действие недоступно в этой версии приложения.")
+
+    @staticmethod
+    def _activity():
+        from client_utils import get_last_fragment
+        fragment = get_last_fragment()
+        if fragment is None or fragment.getParentActivity() is None:
+            raise BookmarkError("Нет активного окна. Откройте список чатов и повторите.")
+        return fragment.getParentActivity()
+
+    def _notice(self, text):
+        from android.widget import Toast
+        try:
+            Toast.makeText(self._activity(), text, Toast.LENGTH_LONG).show()
+        except Exception:
+            self.log("Smart Bookmark: уведомление недоступно")
+
+    def _dialog(self, title):
+        from ui.alert import AlertDialogBuilder
+        dialog = AlertDialogBuilder(self._activity())
+        dialog.set_title(title)
+        self._dialogs.append(dialog)
+        def released(_):
+            if dialog in self._dialogs:
+                self._dialogs.remove(dialog)
+        dialog.set_on_dismiss_listener(released)
+        return dialog
+
+    def _choices(self, title, items, callback):
+        dialog = self._dialog(title)
+        def selected(b, index):
+            b.dismiss()
+            self._guard(lambda: callback(int(index)))
+        dialog.set_items(items, selected)
+        dialog.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        dialog.show()
+
+    def _confirm(self, title, message, callback):
+        dialog = self._dialog(title)
+        dialog.set_message(message)
+        def yes(b, w):
+            b.dismiss()
+            self._guard(callback)
+        dialog.set_positive_button("Продолжить", yes)
+        dialog.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        dialog.show()
+
+    @staticmethod
+    def _color(key):
+        from org.telegram.ui.ActionBar import Theme
+        return Theme.getColor(getattr(Theme, key))
+
+    def _layout(self, padding=12):
+        from android.widget import LinearLayout
+        from org.telegram.messenger import AndroidUtilities
+        layout = LinearLayout(self._activity())
+        layout.setOrientation(1)
+        padding = AndroidUtilities.dp(padding)
+        layout.setPadding(padding, padding, padding, padding)
+        layout.setBackgroundColor(self._color("key_dialogBackground"))
+        return layout
+
+    def _row(self, parent):
+        row = self._layout(0)
+        row.setOrientation(0)
+        parent.addView(row)
+        return row
+
+    @staticmethod
+    def _blend(background, foreground, amount):
+        color = sum(round(((background >> shift) & 255) * (1 - amount) +
+                          ((foreground >> shift) & 255) * amount) << shift
+                    for shift in (0, 8, 16, 24))
+        return color - 2**32 if color >= 2**31 else color
+
+    def _surface(self, view, accent=False, danger=False, interactive=False):
+        from android.graphics.drawable import GradientDrawable, StateListDrawable
+        base = self._color("key_dialogBackground")
+        ink = self._color("key_text_RedBold" if danger else
+                          ("key_dialogTextBlue" if accent else "key_dialogTextGray2"))
+        def drawable(pressed=False):
+            shape = GradientDrawable()
+            shape.setCornerRadius(float(self._dp(12)))
+            shape.setColor(self._blend(base, ink, 0.18 if pressed else (0.12 if accent or danger else 0.06)))
+            shape.setStroke(self._dp(1), self._blend(base, ink, 0.20 if accent or danger else 0.12))
+            return shape
+        if interactive:
+            background = StateListDrawable()
+            background.addState([16842919], drawable(True))  # android.R.attr.state_pressed
+            background.addState([], drawable())
+        else:
+            background = drawable()
+        view.setBackground(background)
+
+    def _heading(self, layout, text):
+        from android.graphics import Typeface
+        view = self._label(layout, text)
+        view.setTextSize(14)
+        view.setTypeface(Typeface.DEFAULT_BOLD)
+        view.setPadding(self._dp(4), self._dp(14), self._dp(4), self._dp(6))
+        return view
+
+    def _label(self, layout, text, secondary=False):
+        from android.widget import TextView
+        from org.telegram.messenger import AndroidUtilities
+        view = TextView(self._activity())
+        view.setText(str(text))
+        view.setTextSize(13 if secondary else 16)
+        view.setTextColor(self._color("key_dialogTextGray2" if secondary else "key_dialogTextBlack"))
+        p = AndroidUtilities.dp(5)
+        view.setPadding(p, p, p, p)
+        layout.addView(view)
+        return view
+
+    def _button(self, layout, text, callback, primary=False, danger=False, compact=False):
+        from android_utils import OnClickListener
+        from android.widget import LinearLayout
+        from android.text import TextUtils
+        view = self._label(layout, text)
+        view.setTextSize(14 if compact else 15)
+        view.setTextColor(self._color("key_text_RedBold" if danger else "key_dialogTextBlue"))
+        view.setMinHeight(self._dp(44 if compact else 48))
+        view.setGravity(17)  # Gravity.CENTER
+        view.setPadding(self._dp(12), self._dp(10), self._dp(12), self._dp(10))
+        if compact:
+            view.setMaxLines(1)
+            view.setEllipsize(TextUtils.TruncateAt.END)
+        params = LinearLayout.LayoutParams(0, -2, 1.0) if compact else LinearLayout.LayoutParams(-1, -2)
+        params.setMargins(self._dp(3), self._dp(4), self._dp(3), self._dp(4))
+        view.setLayoutParams(params)
+        self._surface(view, accent=primary, danger=danger, interactive=True)
+        view.setOnClickListener(OnClickListener(lambda v: self._guard(callback)))
+        return view
+
+    def _chip_state(self, view, active):
+        self._surface(view, accent=active, interactive=True)
+
+    def _watch_text(self, field, callback):
+        from java import dynamic_proxy
+        from android.text import TextWatcher
+        if not hasattr(self, "_text_watcher_type"):
+            class TextListener(dynamic_proxy(TextWatcher)):
+                def __init__(self, callback):
+                    super().__init__()
+                    self.callback = callback
+
+                def beforeTextChanged(self, text, start, count, after):
+                    pass
+
+                def onTextChanged(self, text, start, before, count):
+                    pass
+
+                def afterTextChanged(self, editable):
+                    self.callback()
+            self._text_watcher_type = TextListener
+        field.addTextChangedListener(self._text_watcher_type(lambda: self._guard(callback)))
+
+    @staticmethod
+    def _dp(value):
+        from org.telegram.messenger import AndroidUtilities
+        return AndroidUtilities.dp(value)
+
+    def _input(self, layout, hint, value="", multiline=False):
+        from android.widget import EditText
+        from android.text import InputType
+        view = EditText(self._activity())
+        view.setText(str(value))
+        view.setHint(hint)
+        view.setTextSize(16)
+        view.setTextColor(self._color("key_dialogTextBlack"))
+        view.setHintTextColor(self._color("key_dialogTextHint"))
+        view.setSingleLine(not multiline)
+        view.setInputType(InputType.TYPE_CLASS_TEXT | (InputType.TYPE_TEXT_FLAG_MULTI_LINE if multiline else 0))
+        view.setMinHeight(self._dp(48))
+        view.setPadding(self._dp(12), self._dp(10), self._dp(12), self._dp(10))
+        view.setGravity(51 if multiline else 19)  # TOP|LEFT / CENTER_VERTICAL|LEFT
+        self._surface(view)
+        if multiline:
+            view.setMinLines(2)
+            view.setMaxLines(5)
+        layout.addView(view)
+        return view
+
+    def _scroll(self, layout, height=None):
+        from android.widget import ScrollView
+        scroll = ScrollView(self._activity())
+        scroll.addView(layout)
+        return scroll
+
+    def _prompt(self, title, value, callback, positive="Сохранить", helper=""):
+        layout = self._layout()
+        if helper:
+            self._label(layout, helper, True)
+        field = self._input(layout, title, value)
+        dialog = self._dialog(title)
+        dialog.set_view(layout)
+        def save(b, w):
+            text = str(field.getText())
+            b.dismiss()
+            self._guard(lambda: callback(text))
+        dialog.set_positive_button(positive, save)
+        dialog.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        dialog.show()
+
+    def _message_click(self, context):
+        if not self._enabled():
+            return
+        self._guard(lambda: self._capture(context))
+
+    def _capture(self, context):
+        from org.telegram.messenger import UserConfig, MessagesController, DialogObject
+        message = context.get("message")
+        if message is None:
+            raise BookmarkError("Выберите одно сообщение.")
+        account = int(message.currentAccount)
+        config = UserConfig.getInstance(account)
+        if not config.isClientActivated():
+            raise BookmarkError("Аккаунт не подключён.")
+        controller = MessagesController.getInstance(account)
+        dialog_id = int(message.getDialogId())
+        owner = message.messageOwner
+        peer = owner.peer_id
+        kind = "user"
+        if peer is not None and int(peer.channel_id) != 0:
+            kind = "channel"
+        elif peer is not None and int(peer.chat_id) != 0:
+            kind = "group"
+        if DialogObject.isEncryptedDialog(dialog_id):
+            kind = "secret"
+        chat_name = ""
+        is_forum = False
+        if kind in ("channel", "group"):
+            chat = controller.getChat(-dialog_id)
+            chat_name = str(chat.title) if chat is not None else ""
+            is_forum = chat is not None and bool(chat.forum)
+        elif kind == "user":
+            chat_name = self._user_name(controller.getUser(dialog_id))
+        sender = ""
+        source = owner.from_id
+        if source is not None:
+            if int(source.user_id):
+                sender = self._user_name(controller.getUser(int(source.user_id)))
+            elif int(source.channel_id):
+                user_chat = controller.getChat(int(source.channel_id))
+                sender = str(user_chat.title) if user_chat is not None else ""
+        text = str(owner.message or "")
+        if not text:
+            text = str(message.messageText or "")
+        topic = 0
+        # getTopicId() also returns Saved Messages subdialog IDs on recent clients.
+        # Only real forum topics belong in the navigation thread field.
+        if is_forum:
+            try:
+                topic = max(0, int(message.getTopicId()))
+            except Exception:
+                reply = owner.reply_to
+                if reply is not None and bool(reply.forum_topic):
+                    topic = int(reply.reply_to_top_id or reply.reply_to_msg_id)
+        now = int(time.time())
+        category = self.get_setting("default_category", "Личное")
+        if category not in self._categories:
+            category = "Личное"
+        record = validate_bookmark({
+            "account_slot": account, "account_user_id": int(config.getClientUserId()),
+            "dialog_id": dialog_id, "message_id": int(message.getId()), "topic_id": topic,
+            "peer_kind": kind, "title": " ".join(text.split())[:100] or "Сообщение с вложением",
+            "text": text[:65536], "sender": sender[:500], "chat": chat_name[:500],
+            "category": category, "tags": [], "note": "", "saved_at": now, "updated_at": now,
+        })
+        self._job(lambda: self._store.find(record["account_user_id"], dialog_id, record["message_id"]),
+                  lambda existing: self._duplicate(existing) if existing else self._editor(record))
+
+    @staticmethod
+    def _user_name(user):
+        if user is None:
+            return ""
+        return (str(user.first_name or "") + " " + str(user.last_name or "")).strip()
+
+    def _duplicate(self, record):
+        self._choices("Сообщение уже сохранено", ["Открыть закладку", "Удалить из закладок"],
+                      lambda i: self._details(record) if i == 0 else self._delete(record))
+
+    def _editor(self, record, on_saved=None):
+        record = dict(record)
+        layout = self._layout()
+        self._label(layout, record["chat"] or "Сообщение Telegram", True)
+        self._heading(layout, "Название закладки")
+        title = self._input(layout, "Например, договор с клиентом", record["title"])
+        selected = [record["category"]]
+        def choose_category():
+            choices = self._categories[:]
+            self._choices("Категория", choices, lambda i: set_category(choices[i]))
+        self._heading(layout, "Категория")
+        cat = self._button(layout, selected[0] + "  ▾", choose_category)
+        def set_category(name):
+            selected[0] = name
+            cat.setText(name + "  ▾")
+        self._heading(layout, "Теги · необязательно")
+        tags = self._input(layout, "#договор #клиент", " ".join("#" + t for t in record["tags"]))
+        self._label(layout, "Разделяйте теги пробелом или запятой.", True)
+        suggestions = self._layout(0)
+        layout.addView(suggestions)
+        self._button(layout, "Выбрать из моих тегов", lambda: self._tag_suggestions(tags))
+        self._heading(layout, "Личная заметка · необязательно")
+        note = self._input(layout, "Что важно запомнить?", record["note"], True)
+        self._label(layout, "Сохранено: " + display_date(record["saved_at"]) + "\nДоступно только на этом устройстве.", True)
+        dialog = self._dialog("Редактирование закладки" if "id" in record else "Добавить в закладки")
+        dialog.set_view(self._scroll(layout))
+        busy = [False]
+        def save():
+            if busy[0] or not self._enabled():
+                return
+            new = dict(record, title=str(title.getText()), category=selected[0],
+                       tags=tags_value(str(tags.getText())), note=str(note.getText()), updated_at=int(time.time()))
+            clean = validate_bookmark(new)
+            busy[0] = True
+            save_button = dialog.get_button(-1)
+            save_button.setEnabled(False)
+            save_button.setText("Сохраняем…")
+            # Keep the draft open if storage fails; reject repeated submissions.
+            if "id" in record:
+                work = lambda: (self._store.edit(record["id"], clean["title"], clean["category"], clean["tags"], clean["note"]), record["id"])[1]
+            else:
+                work = lambda: self._store.save(clean)
+            def saved(result):
+                dialog.dismiss()
+                if isinstance(result, tuple) and not result[1]:
+                    self._job(lambda: self._store.get(result[0]), self._duplicate)
+                    return
+                if self.get_setting("notify_saved", True):
+                    self._notice("Закладка сохранена")
+                if on_saved:
+                    on_saved()
+            def failed():
+                busy[0] = False
+                save_button.setEnabled(True)
+                save_button.setText(save_text)
+            self._job(work, saved, on_error=failed)
+        save_text = "Сохранить изменения" if "id" in record else "Сохранить закладку"
+        dialog.set_positive_button(save_text, lambda b, w: self._guard(save))
+        dialog.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        dialog.show()
+        # Telegram dismisses native buttons automatically; replace this listener
+        # so invalid fields do not close the editor.
+        from android_utils import OnClickListener
+        dialog.get_button(-1).setOnClickListener(OnClickListener(lambda v: self._guard(save)))
+        self._watch_tags(tags, suggestions, dialog)
+
+    def _watch_tags(self, field, container, dialog):
+        """Debounced, theme-aware inline completions, not a system-colored popup."""
+        generation = [0]
+        def changed():
+            generation[0] += 1
+            token = generation[0]
+            def lookup():
+                if token != generation[0] or dialog not in self._dialogs or not self._alive:
+                    return
+                current = str(field.getText())
+                prefix = re.split(r"[\s,;]+", current)[-1].lstrip("#")
+                def loaded(values):
+                    if token != generation[0] or dialog not in self._dialogs:
+                        return
+                    container.removeAllViews()
+                    for tag in values:
+                        def complete(value=tag):
+                            # Keep all previous tokens and replace just the partial one.
+                            parts = re.split(r"[\s,;]+", current)
+                            completed = tags_value(parts[:-1] + [value])
+                            field.setText(" ".join("#" + t for t in completed) + " ")
+                            field.setSelection(field.length())
+                        self._button(container, "#" + tag, complete)
+                self._job(lambda: self._store.tags(prefix, limit=5), loaded)
+            self._ui(lambda: self._guard(lookup), 250)
+        self._watch_text(field, changed)
+        changed()
+
+    def _tag_suggestions(self, field):
+        current = str(field.getText())
+        tail = re.split(r"[\s,;]+", current)[-1].lstrip("#")
+        def loaded(values):
+            if not values:
+                self._notice("Подходящих тегов пока нет.")
+                return
+            def append(index):
+                all_tags = tags_value(current)
+                # Replace the partial final token with its completed suggestion.
+                if tail and fold(tail) in all_tags:
+                    all_tags.remove(fold(tail))
+                all_tags = tags_value(all_tags + [values[index]])
+                field.setText(" ".join("#" + t for t in all_tags) + " ")
+                field.setSelection(field.length())
+            self._choices("Ранее использованные теги (до 100)", ["#" + t for t in values], append)
+        self._job(lambda: self._store.tags(tail), loaded)
+
+    def open_manager(self):
+        if not self._enabled():
+            self._notice("Включите Smart Bookmark в настройках плагина.")
+            return
+        self._guard(self._manager)
+
+    def _manager(self):
+        from android.widget import LinearLayout
+        layout = self._layout()
+        search_row = self._row(layout)
+        search = self._input(search_row, "Поиск в закладках")
+        search.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1.0))
+        state = {"category": None, "tags": [], "sort": 0, "offset": 0,
+                 "generation": 0, "typing": 0, "closed": False}
+        find = self._button(search_row, "Найти", lambda: fetch(True), primary=True, compact=True)
+        find.setLayoutParams(LinearLayout.LayoutParams(self._dp(78), -2))
+        filters = self._row(layout)
+        toolbar = self._row(layout)
+        reset_button = self._button(layout, "Сбросить поиск и фильтры", lambda: reset())
+        reset_button.setVisibility(8)
+        status = self._label(layout, "Загружаем закладки…", True)
+        results = self._layout(0)
+        scroll = self._scroll(results)
+        # Fixed viewport bounds the number of native views, even for huge collections.
+        layout.addView(scroll, LinearLayout.LayoutParams(-1, self._dp(300)))
+        pager = self._row(layout)
+        dialog = self._dialog("Мои закладки")
+        dialog.set_view(self._scroll(layout))
+        def active_filters():
+            return bool(str(search.getText()).strip() or state["category"] or state["tags"] or state["sort"])
+        def sync_controls():
+            cat.setText((state["category"] or "Все категории") + "  ▾")
+            tag_button.setText(("Теги · " + str(len(state["tags"])) if state["tags"] else "Все теги") + "  ▾")
+            sort_button.setText(SORTS[state["sort"]] + "  ▾")
+            self._chip_state(cat, bool(state["category"]))
+            self._chip_state(tag_button, bool(state["tags"]))
+            reset_button.setVisibility(0 if active_filters() else 8)
+            tag_button.setContentDescription("Фильтр тегов: " + (", ".join(state["tags"]) or "все теги"))
+        def fetch(reset=False):
+            if state["closed"]:
+                return
+            state["typing"] += 1  # Invalidate a queued live-search callback.
+            if reset:
+                state["offset"] = 0
+            if state["category"] and state["category"] not in self._categories:
+                state["category"] = None
+            sync_controls()
+            state["generation"] += 1
+            generation = state["generation"]
+            params = dict(search=str(search.getText()), category=state["category"], tags=list(state["tags"]),
+                          sort=state["sort"], offset=state["offset"])
+            status.setText("Поиск…")
+            def loaded(value):
+                if state["closed"] or generation != state["generation"]:
+                    return
+                records, total = value
+                # If the final record on a page was deleted, move back one page.
+                if state["offset"] and state["offset"] >= total:
+                    state["offset"] = max(0, ((total - 1) // PAGE_SIZE) * PAGE_SIZE)
+                    fetch()
+                    return
+                results.removeAllViews()
+                pager.removeAllViews()
+                status.setText(("Найдено: " if active_filters() else "Сохранено закладок: ") + str(total))
+                if self._store.skipped_records:
+                    self._label(results, "Повреждённые записи пропущены. Исходные данные сохранены.", True)
+                for record in records:
+                    self._bookmark_card(results, record, lambda r=record: self._details(r, lambda: fetch(False)))
+                if not records:
+                    self._heading(results, "Ничего не найдено" if active_filters() else "Пока нет закладок")
+                    self._label(results, "Попробуйте другой запрос или сбросьте фильтры." if active_filters() else
+                                "Удерживайте сообщение в чате и выберите «Добавить в закладки».", True)
+                pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+                pager.setVisibility(0 if pages > 1 else 8)
+                if pages > 1:
+                    previous = self._button(pager, "← Назад", lambda: page(-1), compact=True)
+                    previous.setEnabled(state["offset"] > 0)
+                    previous.setAlpha(1.0 if state["offset"] > 0 else 0.35)
+                    counter = self._label(pager, "%d / %d" % (state["offset"] // PAGE_SIZE + 1, pages), True)
+                    counter.setGravity(17)
+                    counter.setPadding(self._dp(8), self._dp(16), self._dp(8), 0)
+                    following = self._button(pager, "Далее →", lambda: page(1), compact=True)
+                    following.setEnabled(state["offset"] + PAGE_SIZE < total)
+                    following.setAlpha(1.0 if state["offset"] + PAGE_SIZE < total else 0.35)
+                scroll.scrollTo(0, 0)
+            self._job(lambda: self._store.query(**params), loaded)
+        def page(delta):
+            state["offset"] = max(0, state["offset"] + PAGE_SIZE * delta)
+            fetch()
+        def category():
+            choices = ["Все категории"] + self._categories[:]
+            def chosen(i):
+                state["category"] = None if i == 0 else choices[i]
+                fetch(True)
+            self._choices("Категории", choices, chosen)
+        def filter_tags():
+            self._prompt("Фильтр по тегам", " ".join("#" + t for t in state["tags"]), set_tags,
+                         positive="Применить", helper="Укажите теги через пробел. Найдём закладки со всеми "
+                         "указанными тегами. Пустое поле — любые теги.")
+        def set_tags(value):
+            state["tags"] = tags_value(value)
+            fetch(True)
+        def sort():
+            def selected(i):
+                state["sort"] = i
+                fetch(True)
+            self._choices("Сортировка", list(SORTS), selected)
+        def reset():
+            search.setText("")
+            state.update(category=None, tags=[], sort=0, offset=0)
+            fetch(True)
+        def typing():
+            state["typing"] += 1
+            state["generation"] += 1  # Ignore an older search already in flight.
+            token = state["typing"]
+            def apply():
+                if not state["closed"] and token == state["typing"]:
+                    fetch(True)
+            self._ui(lambda: self._guard(apply), 350)
+        cat = self._button(filters, "Все категории  ▾", category, compact=True)
+        tag_button = self._button(filters, "Все теги  ▾", filter_tags, compact=True)
+        sort_button = self._button(toolbar, SORTS[0] + "  ▾", sort, compact=True)
+        self._button(toolbar, "Настройки", self._settings_dialog, compact=True)
+        self._watch_text(search, typing)
+        dialog.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        def closed(_):
+            state["closed"] = True
+            if dialog in self._dialogs:
+                self._dialogs.remove(dialog)
+        dialog.set_on_dismiss_listener(closed)
+        dialog.show()
+        fetch()
+
+    def _bookmark_card(self, parent, record, callback):
+        from android.widget import LinearLayout
+        from android.graphics import Typeface
+        from android.text import TextUtils
+        from android_utils import OnClickListener
+        card = self._layout(12)
+        self._surface(card, interactive=True)
+        title = self._label(card, record["title"])
+        title.setTextSize(17)
+        title.setTypeface(Typeface.DEFAULT_BOLD)
+        title.setMaxLines(2)
+        title.setEllipsize(TextUtils.TruncateAt.END)
+        snippet = self._label(card, record["text"][:220] or "Сообщение с вложением", True)
+        snippet.setTextSize(14)
+        snippet.setMaxLines(3)
+        snippet.setEllipsize(TextUtils.TruncateAt.END)
+        source = " · ".join(value for value in (record["sender"], record["chat"]) if value)
+        origin = self._label(card, source or "Источник не указан", True)
+        origin.setMaxLines(1)
+        origin.setEllipsize(TextUtils.TruncateAt.END)
+        category = self._label(card, "□ " + record["category"] +
+                               ("   ·   Есть заметка" if record["note"] else ""), True)
+        category.setTextColor(self._color("key_dialogTextBlue"))
+        category.setMaxLines(1)
+        category.setEllipsize(TextUtils.TruncateAt.END)
+        if record["tags"]:
+            tags = self._label(card, " ".join("#" + t for t in record["tags"]), True)
+            tags.setMaxLines(1)
+            tags.setEllipsize(TextUtils.TruncateAt.END)
+        date = self._label(card, display_date(record["saved_at"]) + "   ·   Нажмите, чтобы открыть", True)
+        date.setTextSize(11)
+        card.setOnClickListener(OnClickListener(lambda v: self._guard(callback)))
+        card.setContentDescription("Открыть закладку: " + record["title"])
+        params = LinearLayout.LayoutParams(-1, -2)
+        params.setMargins(0, self._dp(4), 0, self._dp(10))
+        parent.addView(card, params)
+        return card
+
+    def _details(self, record, refresh=None):
+        if record is None:
+            self._notice("Закладка уже удалена или повреждена.")
+            return
+        layout = self._layout()
+        self._label(layout, "□ " + record["category"] + "   ·   " + display_date(record["saved_at"]), True)
+        self._heading(layout, "Сообщение")
+        text = self._label(layout, record["text"] or "Сообщение с вложением")
+        text.setTextIsSelectable(True)
+        if record["tags"]:
+            self._label(layout, " ".join("#" + t for t in record["tags"]), True)
+        self._heading(layout, "Моя заметка")
+        self._label(layout, record["note"] or "Заметка не добавлена", not bool(record["note"]))
+        self._heading(layout, "Источник")
+        self._label(layout, (record["chat"] or "Чат не указан") + "\n" +
+                    (record["sender"] or "Отправитель неизвестен"), True)
+        self._label(layout, "Аккаунт Telegram: " + str(record["account_user_id"]), True)
+        dialog = self._dialog(record["title"])
+        def after():
+            dialog.dismiss()
+            if refresh:
+                refresh()
+        self._heading(layout, "Действия")
+        self._button(layout, "Открыть сообщение в Telegram", lambda: self._open_original(record), primary=True)
+        actions = self._row(layout)
+        self._button(actions, "Изменить", lambda: self._editor(record, after), compact=True)
+        from android_utils import copy_to_clipboard
+        self._button(actions, "Копировать", lambda: copy_to_clipboard(record["text"]), compact=True)
+        def category():
+            choices = self._categories[:]
+            self._choices("Категория", choices, lambda i: self._job(
+                lambda: self._store.edit(record["id"], record["title"], choices[i], record["tags"], record["note"]),
+                lambda _: after()))
+        self._button(layout, "Перенести в другую категорию", category)
+        self._button(layout, "Удалить закладку", lambda: self._delete(record, after), danger=True)
+        dialog.set_view(self._scroll(layout))
+        dialog.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        dialog.show()
+
+    def _delete(self, record, done=None):
+        self._confirm("Удалить закладку?", "Оригинальное сообщение останется в Telegram.",
+                      lambda: self._job(lambda: self._store.delete(record["id"]),
+                                        lambda _: done() if done else self._notice("Закладка удалена")))
+
+    def _categories_dialog(self):
+        self._job(self._store.categories if self._store else lambda: [], self._show_categories)
+
+    def _show_categories(self, categories):
+        names = ["Создать категорию"] + ["□ " + c["name"] for c in categories]
+        def chosen(i):
+            if i == 0:
+                self._prompt("Новая категория", "", lambda value: self._job(
+                    lambda: self._store.category_add(value), lambda _: self._categories_dialog()))
+                return
+            category = categories[i - 1]
+            name = category["name"]
+            if category["builtin"]:
+                self._notice("Встроенная категория. Свои категории можно создавать, переименовывать и удалять.")
+                return
+            def action(index):
+                if index == 0:
+                    def renamed(value):
+                        def complete(_):
+                            if self.get_setting("default_category", "Личное") == name:
+                                self.set_setting("default_category", value.strip())
+                            self._categories_dialog()
+                        self._job(lambda: self._store.category_rename(name, value), complete)
+                    self._prompt("Название категории", name, renamed)
+                else:
+                    self._confirm("Удалить категорию?", "Закладки будут перенесены в «Личное», а не удалены.",
+                        lambda: self._job(lambda: self._store.category_delete(name), lambda _: self._category_deleted(name)))
+            self._choices("□ " + name, ["Переименовать", "Удалить и перенести в «Личное»"], action)
+        self._choices("Категории", names, chosen)
+
+    def _category_deleted(self, name):
+        if self.get_setting("default_category", "Личное") == name:
+            self.set_setting("default_category", "Личное")
+        self._categories_dialog()
+
+    def _default_category(self):
+        choices = self._categories[:]
+        self._choices("Категория по умолчанию", choices,
+                      lambda i: self.set_setting("default_category", choices[i], reload_settings=True))
+
+    def _clear(self):
+        self._confirm("Очистить все закладки?", "Будут удалены закладки всех аккаунтов. Отменить нельзя. Сначала сделайте экспорт.",
+                      lambda: self._job(self._store.clear, lambda _: self._notice("Закладки очищены")))
+
+    def create_settings(self):
+        from ui.settings import Header, Switch, Text, Divider
+        return [
+            Header(text="Smart Bookmark"),
+            Switch(key="feature_enabled", text="Включить Smart Bookmark", default=True, on_change=self._toggle),
+            Text(text="Мои закладки", icon="msg_saved", on_click=lambda v: self.open_manager()),
+            Text(text="Категория по умолчанию", subtext=self.get_setting("default_category", "Личное"),
+                 on_click=lambda v: self._guard(self._default_category)),
+            Switch(key="notify_saved", text="Уведомлять после сохранения", default=True),
+            Text(text="Управление категориями", on_click=lambda v: self._guard(self._categories_dialog)),
+            Divider(), Header(text="Данные и резервные копии"),
+            Text(text="Экспорт закладок", on_click=lambda v: self._guard(self._export)),
+            Text(text="Импорт закладок", on_click=lambda v: self._guard(lambda: self._pick_document("import"))),
+            Text(text="Очистить закладки", red=True, on_click=lambda v: self._guard(self._clear)),
+            Text(text="Количество сохранённых закладок: " + str(getattr(self, "_count", 0)),
+                 subtext="Нажмите, чтобы обновить", on_click=lambda v: self._job(lambda: self._store.count(),
+                     lambda n: self._notice("Сохранено закладок: " + str(n)))),
+            Text(text="Версия плагина: " + __version__),
+            Divider(text="Данные только на устройстве. Экспорт содержит личную переписку и не зашифрован."),
+        ]
+
+    def _settings_dialog(self):
+        items = ["Категория по умолчанию", "Управление категориями", "Уведомления: " +
+                 ("включены" if self.get_setting("notify_saved", True) else "выключены"),
+                 "Экспорт закладок", "Импорт закладок", "Очистить закладки",
+                 "Количество закладок", "Отключить Smart Bookmark"]
+        callbacks = [self._default_category, self._categories_dialog,
+                     lambda: self.set_setting("notify_saved", not self.get_setting("notify_saved", True)),
+                     self._export, lambda: self._pick_document("import"), self._clear,
+                     lambda: self._job(self._store.count, lambda n: self._notice("Закладок: " + str(n))),
+                     lambda: self._toggle(False)]
+        self._choices("Настройки · версия " + __version__, items, lambda i: callbacks[i]())
+
+    # Android Storage Access Framework; only this narrow UI-result hook is needed.
+    # No broad JSON file handler, no permission to access arbitrary shared files.
+    def _setup_documents(self):
+        from hook_utils import find_class
+        from java import jint
+        self._document_hook = False
+        try:
+            method = find_class("org.telegram.ui.LaunchActivity").getDeclaredMethod(
+                "onActivityResult", jint, jint, find_class("android.content.Intent"))
+            method.setAccessible(True)
+            self._document_hook = bool(self.hook_method(method, after=self._document_result))
+        except Exception as exc:
+            self.log("Smart Bookmark: SAF " + type(exc).__name__)
+
+    def _export(self):
+        self._confirm("Экспорт закладок", "JSON-файл может содержать конфиденциальную переписку, заметки и ID аккаунтов. "
+                      "Он не зашифрован. Храните его безопасно; выбор облачного хранилища передаст файл этому провайдеру.",
+                      lambda: self._pick_document("export"))
+
+    def _pick_document(self, mode):
+        from android.content import Intent
+        if not self._document_hook:
+            raise BookmarkError("Системный выбор файлов недоступен в этой сборке приложения.")
+        if self._pending_document:
+            raise BookmarkError("Сначала завершите открытый выбор файла.")
+        activity = self._activity()
+        request = 27441 if mode == "import" else 27442
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT if mode == "import" else Intent.ACTION_CREATE_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*" if mode == "import" else "application/json")
+        if mode == "export":
+            intent.putExtra(Intent.EXTRA_TITLE, "smart_bookmark_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
+        self._pending_document = (request, mode, activity)
+        try:
+            activity.startActivityForResult(intent, request)
+        except Exception:
+            self._pending_document = None
+            raise BookmarkError("На устройстве нет приложения для выбора файлов.")
+
+    def _document_result(self, param):
+        pending = self._pending_document
+        if not self._alive or not pending or int(param.args[0]) != pending[0] or param.thisObject != pending[2]:
+            return
+        self._pending_document = None
+        if int(param.args[1]) != -1 or param.args[2] is None:
+            return
+        uri = param.args[2].getData()
+        if uri is None:
+            return
+        resolver = pending[2].getContentResolver()
+        if pending[1] == "export":
+            def export():
+                with tempfile.TemporaryDirectory(prefix="smart-bookmark-") as directory:
+                    path = os.path.join(directory, "backup.json")
+                    write_backup(path, self._store.export_data())
+                    self._copy_uri(resolver, uri, path, False)
+            self._job(export, lambda _: self._notice("Экспорт завершён. Повреждённые записи пропущены."
+                if self._store.skipped_records else "Экспорт закладок завершён"))
+        else:
+            def stage():
+                with tempfile.TemporaryDirectory(prefix="smart-bookmark-") as directory:
+                    path = os.path.join(directory, "backup.json")
+                    self._copy_uri(resolver, uri, path, True)
+                    return read_backup(path)
+            def preview(data):
+                self._confirm("Импорт закладок", "Проверено записей: %d. Категорий: %d. "
+                    "Существующие закладки не изменятся, дубликаты будут пропущены. Импортировать?" %
+                    (len(data["bookmarks"]), len(data["categories"])),
+                    lambda: self._job(lambda: self._store.import_data(data), lambda result: self._notice(
+                        "Импортировано: %d. Дубликатов пропущено: %d." % result)))
+            self._job(stage, preview)
+
+    @staticmethod
+    def _copy_uri(resolver, uri, path, importing):
+        from java import jarray, jbyte
+        from java.io import FileInputStream, FileOutputStream
+        with contextlib.ExitStack() as stack:
+            source = resolver.openInputStream(uri) if importing else FileInputStream(path)
+            if source is None:
+                raise BookmarkError("Не удалось открыть выбранный файл.")
+            stack.callback(source.close)
+            target = FileOutputStream(path) if importing else resolver.openOutputStream(uri, "wt")
+            if target is None:
+                raise BookmarkError("Не удалось открыть выбранный файл.")
+            stack.callback(target.close)
+            buffer = jarray(jbyte)(65536)
+            total = 0
+            while True:
+                count = source.read(buffer)
+                if count < 0:
+                    break
+                if count == 0:
+                    continue
+                total += count
+                if total > MAX_BACKUP_BYTES:
+                    raise BookmarkError("Файл превышает допустимые 32 МБ.")
+                target.write(buffer, 0, count)
+            target.flush()
+
+    def _open_original(self, record):
+        from org.telegram.messenger import UserConfig, MessagesController
+        from org.telegram.tgnet import TLRPC, ConnectionsManager
+        from client_utils import RequestCallback
+        from java.lang import Integer
+        if not self._enabled():
+            return
+        if record["peer_kind"] == "secret" or record["message_id"] <= 0:
+            raise BookmarkError("Точный переход к секретному, отложенному или ещё не отправленному сообщению не поддерживается. Копия закладки сохранена.")
+        accounts = []
+        for slot in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            config = UserConfig.getInstance(slot)
+            if config.isClientActivated():
+                accounts.append((slot, int(config.getClientUserId())))
+        account = choose_account(record, accounts)
+        controller = MessagesController.getInstance(account)
+        if record["peer_kind"] == "channel":
+            request = TLRPC.TL_channels_getMessages()
+            request.channel = controller.getInputChannel(-record["dialog_id"])
+            if request.channel is None or int(request.channel.channel_id) == 0:
+                raise BookmarkError("Канал недоступен в этом аккаунте. Откройте его вручную и повторите.")
+        else:
+            request = TLRPC.TL_messages_getMessages()
+        request.id.add(Integer(record["message_id"]))
+        manager = ConnectionsManager.getInstance(account)
+        epoch = self._epoch
+        navigation_epoch = getattr(self, "_navigation_epoch", self._epoch)
+        def valid():
+            return (self._enabled() and self._epoch is epoch and
+                    getattr(self, "_navigation_epoch", self._epoch) is navigation_epoch)
+        completed = [False]
+        handle = [None]
+        def response(result, error):
+            def finish():
+                if completed[0] or not valid():
+                    return
+                completed[0] = True
+                if handle[0] in self._requests:
+                    self._requests.remove(handle[0])
+                if error is not None or result is None:
+                    self._notice("Оригинал недоступен. Проверьте подключение и доступ к чату. Закладка сохранена.")
+                    return
+                messages = result.messages
+                available = [(int(messages.get(i).id), isinstance(messages.get(i), TLRPC.TL_messageEmpty))
+                             for i in range(messages.size())]
+                if not original_available(available, record):
+                    self._notice("Сообщение удалено или недоступно. Сохранённая закладка осталась.")
+                    return
+                controller.putUsers(result.users, False)
+                controller.putChats(result.chats, False)
+                self._guard(lambda: self._navigate(record, account, controller))
+            self._ui(lambda: self._guard(finish))
+        request_id = manager.sendRequest(request, RequestCallback(response))
+        handle[0] = (manager, request_id)
+        self._requests.append(handle[0])
+        self._notice("Проверка доступности оригинала…")
+        def timeout():
+            if completed[0] or not valid():
+                return
+            completed[0] = True
+            manager.cancelRequest(request_id, True)
+            if handle[0] in self._requests:
+                self._requests.remove(handle[0])
+            self._notice("Нет ответа от Telegram. Проверьте сеть и повторите. Закладка сохранена.")
+        self._ui(timeout, 15000)
+
+    def _navigate(self, record, account, controller):
+        from android.os import Bundle
+        from org.telegram.ui import ChatActivity
+        from org.telegram.messenger import UserConfig, MessageObject
+        from client_utils import get_last_fragment
+        from android_utils import R
+        from java.util import ArrayList
+        navigation_epoch = getattr(self, "_navigation_epoch", self._epoch)
+        def active():
+            return self._enabled() and getattr(self, "_navigation_epoch", self._epoch) is navigation_epoch
+        # Recheck identity after the asynchronous RPC (the user may have logged out).
+        if int(UserConfig.getInstance(account).getClientUserId()) != record["account_user_id"]:
+            raise BookmarkError("Аккаунт изменился. Повторите открытие закладки.")
+        args = Bundle()
+        if record["dialog_id"] > 0:
+            args.putLong("user_id", record["dialog_id"])
+        else:
+            args.putLong("chat_id", -record["dialog_id"])
+        args.putInt("message_id", record["message_id"])
+        chat = ChatActivity(args)
+        chat.setCurrentAccount(account)
+        def present():
+            if not active():
+                return
+            config = UserConfig.getInstance(account)
+            if not config.isClientActivated() or int(config.getClientUserId()) != record["account_user_id"]:
+                raise BookmarkError("Аккаунт изменился. Повторите открытие закладки.")
+            if int(UserConfig.selectedAccount) != account:
+                self._activity().switchToAccount(account, True)
+            fragment = get_last_fragment()
+            if fragment is None or not fragment.presentFragment(chat):
+                raise BookmarkError("Не удалось открыть чат. Возможно, доступ к нему потерян.")
+            for dialog in self._dialogs[:]:
+                dialog.dismiss()
+        if record["topic_id"]:
+            topics = controller.getTopicsController()
+            epoch = self._epoch
+            settled = [False]
+            def ready():
+                if settled[0] or not active() or self._epoch is not epoch:
+                    return
+                settled[0] = True
+                topic = topics.findTopic(-record["dialog_id"], record["topic_id"])
+                if topic is None or topic.topicStartMessage is None:
+                    self._notice("Тема форума удалена или недоступна. Закладка сохранена.")
+                    return
+                objects = ArrayList()
+                objects.add(MessageObject(account, topic.topicStartMessage, False, False))
+                chat.setThreadMessages(objects, controller.getChat(-record["dialog_id"]), int(topic.id),
+                                       int(topic.read_inbox_max_id), int(topic.read_outbox_max_id), topic)
+                self._guard(present)
+            if topics.findTopic(-record["dialog_id"], record["topic_id"]) is not None:
+                ready()
+            else:
+                topics.loadTopic(-record["dialog_id"], record["topic_id"], R(lambda: self._ui(lambda: self._guard(ready))))
+                def topic_timeout():
+                    if not settled[0] and active() and self._epoch is epoch:
+                        settled[0] = True
+                        self._notice("Не удалось загрузить тему форума. Проверьте сеть и повторите.")
+                self._ui(topic_timeout, 15000)
+        else:
+            present()
