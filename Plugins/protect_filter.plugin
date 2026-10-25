@@ -2,46 +2,106 @@
 
 """ Канал с плагинами: t.me/HzzzPlugins """
 
+import json
+import re
+import time
 from typing import Any, List
 from base_plugin import BasePlugin, HookResult
 from ui.settings import Header, Switch, Divider, Text
 from ui.alert import AlertDialogBuilder
 from client_utils import get_last_fragment, run_on_queue
-from android_utils import log
 from org.telegram.messenger import AccountInstance, AndroidUtilities, ApplicationLoader
-from org.telegram.messenger import UserConfig, MessagesStorage
+from org.telegram.messenger import UserConfig, MessagesStorage, SendMessagesHelper
+from org.telegram.tgnet import TLRPC
 from android.app import Notification, NotificationManager, NotificationChannel, PendingIntent
 from android.content import Context, Intent
 from android.net import Uri
 from android.os import Build
 from android.view import Gravity
 from java.lang import Long, Integer, Boolean
+from java.util import ArrayList
 from java import dynamic_proxy
 from java.lang import Runnable
-from android.widget import Toast
+from android.widget import Toast, LinearLayout, EditText
+
+import os
+from file_utils import get_plugins_dir, read_file
+
+_EXPECTED_CHARS = 34015
+
+def _integrity_check():
+    try:
+        content = None
+        try:
+            if __file__:
+                content = read_file(__file__)
+        except Exception:
+            pass
+        if content is None:
+            plugins_dir = get_plugins_dir()
+            for name in ("protect_filter.py", "protect_filter.plugin", "Protect Filter.plugin"):
+                path = os.path.join(plugins_dir, name)
+                content = read_file(path)
+                if content is not None:
+                    break
+        if content is None:
+            import inspect
+            import sys
+            mod = sys.modules.get(__name__)
+            if mod is not None:
+                content = inspect.getsource(mod)
+        if content is None:
+            raise RuntimeError("Integrity check failed: cannot read own source")
+        actual = len(content)
+        if actual != _EXPECTED_CHARS:
+            raise RuntimeError(
+                f"check failed: {_EXPECTED_CHARS} chars, got {actual}. "
+                "Rat detected | НАПИШИ @exoseo СКАЖИ ГДЕ СКАЧАЛ РАТКУ"
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError("check failed: verification error") from e
+
+_integrity_check()
 
 __id__ = "protect_filter"
 __name__ = "Protect Filter"
 __description__ = "Автоматическая блокировка новых диалогов по ключевым словам. Например: угрозы/спам"
-__author__ = "@exoseo"
-__version__ = "1.1.6"
+__author__ = "@HzzzPlugins <- @exoseo"
+__version__ = "1.2"
 __icon__ = "UtyaDuckFull/25"
-__app_version__ = ">=12.5.1"
-__sdk_version__ = ">=1.4.3.3"
+__app_version__ = ">=12.10.6"
+__category__ = ["privacy", "chats"]
+__sdk_version__ = ">=1.3.3.3"
+
+
+HOMOGLYPHS = str.maketrans({
+    "a": "а", "b": "в", "c": "с", "e": "е", "h": "н",
+    "k": "к", "m": "м", "o": "о", "p": "р", "t": "т",
+    "x": "х", "y": "у", "0": "о", "@": "а", "3": "з",
+    "4": "ч", "6": "б"
+})
+
+
+class DelayedActionRunnable(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self):
+        self.fn()
 
 
 class CheckRunnable(dynamic_proxy(Runnable)):
-    def __init__(self, plugin, account, dialog_id, sender_id, text_lower, keywords):
+    def __init__(self, plugin, account, dialog_id, sender_id, text, has_link):
         self.plugin = plugin
         self.account = account
         self.dialog_id = dialog_id
         self.sender_id = sender_id
-        self.text_lower = text_lower
-        self.keywords = keywords
+        self.text = text
+        self.has_link = has_link
 
     def run(self):
-        triggered = False
-        add_to_old = False
         try:
             messages_storage = MessagesStorage.getInstance(self.account)
             db = messages_storage.getDatabase()
@@ -51,34 +111,68 @@ class CheckRunnable(dynamic_proxy(Runnable)):
                 count = cursor.intValue(0)
             cursor.dispose()
 
-            if count <= 1:
-                matched = False
-                for keyword in self.keywords:
-                    if keyword in self.text_lower:
-                        matched = True
-                        break
-
-                if matched:
-                    triggered = True
-                    run_on_queue(lambda: self.plugin._handle_trigger(self.account, self.dialog_id, self.sender_id))
+            if count <= 3:
+                run_on_queue(lambda: self.plugin._register_incoming(
+                    self.account, self.dialog_id, self.sender_id, self.text, self.has_link
+                ))
             else:
-                add_to_old = True
-        except Exception as e:
-            log(f"ProtectFilter CheckRunnable error: {e}")
-        finally:
-            if not triggered:
-                self.plugin._processing.discard(self.dialog_id)
-                if add_to_old:
-                    self.plugin._old_dialogs.add(self.dialog_id)
+                self.plugin._old_dialogs.add(self.dialog_id)
+        except Exception:
+            pass
 
 
 class ProtectFilterPlugin(BasePlugin):
     def on_plugin_load(self):
         self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_updateShortMessage")
         self._processing = set()
         self._old_dialogs = set()
+        self._pending_batches = {}
         self._cache = {}
+        self._cached_keywords = None
         self._welcome_shown = False
+        self._refresh_keywords_cache()
+
+    def _refresh_keywords_cache(self):
+        keywords_str = self.get_setting("keywords", "докс, деанон, сват, откуп, снос")
+        raw_list = [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
+        self._cached_keywords = [self._normalize_word(w) for w in raw_list if w]
+
+    def _normalize_word(self, word: str) -> str:
+        w = word.lower().translate(HOMOGLYPHS)
+        return re.sub(r"(.)\1+", r"\1", w)
+
+    def _check_text_match(self, text: str) -> str:
+        if self._cached_keywords is None:
+            self._refresh_keywords_cache()
+
+        tokens = re.findall(r"[a-zа-яё0-9@]+", text.lower())
+        for token in tokens:
+            norm_token = self._normalize_word(token)
+            for kw in self._cached_keywords:
+                if not kw:
+                    continue
+                if len(kw) <= 3:
+                    if norm_token == kw:
+                        return kw
+                else:
+                    if norm_token.startswith(kw) or (len(kw) >= 4 and kw in norm_token):
+                        return kw
+        return ""
+
+    def _has_links_in_message(self, message: Any, text: str) -> bool:
+        if text and re.search(r"(https?://|t\.me/|telegram\.me/|www\.|[a-zA-Z0-9-]+\.(ru|com|net|org|fun|io|me|cc|xyz)\b)", text, re.IGNORECASE):
+            return True
+        if message is not None and hasattr(message, "entities") and message.entities:
+            try:
+                for i in range(message.entities.size()):
+                    ent = message.entities.get(i)
+                    ent_name = ent.getClass().getSimpleName()
+                    if "Url" in ent_name or "Mention" in ent_name:
+                        return True
+            except Exception:
+                pass
+        return False
 
     def _get_cached_field(self, obj, name):
         key = f"{obj.getClass().getName()}.{name}"
@@ -97,59 +191,80 @@ class ProtectFilterPlugin(BasePlugin):
             self._cache[key] = method
         return self._cache[key]
 
+    def _is_whitelisted_user(self, account: int, sender_id: int) -> bool:
+        try:
+            account_instance = AccountInstance.getInstance(account)
+            messages_controller = account_instance.getMessagesController()
+            user = messages_controller.getUser(Long(sender_id))
+            if user is None:
+                user = messages_controller.getUser(Integer(sender_id))
+            if user is not None:
+                if getattr(user, "bot", False) or getattr(user, "contact", False) or getattr(user, "mutual_contact", False) or getattr(user, "self", False) or getattr(user, "support", False):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
-        if update_name != "TL_updateNewMessage":
+        if update_name not in ("TL_updateNewMessage", "TL_updateShortMessage"):
             return HookResult()
 
         try:
             if not self.get_setting("enabled", True):
                 return HookResult()
 
-            message = update.message
-            if message is None:
+            message = None
+            text = ""
+            sender_id = None
+
+            if update_name == "TL_updateNewMessage":
+                message = getattr(update, "message", None)
+                if message is None or getattr(message, "out", False):
+                    return HookResult()
+
+                text = getattr(message, "message", "") or ""
+                if not isinstance(text, str):
+                    text = ""
+
+                peer_id = getattr(message, "peer_id", None)
+                from_id = getattr(message, "from_id", None)
+
+                if peer_id is not None and hasattr(peer_id, "user_id") and peer_id.user_id != 0:
+                    sender_id = int(peer_id.user_id)
+                elif from_id is not None and hasattr(from_id, "user_id") and from_id.user_id != 0:
+                    sender_id = int(from_id.user_id)
+            else:
+                if getattr(update, "out", False):
+                    return HookResult()
+                text = getattr(update, "message", "") or ""
+                user_id_val = getattr(update, "user_id", 0)
+                if user_id_val:
+                    sender_id = int(user_id_val)
+
+            if not sender_id or sender_id <= 0:
                 return HookResult()
 
-            if message.out:
-                return HookResult()
-
-            text = message.message
-            if not text or not isinstance(text, str):
-                return HookResult()
-
-            peer_id = message.peer_id
-            from_id = message.from_id
-
-            if peer_id is None or from_id is None:
-                return HookResult()
-
-            if not hasattr(peer_id, "user_id") or not hasattr(from_id, "user_id"):
-                return HookResult()
-
-            sender_id = from_id.user_id
             dialog_id = sender_id
 
             user_config = UserConfig.getInstance(account)
             current_user = user_config.getCurrentUser()
-            if current_user and sender_id == current_user.id:
+            if current_user and sender_id == int(current_user.id):
                 return HookResult()
 
-            if dialog_id in self._old_dialogs:
+            if dialog_id in self._old_dialogs or dialog_id in self._processing:
                 return HookResult()
 
-            if dialog_id in self._processing:
+            if self._is_whitelisted_user(account, sender_id):
+                self._old_dialogs.add(dialog_id)
                 return HookResult()
 
-            keywords_str = self.get_setting("keywords", "докс, деанон, сват, откуп")
-            keywords = [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
-            text_lower = text.lower()
+            has_link = self._has_links_in_message(message, text)
 
-            matched = False
-            for keyword in keywords:
-                if keyword in text_lower:
-                    matched = True
-                    break
+            if not text and not has_link:
+                return HookResult()
 
-            if not matched:
+            if dialog_id in self._pending_batches:
+                run_on_queue(lambda: self._register_incoming(account, dialog_id, sender_id, text, has_link))
                 return HookResult()
 
             account_instance = AccountInstance.getInstance(account)
@@ -160,42 +275,164 @@ class ProtectFilterPlugin(BasePlugin):
             dialog = dialogs_dict.get(dialog_id) if dialogs_dict else None
 
             if dialog is None:
-                self._processing.add(dialog_id)
-                run_on_queue(lambda: self._handle_trigger(account, dialog_id, sender_id))
+                run_on_queue(lambda: self._register_incoming(account, dialog_id, sender_id, text, has_link))
                 return HookResult()
 
             top_message_field = self._get_cached_field(dialog, "top_message")
             top_message = top_message_field.get(dialog)
 
             if top_message == 0:
-                self._processing.add(dialog_id)
-                run_on_queue(lambda: self._handle_trigger(account, dialog_id, sender_id))
+                run_on_queue(lambda: self._register_incoming(account, dialog_id, sender_id, text, has_link))
                 return HookResult()
 
-            self._processing.add(dialog_id)
             messages_storage = MessagesStorage.getInstance(account)
             storage_queue = messages_storage.getStorageQueue()
-            storage_queue.postRunnable(CheckRunnable(self, account, dialog_id, sender_id, text_lower, keywords))
+            storage_queue.postRunnable(CheckRunnable(self, account, dialog_id, sender_id, text, has_link))
 
-        except Exception as e:
-            log(f"ProtectFilter error: {e}")
+        except Exception:
+            pass
 
         return HookResult()
 
-    def _handle_trigger(self, account: int, dialog_id: int, user_id: int):
+    def _register_incoming(self, account: int, dialog_id: int, sender_id: int, text: str, has_link: bool):
+        if dialog_id in self._old_dialogs or dialog_id in self._processing:
+            return
+
+        batch = self._pending_batches.get(dialog_id)
+        if batch is None:
+            batch = {
+                "account": account,
+                "sender_id": sender_id,
+                "messages": [],
+                "triggered": False,
+                "reason": "",
+                "timer_started": False,
+            }
+            self._pending_batches[dialog_id] = batch
+
+        if len(batch["messages"]) >= 5:
+            return
+
+        if text:
+            batch["messages"].append(text)
+
+        if not batch["triggered"]:
+            if self.get_setting("block_links", False) and has_link:
+                batch["triggered"] = True
+                batch["reason"] = "Ссылка в сообщении"
+            elif text:
+                matched_kw = self._check_text_match(text)
+                if matched_kw:
+                    batch["triggered"] = True
+                    batch["reason"] = f"Слово: {matched_kw}"
+
+        delay_sec = int(self.get_setting("batch_delay", 5))
+        if delay_sec <= 0:
+            if batch["triggered"]:
+                self._finalize_batch(dialog_id)
+            elif len(batch["messages"]) >= 3:
+                self._pending_batches.pop(dialog_id, None)
+                self._old_dialogs.add(dialog_id)
+        else:
+            if not batch["timer_started"]:
+                batch["timer_started"] = True
+                runnable = DelayedActionRunnable(lambda: self._finalize_batch(dialog_id))
+                AndroidUtilities.runOnUIThread(runnable, Long(delay_sec * 1000))
+
+    def _finalize_batch(self, dialog_id: int):
+        batch = self._pending_batches.pop(dialog_id, None)
+        if not batch:
+            return
+
+        if not batch["triggered"]:
+            combined_text = " ".join(batch["messages"])
+            matched_kw = self._check_text_match(combined_text)
+            if matched_kw:
+                batch["triggered"] = True
+                batch["reason"] = f"Слово: {matched_kw}"
+
+        if batch["triggered"]:
+            self._processing.add(dialog_id)
+            self._handle_trigger(
+                batch["account"],
+                dialog_id,
+                batch["sender_id"],
+                batch["messages"],
+                batch["reason"],
+            )
+        else:
+            if len(batch["messages"]) >= 3:
+                self._old_dialogs.add(dialog_id)
+
+    def _handle_trigger(self, account: int, dialog_id: int, user_id: int, messages_list: List[str], reason: str):
+        try:
+            self._save_to_journal(account, user_id, messages_list, reason)
+
+            if self.get_setting("send_reply_before_block", False):
+                reply_text = self.get_setting(
+                    "reply_text",
+                    "ты заблокирован защитной системой: Protect Filter"
+                ).strip()
+                if reply_text:
+                    self._send_bold_message(account, dialog_id, reply_text)
+                    runnable = DelayedActionRunnable(
+                        lambda: self._execute_punishment(account, dialog_id, user_id)
+                    )
+                    AndroidUtilities.runOnUIThread(runnable, Long(900))
+                    return
+
+            self._execute_punishment(account, dialog_id, user_id)
+        except Exception:
+            self._processing.discard(dialog_id)
+
+    def _execute_punishment(self, account: int, dialog_id: int, user_id: int):
         try:
             if self.get_setting("block_user", True):
                 self._block_user(account, dialog_id)
 
             if self.get_setting("delete_chat", True):
-                self._delete_chat(account, dialog_id)
+                revoke = self.get_setting("delete_for_both", False)
+                self._delete_chat(account, dialog_id, revoke)
 
             if self.get_setting("notify_trigger", True):
                 self._send_notification(user_id)
-        except Exception as e:
-            log(f"ProtectFilter _handle_trigger error: {e}")
+        except Exception:
+            pass
         finally:
             self._processing.discard(dialog_id)
+
+    def _send_bold_message(self, account: int, dialog_id: int, text: str):
+        try:
+            send_helper = SendMessagesHelper.getInstance(account)
+            entities = ArrayList()
+            bold_entity = TLRPC.TL_messageEntityBold()
+            bold_entity.offset = 0
+            bold_entity.length = len(text.encode("utf-16-le")) // 2
+            entities.add(bold_entity)
+
+            req_params = SendMessagesHelper.SendMessageParams.of(
+                text,
+                Long(dialog_id),
+                None,
+                None,
+                None,
+                True,
+                entities,
+                None,
+                None,
+                True,
+                0,
+                None,
+                False
+            )
+            send_helper.sendMessage(req_params)
+        except Exception:
+            try:
+                account_instance = AccountInstance.getInstance(account)
+                send_helper = account_instance.getSendMessagesHelper()
+                send_helper.sendMessage(text, Long(dialog_id), None, None, None, True, None, None, None, True, 0, None, False)
+            except Exception:
+                pass
 
     def _block_user(self, account: int, dialog_id: int):
         try:
@@ -206,10 +443,22 @@ class ProtectFilterPlugin(BasePlugin):
                 messages_controller.getClass(), "blockPeer", Long.TYPE
             )
             block_method.invoke(messages_controller, Long(dialog_id))
-        except Exception as e:
-            log(f"ProtectFilter block_user error: {e}")
+        except Exception:
+            pass
 
-    def _delete_chat(self, account: int, dialog_id: int):
+    def _unblock_user(self, account: int, dialog_id: int):
+        try:
+            account_instance = AccountInstance.getInstance(account)
+            messages_controller = account_instance.getMessagesController()
+
+            unblock_method = self._get_cached_method(
+                messages_controller.getClass(), "unblockPeer", Long.TYPE
+            )
+            unblock_method.invoke(messages_controller, Long(dialog_id))
+        except Exception:
+            pass
+
+    def _delete_chat(self, account: int, dialog_id: int, revoke: bool = False):
         try:
             account_instance = AccountInstance.getInstance(account)
             messages_controller = account_instance.getMessagesController()
@@ -217,9 +466,112 @@ class ProtectFilterPlugin(BasePlugin):
             delete_method = self._get_cached_method(
                 messages_controller.getClass(), "deleteDialog", Long.TYPE, Integer.TYPE, Boolean.TYPE
             )
-            delete_method.invoke(messages_controller, Long(dialog_id), Integer(0), Boolean(False))
-        except Exception as e:
-            log(f"ProtectFilter delete_chat error: {e}")
+            delete_method.invoke(messages_controller, Long(dialog_id), Integer(0), Boolean(bool(revoke)))
+        except Exception:
+            pass
+
+    def _save_to_journal(self, account: int, user_id: int, messages_list: List[str], reason: str):
+        try:
+            username = "Нет юзернейма"
+            full_name = "Неизвестный"
+            try:
+                account_instance = AccountInstance.getInstance(account)
+                messages_controller = account_instance.getMessagesController()
+                user = messages_controller.getUser(Long(user_id))
+                if user is None:
+                    user = messages_controller.getUser(Integer(user_id))
+                if user is not None:
+                    uname = getattr(user, "username", None)
+                    if uname:
+                        username = f"@{uname}"
+                    first = getattr(user, "first_name", "") or ""
+                    last = getattr(user, "last_name", "") or ""
+                    combined_name = f"{first} {last}".strip()
+                    if combined_name:
+                        full_name = combined_name
+            except Exception:
+                pass
+
+            raw_logs = self.get_setting("blocked_journal", "[]")
+            try:
+                logs_list = json.loads(raw_logs)
+                if not isinstance(logs_list, list):
+                    logs_list = []
+            except Exception:
+                logs_list = []
+
+            entry = {
+                "account": account,
+                "user_id": user_id,
+                "username": username,
+                "name": full_name,
+                "messages": messages_list if messages_list else ["(без текста)"],
+                "reason": reason,
+                "date": time.strftime("%d.%m.%Y %H:%M:%S"),
+            }
+
+            logs_list.insert(0, entry)
+            logs_list = logs_list[:3]
+            self.set_setting("blocked_journal", json.dumps(logs_list, ensure_ascii=False), reload_settings=True)
+        except Exception:
+            pass
+
+    def _get_journal_entries(self) -> List[dict]:
+        raw_logs = self.get_setting("blocked_journal", "[]")
+        try:
+            data = json.loads(raw_logs)
+            if isinstance(data, list):
+                return data[:3]
+        except Exception:
+            pass
+        return []
+
+    def _on_journal_entry_click(self, entry: dict):
+        try:
+            current_fragment = get_last_fragment()
+            if not current_fragment:
+                return
+            activity = current_fragment.getParentActivity()
+            if not activity:
+                return
+
+            msgs_formatted = "\n".join(f"- {m}" for m in entry.get("messages", []))
+            details = (
+                f"Имя: {entry.get('name', 'Неизвестный')}\n"
+                f"Юзернейм: {entry.get('username', 'Нет')}\n"
+                f"ID: {entry.get('user_id')}\n"
+                f"Время: {entry.get('date', '-')}\n"
+                f"Причина: {entry.get('reason', '-')}\n\n"
+                f"История сообщений:\n{msgs_formatted}"
+            )
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Информация о блокировке")
+            builder.set_message(details)
+
+            def on_unblock(bld, which):
+                acc = entry.get("account", UserConfig.selectedAccount)
+                uid = int(entry.get("user_id", 0))
+                if uid:
+                    self._unblock_user(acc, uid)
+                    Toast.makeText(
+                        ApplicationLoader.applicationContext,
+                        f"Пользователь {uid} разблокирован",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                bld.dismiss()
+
+            def on_close(bld, which):
+                bld.dismiss()
+
+            builder.set_positive_button("Разблокировать", on_unblock)
+            builder.set_negative_button("Закрыть", on_close)
+            builder.show()
+        except Exception:
+            pass
+
+    def _on_clear_journal_click(self, view):
+        self.set_setting("blocked_journal", "[]", reload_settings=True)
 
     def _send_notification(self, user_id: int):
         try:
@@ -260,8 +612,8 @@ class ProtectFilterPlugin(BasePlugin):
             notification_id = hash((user_id, "protect_filter")) & 0x7FFFFFFF
             notification_manager.notify(notification_id, builder.build())
 
-        except Exception as e:
-            log(f"ProtectFilter notification error: {e}")
+        except Exception:
+            pass
 
     def _open_tg_link(self, username: str):
         try:
@@ -270,8 +622,8 @@ class ProtectFilterPlugin(BasePlugin):
             intent.setPackage(context.getPackageName())
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(intent)
-        except Exception as e:
-            log(f"ProtectFilter open tg link error: {e}")
+        except Exception:
+            pass
 
     def _show_welcome_dialog(self):
         try:
@@ -284,7 +636,7 @@ class ProtectFilterPlugin(BasePlugin):
 
             builder = AlertDialogBuilder(activity)
             builder.set_title(__name__)
-            builder.set_message("Даров,пока насильно в канал не загоняю,но это под вопросом")
+            builder.set_message("даров,пока насильно в канал не загоняю,но это под вопросом")
 
             def on_good_boy(bld, which):
                 self.set_setting("welcome_shown", True)
@@ -297,11 +649,11 @@ class ProtectFilterPlugin(BasePlugin):
                 Toast.makeText(context, "🙄🙄💔", Toast.LENGTH_SHORT).show()
                 bld.dismiss()
 
-            builder.set_positive_button("Быть хорошим мальчиком 🫶", on_good_boy)
-            builder.set_negative_button("Больше не показывать", on_never_show)
+            builder.set_positive_button("быть хорошим мальчиком 🫶", on_good_boy)
+            builder.set_negative_button("скрыть", on_never_show)
             builder.show()
-        except Exception as e:
-            log(f"ProtectFilter welcome dialog error: {e}")
+        except Exception:
+            pass
 
     def _on_keywords_click(self, view):
         try:
@@ -312,8 +664,6 @@ class ProtectFilterPlugin(BasePlugin):
             activity = current_fragment.getParentActivity()
             if not activity:
                 return
-
-            from android.widget import LinearLayout, EditText
 
             layout = LinearLayout(activity)
             layout.setOrientation(LinearLayout.VERTICAL)
@@ -326,64 +676,224 @@ class ProtectFilterPlugin(BasePlugin):
             )
 
             edit = EditText(activity)
-            edit.setText(self.get_setting("keywords", "докс, деанон, сват, откуп"))
-            edit.setHint("докс, деанон, сват, откуп")
+            edit.setText(self.get_setting("keywords", "докс, деанон, сват, откуп, снос"))
+            edit.setHint("докс, деанон, сват, откуп, снос")
             layout.addView(edit, -1, -2)
 
             def on_save(bld, which):
                 self.set_setting("keywords", str(edit.getText()), reload_settings=True)
+                self._refresh_keywords_cache()
                 bld.dismiss()
 
             def on_cancel(bld, which):
                 bld.dismiss()
 
             builder = AlertDialogBuilder(activity)
-            builder.set_title("Фильтр ключевых слов")
-            builder.set_message("Каждое слово отделяйте запятой")
+            builder.set_title("фильтр ключевых слов")
+            builder.set_message("каждое слово отделяй запятой")
             builder.set_view(layout)
             builder.set_positive_button("Сохранить", on_save)
             builder.set_negative_button("Отмена", on_cancel)
             builder.show()
 
-        except Exception as e:
-            log(f"ProtectFilter keywords dialog error: {e}")
+        except Exception:
+            pass
+
+    def _on_reply_text_click(self, view):
+        try:
+            current_fragment = get_last_fragment()
+            if not current_fragment:
+                return
+
+            activity = current_fragment.getParentActivity()
+            if not activity:
+                return
+
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setGravity(Gravity.CENTER_HORIZONTAL)
+            layout.setPadding(
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+            )
+
+            default_reply = "ты заблокирован защитной системой: Protect Filter"
+            edit = EditText(activity)
+            edit.setText(self.get_setting("reply_text", default_reply))
+            edit.setHint(default_reply)
+            layout.addView(edit, -1, -2)
+
+            def on_save(bld, which):
+                val = str(edit.getText()).strip() or default_reply
+                self.set_setting("reply_text", val, reload_settings=True)
+                bld.dismiss()
+
+            def on_cancel(bld, which):
+                bld.dismiss()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("текст перед блокировкой")
+            builder.set_message(":3")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", on_save)
+            builder.set_negative_button("Отмена", on_cancel)
+            builder.show()
+        except Exception:
+            pass
+
+    def _on_delay_click(self, view):
+        current_delay = int(self.get_setting("batch_delay", 5))
+        next_delay = 10 if current_delay == 5 else (0 if current_delay == 10 else 5)
+        self.set_setting("batch_delay", next_delay, reload_settings=True)
 
     def _get_keywords_subtext(self) -> str:
-        keywords = self.get_setting("keywords", "докс, деанон, сват, откуп")
+        keywords = self.get_setting("keywords", "докс, деанон, сват, откуп, снос")
         if len(keywords) > 30:
             return keywords[:30] + "..."
         return keywords
+
+    def _get_reply_subtext(self) -> str:
+        text = self.get_setting("reply_text", "ты заблокирован защитной системой: Protect Filter")
+        if len(text) > 32:
+            return text[:32] + "..."
+        return text
+
+    def _get_delay_subtext(self) -> str:
+        delay = int(self.get_setting("batch_delay", 5))
+        if delay == 0:
+            return "Мгновенно (без ожидания)"
+        return f"{delay} сек. (сбор серии сообщений)"
 
     def create_settings(self) -> List[Any]:
         if not self._welcome_shown and not self.get_setting("welcome_shown", False):
             self._welcome_shown = True
             run_on_queue(self._show_welcome_dialog)
 
-        return [
-            Header(text="Основные настройки"),
-            Switch(key="enabled", text="Включить фильтр", default=True),
-            Divider(text="ᅠ"),
-            Switch(key="block_user", text="Блокировать пользователя", default=True),
-            Switch(key="delete_chat", text="Удалять чат (локально)", default=True),
-            Divider(text="ᅠ"),
+        settings_items = [
+            Header(text="основные"),
             Text(
-                text="Фильтр ключевых слов",
+                text="фильтр ключевых слов",
                 subtext=self._get_keywords_subtext(),
                 icon="msg_filter",
                 on_click=self._on_keywords_click,
                 link_alias="keywords_filter",
             ),
-            Divider(text="ᅠ"),
-            Switch(key="notify_trigger", text="Уведомлять о срабатывании", default=True),
-            Divider(text="ᅠ"),
+            Switch(
+                key="block_links",
+                text="триггер на любые ссылки",
+                default=False,
+            ),
+            
+            Divider(text=""),
+            Header(text="действия"),
+            Switch(
+                key="block_user",
+                text="блокировать юзера",
+                default=True,
+                on_change=lambda val: self.set_setting("block_user", val, reload_settings=True),
+            ),
+            Divider(text=""),
+            Switch(
+                key="notify_trigger",
+                text="уведомление о срабатывании",
+                default=True,
+            ),
+            Divider(text=""),
+            Switch(
+                key="send_reply_before_block",
+                text="прощальный текст",
+                default=False,
+                on_change=lambda val: self.set_setting("send_reply_before_block", val, reload_settings=True),
+            ),
+        ]
+
+        if self.get_setting("send_reply_before_block", False):
+            settings_items.append(
+                Text(
+                    text="текст сообщения",
+                    subtext=self._get_reply_subtext(),
+                    on_click=self._on_reply_text_click,
+                    link_alias="reply_text_setting",
+                )
+            )
+
+        settings_items.extend([
+            Divider(text=""),
+            Switch(
+                key="delete_chat",
+                text="удалять чат",
+                default=True,
+                on_change=lambda val: self.set_setting("delete_chat", val, reload_settings=True),
+            ),
+        ])
+
+        if self.get_setting("delete_chat", True):
+            settings_items.append(
+                Switch(
+                    key="delete_for_both",
+                    text="удалять у обоих?",
+                    default=False,
+                    on_change=lambda val: self.set_setting("delete_for_both", val, reload_settings=True),
+                )
+            )
+
+        settings_items.extend([
+            Divider(text=""),
+            Header(text="лог срабатываний"),
+        ])
+
+        journal_entries = self._get_journal_entries()
+        if not journal_entries:
+            settings_items.append(
+                Text(
+                    text="нема",
+                    subtext="ваще",
+                )
+            )
+        else:
+            for idx, entry in enumerate(journal_entries):
+                uid = entry.get("user_id", 0)
+                uname = entry.get("username", "нет юза")
+                msgs_preview = " | ".join(entry.get("messages", []))
+                if len(msgs_preview) > 40:
+                    msgs_preview = msgs_preview[:40] + "..."
+                settings_items.append(
+                    Text(
+                        text=f"{entry.get('name', 'пользователь')} ({uname}) [ID: {uid}]",
+                        subtext=f"{entry.get('reason', 'фильтр')} — {msgs_preview}",
+                        on_click=lambda v, e=entry: self._on_journal_entry_click(e),
+                        link_alias=f"journal_entry_{idx}",
+                    )
+                )
+            settings_items.append(
+                Text(
+                    text="очистить лог",
+                    on_click=self._on_clear_journal_click,
+                    link_alias="clear_journal_btn",
+                )
+            )
+
+        settings_items.extend([
+            Divider(text=""),
+            Divider(text=""),
+            Divider(text="public-1.2 | be safe ⛨"),
             Text(
-                text="Сделал: @exoseo",
+                text="сделал: @exoseo",
                 on_click=lambda v: self._open_tg_link("exoseo"),
                 link_alias="creator_link",
             ),
             Text(
-                text="Канал: @HzzzPlugins",
+                text="канал: @HzzzPlugins",
                 on_click=lambda v: self._open_tg_link("HzzzPlugins"),
                 link_alias="channel_link",
             ),
-        ]
+            Text(
+                    text="найдет все тайны: @xucxbot",
+                    accent=True,
+                    on_click=lambda v: self._open_tg_link("xucxbot"),
+                ),
+        ])
+
+        return settings_items
