@@ -1,0 +1,1068 @@
+import gc
+import json
+import threading
+import weakref
+import time
+import datetime
+import base64
+import zlib
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from android_utils import run_on_ui_thread, OnClickListener
+from java import dynamic_proxy, jint, jlong
+from java.lang import Long, Runnable
+from java.nio import ByteBuffer
+from dalvik.system import InMemoryDexClassLoader
+from org.telegram.messenger import ApplicationLoader, UserConfig
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from android.os import Bundle
+from android.widget import ScrollView, LinearLayout, TextView, ImageView
+from android.util import TypedValue
+
+__id__ = "pill_mentions"
+__name__ = "PillMentions"
+__description__ = "Показывает в Pill Stack кто упомянул, в каком чате и когда с редиректом в чат по нажатию"
+__author__ = "@dekma0091"
+__version__ = "2.1"
+__icon__ = "pixelcamera/6"
+__min_version__ = "12.5.1"
+
+MY_PILL_ID = 1560
+TAG_KEY = 0x50494C4C
+TAG_KEY_J = jint(TAG_KEY)
+PILL_ID_J = jint(MY_PILL_ID)
+
+DIALOG_ANIM_DURATION_MS = 250
+LAZY_LOAD_DELAY_MS = 20
+LAZY_LOAD_BATCH_SIZE = 1
+POPUP_ALPHA = 190
+POPUP_BG_COLOR_DARK = 0xff141414
+POPUP_BG_COLOR_LIGHT = 0xffffffff
+CARD_BG_OPACITY_DARK = 0x08
+CARD_BG_OPACITY_LIGHT = 0x04
+UPDATE_INTERVAL_SECONDS = 8
+PAGE_SIZE = 20
+
+ENTRY_CLASS = "ni.dekma.pill_mentions.PillMentionsBridge"
+
+_ui_package_prefix = None
+_pillstack_package_prefix = None
+
+def _find_ui_cls(name):
+    global _ui_package_prefix
+    if not _ui_package_prefix:
+        for candidate in ["org.telegram.ui"] + [f"org.telegram.p{i:03d}ui" for i in range(200)]:
+            try:
+                if find_class(f"{candidate}.LaunchActivity") is not None:
+                    _ui_package_prefix = candidate
+                    break
+            except Exception:
+                pass
+        _ui_package_prefix = _ui_package_prefix or "org.telegram.ui"
+    try:
+        return find_class(f"{_ui_package_prefix}.{name}")
+    except Exception:
+        return None
+
+def _find_pillstack_cls(name):
+    global _pillstack_package_prefix
+    if not _pillstack_package_prefix:
+        for candidate in ["com.exteragram.messenger.pillstack.ui", "com.exteragram.messenger.pillstack.p014ui"]:
+            try:
+                if find_class(f"{candidate}.pills.weather.WeatherPill") is not None:
+                    _pillstack_package_prefix = candidate
+                    break
+            except Exception:
+                pass
+        _pillstack_package_prefix = _pillstack_package_prefix or "com.exteragram.messenger.pillstack.ui"
+    try:
+        return find_class(f"{_pillstack_package_prefix}.{name}")
+    except Exception:
+        return None
+
+def _clear_view_references(view):
+    try:
+        if hasattr(view, 'setOnClickListener'):
+            view.setOnClickListener(None)
+        if hasattr(view, 'getChildCount'):
+            count = view.getChildCount()
+            for i in range(count):
+                _clear_view_references(view.getChildAt(i))
+    except Exception:
+        pass
+
+
+class NativeBridge:
+    def __init__(self, entry_class_name):
+        self.entry_class_name = entry_class_name
+        self.target_class = None
+        self.is_active = False
+        self.is_loading = False
+        self.is_stopped = False
+        self._lock = threading.Lock()
+
+    def start(self):
+        with self._lock:
+            if self.is_active or self.is_loading or self.is_stopped:
+                return
+            self.is_loading = True
+        try:
+            if self.target_class is None:
+                ctx = ApplicationLoader.applicationContext
+                if ctx is None or not _DEX_BASE64:
+                    with self._lock:
+                        self.is_loading = False
+                    return
+                compressed_data = base64.b64decode(_DEX_BASE64)
+                dex_data = zlib.decompress(compressed_data)
+                dex_buffer = ByteBuffer.wrap(dex_data)
+                class_loader = InMemoryDexClassLoader(dex_buffer, ctx.getClassLoader())
+                self.target_class = class_loader.loadClass(self.entry_class_name)
+            self._invoke_static("load")
+            with self._lock:
+                if self.is_stopped:
+                    try:
+                        self._invoke_static("unload")
+                    except Exception:
+                        pass
+                    self.is_active = False
+                else:
+                    self.is_active = True
+                self.is_loading = False
+        except Exception:
+            with self._lock:
+                self.is_active = False
+                self.is_loading = False
+            try:
+                self._invoke_static("unload")
+            except Exception:
+                pass
+            raise
+
+    def stop(self):
+        with self._lock:
+            self.is_stopped = True
+            if self.target_class is None or not self.is_active:
+                return
+            self.is_active = False
+        try:
+            self._invoke_static("unload")
+        except Exception:
+            pass
+
+    def create_index(self):
+        if self.is_active:
+            try:
+                self._invoke_static("createIndex")
+            except Exception:
+                pass
+
+    def get_unread_count(self):
+        if not self.is_active:
+            return 0
+        try:
+            result = self._invoke_static("getUnreadCount")
+            return int(result) if result is not None else 0
+        except Exception:
+            return 0
+
+    def fetch_mentions(self, time_limit, limit, offset, sort_asc):
+        if not self.is_active:
+            return '{"items":[],"hasMore":false}'
+        try:
+            params = f"{time_limit},{limit},{offset},{1 if sort_asc else 0}"
+            result = self._invoke_static("fetchMentions", params)
+            return str(result) if result else '{"items":[],"hasMore":false}'
+        except Exception:
+            return '{"items":[],"hasMore":false}'
+
+    def mark_as_read(self, uid, mid):
+        if self.is_active:
+            try:
+                params = f"{uid},{mid}"
+                self._invoke_static("markAsRead", params)
+            except Exception:
+                pass
+
+    def _invoke_static(self, method_name, *args):
+        if self.target_class is None:
+            return None
+        for method in self.target_class.getDeclaredMethods():
+            if str(method.getName()) == method_name and len(method.getParameterTypes()) == len(args):
+                method.setAccessible(True)
+                if not args:
+                    return method.invoke(None)
+                return method.invoke(None, *args)
+        return None
+
+
+class WhitelistCreator(dynamic_proxy(find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator"))):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def create(self, context, resourcesProvider):
+        try:
+            pill = self.plugin.WeatherPill(context, resourcesProvider)
+            pill.setTag(TAG_KEY_J, PILL_ID_J)
+            self.plugin.active_pills.add(pill)
+            run_on_ui_thread(lambda: self.plugin.update_pill_ui(pill))
+            return pill
+        except Exception:
+            return None
+        finally:
+            del context
+            del resourcesProvider
+
+class MenuAction(dynamic_proxy(Runnable)):
+    def __init__(self, idx, label, plugin, btn):
+        super().__init__()
+        self.idx = idx
+        self.label = label
+        self.plugin = plugin
+        self.btn = btn
+    def run(self):
+        try:
+            self.plugin.set_setting("time_filter", self.idx)
+            filter_labels = ["За все время", "За час", "За сегодня", "За 3 дня", "За неделю"]
+            self.btn.setText(filter_labels[self.idx])
+            threading.Thread(target=self.plugin._load_mentions_async, args=(True,)).start()
+        except Exception:
+            pass
+
+class GetIdHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            tag = param.thisObject.getTag(TAG_KEY_J)
+            if tag and int(tag) == MY_PILL_ID:
+                self.plugin.active_pills.add(param.thisObject)
+                param.setResult(PILL_ID_J)
+        finally:
+            del param
+
+    def after_hooked_method(self, param):
+        try:
+            pass
+        finally:
+            del param
+
+class InteractionHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            tag = param.thisObject.getTag(TAG_KEY_J)
+            if tag and int(tag) == MY_PILL_ID:
+                method_name = param.method.getName()
+                if method_name == "onPillClicked":
+                    self.plugin.on_click_action()
+                    param.setResult(None)
+                elif method_name == "onPillLongClicked":
+                    param.setResult(True)
+                elif method_name in ["onUpdateData", "setData"]:
+                    param.setResult(None)
+        finally:
+            del param
+
+    def after_hooked_method(self, param):
+        try:
+            pass
+        finally:
+            del param
+
+class MentionsViewerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._registered_unhooks = []
+        self.active_pills = weakref.WeakSet()
+        self.sort_asc = False
+        self.current_dialog_mentions = None
+        self.render_cards_callback = None
+        self.updater_running = False
+        self.render_generation = 0
+        self._mentions_offset = 0
+        self._has_more = False
+        self._load_more_btn = None
+        self.bridge = NativeBridge(ENTRY_CLASS)
+
+        self.PillRegistry = None
+        self.PillInfo = None
+        self.PillCreator = None
+        self.PillStackConfig = None
+        self.WeatherPill = None
+        self.ChatActivity = None
+        self.AvatarDrawable = None
+        self.BackupImageView = None
+        self.ItemOptions = None
+        self.Theme = None
+        self.AndroidUtilities = None
+        self.LayoutTransition = None
+        self.TransitionManager = None
+        self.AutoTransition = None
+        self.MessagesController = None
+
+    def on_plugin_load(self):
+        self.updater_running = True
+        threading.Thread(target=self._load_async_plugin_tasks, daemon=True).start()
+
+    def _load_async_plugin_tasks(self):
+        try:
+            self.bridge.start()
+            if self.bridge.is_stopped:
+                return
+            self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+            self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+            self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+            self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+            self.WeatherPill = _find_pillstack_cls("pills.weather.WeatherPill")
+            self.ChatActivity = _find_ui_cls("ChatActivity")
+            self.AvatarDrawable = _find_ui_cls("Components.AvatarDrawable")
+            self.BackupImageView = _find_ui_cls("Components.BackupImageView")
+            self.ItemOptions = _find_ui_cls("Components.ItemOptions")
+            self.Theme = find_class("org.telegram.ui.ActionBar.Theme")
+            self.AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+            self.LayoutTransition = find_class("android.animation.LayoutTransition")
+            self.TransitionManager = find_class("android.transition.TransitionManager")
+            self.AutoTransition = find_class("android.transition.AutoTransition")
+            self.MessagesController = find_class("org.telegram.messenger.MessagesController")
+
+            if self.bridge.is_stopped:
+                return
+
+            self.bridge.create_index()
+
+            if self.bridge.is_stopped:
+                return
+
+            if self.PillRegistry and self.PillInfo and self.WeatherPill:
+                self._register_pill_stack()
+                self._badge_updater_loop()
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        self.updater_running = False
+        if self.PillRegistry:
+            try:
+                self.PillRegistry.unregister(PILL_ID_J)
+            except Exception:
+                pass
+
+        for u in self._registered_unhooks:
+            try:
+                self.unhook_method(u)
+            except Exception:
+                pass
+        self._registered_unhooks.clear()
+        self.active_pills.clear()
+        self.bridge.stop()
+
+    def _register_pill_stack(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            res = ctx.getResources()
+            icon_res = res.getIdentifier("msg_mention", "drawable", ctx.getPackageName())
+            if icon_res == 0:
+                icon_res = res.getIdentifier("msg_notifications", "drawable", ctx.getPackageName())
+            if icon_res == 0:
+                icon_res = res.getIdentifier("msg_message", "drawable", ctx.getPackageName())
+
+            color_top = jint(-11565578)
+            color_bottom = jint(-13276952)
+
+            creator = WhitelistCreator(self)
+            pill_info = self.PillInfo(
+                PILL_ID_J,
+                "Упоминания",
+                jint(icon_res),
+                color_top,
+                color_bottom,
+                creator
+            )
+
+            self.PillRegistry.register(pill_info)
+            self.PillRegistry.activatePill(PILL_ID_J)
+
+            u1 = self.hook_all_methods(self.WeatherPill, "getPillId", GetIdHook(self))
+            if u1:
+                self._registered_unhooks.append(u1)
+
+            u2 = self.hook_all_methods(self.WeatherPill, "onPillClicked", InteractionHook(self))
+            if u2:
+                self._registered_unhooks.append(u2)
+
+            u3 = self.hook_all_methods(self.WeatherPill, "onPillLongClicked", InteractionHook(self))
+            if u3:
+                self._registered_unhooks.append(u3)
+
+            u4 = self.hook_all_methods(self.WeatherPill, "onUpdateData", InteractionHook(self))
+            if u4:
+                self._registered_unhooks.append(u4)
+
+            u5 = self.hook_all_methods(self.WeatherPill, "setData", InteractionHook(self))
+            if u5:
+                self._registered_unhooks.append(u5)
+        except Exception:
+            pass
+
+    def update_pill_ui(self, pill):
+        try:
+            tv = get_private_field(pill, "textView")
+            if tv:
+                tv.setText("Упоминания")
+
+            iv = get_private_field(pill, "iconView")
+            if iv:
+                ctx = pill.getContext()
+                icon_res = ctx.getResources().getIdentifier("msg_mention", "drawable", ctx.getPackageName())
+                if icon_res == 0:
+                    icon_res = ctx.getResources().getIdentifier("msg_notifications", "drawable", ctx.getPackageName())
+                if icon_res == 0:
+                    icon_res = ctx.getResources().getIdentifier("msg_message", "drawable", ctx.getPackageName())
+                if icon_res != 0:
+                    iv.setImageResource(icon_res)
+
+            themedColor = 0xff2196f3
+            if tv:
+                tv.setTextColor(jint(themedColor))
+            if iv:
+                iv.setColorFilter(jint(themedColor))
+
+            if self.Theme and self.AndroidUtilities:
+                default_color = self.Theme.getColor(self.Theme.key_windowBackgroundWhite) if self.Theme.isCurrentThemeDark() else self.Theme.multAlpha(themedColor, 0.09)
+                pressed_color = self.Theme.multAlpha(themedColor, 0.1)
+
+                layout = get_private_field(pill, "layout")
+                if layout:
+                    layout.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                        self.AndroidUtilities.dp(14),
+                        jint(default_color),
+                        jint(pressed_color)
+                    ))
+            threading.Thread(target=self.update_badge_count).start()
+        except Exception:
+            pass
+
+    def _badge_updater_loop(self):
+        while self.updater_running:
+            try:
+                self.update_badge_count()
+            except Exception:
+                pass
+            time.sleep(UPDATE_INTERVAL_SECONDS)
+
+    def update_badge_count(self):
+        try:
+            count = self.bridge.get_unread_count()
+            run_on_ui_thread(lambda: self._apply_badge_to_pills(count))
+        except Exception:
+            pass
+
+    def _apply_badge_to_pills(self, count):
+        try:
+            text = f"Упоминания ({count})" if count > 0 else "Упоминания"
+            themedColor = 0xffe53935 if count > 0 else 0xff2196f3
+
+            for pill in list(self.active_pills):
+                if not pill:
+                    continue
+                tv = get_private_field(pill, "textView")
+                if tv:
+                    tv.setText(text)
+                    tv.setTextColor(jint(themedColor))
+
+                iv = get_private_field(pill, "iconView")
+                if iv:
+                    iv.setColorFilter(jint(themedColor))
+
+                if self.Theme and self.AndroidUtilities:
+                    default_color = self.Theme.getColor(self.Theme.key_windowBackgroundWhite) if self.Theme.isCurrentThemeDark() else self.Theme.multAlpha(themedColor, 0.09)
+                    pressed_color = self.Theme.multAlpha(themedColor, 0.1)
+
+                    layout = get_private_field(pill, "layout")
+                    if layout:
+                        layout.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                            self.AndroidUtilities.dp(14),
+                            jint(default_color),
+                            jint(pressed_color)
+                        ))
+        except Exception:
+            pass
+
+    def _build_mentions_query(self):
+        time_filter = 0
+        try:
+            time_filter = int(self.get_setting("time_filter", 0))
+        except Exception:
+            pass
+
+        current_time = int(time.time())
+        time_limit = 0
+        if time_filter == 1:
+            time_limit = current_time - 3600
+        elif time_filter == 2:
+            now = datetime.datetime.now()
+            midnight = datetime.datetime(now.year, now.month, now.day)
+            time_limit = int(midnight.timestamp())
+        elif time_filter == 3:
+            time_limit = current_time - 259200
+        elif time_filter == 4:
+            time_limit = current_time - 604800
+        return time_limit
+
+    def on_click_action(self):
+        self.current_dialog_mentions = None
+        self.render_cards_callback = None
+        self.render_generation = 0
+        self._mentions_offset = 0
+        self._has_more = False
+        threading.Thread(target=self._load_mentions_async, args=(False,)).start()
+
+    def _load_mentions_async(self, refresh_only, append=False):
+        try:
+            if not append:
+                self._mentions_offset = 0
+
+            time_limit = self._build_mentions_query()
+            offset = self._mentions_offset
+
+            json_str = self.bridge.fetch_mentions(time_limit, PAGE_SIZE, offset, self.sort_asc)
+            data = json.loads(json_str)
+
+            mentions = data.get("items", [])
+            self._has_more = data.get("hasMore", False)
+            self._mentions_offset = offset + len(mentions)
+
+            if append:
+                run_on_ui_thread(lambda: self._append_mentions(mentions))
+            elif refresh_only:
+                run_on_ui_thread(lambda: self.update_active_dialog(mentions))
+            else:
+                run_on_ui_thread(lambda: self.show_mentions_dialog(mentions))
+        except Exception:
+            pass
+
+    def _append_mentions(self, new_mentions):
+        try:
+            if self.current_dialog_mentions is not None and new_mentions:
+                self.current_dialog_mentions.extend(new_mentions)
+                if self.render_cards_callback:
+                    self.render_cards_callback()
+        except Exception:
+            pass
+
+    def update_active_dialog(self, new_mentions):
+        try:
+            if self.current_dialog_mentions is not None:
+                self.current_dialog_mentions = new_mentions
+                if self.render_cards_callback:
+                    self.render_cards_callback()
+            threading.Thread(target=self.update_badge_count).start()
+        except Exception:
+            pass
+
+    def show_mentions_dialog(self, mentions):
+        try:
+            last_fragment = get_last_fragment()
+            if not last_fragment:
+                return
+            activity = last_fragment.getParentActivity()
+            if not activity:
+                return
+
+            self.current_dialog_mentions = mentions
+            mc = self.MessagesController.getInstance(UserConfig.selectedAccount)
+            ctx = ApplicationLoader.applicationContext
+
+            builder = AlertDialogBuilder(activity)
+
+            root = LinearLayout(activity)
+            root.setOrientation(1)
+
+            header_layout = LinearLayout(activity)
+            header_layout.setOrientation(0)
+            header_layout.setPadding(
+                self.AndroidUtilities.dp(20),
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(8)
+            )
+
+            title_view = TextView(activity)
+            title_view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20)
+            title_view.setTypeface(self.AndroidUtilities.bold())
+            title_tv_color = self.Theme.getColor(self.Theme.key_dialogTextBlack)
+            title_view.setTextColor(jint(title_tv_color))
+            title_view.setText("Упоминания")
+
+            title_lp = LinearLayout.LayoutParams(0, -2, 1.0)
+            title_view.setLayoutParams(title_lp)
+            header_layout.addView(title_view)
+
+            time_filter = 0
+            try:
+                time_filter = int(self.get_setting("time_filter", 0))
+            except Exception:
+                pass
+            filter_labels = ["За все время", "За час", "За сегодня", "За 3 дня", "За неделю"]
+            initial_label = filter_labels[time_filter] if 0 <= time_filter < len(filter_labels) else "За все время"
+
+            is_dark = self.Theme.isCurrentThemeDark()
+            card_bg = (CARD_BG_OPACITY_DARK << 24) | 0xffffff if is_dark else (CARD_BG_OPACITY_LIGHT << 24)
+            pressed_bg = (int(CARD_BG_OPACITY_DARK * 2.25) << 24) | 0xffffff if is_dark else (int(CARD_BG_OPACITY_LIGHT * 2.75) << 24)
+
+            text_color = self.Theme.getColor(self.Theme.key_dialogTextBlack)
+            link_color = self.Theme.getColor(self.Theme.key_dialogTextLink)
+            gray_color = self.Theme.getColor(self.Theme.key_dialogTextGray)
+
+            filter_btn = TextView(activity)
+            filter_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+            filter_btn.setTextColor(jint(link_color))
+            filter_btn.setText(initial_label)
+            filter_btn.setPadding(
+                self.AndroidUtilities.dp(8),
+                self.AndroidUtilities.dp(4),
+                self.AndroidUtilities.dp(8),
+                self.AndroidUtilities.dp(4)
+            )
+            filter_btn.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                self.AndroidUtilities.dp(8),
+                jint(0),
+                jint(pressed_bg)
+            ))
+            header_layout.addView(filter_btn)
+
+            sort_btn = TextView(activity)
+            sort_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+            sort_btn.setTextColor(jint(link_color))
+            sort_btn.setPadding(
+                self.AndroidUtilities.dp(8),
+                self.AndroidUtilities.dp(4),
+                self.AndroidUtilities.dp(8),
+                self.AndroidUtilities.dp(4)
+            )
+            sort_btn.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                self.AndroidUtilities.dp(8),
+                jint(0),
+                jint(pressed_bg)
+            ))
+            header_layout.addView(sort_btn)
+
+            root.addView(header_layout)
+
+            scroll = ScrollView(activity)
+            scroll.setVerticalScrollBarEnabled(False)
+
+            container = LinearLayout(activity)
+            container.setOrientation(1)
+            container.setPadding(
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(4),
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(8)
+            )
+            if self.LayoutTransition:
+                container.setLayoutTransition(self.LayoutTransition())
+
+            scroll.addView(container)
+            root.addView(scroll)
+
+            cards_container = LinearLayout(activity)
+            cards_container.setOrientation(1)
+            if self.LayoutTransition:
+                cards_container.setLayoutTransition(self.LayoutTransition())
+            container.addView(cards_container)
+
+            empty_view = TextView(activity)
+            empty_view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16)
+            empty_view.setTextColor(jint(gray_color))
+            empty_view.setGravity(17)
+            empty_view.setPadding(
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(40),
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(40)
+            )
+            empty_view.setText("Упоминаний не найдено")
+            empty_view.setVisibility(8)
+            container.addView(empty_view)
+
+            def make_read_listener(mid, uid):
+                def on_click(v):
+                    try:
+                        self.bridge.mark_as_read(uid, mid)
+                        for it in list(self.current_dialog_mentions):
+                            if it["mid"] == mid and it["uid"] == uid:
+                                self.current_dialog_mentions.remove(it)
+                                break
+                        render_cards()
+                    except Exception:
+                        pass
+                    finally:
+                        del v
+                return OnClickListener(on_click)
+
+            def make_click_listener(mid, uid):
+                def on_click(v):
+                    try:
+                        builder.dismiss()
+                        if self.ChatActivity:
+                            b = Bundle()
+                            b.putLong("chat_id", -uid)
+                            b.putInt("message_id", mid)
+                            lf = get_last_fragment()
+                            if lf:
+                                lf.presentFragment(self.ChatActivity(b))
+                    except Exception:
+                        pass
+                    finally:
+                        del v
+                return OnClickListener(on_click)
+
+            def get_sender_object(sender_id, sender_type):
+                if not sender_id:
+                    return None
+                try:
+                    if sender_type == "user":
+                        try:
+                            return mc.getUser(Long(sender_id))
+                        except Exception:
+                            return mc.getUser(jlong(sender_id))
+                    elif sender_type in ("channel", "chat"):
+                        try:
+                            return mc.getChat(Long(sender_id))
+                        except Exception:
+                            return mc.getChat(jlong(sender_id))
+                except Exception:
+                    pass
+                return None
+
+            def render_slice(sorted_mentions, start_idx, end_idx):
+                existing_count = cards_container.getChildCount()
+                for idx in range(start_idx, end_idx):
+                    item = sorted_mentions[idx]
+                    mid = item["mid"]
+                    uid = item["uid"]
+                    sender_name = item.get("senderName", "Неизвестно")
+                    chat_name = item.get("chatName", "Неизвестный чат")
+
+                    sender_id = item.get("senderId", 0)
+                    sender_type = item.get("senderType", "unknown")
+                    sender_obj = get_sender_object(sender_id, sender_type)
+
+                    text = item.get("text", "")
+                    text = text.replace("\n", " ").strip()
+                    if len(text) > 80:
+                        text = text[:77] + "..."
+
+                    msg_date = datetime.datetime.fromtimestamp(item.get("date", 0))
+                    now = datetime.datetime.now()
+                    if msg_date.date() == now.date():
+                        time_str = msg_date.strftime('%H:%M')
+                    elif (now.date() - msg_date.date()).days == 1:
+                        time_str = "Вчера"
+                    else:
+                        time_str = msg_date.strftime('%d.%m')
+
+                    if idx < existing_count:
+                        card = cards_container.getChildAt(idx)
+                        avatar_view = card.getChildAt(0)
+                        center_layout = card.getChildAt(1)
+                        top_row = center_layout.getChildAt(0)
+                        title_tv = top_row.getChildAt(0)
+                        time_tv = top_row.getChildAt(1)
+                        msg_tv = center_layout.getChildAt(2)
+                        read_btn = card.getChildAt(2)
+
+                        title_tv.setText(f"{sender_name} в {chat_name}")
+                        time_tv.setText(time_str)
+                        msg_tv.setText(text)
+
+                        if avatar_view and self.AvatarDrawable:
+                            avatar_drawable = self.AvatarDrawable()
+                            if sender_obj:
+                                avatar_drawable.setInfo(sender_obj)
+                                avatar_view.setForUserOrChat(sender_obj, avatar_drawable)
+                            else:
+                                avatar_view.setImageDrawable(avatar_drawable)
+
+                        read_btn.setOnClickListener(make_read_listener(mid, uid))
+                        card.setOnClickListener(make_click_listener(mid, uid))
+                    else:
+                        card = LinearLayout(activity)
+                        card.setOrientation(0)
+                        card.setPadding(
+                            self.AndroidUtilities.dp(10),
+                            self.AndroidUtilities.dp(10),
+                            self.AndroidUtilities.dp(10),
+                            self.AndroidUtilities.dp(10)
+                        )
+
+                        lp = LinearLayout.LayoutParams(-1, -2)
+                        lp.topMargin = self.AndroidUtilities.dp(5)
+                        lp.bottomMargin = self.AndroidUtilities.dp(5)
+                        card.setLayoutParams(lp)
+
+                        card.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                            self.AndroidUtilities.dp(12),
+                            jint(card_bg),
+                            jint(pressed_bg)
+                        ))
+
+                        if self.BackupImageView and self.AvatarDrawable:
+                            avatar_view = self.BackupImageView(activity)
+                            avatar_view.setRoundRadius(self.AndroidUtilities.dp(20))
+
+                            av_lp = LinearLayout.LayoutParams(self.AndroidUtilities.dp(40), self.AndroidUtilities.dp(40))
+                            av_lp.gravity = 16
+                            av_lp.rightMargin = self.AndroidUtilities.dp(10)
+                            avatar_view.setLayoutParams(av_lp)
+
+                            avatar_drawable = self.AvatarDrawable()
+                            if sender_obj:
+                                avatar_drawable.setInfo(sender_obj)
+                                avatar_view.setForUserOrChat(sender_obj, avatar_drawable)
+                            else:
+                                avatar_view.setImageDrawable(avatar_drawable)
+                            card.addView(avatar_view)
+
+                        center_layout = LinearLayout(activity)
+                        center_layout.setOrientation(1)
+                        center_lp = LinearLayout.LayoutParams(0, -2, 1.0)
+                        center_lp.gravity = 16
+                        center_layout.setLayoutParams(center_lp)
+
+                        top_row = LinearLayout(activity)
+                        top_row.setOrientation(0)
+
+                        title_tv = TextView(activity)
+                        title_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
+                        title_tv.setTypeface(self.AndroidUtilities.bold())
+                        title_tv.setTextColor(jint(link_color))
+                        title_tv.setText(f"{sender_name} в {chat_name}")
+                        title_tv_lp = LinearLayout.LayoutParams(0, -2, 1.0)
+                        title_tv.setLayoutParams(title_tv_lp)
+                        top_row.addView(title_tv)
+
+                        time_tv = TextView(activity)
+                        time_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11)
+                        time_tv.setTextColor(jint(gray_color))
+                        time_tv.setText(time_str)
+                        top_row.addView(time_tv)
+
+                        center_layout.addView(top_row)
+
+                        space = TextView(activity)
+                        space.setTextSize(TypedValue.COMPLEX_UNIT_SP, 2)
+                        center_layout.addView(space)
+
+                        msg_tv = TextView(activity)
+                        msg_tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
+                        msg_tv.setTextColor(jint(text_color))
+                        msg_tv.setText(text)
+                        center_layout.addView(msg_tv)
+
+                        card.addView(center_layout)
+
+                        read_btn = ImageView(activity)
+                        read_btn.setPadding(
+                            self.AndroidUtilities.dp(8),
+                            self.AndroidUtilities.dp(8),
+                            self.AndroidUtilities.dp(8),
+                            self.AndroidUtilities.dp(8)
+                        )
+
+                        btn_lp = LinearLayout.LayoutParams(self.AndroidUtilities.dp(36), self.AndroidUtilities.dp(36))
+                        btn_lp.gravity = 16
+                        btn_lp.leftMargin = self.AndroidUtilities.dp(6)
+                        read_btn.setLayoutParams(btn_lp)
+
+                        done_res = ctx.getResources().getIdentifier("msg_done", "drawable", ctx.getPackageName())
+                        if done_res != 0:
+                            read_btn.setImageResource(done_res)
+                            read_btn.setColorFilter(jint(gray_color))
+
+                        read_btn.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                            self.AndroidUtilities.dp(18),
+                            jint(0),
+                            jint(pressed_bg)
+                        ))
+
+                        read_btn.setOnClickListener(make_read_listener(mid, uid))
+                        card.addView(read_btn)
+
+                        card.setOnClickListener(make_click_listener(mid, uid))
+                        cards_container.addView(card)
+
+            load_more_btn = TextView(activity)
+            load_more_btn.setText("Загрузить ещё")
+            load_more_btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+            load_more_btn.setTextColor(jint(link_color))
+            load_more_btn.setTypeface(self.AndroidUtilities.bold())
+            load_more_btn.setGravity(17)
+            load_more_btn.setPadding(
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(14),
+                self.AndroidUtilities.dp(16),
+                self.AndroidUtilities.dp(14)
+            )
+            lm_lp = LinearLayout.LayoutParams(-1, -2)
+            lm_lp.topMargin = self.AndroidUtilities.dp(4)
+            load_more_btn.setLayoutParams(lm_lp)
+            load_more_btn.setBackground(self.Theme.createSimpleSelectorRoundRectDrawable(
+                self.AndroidUtilities.dp(12),
+                jint(card_bg),
+                jint(pressed_bg)
+            ))
+            self._load_more_btn = load_more_btn
+
+            def on_load_more(v):
+                try:
+                    load_more_btn.setText("Загрузка...")
+                    threading.Thread(target=self._load_mentions_async, args=(False, True)).start()
+                except Exception:
+                    pass
+                finally:
+                    del v
+            load_more_btn.setOnClickListener(OnClickListener(on_load_more))
+
+            def render_cards():
+                self.render_generation += 1
+                gen = self.render_generation
+
+                sorted_mentions = self.current_dialog_mentions
+                needed_count = len(sorted_mentions)
+
+                if self.TransitionManager and self.AutoTransition:
+                    try:
+                        transition = self.AutoTransition()
+                        transition.setDuration(Long(DIALOG_ANIM_DURATION_MS))
+                        self.TransitionManager.beginDelayedTransition(root, transition)
+                    except Exception:
+                        pass
+
+                if load_more_btn.getParent():
+                    cards_container.removeView(load_more_btn)
+
+                if needed_count == 0:
+                    empty_view.setVisibility(0)
+                    for i in range(cards_container.getChildCount() - 1, -1, -1):
+                        cards_container.removeViewAt(i)
+                    return
+                else:
+                    empty_view.setVisibility(8)
+
+                existing_count = cards_container.getChildCount()
+                if existing_count > needed_count:
+                    for i in range(existing_count - 1, needed_count - 1, -1):
+                        cards_container.removeViewAt(i)
+
+                render_slice(sorted_mentions, 0, min(needed_count, LAZY_LOAD_BATCH_SIZE))
+
+                if needed_count > LAZY_LOAD_BATCH_SIZE:
+                    def load_remaining():
+                        time.sleep(LAZY_LOAD_DELAY_MS / 1000.0)
+                        if self.render_generation == gen:
+                            def finish_render():
+                                if self.render_generation == gen:
+                                    render_slice(sorted_mentions, LAZY_LOAD_BATCH_SIZE, needed_count)
+                                    if self._has_more:
+                                        load_more_btn.setText("Загрузить ещё")
+                                        cards_container.addView(load_more_btn)
+                            run_on_ui_thread(finish_render)
+                    threading.Thread(target=load_remaining).start()
+                else:
+                    if self._has_more:
+                        load_more_btn.setText("Загрузить ещё")
+                        cards_container.addView(load_more_btn)
+
+            self.render_cards_callback = render_cards
+
+            def toggle_sort(v):
+                try:
+                    self.sort_asc = not self.sort_asc
+                    sort_btn.setText("⇅ Новые" if not self.sort_asc else "⇅ Старые")
+                    threading.Thread(target=self._load_mentions_async, args=(True,)).start()
+                finally:
+                    del v
+                    gc.collect()
+
+            sort_btn.setText("⇅ Новые" if not self.sort_asc else "⇅ Старые")
+            sort_btn.setOnClickListener(OnClickListener(toggle_sort))
+
+            sort_btn_lp = LinearLayout.LayoutParams(-2, -2)
+            sort_btn_lp.gravity = 16
+            sort_btn_lp.leftMargin = self.AndroidUtilities.dp(6)
+            sort_btn.setLayoutParams(sort_btn_lp)
+
+            plugin_ref = self
+            def show_filter_menu(v):
+                try:
+                    last_frag = get_last_fragment()
+                    if not last_frag or not plugin_ref.ItemOptions:
+                        return
+
+                    options = plugin_ref.ItemOptions.makeOptions(root, v)
+                    options.setBlur(True)
+                    color = POPUP_BG_COLOR_DARK if is_dark else POPUP_BG_COLOR_LIGHT
+                    if color > 0x7fffffff:
+                        color -= 0x100000000
+                    options.setBackgroundColor(jint(color))
+                    opt_layout = options.getLinearLayout()
+                    if opt_layout:
+                        for i in range(opt_layout.getChildCount()):
+                            child = opt_layout.getChildAt(i)
+                            if hasattr(child, 'setBackAlpha'):
+                                child.setBackAlpha(jint(POPUP_ALPHA))
+                    filter_items = ["За все время", "За последний час", "За сегодня", "За последние 3 дня", "За неделю"]
+
+                    current_filter = 0
+                    try:
+                        current_filter = int(plugin_ref.get_setting("time_filter", 0))
+                    except Exception:
+                        pass
+
+                    for idx, label in enumerate(filter_items):
+                        action = MenuAction(idx, label, plugin_ref, filter_btn)
+                        options.addChecked(idx == current_filter, label, action)
+
+                    options.show()
+                except Exception:
+                    pass
+                finally:
+                    del v
+                    gc.collect()
+
+            filter_btn.setOnClickListener(OnClickListener(show_filter_menu))
+
+            filter_btn_lp = LinearLayout.LayoutParams(-2, -2)
+            filter_btn_lp.gravity = 16
+            filter_btn.setLayoutParams(filter_btn_lp)
+
+            render_cards()
+
+            def on_cancel(dialog, which):
+                try:
+                    _clear_view_references(root)
+                    dialog.dismiss()
+                    self.current_dialog_mentions = None
+                    self.render_cards_callback = None
+                finally:
+                    del dialog
+                    gc.collect()
+
+            builder.set_view(root)
+            builder.set_negative_button("Закрыть", on_cancel)
+            builder.show()
+        except Exception:
+            pass
+
+
+_DEX_BASE64 = "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"
