@@ -1,0 +1,1663 @@
+"""Плагин для exteraGram / AyuGram: отложенная отправка Telegram-подарков.
+
+Выбираете подарок из каталога, получателя (@username, ID или «я»), дату и время, и плагин
+сам отправит подарок в назначенный момент (звёзды спишутся в момент отправки).
+
+Важно: плагин работает внутри приложения. Если Telegram в нужное время закрыт или убит
+системой, отправка произойдёт при следующем запуске, но только если опоздание не больше
+лимита из настроек (по умолчанию 60 минут), иначе задача пометится как пропущенная.
+"""
+
+import json
+import re
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+from typing import Any, Optional
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.bulletin import BulletinHelper
+
+__id__ = "gift_scheduler"
+__name__ = "Gift Scheduler"
+__description__ = (
+    "Отложенная отправка Telegram-подарков: выберите подарок, получателя и время, "
+    "плагин отправит его сам. Быть в сети и держать Telegram открытым не обязательно: "
+    "включите раздел «Работа в фоне» в настройках плагина.\n"
+    "\n"
+    "Scheduled Telegram gifts: pick a gift, a recipient and a time, and the plugin sends it "
+    "for you. You do not have to stay online or keep Telegram open: turn on the \"Background work\" "
+    "section in plugin settings."
+)
+__author__ = "@MicusYo"
+__version__ = "1.4.3"
+__icon__ = "Ie92iwue_by_fStikBot/0"
+__min_version__ = "12.10.6"
+__category__ = ["tools"]
+
+TICK_SECONDS = 15
+RETRY_DELAY = 30
+ALARM_REQUEST_CODE = 7731
+TL_CONTAINERS = (
+    "org.telegram.tgnet.TLRPC$",
+    "org.telegram.tgnet.tl.TL_stars$",
+    "org.telegram.tgnet.tl.TL_payments$",
+    "org.telegram.tgnet.tl.TL_account$",
+)
+BOTTOM_SHEET_CLASS = "org.telegram.ui.ActionBar.BottomSheet"
+HIDE_NAME_TEXTS = ("скрыть моё имя", "скрыть мое имя", "hide my name")
+CATALOG_TTL = 600
+STATUS_ICONS = {"pending": "⏳", "sending": "📤", "sent": "✅", "failed": "❌", "missed": "⚠️"}
+SELF_WORDS = ("me", "self", "я", "мне", "себе")
+_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
+_REL_RE = re.compile(
+    r"^(?:через\s+|in\s+|\+)\s*(\d{1,4})\s*(м|мин|минут\w*|m|min\w*|ч|час\w*|h|hour\w*|д|дн\w*|день|d|day\w*)\.?$",
+    re.IGNORECASE,
+)
+_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+_DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?")
+
+
+# ---------------------------------------------------------------------- чистые функции
+
+def parse_recipient(text: Any) -> Optional[dict]:
+    """«@name», «t.me/name», «123456», «tg://user?id=1», «я» -> {"kind": ..., ...} или None."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.lower() in SELF_WORDS:
+        return {"kind": "self"}
+    match = re.search(r"tg://user\?id=(\d+)", raw, re.IGNORECASE)
+    if match:
+        return {"kind": "id", "id": int(match.group(1))}
+    raw = re.sub(r"^(https?://)?(www\.)?(t|telegram)\.me/", "", raw, flags=re.IGNORECASE)
+    raw = raw.split("?")[0].split("/")[0].strip().lstrip("@")
+    if re.fullmatch(r"\d{1,15}", raw):
+        return {"kind": "id", "id": int(raw)}
+    if _USERNAME_RE.fullmatch(raw):
+        return {"kind": "username", "username": raw}
+    return None
+
+
+def parse_when(text: Any, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Время отправки по местному времени устройства.
+
+    «25.12 18:00», «25.12.2026 18:00», «18:30» (сегодня или завтра), «завтра 09:00»,
+    «сегодня 21:15», «через 90 мин», «+2ч», «+1д».
+    """
+    raw = str(text or "").strip().lower()
+    now = now or datetime.now()
+    if not raw:
+        return None
+
+    rel = _REL_RE.match(raw)
+    if rel:
+        amount = int(rel.group(1))
+        unit = rel.group(2)[0]
+        if unit in "мm":
+            delta = timedelta(minutes=amount)
+        elif unit in "чh":
+            delta = timedelta(hours=amount)
+        else:
+            delta = timedelta(days=amount)
+        return (now + delta).replace(second=0, microsecond=0)
+
+    tm = _TIME_RE.search(raw)
+    if not tm:
+        return None
+    hour, minute = int(tm.group(1)), int(tm.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    rest = (raw[:tm.start()] + " " + raw[tm.end():]).strip()
+
+    try:
+        if rest in ("", "сегодня", "today"):
+            when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if rest == "" and when <= now:
+                when += timedelta(days=1)
+            return when
+        if rest in ("завтра", "tomorrow"):
+            day = now + timedelta(days=1)
+            return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if rest in ("послезавтра",):
+            day = now + timedelta(days=2)
+            return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        dm = _DATE_RE.fullmatch(rest)
+        if dm:
+            day, month = int(dm.group(1)), int(dm.group(2))
+            year_text = dm.group(3)
+            if year_text:
+                year = int(year_text)
+                if year < 100:
+                    year += 2000
+                return datetime(year, month, day, hour, minute)
+            when = datetime(now.year, month, day, hour, minute)
+            if when <= now:
+                when = datetime(now.year + 1, month, day, hour, minute)
+            return when
+    except ValueError:
+        return None
+    return None
+
+
+def fmt_when(ts: float) -> str:
+    when = datetime.fromtimestamp(ts)
+    fmt = "%d.%m %H:%M" if when.year == datetime.now().year else "%d.%m.%Y %H:%M"
+    return when.strftime(fmt)
+
+
+def is_retryable(error) -> bool:
+    """Сетевой сбой, после которого можно безопасно повторить (до оплаты)."""
+    text = str(getattr(error, "text", "") or "")
+    try:
+        code = int(getattr(error, "code", 0) or 0)
+    except Exception:
+        code = 0
+    if code in (-1, -2000, -3000, 500) or code <= -1000:
+        return True
+    return text == "" or any(k in text.upper() for k in ("TIMEOUT", "CONNECTION", "NETWORK", "INTERNAL", "SERVER_ERROR"))
+
+
+def friendly_error(text: str) -> str:
+    """Код ошибки Telegram -> понятная подпись."""
+    text = str(text or "")
+    table = (
+        ("BALANCE_TOO_LOW", "не хватает звёзд на балансе"),
+        ("STARGIFT_USAGE_LIMITED", "подарок закончился"),
+        ("STARGIFT_INVALID", "такого подарка больше нет"),
+        ("USER_PRIVACY", "получатель не принимает подарки"),
+        ("PEER_ID_INVALID", "получатель недоступен (нужен @username или человек, которого клиент видел)"),
+        ("USER_ID_INVALID", "получатель недоступен (нужен @username или человек, которого клиент видел)"),
+        ("FLOOD", "Telegram просит подождать: слишком много запросов"),
+        ("MESSAGE_TOO_LONG", "слишком длинная подпись"),
+        ("FORM_EXPIRED", "форма оплаты устарела"),
+        ("PAYMENT_FAILED", "оплата не прошла"),
+    )
+    for code, human in table:
+        if code in text:
+            return human
+    return text or "неизвестная ошибка"
+
+
+def _cls_name(obj) -> str:
+    try:
+        return str(obj.getClass().getName())
+    except Exception:
+        return type(obj).__name__
+
+
+ABOUT_RU = [
+    ("Что делает плагин",
+     "Отправляет Telegram-подарок в заданное время: открываете обычное окно отправки подарка, "
+     "нажимаете «Отложить отправку» под «Скрыть моё имя» и выбираете дату и время."),
+    ("Получатель",
+     "@username, ссылка t.me/username, числовой ID или слово «я» (подарок самому себе, удобно "
+     "для проверки). По одному числовому ID профиль находится, только если клиент уже видел человека."),
+    ("Время",
+     "По местному времени устройства. Примеры: 25.12 18:00, 25.12.2026 09:00, завтра 10:30, "
+     "18:30 (сегодня или завтра), через 90 мин, +2ч, +1д."),
+    ("Деньги",
+     "Звёзды спишутся с вашего баланса в момент отправки, а не при планировании. Если звёзд не "
+     "хватит или подарок закончится, задача получит статус «ошибка», и вы увидите причину."),
+    ("Работа в фоне",
+     "Чтобы подарок ушёл, не обязательно быть в сети и держать Telegram открытым: включите в настройках "
+     "плагина раздел «Работа в фоне» (разрешение работать без ограничений и точные будильники). "
+     "Плагин работает внутри Telegram, но не зависит от того, открыт ли чат или виден ли вам экран. "
+     "На ближайшее время плагин ставит системный будильник: он сам запускает Telegram, даже если "
+     "его выгрузили из памяти или телефон уснул. Если сети нет, отправка повторяется каждые 30 секунд "
+     "до лимита из настроек. Для надёжности отключите для Telegram экономию заряда и разрешите "
+     "точные будильники (оба пункта в настройках плагина). Если телефон полностью выключен или "
+     "Telegram принудительно остановлен, отправка произойдёт после следующего запуска."),
+    ("Прямо в окне подарка",
+     "Откройте профиль человека, выберите подарок: под «Скрыть моё имя» появится строка "
+     "«Отложить отправку». Нажмите её, выберите дату и время в штатном меню «Отправить позже» и подтвердите."),
+    ("Список и отмена",
+     "Команда .gift в любом чате или пункт «Запланированные» в настройках: показывает все задачи, "
+     "любую можно отменить или убрать из списка. «.gift cancel» отменяет все ожидающие сразу. "
+     "В окне подарка над кнопкой есть строка «Уже запланировано», она открывает список для этого "
+     "человека. Отменить можно до наступления времени, звёзды при отмене не списываются."),
+    ("Если что-то не работает",
+     "Команда .giftdebug копирует отчёт о состоянии плагина в буфер обмена."),
+]
+
+ABOUT_EN = [
+    ("What it does",
+     "Sends a Telegram gift at a set time: open the regular gift window, tap \"Postpone sending\" "
+     "under \"Hide My Name\" and pick a date and time."),
+    ("Recipient",
+     "@username, a t.me/username link, a numeric ID or the word \"me\" (a gift to yourself, handy for "
+     "testing). A bare ID only resolves if the client has already seen that person."),
+    ("Time",
+     "Device local time. Examples: 25.12 18:00, 25.12.2026 09:00, tomorrow 10:30, 18:30 "
+     "(today or tomorrow), in 90 min, +2h, +1d."),
+    ("Money",
+     "Stars are charged at send time, not when you schedule. If the balance is too low or the gift "
+     "sold out, the task gets the \"failed\" status with the reason."),
+    ("Background work",
+     "You do not have to be online or keep Telegram open for the gift to go out: turn on the "
+     "\"Background work\" section in plugin settings (unrestricted background and exact alarms). "
+     "The plugin runs inside Telegram but does not depend on a chat being open or the screen being on. "
+     "It sets a system alarm for the next task, which starts Telegram itself even if it was unloaded "
+     "or the phone is asleep. Without a network the send is retried every 30 seconds up to the limit "
+     "from settings. For reliability turn off battery optimization for Telegram and allow exact alarms "
+     "(both in plugin settings). If the phone is off or Telegram was force-stopped, the gift is sent "
+     "after the next launch."),
+    ("Right in the gift window",
+     "Open a person's profile and pick a gift: a \"Postpone sending\" switch appears under \"Hide My "
+     "Name\". Turn it on, enter the time and press \"Schedule gift\"."),
+    ("List and cancel",
+     "The .gift command in any chat, or \"Scheduled\" in settings, shows all tasks; any of them "
+     "can be cancelled or removed. \".gift cancel\" cancels all pending ones at once. The gift window "
+     "also shows an \"Already scheduled\" line that opens the list for that person. A task can be "
+     "cancelled until its time comes; no stars are charged on cancel."),
+    ("If something does not work",
+     "The .giftdebug command copies a diagnostic report to the clipboard."),
+]
+
+
+class _SafeLogger:
+    def __init__(self, plugin):
+        self._plugin = plugin
+
+    def _write(self, level: str, msg: str, with_trace: bool = False):
+        text = str(msg) + (("\n" + traceback.format_exc()) if with_trace else "")
+        real = getattr(self._plugin, "logger", None)
+        if real is not None:
+            try:
+                getattr(real, level)(text)
+                return
+            except Exception:
+                pass
+        legacy = getattr(self._plugin, "log", None)
+        if callable(legacy):
+            try:
+                legacy(text)
+                return
+            except Exception:
+                pass
+        try:
+            print(f"[gift_scheduler] {text}")
+        except Exception:
+            pass
+
+    def info(self, msg):
+        self._write("info", msg)
+
+    def exception(self, msg):
+        self._write("error", msg, with_trace=True)
+
+
+class _SheetHook(MethodHook):
+    """После показа любого BottomSheet: если это окно отправки подарка, добавляем свою строку."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.on_sheet_shown(param.thisObject)
+        except Exception as e:
+            self.plugin._last_error = f"sheet hook: {type(e).__name__}: {e}"
+
+
+class GiftSchedulerPlugin(BasePlugin):
+    # ------------------------------------------------------------------ жизненный цикл
+
+    def on_plugin_load(self):
+        self._lg = _SafeLogger(self)
+        self._alive = True
+        self._lock = threading.RLock()
+        self._catalog = None  # (время загрузки, список подарков)
+        self._last_error = ""
+        self._last_tick = 0.0
+        self.stats = {"scheduled": 0, "sent": 0, "failed": 0, "missed": 0}
+        self._sheet_info = "not installed"
+        self._alarm_status = "-"
+        self._tl_cache = {}
+        self._tl_index = None
+        self._tl_scan = "-"
+        self._ui_dump = ""
+        self._ui_status = "-"
+        self._sheets_done = set()
+
+        try:
+            self._install_sheet_hook()
+        except Exception as e:
+            self._sheet_info = f"error: {type(e).__name__}: {e}"
+            self._last_error = f"install_sheet_hook: {type(e).__name__}: {e}"
+
+        try:
+            self.add_on_send_message_hook()
+        except Exception as e:
+            self._last_error = f"add_on_send_message_hook: {type(e).__name__}: {e}"
+
+        self._thread = threading.Thread(target=self._loop, name="gift-scheduler", daemon=True)
+        self._thread.start()
+        self._arm_alarm()
+        self._lg.info("Gift Scheduler loaded")
+
+    def on_plugin_unload(self):
+        self._alive = False
+
+    def _hook_all(self, cls, name: str, handler):
+        if hasattr(self, "hook_all_methods"):
+            return self.hook_all_methods(cls, name, handler)
+        unhooks = []
+        for method in cls.getDeclaredMethods():
+            if method.getName() == name:
+                method.setAccessible(True)
+                unhook = self.hook_method(method, handler)
+                if unhook:
+                    unhooks.append(unhook)
+        return unhooks
+
+    def _install_sheet_hook(self):
+        cls = find_class(BOTTOM_SHEET_CLASS)
+        if not cls:
+            self._sheet_info = "BottomSheet not found"
+            return
+        unhooks = self._hook_all(cls, "show", _SheetHook(self))
+        self._sheet_info = f"BottomSheet.show={len(unhooks or [])}"
+
+    def _loop(self):
+        for _ in range(8):  # после запуска будильником клиенту нужно время подняться и подключиться
+            if not self._alive:
+                return
+            time.sleep(1)
+        while self._alive:
+            try:
+                self._tick()
+            except Exception as e:
+                self._last_error = f"tick: {type(e).__name__}: {e}"
+            for _ in range(TICK_SECONDS):
+                if not self._alive:
+                    return
+                time.sleep(1)
+
+    # ------------------------------------------------------------------ хранилище задач
+
+    def _flag(self, key: str, default: bool) -> bool:
+        value = self.get_setting(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _set(self, key: str, value, reload: bool = False):
+        try:
+            self.set_setting(key, value, reload_settings=reload)
+        except TypeError:
+            self.set_setting(key, value)
+
+    def _tasks(self) -> list:
+        try:
+            data = json.loads(str(self.get_setting("tasks", "[]") or "[]"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_tasks(self, tasks: list):
+        self._set("tasks", json.dumps(tasks, ensure_ascii=False))
+        self._arm_alarm(tasks)
+
+    def _update_task(self, task_id: int, **changes):
+        with self._lock:
+            tasks = self._tasks()
+            for task in tasks:
+                if task.get("id") == task_id:
+                    task.update(changes)
+                    break
+            self._save_tasks(tasks)
+
+    def _max_late(self) -> float:
+        try:
+            return max(0.0, float(str(self.get_setting("max_late_min", "360")).strip().replace(",", "."))) * 60
+        except Exception:
+            return 3600.0
+
+    # ------------------------------------------------------------------ планировщик
+
+    def _tick(self):
+        self._last_tick = time.time()
+        now = time.time()
+        due = []
+        with self._lock:
+            tasks = self._tasks()
+            changed = False
+            for task in tasks:
+                if task.get("status") != "pending" or task.get("when", 0) > now or task.get("next_try", 0) > now:
+                    continue
+                if now - task["when"] > self._max_late():
+                    task["status"] = "missed"
+                    task["error"] = "приложение было закрыто в назначенное время"
+                    self.stats["missed"] += 1
+                    changed = True
+                    self._toast(f"Подарок пропущен: {self._short(task)}")
+                    continue
+                task["status"] = "sending"
+                changed = True
+                due.append(dict(task))
+            if changed:
+                self._save_tasks(tasks)
+        for task in due:
+            run_on_ui_thread(lambda t=task: self._send_task(t))
+
+    @staticmethod
+    def _short(task: dict) -> str:
+        return f"{task.get('label', 'подарок')} → {task.get('recipient', '?')} ({fmt_when(task.get('when', 0))})"
+
+    # ------------------------------------------------------------------ отправка
+
+    def _mc(self, account: int):
+        from client_utils import get_messages_controller
+
+        try:
+            return get_messages_controller(account)
+        except TypeError:
+            return get_messages_controller()
+
+    def _build_tl_index(self) -> dict:
+        """Сканирует классы клиента и запоминает, где лежит каждый TL_*: короткое имя -> полное.
+        Нужен, потому что в разных версиях Telegram одни и те же запросы лежат в разных контейнерах."""
+        if getattr(self, "_tl_index", None) is not None:
+            return self._tl_index
+        index = {}
+        self._tl_scan = "не запускался"
+        try:
+            from java import jclass
+
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            dex = jclass("dalvik.system.DexFile")(str(ctx.getPackageCodePath()))
+            entries = dex.entries()
+            total = 0
+            while entries.hasMoreElements():
+                name = str(entries.nextElement())
+                total += 1
+                if not name.startswith("org.telegram.tgnet."):
+                    continue
+                simple = name.replace("$", ".").rsplit(".", 1)[-1]
+                if simple.startswith("TL_"):
+                    # TLRPC в приоритете: при совпадении коротких имён оставляем его
+                    if simple not in index or name.startswith("org.telegram.tgnet.TLRPC$"):
+                        index[simple] = name
+            try:
+                dex.close()
+            except Exception:
+                pass
+            self._tl_scan = f"ok: {total} классов, TL_*: {len(index)}"
+        except Exception as e:
+            self._tl_scan = f"ошибка: {type(e).__name__}: {e}"
+        self._tl_index = index
+        return index
+
+    def _tl_class(self, class_name: str):
+        """TL-класс ищется в TLRPC, в известных контейнерах и, если не нашёлся, по индексу классов клиента."""
+        from java import jclass
+
+        if class_name in self._tl_cache:
+            return self._tl_cache[class_name][1]
+        last = None
+        for prefix in TL_CONTAINERS:
+            try:
+                cls = jclass(prefix + class_name)
+                self._tl_cache[class_name] = (prefix, cls)
+                return cls
+            except Exception as e:
+                last = e
+        index = self._build_tl_index()
+        full = index.get(class_name)
+        if full:
+            try:
+                cls = jclass(full)
+                self._tl_cache[class_name] = (full, cls)
+                return cls
+            except Exception as e:
+                last = e
+        tail = class_name.replace("TL_payments_", "").replace("TL_", "")
+        similar = sorted(n for n in index if tail[:12].lower() in n.lower())[:8]
+        raise RuntimeError(
+            f"{class_name} не найден в клиенте ({type(last).__name__}); скан: {getattr(self, '_tl_scan', '-')}; "
+            f"похожие: {', '.join(similar) or 'нет'}"
+        )
+
+    def _tl_request(self, class_name: str, fields: dict, handler):
+        from client_utils import RequestCallback, send_request
+
+        req = self._tl_class(class_name)()
+        for name, value in fields.items():
+            setattr(req, name, value)
+        return send_request(req, RequestCallback(handler))
+
+    def _fail_task(self, task: dict, reason: str, note: str = "", retry: bool = False):
+        if retry and time.time() - task.get("when", 0) < self._max_late():
+            # Нет сети или Telegram ещё подключается: оплаты не было, пробуем снова.
+            self._update_task(task["id"], status="pending", next_try=time.time() + RETRY_DELAY,
+                              error=f"повтор: {reason}")
+            return
+        self.stats["failed"] += 1
+        self._update_task(task["id"], status="failed", error=reason + note)
+        self._toast(f"Подарок не отправлен ({self._short(task)}): {reason}")
+
+    def _hold_awake(self, millis: int = 90000):
+        """Не даём процессору уснуть, пока идёт отправка."""
+        try:
+            from java import jclass
+
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            power = ctx.getSystemService("power")
+            lock = power.newWakeLock(1, "giftscheduler:send")  # PARTIAL_WAKE_LOCK
+            lock.acquire(int(millis))
+        except Exception as e:
+            self._last_error = f"wakelock: {type(e).__name__}: {e}"
+
+    def _send_task(self, task: dict):
+        """Запускается в UI-потоке для задачи, у которой наступило время."""
+        self._hold_awake()
+        try:
+            account = int(task.get("account", 0))
+            target = parse_recipient(task.get("recipient"))
+            if target is None:
+                self._fail_task(task, "некорректный получатель")
+                return
+            self._resolve_peer(
+                account, target, lambda peer, err: self._send_with_peer(task, account, peer, err)
+            )
+        except Exception as e:
+            self._last_error = f"send_task: {type(e).__name__}: {e}"
+            self._lg.exception("send_task")
+            self._fail_task(task, f"{type(e).__name__}: {e}")
+
+    def _resolve_peer(self, account: int, target: dict, done):
+        """done(input_peer, error_text). InputPeer для получателя подарка."""
+        from java import jclass
+
+        if target["kind"] == "self":
+            done(self._tl_class("TL_inputPeerSelf")(), None)
+            return
+
+        controller = jclass("org.telegram.messenger.MessagesController")
+        mc = self._mc(account)
+
+        def finish_with(user):
+            if user is None:
+                done(None, "получатель не найден")
+                return
+            try:
+                done(controller.getInputPeer(user), None)
+            except Exception as e:
+                done(None, f"{type(e).__name__}: {e}")
+
+        if target["kind"] == "id":
+            user = None
+            try:
+                from java import jlong
+
+                user = mc.getUser(jlong(target["id"]))
+            except Exception:
+                try:
+                    user = mc.getUser(target["id"])
+                except Exception:
+                    user = None
+            if user is None:
+                try:
+                    from client_utils import get_messages_storage
+
+                    try:
+                        storage = get_messages_storage(account)
+                    except TypeError:
+                        storage = get_messages_storage()
+                    user = storage.getUser(target["id"])
+                except Exception:
+                    user = None
+            if user is None:
+                done(None, "PEER_ID_INVALID")
+                return
+            finish_with(user)
+            return
+
+        name = target["username"]
+        cached = None
+        try:
+            cached = mc.getUserOrChat(name)
+        except Exception:
+            cached = None
+        if cached is not None and hasattr(cached, "first_name"):
+            finish_with(cached)
+            return
+
+        def on_response(response, error):
+            def finish():
+                try:
+                    if error is not None or response is None:
+                        text = str(getattr(error, "text", "") or "")
+                        done(None, "@%s не найден" % name if ("NOT_OCCUPIED" in text or "INVALID" in text) else (text or "нет ответа"))
+                        return
+                    users = list(getattr(response, "users", None) or [])
+                    try:
+                        mc.putUsers(response.users, False)
+                        mc.putChats(response.chats, False)
+                    except Exception:
+                        pass
+                    user = next(
+                        (u for u in users if str(getattr(u, "username", "") or "").lower() == name.lower()),
+                        users[0] if len(users) == 1 else None,
+                    )
+                    if user is None or not hasattr(user, "first_name"):
+                        done(None, f"@{name}: это не пользователь")
+                        return
+                    finish_with(user)
+                except Exception as e:
+                    done(None, f"{type(e).__name__}: {e}")
+
+            run_on_ui_thread(finish)
+
+        self._tl_request("TL_contacts_resolveUsername", {"username": name}, on_response)
+
+    def _build_invoice(self, task: dict, peer):
+        from java import jclass
+
+        invoice = self._tl_class("TL_inputInvoiceStarGift")()
+        invoice.peer = peer
+        invoice.gift_id = int(task["gift_id"])
+        flags = 0
+        if task.get("hide"):
+            invoice.hide_name = True
+            flags |= 1
+        text = str(task.get("text") or "").strip()
+        if text:
+            message = self._tl_class("TL_textWithEntities")()
+            message.text = text
+            message.entities = jclass("java.util.ArrayList")()
+            invoice.message = message
+            flags |= 2
+        invoice.flags = flags
+        return invoice
+
+    def _send_with_peer(self, task: dict, account: int, peer, error_text: Optional[str]):
+        if peer is None:
+            net = (not error_text) or any(k in str(error_text).upper() for k in ("TIMEOUT", "CONNECTION", "NETWORK", "НЕТ ОТВЕТА"))
+            self._fail_task(task, friendly_error(error_text or "получатель не найден"), retry=net)
+            return
+        try:
+            invoice = self._build_invoice(task, peer)
+        except Exception as e:
+            self._last_error = f"build invoice: {type(e).__name__}: {e}"
+            self._fail_task(task, f"не удалось собрать запрос ({type(e).__name__})")
+            return
+
+        def on_form(response, error):
+            def after_form():
+                try:
+                    if error is not None or response is None:
+                        self._fail_task(
+                            task, friendly_error(str(getattr(error, "text", "") or "нет ответа")),
+                            retry=is_retryable(error) if error is not None else True,
+                        )
+                        return
+                    form_id = getattr(response, "form_id", None)
+                    if form_id is None:
+                        self._fail_task(task, "Telegram не вернул форму оплаты")
+                        return
+                    self._tl_request(
+                        "TL_payments_sendStarsForm", {"form_id": form_id, "invoice": invoice}, on_paid
+                    )
+                except Exception as e:
+                    self._last_error = f"after_form: {type(e).__name__}: {e}"
+                    self._fail_task(task, f"{type(e).__name__}: {e}")
+
+            run_on_ui_thread(after_form)
+
+        def on_paid(response, error):
+            def after_paid():
+                try:
+                    if error is not None:
+                        # Деньги могли и списаться, если ответ потерялся: повторно не пробуем.
+                        reason = friendly_error(str(getattr(error, "text", "") or ""))
+                        self._fail_task(task, reason, " (проверьте, не ушёл ли подарок)" if not getattr(error, "text", "") else "")
+                        return
+                    self.stats["sent"] += 1
+                    self._update_task(task["id"], status="sent", error="", sent_at=time.time())
+                    self._toast(f"🎁 Подарок отправлен: {self._short(task)}")
+                except Exception as e:
+                    self._last_error = f"after_paid: {type(e).__name__}: {e}"
+
+            run_on_ui_thread(after_paid)
+
+        self._tl_request("TL_payments_getPaymentForm", {"invoice": invoice}, on_form)
+
+    # ------------------------------------------------------------------ будильник
+
+    def _arm_alarm(self, tasks: Optional[list] = None):
+        """Будильник системы на ближайшую задачу. Он запускает сервис Telegram, а значит и поднимает
+        приложение (и этот плагин), даже если его выгрузили из памяти или телефон уснул."""
+        try:
+            from java import jclass, jlong
+
+            if tasks is None:
+                tasks = self._tasks()
+            moments = [
+                max(float(t.get("when", 0)), float(t.get("next_try", 0)))
+                for t in tasks if t.get("status") == "pending"
+            ]
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            manager = ctx.getSystemService("alarm")
+            service_cls = find_class("org.telegram.messenger.NotificationsService")
+            if service_cls is None:
+                self._alarm_status = "NotificationsService не найден"
+                return
+            intent = jclass("android.content.Intent")(ctx, service_cls)
+            intent.setAction("gift_scheduler.WAKE")
+            pending = jclass("android.app.PendingIntent").getService(
+                ctx, ALARM_REQUEST_CODE, intent, 134217728 | 67108864  # UPDATE_CURRENT | IMMUTABLE
+            )
+            if not moments:
+                manager.cancel(pending)
+                self._alarm_status = "нет ожидающих задач"
+                return
+            trigger = max(int(min(moments) * 1000), int(time.time() * 1000) + 1500)
+            try:
+                exact = bool(manager.canScheduleExactAlarms())
+            except Exception:
+                exact = True
+            try:
+                if exact:
+                    manager.setExactAndAllowWhileIdle(0, jlong(trigger), pending)
+                    self._alarm_status = f"точный на {fmt_when(trigger / 1000)}"
+                    return
+            except Exception as e:
+                self._last_error = f"exact alarm: {type(e).__name__}: {e}"
+            manager.setAndAllowWhileIdle(0, jlong(trigger), pending)
+            self._alarm_status = f"неточный на {fmt_when(trigger / 1000)} (нет разрешения на точные)"
+        except Exception as e:
+            self._alarm_status = f"ошибка: {type(e).__name__}: {e}"
+            self._last_error = f"arm_alarm: {type(e).__name__}: {e}"
+
+    def _open_system_settings(self, action: str, with_package: bool = False):
+        try:
+            from java import jclass
+
+            activity = self._activity()
+            intent = jclass("android.content.Intent")(action)
+            if with_package:
+                intent.setData(jclass("android.net.Uri").parse("package:" + str(activity.getPackageName())))
+            activity.startActivity(intent)
+        except Exception as e:
+            self._last_error = f"open settings: {type(e).__name__}: {e}"
+            self._toast(f"Не удалось открыть настройки: {type(e).__name__}")
+
+    # ------------------------------------------------------------------ каталог подарков
+
+    def _fetch_catalog(self, account: int, done):
+        """done(список подарков | None, ошибка). Вызывается ровно один раз."""
+        if self._catalog and time.time() - self._catalog[0] < CATALOG_TTL:
+            done(self._catalog[1], None)
+            return
+
+        state = {"finished": False}
+
+        def finish(gifts, error):
+            if state["finished"]:
+                return
+            state["finished"] = True
+            done(gifts, error)
+
+        def on_response(response, error):
+            def handle():
+                try:
+                    if error is not None or response is None:
+                        finish(None, friendly_error(str(getattr(error, "text", "") or "нет ответа")))
+                        return
+                    gifts = []
+                    for gift in list(getattr(response, "gifts", None) or []):
+                        if getattr(gift, "sold_out", False):
+                            continue
+                        gifts.append(self._gift_info(gift))
+                    gifts = [g for g in gifts if g]
+                    if not gifts:
+                        finish(None, f"каталог пуст ({_cls_name(response).rsplit('.', 1)[-1]})")
+                        return
+                    gifts.sort(key=lambda g: (g["stars"], g["id"]))
+                    self._catalog = (time.time(), gifts)
+                    finish(gifts, None)
+                except Exception as e:
+                    self._last_error = f"catalog: {type(e).__name__}: {e}"
+                    finish(None, f"{type(e).__name__}: {e}")
+
+            run_on_ui_thread(handle)
+
+        try:
+            self._tl_request("TL_payments_getStarGifts", {"hash": 0}, on_response)
+        except Exception as e:
+            self._last_error = f"catalog request: {type(e).__name__}: {e}"
+            finish(None, f"{type(e).__name__}: {e}")
+            return
+        self._post_delayed(lambda: finish(None, "Telegram не ответил за 20 секунд"), 20000)
+
+    def _pick_gift(self):
+        try:
+            account = self._account()
+            self._toast("Загружаю каталог подарков…")
+
+            def got(gifts, error):
+                if gifts is None:
+                    self._toast(f"Не удалось загрузить каталог: {error}")
+                    return
+
+                def pick(i):
+                    gift = gifts[i]
+                    self._set("new_gift_id", str(gift["id"]))
+                    self._set("new_gift_label", gift["label"])
+                    self._set("new_gift_stars", str(gift["stars"]), reload=True)
+                    self._toast(f"Выбран подарок: {gift['label']} ({gift['stars']} ⭐)")
+
+                self._choose("Выберите подарок", [g["menu"] for g in gifts], pick)
+
+            self._fetch_catalog(account, got)
+        except Exception as e:
+            self._last_error = f"pick_gift: {type(e).__name__}: {e}"
+            self._toast(f"Не удалось открыть каталог: {type(e).__name__}: {e}")
+
+    @staticmethod
+    def _gift_info(gift) -> Optional[dict]:
+        try:
+            gift_id = int(gift.id)
+            stars = int(getattr(gift, "stars", 0) or 0)
+        except Exception:
+            return None
+        emoji = ""
+        try:
+            for attr in list(getattr(getattr(gift, "sticker", None), "attributes", None) or []):
+                alt = getattr(attr, "alt", None)
+                if alt:
+                    emoji = str(alt)
+                    break
+        except Exception:
+            pass
+        title = str(getattr(gift, "title", "") or "")
+        limited = bool(getattr(gift, "limited", False))
+        left = getattr(gift, "availability_remains", None)
+        label = f"{emoji} {title}".strip() or f"Подарок {gift_id}"
+        extra = f", осталось {int(left)}" if limited and left is not None else (", лимит" if limited else "")
+        return {"id": gift_id, "stars": stars, "label": label, "menu": f"{stars} ⭐   {label}{extra}"}
+
+    def _pick_gift(self):
+        account = self._account()
+        self._toast("Загружаю каталог подарков…")
+
+        def got(gifts, error):
+            if gifts is None:
+                self._toast(f"Не удалось загрузить каталог: {error}")
+                return
+
+            def pick(i):
+                gift = gifts[i]
+                self._set("new_gift_id", str(gift["id"]))
+                self._set("new_gift_label", gift["label"])
+                self._set("new_gift_stars", str(gift["stars"]), reload=True)
+                self._toast(f"Выбран подарок: {gift['label']} ({gift['stars']} ⭐)")
+
+            self._choose("Выберите подарок", [g["menu"] for g in gifts], pick)
+
+        self._fetch_catalog(account, got)
+
+    # ------------------------------------------------------------------ создание задачи
+
+    @staticmethod
+    def _account() -> int:
+        try:
+            from java import jclass
+
+            return int(jclass("org.telegram.messenger.UserConfig").selectedAccount)
+        except Exception:
+            return 0
+
+    def _schedule_from_settings(self):
+        gift_id = str(self.get_setting("new_gift_id", "") or "").strip()
+        if not gift_id.isdigit():
+            self._toast("Сначала выберите подарок")
+            return
+        recipient_raw = str(self.get_setting("new_recipient", "") or "").strip()
+        target = parse_recipient(recipient_raw)
+        if target is None:
+            self._toast("Укажите получателя: @username, ID или «я»")
+            return
+        when = parse_when(self.get_setting("new_time", ""))
+        if when is None:
+            self._toast("Не понял время. Пример: 25.12 18:00, завтра 10:30, через 90 мин")
+            return
+        if when <= datetime.now() + timedelta(seconds=30):
+            self._toast("Время уже прошло или слишком близко")
+            return
+
+        text = str(self.get_setting("new_message", "") or "").strip()
+        if len(text) > 255:
+            self._toast("Подпись слишком длинная (до 255 символов)")
+            return
+
+        label = str(self.get_setting("new_gift_label", "") or "") or f"Подарок {gift_id}"
+        stars = str(self.get_setting("new_gift_stars", "") or "?")
+        task = {
+            "id": int(time.time() * 1000),
+            "when": when.timestamp(),
+            "recipient": recipient_raw if target["kind"] != "self" else "я",
+            "gift_id": int(gift_id),
+            "label": label,
+            "stars": stars,
+            "text": text,
+            "hide": self._flag("new_hide", False),
+            "account": self._account(),
+            "status": "pending",
+            "error": "",
+        }
+        summary = (
+            f"{label} ({stars} ⭐)\nПолучатель: {task['recipient']}\nКогда: {fmt_when(task['when'])}"
+            + (f"\nПодпись: {text}" if text else "")
+            + ("\nИмя скрыто" if task["hide"] else "")
+            + "\n\nЗвёзды спишутся в момент отправки. Telegram должен быть запущен."
+        )
+
+        def commit():
+            with self._lock:
+                tasks = self._tasks()
+                tasks.append(task)
+                self._save_tasks(tasks)
+            self.stats["scheduled"] += 1
+            self._set("new_time", "")
+            self._set("new_message", "", reload=True)
+            self._toast(f"Запланировано на {fmt_when(task['when'])}")
+
+        self._confirm("Запланировать подарок?", summary, "Запланировать", commit)
+
+    # ------------------------------------------------------------------ список задач
+
+    def _show_list(self, recipient: Optional[str] = None):
+        tasks = sorted(self._tasks(), key=lambda t: t.get("when", 0))
+        if recipient is not None:
+            tasks = [t for t in tasks if str(t.get("recipient")) == str(recipient)]
+        if not tasks:
+            self._toast("Запланированных подарков нет")
+            return
+        labels = [
+            f"{STATUS_ICONS.get(t.get('status'), '•')} {fmt_when(t.get('when', 0))} · {t.get('recipient', '?')} · "
+            f"{t.get('label', '')}" for t in tasks
+        ]
+
+        def pick(i):
+            task = tasks[i]
+            status = task.get("status")
+            detail = f"{self._short(task)}\nСтатус: {status}" + (f"\n{task['error']}" if task.get("error") else "")
+            if status == "sending":
+                self._toast("Подарок уже отправляется, отменить нельзя")
+            elif status == "pending":
+                self._confirm("Отменить отправку?", detail, "Отменить", lambda: self._cancel_task(task["id"]))
+            else:
+                self._confirm("Убрать из списка?", detail, "Убрать", lambda: self._remove_task(task["id"]))
+
+        self._choose("Подарки по расписанию", labels, pick)
+
+    def _cancel_task(self, task_id: int):
+        """Отмена ожидающей задачи: только если она ещё не начала отправляться."""
+        with self._lock:
+            tasks = self._tasks()
+            task = next((t for t in tasks if t.get("id") == task_id), None)
+            if task is None:
+                self._toast("Задача уже удалена")
+                return
+            if task.get("status") != "pending":
+                self._toast("Подарок уже отправляется или отправлен, отменить нельзя")
+                return
+            self._save_tasks([t for t in tasks if t.get("id") != task_id])
+        self._toast("Отправка отменена, звёзды не списаны")
+
+    def _cancel_all_pending(self):
+        with self._lock:
+            tasks = self._tasks()
+            keep = [t for t in tasks if t.get("status") != "pending"]
+            count = len(tasks) - len(keep)
+            self._save_tasks(keep)
+        self._toast(f"Отменено отправок: {count}" if count else "Ожидающих отправок нет")
+
+    def _pending_for(self, recipient: Optional[str]) -> int:
+        return sum(
+            1 for t in self._tasks()
+            if t.get("status") == "pending" and (recipient is None or str(t.get("recipient")) == str(recipient))
+        )
+
+    def _remove_task(self, task_id: int):
+        with self._lock:
+            tasks = [t for t in self._tasks() if t.get("id") != task_id]
+            self._save_tasks(tasks)
+        self._toast("Готово")
+
+    # ------------------------------------------------------------------ настройки
+
+    def create_settings(self):
+        from ui.settings import Header, Input, Switch, Text
+
+        pending = sum(1 for t in self._tasks() if t.get("status") == "pending")
+
+        return [
+            Header(text="Окно отправки подарка"),
+            Switch(
+                key="sheet_ui",
+                text="«Отложить» в окне отправки",
+                default=True,
+                subtext="Добавляет строку «Отложить отправку» под «Скрыть моё имя» в окне подарка",
+                icon="msg_info",
+            ),
+            Header(text="Расписание"),
+            Text(
+                text="Запланированные",
+                subtext=f"Ожидают отправки: {pending}. Нажмите, чтобы посмотреть или отменить",
+                on_click=lambda view: self._show_list(),
+            ),
+            Text(
+                text="Отменить все ожидающие",
+                subtext="Звёзды не списываются, пока подарок не отправлен",
+                red=True,
+                on_click=lambda view: self._confirm(
+                    "Отменить все отправки?",
+                    f"Будет отменено подарков: {self._pending_for(None)}",
+                    "Отменить все",
+                    self._cancel_all_pending,
+                ),
+            ),
+            Input(
+                key="max_late_min",
+                text="Допустимое опоздание, мин",
+                default="360",
+                subtext="Если Telegram был закрыт и подарок просрочен больше, чем на это время, "
+                        "он не уйдёт, а пометится как пропущенный",
+            ),
+            Header(text="Работа в фоне"),
+            Text(
+                text="Разрешить работу без ограничений",
+                subtext="Отключите для Telegram экономию заряда, иначе система может усыпить его до срока",
+                on_click=lambda view: self._open_system_settings("android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS"),
+            ),
+            Text(
+                text="Точные будильники",
+                subtext="Нужны, чтобы Telegram проснулся ровно в срок, даже если его выгрузили из памяти",
+                on_click=lambda view: self._open_system_settings(
+                    "android.settings.REQUEST_SCHEDULE_EXACT_ALARM", with_package=True
+                ),
+            ),
+            Header(text="Описание"),
+            Text(
+                text="Описание \U0001F1F7\U0001F1FA",
+                subtext="Что умеет плагин (по-русски)",
+                on_click=lambda view: self._show_about("Описание", "Закрыть", ABOUT_RU),
+            ),
+            Text(
+                text="Description \U0001F1EC\U0001F1E7",
+                subtext="What the plugin can do (in English)",
+                on_click=lambda view: self._show_about("Description", "Close", ABOUT_EN),
+            ),
+            Header(text="Команды плагина"),
+            Text(text=".gift", subtext="Показать запланированные подарки, любой можно отменить"),
+            Text(text=".gift cancel", subtext="Отменить все ожидающие отправки сразу"),
+            Text(text=".giftui", subtext="Скопировать отчёт об окне отправки подарка (для настройки вставки)"),
+            Text(text=".giftdebug", subtext="Скопировать отчёт о состоянии плагина в буфер обмена"),
+        ]
+
+    # ------------------------------------------------------------------ диалоги
+
+    def _activity(self):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            raise RuntimeError("нет активности для диалога")
+        return activity
+
+    def _choose(self, title: str, labels: list, on_pick):
+        def show():
+            try:
+                from ui.alert import AlertDialogBuilder
+
+                def handler(builder, which):
+                    builder.dismiss()
+                    on_pick(int(which))
+
+                builder = AlertDialogBuilder(self._activity())
+                builder.set_title(title[:120])
+                builder.set_items(labels, handler)
+                builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+                builder.show()
+            except Exception as e:
+                self._last_error = f"choose: {type(e).__name__}: {e}"
+                self._toast(f"Не удалось показать список: {type(e).__name__}")
+
+        run_on_ui_thread(show)
+
+    def _confirm(self, title: str, message: str, ok_label: str, on_ok):
+        def show():
+            try:
+                from ui.alert import AlertDialogBuilder
+
+                def accept(builder, which):
+                    builder.dismiss()
+                    on_ok()
+
+                builder = AlertDialogBuilder(self._activity(), AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+                builder.set_title(title)
+                builder.set_message(message)
+                builder.set_positive_button(ok_label, accept)
+                builder.set_negative_button("Назад", lambda b, w: b.dismiss())
+                builder.create()
+                builder.show()
+            except Exception as e:
+                self._last_error = f"confirm: {type(e).__name__}: {e}"
+                self._toast(f"Не удалось показать окно: {type(e).__name__}")
+
+        run_on_ui_thread(show)
+
+    def _show_about(self, title: str, close_label: str, entries):
+        message = "\n\n".join(f"{head}\n{text}" for head, text in entries)
+
+        def show():
+            try:
+                from ui.alert import AlertDialogBuilder
+
+                builder = AlertDialogBuilder(self._activity(), AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+                builder.set_title(title)
+                builder.set_message(message)
+                builder.set_positive_button(close_label, lambda b, w: b.dismiss())
+                builder.create()
+                builder.show()
+            except Exception as e:
+                self._last_error = f"about: {type(e).__name__}: {e}"
+                self._toast(message[:400])
+
+        run_on_ui_thread(show)
+
+    # ------------------------------------------------------------------ строка в окне отправки подарка
+
+    def _post_delayed(self, fn, delay_ms: int):
+        from java import dynamic_proxy, jclass
+
+        runnable_cls = jclass("java.lang.Runnable")
+
+        class _Run(dynamic_proxy(runnable_cls)):
+            def run(self):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        looper = jclass("android.os.Looper").getMainLooper()
+        jclass("android.os.Handler")(looper).postDelayed(_Run(), int(delay_ms))
+
+    def on_sheet_shown(self, sheet):
+        """Любой BottomSheet.show: берём только окна подарков, ждём, пока нарисуется содержимое."""
+        if not self._alive or not self._flag("sheet_ui", True) or sheet is None:
+            return
+        if "gift" not in _cls_name(sheet).lower():
+            return
+        key = int(sheet.hashCode())
+        if key in self._sheets_done:
+            return
+        self._sheets_done.add(key)
+        if len(self._sheets_done) > 50:
+            self._sheets_done.pop()
+        self._ui_status = f"{_cls_name(sheet)}: waiting"
+        for delay in (400, 1000, 2000):
+            self._post_delayed(lambda d=delay: self._probe_sheet(sheet, d), delay)
+
+    @staticmethod
+    def _walk(root, limit: int = 1500):
+        """Все view под root: (view, depth, parent)."""
+        out = []
+        stack = [(root, 0, None)]
+        while stack and len(out) < limit:
+            view, depth, parent = stack.pop()
+            out.append((view, depth, parent))
+            try:
+                count = int(view.getChildCount())
+            except Exception:
+                continue
+            for i in range(count - 1, -1, -1):
+                try:
+                    stack.append((view.getChildAt(i), depth + 1, view))
+                except Exception:
+                    pass
+        return out
+
+    @staticmethod
+    def _text_of(view) -> str:
+        try:
+            text = view.getText()
+            return str(text) if text is not None else ""
+        except Exception:
+            return ""
+
+    def _probe_sheet(self, sheet, delay: int):
+        if not self._alive:
+            return
+        try:
+            root = sheet.getWindow().getDecorView()
+        except Exception as e:
+            self._ui_status = f"no window: {type(e).__name__}"
+            return
+        nodes = self._walk(root)
+        hide_view = None
+        for view, _depth, _parent in nodes:
+            if self._text_of(view).strip().lower() in HIDE_NAME_TEXTS:
+                hide_view = view
+                break
+        if hide_view is None:
+            self._ui_status = f"{_cls_name(sheet)}: «Скрыть моё имя» не найдено ({delay} мс)"
+            if delay >= 2000:
+                self._ui_dump = self._dump_ui(sheet, nodes)
+            return
+        if getattr(sheet, "_gs_injected", False) or int(sheet.hashCode()) in getattr(self, "_injected", set()):
+            return
+        self._injected = getattr(self, "_injected", set())
+        self._injected.add(int(sheet.hashCode()))
+        self._ui_dump = self._dump_ui(sheet, nodes)
+        try:
+            self._inject_row(sheet, nodes, hide_view)
+        except Exception as e:
+            self._last_error = f"inject: {type(e).__name__}: {e}"
+            self._ui_status = f"inject failed: {type(e).__name__}: {e}"
+            self._lg.exception("inject row")
+
+    def _dump_ui(self, sheet, nodes) -> str:
+        """Отчёт о структуре окна: по нему можно точно подогнать вставку под вашу версию клиента."""
+        lines = [f"Gift Scheduler {__version__} UI dump", f"sheet={_cls_name(sheet)}"]
+        try:
+            cls = sheet.getClass()
+            while cls is not None and str(cls.getName()) != "java.lang.Object":
+                lines.append(f"-- fields of {cls.getName()}")
+                for field in cls.getDeclaredFields():
+                    try:
+                        field.setAccessible(True)
+                        value = field.get(sheet)
+                        shown = ""
+                        if value is not None:
+                            tname = str(field.getType().getName())
+                            if tname in ("long", "int", "boolean", "float", "double", "java.lang.String", "java.lang.Long"):
+                                shown = " = " + str(value)[:40]
+                        lines.append(f"{field.getName()}: {field.getType().getSimpleName()}{shown}")
+                    except Exception:
+                        lines.append(f"{field.getName()}: ?")
+                cls = cls.getSuperclass()
+        except Exception as e:
+            lines.append(f"fields error: {type(e).__name__}: {e}")
+        lines.append("-- views")
+        for view, depth, _parent in nodes[:400]:
+            try:
+                text = self._text_of(view).replace("\n", " ")[:40]
+                lines.append(
+                    f"{'  ' * min(depth, 14)}{_cls_name(view).rsplit('.', 1)[-1]} "
+                    f"[{int(view.getLeft())},{int(view.getTop())} {int(view.getWidth())}x{int(view.getHeight())}]"
+                    f" vis={int(view.getVisibility())}" + (f" «{text}»" if text else "")
+                )
+            except Exception:
+                pass
+        return "\n".join(lines)
+
+    @staticmethod
+    def _argb(value: int) -> int:
+        return value - (1 << 32) if value >= (1 << 31) else value
+
+    def _inject_row(self, sheet, nodes, hide_view):
+        from java import dynamic_proxy, jclass
+
+        ctx = sheet.getContext()
+        density = float(ctx.getResources().getDisplayMetrics().density)
+
+        def dp(x):
+            return int(x * density + 0.5)
+
+        button = None
+        for view, _depth, _parent in nodes:
+            if _cls_name(view).endswith("ButtonWithCounterView"):
+                button = view
+                break
+        if button is None:
+            self._ui_status = "кнопка «Отправить подарок» не найдена"
+            return
+        parent = button.getParent()
+        if parent is None:
+            self._ui_status = "у кнопки нет родителя"
+            return
+
+        text_color = self._argb(0xFFFFFFFF)
+        try:
+            theme = jclass("org.telegram.ui.ActionBar.Theme")
+            text_color = int(theme.getColor(theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        hint_color = self._argb(0x99888888)
+        green = self._argb(0xFF6FA24C)
+
+        LinearLayout = jclass("android.widget.LinearLayout")
+        TextView = jclass("android.widget.TextView")
+        EditText = jclass("android.widget.EditText")
+        Switch = jclass("android.widget.Switch")
+        LP = jclass("android.widget.LinearLayout$LayoutParams")
+
+        box = LinearLayout(ctx)
+        box.setOrientation(1)
+        box.setPadding(dp(22), dp(8), dp(22), dp(8))
+        try:
+            theme = jclass("org.telegram.ui.ActionBar.Theme")
+            box.setBackgroundColor(int(theme.getColor(theme.key_dialogBackground)))
+        except Exception:
+            box.setBackgroundColor(self._argb(0xFF1C1C1E))
+
+        top = LinearLayout(ctx)
+        top.setOrientation(0)
+        top.setGravity(16)
+        top.setMinimumHeight(dp(48))
+        title = TextView(ctx)
+        title.setText("Отложить отправку")
+        title.setTextSize(16.0)
+        title.setTextColor(text_color)
+        top.addView(title, LP(0, -2, 1.0))
+        try:  # значок «отложить» из ресурсов самого Telegram
+            icon = jclass("android.widget.ImageView")(ctx)
+            icon.setImageResource(int(jclass("org.telegram.messenger.R$drawable").msg_schedule))
+            icon.setColorFilter(hint_color)
+            top.addView(icon, LP(dp(24), dp(24)))
+        except Exception:
+            pass
+        top.setClickable(True)
+        box.addView(top, LP(-1, -2))
+
+        extra = LinearLayout(ctx)
+        extra.setOrientation(1)
+        extra.setVisibility(8)
+        field = EditText(ctx)
+        field.setHint("Когда: 25.12 18:00, завтра 10:30, +2ч")
+        field.setHintTextColor(hint_color)
+        field.setTextColor(text_color)
+        field.setTextSize(15.0)
+        field.setSingleLine(True)
+        extra.addView(field, LP(-1, -2))
+        action = TextView(ctx)
+        action.setText("Запланировать подарок")
+        action.setTextSize(16.0)
+        action.setTextColor(self._argb(0xFFFFFFFF))
+        action.setGravity(17)
+        action.setPadding(dp(12), dp(14), dp(12), dp(14))
+        shape = jclass("android.graphics.drawable.GradientDrawable")()
+        shape.setColor(green)
+        shape.setCornerRadius(float(dp(12)))
+        action.setBackground(shape)
+        action_lp = LP(-1, -2)
+        action_lp.setMargins(0, dp(10), 0, dp(2))
+        extra.addView(action, action_lp)
+        box.addView(extra, LP(-1, -2))
+
+        recipient = self._sheet_recipient(sheet)
+        if self._pending_for(recipient) > 0:
+            pending = TextView(ctx)
+            pending.setText(f"Уже запланировано: {self._pending_for(recipient)}. Нажмите, чтобы отменить")
+            pending.setTextSize(14.0)
+            pending.setTextColor(green)
+            pending.setPadding(0, dp(10), 0, dp(2))
+            box.addView(pending, LP(-1, -2))
+            plugin_ref = self
+
+            class _Pending(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+                def onClick(self, view):
+                    try:
+                        plugin_ref._show_list(recipient)
+                    except Exception:
+                        pass
+
+            pending.setOnClickListener(_Pending())
+
+        plugin = self
+
+        class _Click(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+            def onClick(self, view):
+                try:
+                    plugin._schedule_from_sheet(sheet, nodes, hide_view, str(field.getText()))
+                except Exception as exc:
+                    plugin._last_error = f"schedule_from_sheet: {type(exc).__name__}: {exc}"
+                    plugin._toast(f"Не удалось запланировать: {type(exc).__name__}")
+
+        def show_fallback():
+            """Штатное меню недоступно: показываем своё поле для ввода времени."""
+            extra.setVisibility(0)
+            button.setVisibility(8)
+
+        class _Open(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+            def onClick(self, view):
+                try:
+                    opened = plugin._open_native_picker(
+                        lambda when: plugin._schedule_from_sheet_at(sheet, nodes, hide_view, when)
+                    )
+                    if not opened:
+                        show_fallback()
+                except Exception as exc:
+                    plugin._last_error = f"open picker: {type(exc).__name__}: {exc}"
+                    show_fallback()
+
+        action.setOnClickListener(_Click())
+        top.setOnClickListener(_Open())
+
+        parent_name = _cls_name(parent)
+        if "LinearLayout" in parent_name:
+            parent.addView(box, int(parent.indexOfChild(button)), LP(-1, -2))
+            self._ui_status = f"вставлено в {parent_name} перед кнопкой"
+        else:
+            Frame = jclass("android.widget.FrameLayout$LayoutParams")
+            lp = Frame(-1, -2, 80)  # Gravity.BOTTOM
+            lp.bottomMargin = int(button.getHeight()) + dp(16)
+            parent.addView(box, lp)
+            self._ui_status = f"вставлено в {parent_name} над кнопкой"
+
+    def _open_native_picker(self, on_date) -> bool:
+        """Штатное меню «Отправить позже» из Telegram. on_date(datetime) вызывается после выбора."""
+        from java import dynamic_proxy, jclass, jlong
+
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            self._ui_status = "picker: нет активности"
+            return False
+        creator = jclass("org.telegram.ui.Components.AlertsCreator")
+        delegate_cls = jclass("org.telegram.ui.Components.AlertsCreator$ScheduleDatePickerDelegate")
+        plugin = self
+
+        class _Delegate(dynamic_proxy(delegate_cls)):
+            def didSelectDate(self, notify, date, repeat=None):
+                try:
+                    ts = int(date)
+                    if ts > 2000000000:  # «когда будет онлайн» и подобные служебные значения
+                        plugin._toast("Выберите конкретную дату и время")
+                        return
+                    on_date(datetime.fromtimestamp(ts))
+                except Exception as exc:
+                    plugin._last_error = f"picker callback: {type(exc).__name__}: {exc}"
+                    plugin._toast(f"Не удалось запланировать: {type(exc).__name__}")
+
+        delegate = _Delegate()
+        attempts = (
+            lambda: creator.createScheduleDatePickerDialog(activity, jlong(0), delegate, None),
+            lambda: creator.createScheduleDatePickerDialog(activity, jlong(0), jlong(-1), delegate, None),
+            lambda: creator.createScheduleDatePickerDialog(activity, jlong(0), delegate),
+        )
+        for index, call in enumerate(attempts):
+            try:
+                call()
+                self._ui_status = f"picker: вариант {index + 1}"
+                return True
+            except Exception as exc:
+                self._last_error = f"picker variant {index + 1}: {type(exc).__name__}: {exc}"
+        return False
+
+    def _sheet_recipient(self, sheet) -> Optional[str]:
+        for name in ("dialogId", "dialog_id", "userId", "user_id", "peerId"):
+            try:
+                value = get_private_field(sheet, name)
+                if value is not None and int(value) > 0:
+                    return str(int(value))
+            except Exception:
+                pass
+        return None
+
+    def _read_sheet(self, sheet, nodes, hide_view) -> Optional[dict]:
+        """Достаёт из окна отправки: получатель, подарок, «скрыть имя», подпись. None, если не вышло."""
+        def field(*names):
+            for name in names:
+                try:
+                    value = get_private_field(sheet, name)
+                    if value is not None:
+                        return value
+                except Exception:
+                    pass
+            return None
+
+        dialog_id = field("dialogId", "dialog_id", "userId", "user_id", "peerId")
+        gift = field("gift", "starGift", "giftToSend", "selectedGift", "option", "giftOption")
+        if dialog_id is None or gift is None:
+            return None
+        try:
+            dialog_id = int(dialog_id)
+            gift_id = int(getattr(gift, "id"))
+        except Exception:
+            return None
+        if dialog_id <= 0:
+            return None
+        stars = getattr(gift, "stars", None)
+        info = self._gift_info(gift) or {"label": f"Подарок {gift_id}", "stars": int(stars or 0)}
+
+        hide = False
+        node = hide_view
+        for _ in range(4):  # переключатель - соседний/родительский TextCheckCell
+            try:
+                if hasattr(node, "isChecked"):
+                    hide = bool(node.isChecked())
+                    break
+                node = node.getParent()
+            except Exception:
+                break
+
+        text = ""
+        for view, _depth, _parent in nodes:
+            name = _cls_name(view)
+            if "EditText" in name and view is not None:
+                value = self._text_of(view).strip()
+                if value and "Switch" not in name:
+                    text = value
+                    break
+        return {
+            "recipient": str(dialog_id), "gift_id": gift_id, "label": info["label"],
+            "stars": str(info["stars"]), "hide": hide, "text": text[:255],
+        }
+
+    def _schedule_from_sheet(self, sheet, nodes, hide_view, when_text: str):
+        when = parse_when(when_text)
+        if when is None:
+            self._toast("Не понял время. Пример: 25.12 18:00, завтра 10:30, через 90 мин")
+            return
+        self._schedule_from_sheet_at(sheet, nodes, hide_view, when)
+
+    def _schedule_from_sheet_at(self, sheet, nodes, hide_view, when: datetime):
+        if when <= datetime.now() + timedelta(seconds=30):
+            self._toast("Время уже прошло или слишком близко")
+            return
+        data = self._read_sheet(sheet, nodes, hide_view)
+        if data is None:
+            self._toast("Не удалось прочитать данные подарка. Откройте .giftui и отправьте отчёт разработчику")
+            return
+        task = {
+            "id": int(time.time() * 1000), "when": when.timestamp(), "account": self._account(),
+            "status": "pending", "error": "", **data,
+        }
+        summary = (
+            f"{task['label']} ({task['stars']} ⭐)\nПолучатель: {task['recipient']}\nКогда: {fmt_when(task['when'])}"
+            + (f"\nПодпись: {task['text']}" if task["text"] else "")
+            + ("\nИмя скрыто" if task["hide"] else "")
+            + "\n\nЗвёзды спишутся в момент отправки. Telegram должен быть запущен."
+        )
+
+        def commit():
+            with self._lock:
+                tasks = self._tasks()
+                tasks.append(task)
+                self._save_tasks(tasks)
+            self.stats["scheduled"] += 1
+            self._toast(f"Запланировано на {fmt_when(task['when'])}")
+            try:
+                sheet.dismiss()
+            except Exception:
+                pass
+
+        self._confirm("Запланировать подарок?", summary, "Запланировать", commit)
+
+    # ------------------------------------------------------------------ команды в чате
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        text = getattr(params, "message", None)
+        if not isinstance(text, str):
+            return HookResult()
+        command = text.strip().lower()
+        if command in (".gift cancel", ".gift cancel all", ".gift отмена"):
+            self._cancel_all_pending()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if command == ".gift":
+            self._show_list()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if command == ".giftui":
+            self._cmd_ui_dump()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if command == ".giftdebug":
+            self._cmd_debug()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    def _cmd_ui_dump(self):
+        def dump():
+            text = self._ui_dump or "Окно отправки подарка ещё не открывалось: откройте его и снова введите .giftui"
+            text = f"status: {self._ui_status}\n{text}"
+            try:
+                from android_utils import copy_to_clipboard
+
+                copy_to_clipboard(text)
+                self._toast("Отчёт об окне подарка скопирован в буфер обмена")
+            except Exception as e:
+                self._toast(f"Не удалось скопировать: {type(e).__name__}: {e}")
+
+        run_on_ui_thread(dump)
+
+    def _cmd_debug(self):
+        def dump():
+            tasks = self._tasks()
+            counts = {}
+            for t in tasks:
+                counts[t.get("status")] = counts.get(t.get("status"), 0) + 1
+            lines = [
+                f"Gift Scheduler {__version__}",
+                f"thread alive={getattr(self, '_thread', None) is not None and self._thread.is_alive()}",
+                f"last_tick={fmt_when(self._last_tick) if self._last_tick else '-'}",
+                f"tasks={counts}",
+                f"max_late_min={self._max_late() / 60:g}",
+                f"catalog={'cached %d' % len(self._catalog[1]) if self._catalog else 'not loaded'}",
+                f"stats={self.stats}",
+                f"sheet_hook={self._sheet_info}",
+                f"alarm={self._alarm_status}",
+                f"tl_classes={ {k: v[0] for k, v in self._tl_cache.items()} }",
+                f"tl_scan={self._tl_scan}",
+                f"ui_status={self._ui_status}",
+                f"last_error={self._last_error or '-'}",
+            ]
+            try:
+                from android_utils import copy_to_clipboard
+
+                copy_to_clipboard("\n".join(lines))
+                self._toast("Диагностика скопирована в буфер обмена")
+            except Exception as e:
+                self._toast(f"Не удалось скопировать: {type(e).__name__}: {e}")
+
+        run_on_ui_thread(dump)
+
+    def _toast(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_info(text))
