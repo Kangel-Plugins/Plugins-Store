@@ -1,0 +1,816 @@
+__id__ = "crypto_rates"
+__name__ = "CryptoRates"
+__description__ = "Курс криптовалют в MD3-оверлее из бокового меню"
+__author__ = "@LuPlugins (@optimist_opti)"
+__version__ = "1.0"
+__icon__ = "rei_plugins/6"
+__min_version__ = "12.10.6"
+
+import json
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from android_utils import run_on_ui_thread
+from client_utils import get_last_fragment
+
+from java import dynamic_proxy
+from android.app import Dialog
+from android.content import DialogInterface
+from android.graphics import Bitmap, BitmapFactory, Color, PorterDuff, Typeface
+from android.graphics.drawable import ColorDrawable, GradientDrawable
+from android.view import Gravity, KeyEvent, View, ViewOutlineProvider
+from android.view.animation import DecelerateInterpolator
+from android.widget import (FrameLayout, HorizontalScrollView, ImageView,
+                            LinearLayout, ScrollView, TextView)
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.ActionBar import Theme
+
+COINS = [
+    ("BTC", "Bitcoin"), ("ETH", "Ethereum"), ("BNB", "BNB"),
+    ("GRAM", "Gram (ex-Toncoin)"), ("SOL", "Solana"), ("XRP", "XRP"),
+    ("DOGE", "Dogecoin"), ("ADA", "Cardano"), ("TRX", "TRON"),
+    ("AVAX", "Avalanche"), ("LINK", "Chainlink"), ("DOT", "Polkadot"),
+    ("LTC", "Litecoin"), ("SUI", "Sui"), ("NOT", "Notcoin"),
+    ("DOGS", "Dogs"), ("HMSTR", "Hamster Kombat"),
+]
+SYMS = [c[0] for c in COINS]
+ALIAS = {"TON": "GRAM"}
+
+CURRENCIES = [
+    ("USD", "$", True, False),
+    ("EUR", "€", True, False),
+    ("RUB", "₽", False, True),
+    ("UAH", "₴", False, True),
+    ("KZT", "₸", False, True),
+    ("BYN", "Br", False, True),
+    ("TRY", "₺", True, False),
+    ("GBP", "£", True, False),
+    ("CNY", "¥", True, False),
+    ("AED", "AED", False, False),
+]
+CUR_META = {c[0]: c[1:] for c in CURRENCIES}
+FX_CODES = [c[0] for c in CURRENCIES]
+FX_TTL = 1800
+
+UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) exteraGram"}
+
+CACHE = {"coins": None, "src": None, "time": None,
+         "fx": {"USD": 1.0}, "fx_ts": 0.0}
+ICON_CACHE = {}
+ICON_FAILED = set()
+ICON_WAITERS = {}
+ICON_LOCK = threading.Lock()
+
+MATCH, WRAP = -1, -2
+GREEN, RED = 0xFF2E9E5B, 0xFFD93F3F
+NBSP = "\u00a0"
+PALETTE = [0xFF5C6BC0, 0xFF26A69A, 0xFFEF6C00, 0xFF8E24AA,
+           0xFF00897B, 0xFFD81B60, 0xFF3949AB, 0xFF6D4C41]
+
+
+def canon(sym):
+    sym = sym.upper()
+    return ALIAS.get(sym, sym)
+
+
+def candidates(sym):
+    return [sym] + [k for k, v in ALIAS.items() if v == sym]
+
+
+def http_get(url, timeout=5):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def http_json(url, timeout=5):
+    return json.loads(http_get(url, timeout).decode("utf-8"))
+
+
+def parse_binance(d):
+    return dict(
+        price=float(d["lastPrice"]),
+        chg=float(d["priceChangePercent"]),
+        high=float(d["highPrice"]),
+        low=float(d["lowPrice"]),
+        vol=float(d["quoteVolume"]),
+    )
+
+
+def src_binance(host):
+    out = {}
+    syms = [s + "USDT" for s in SYMS]
+    q = urllib.parse.quote(json.dumps(syms, separators=(",", ":")))
+    try:
+        for d in http_json(f"https://{host}/api/v3/ticker/24hr?symbols={q}"):
+            out[canon(d["symbol"][:-4])] = parse_binance(d)
+        return out
+    except urllib.error.HTTPError as e:
+        if e.code in (418, 429):
+            raise
+    for s in SYMS:
+        for cand in candidates(s):
+            try:
+                d = http_json(
+                    f"https://{host}/api/v3/ticker/24hr?symbol={cand}USDT")
+                out[s] = parse_binance(d)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (418, 429):
+                    raise
+    return out
+
+
+def src_okx():
+    data = http_json(
+        "https://www.okx.com/api/v5/market/tickers?instType=SPOT")["data"]
+    out = {}
+    for d in data:
+        inst = d["instId"]
+        if not inst.endswith("-USDT"):
+            continue
+        s = canon(inst[:-5])
+        if s not in SYMS:
+            continue
+        last = float(d["last"])
+        op = float(d["open24h"])
+        out[s] = dict(
+            price=last,
+            chg=((last - op) / op * 100) if op else 0.0,
+            high=float(d["high24h"]),
+            low=float(d["low24h"]),
+            vol=float(d["volCcy24h"]),
+        )
+    return out
+
+
+def src_bybit():
+    data = http_json(
+        "https://api.bybit.com/v5/market/tickers?category=spot")["result"]["list"]
+    out = {}
+    for d in data:
+        if not d["symbol"].endswith("USDT"):
+            continue
+        s = canon(d["symbol"][:-4])
+        if s not in SYMS:
+            continue
+        out[s] = dict(
+            price=float(d["lastPrice"]),
+            chg=float(d["price24hPcnt"]) * 100,
+            high=float(d["highPrice24h"]),
+            low=float(d["lowPrice24h"]),
+            vol=float(d["turnover24h"]),
+        )
+    return out
+
+
+def src_cryptocompare():
+    url = ("https://min-api.cryptocompare.com/data/pricemultifull?fsyms="
+           + ",".join(SYMS + list(ALIAS)) + "&tsyms=USD")
+    out = {}
+    for s, v in http_json(url)["RAW"].items():
+        d = v["USD"]
+        out[canon(s)] = dict(
+            price=float(d["PRICE"]),
+            chg=float(d["CHANGEPCT24HOUR"]),
+            high=float(d["HIGH24HOUR"]),
+            low=float(d["LOW24HOUR"]),
+            vol=float(d["VOLUME24HOURTO"]),
+            cap=float(d.get("MKTCAP") or 0),
+        )
+    return out
+
+
+GECKO_IDS = ("bitcoin,ethereum,binancecoin,the-open-network,solana,ripple,"
+             "dogecoin,cardano,tron,avalanche-2,chainlink,polkadot,"
+             "litecoin,sui,notcoin,dogs-2,hamster-kombat")
+
+
+def src_coingecko():
+    url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
+           "&ids=" + GECKO_IDS + "&price_change_percentage=24h")
+    out = {}
+    for d in http_json(url):
+        out[canon(d["symbol"])] = dict(
+            price=float(d["current_price"]),
+            chg=float(d.get("price_change_percentage_24h") or 0),
+            high=float(d.get("high_24h") or 0),
+            low=float(d.get("low_24h") or 0),
+            vol=float(d.get("total_volume") or 0),
+            cap=float(d.get("market_cap") or 0),
+            image=d.get("image"),
+        )
+    return out
+
+
+SOURCES = [
+    ("Binance", lambda: src_binance("data-api.binance.vision")),
+    ("Binance", lambda: src_binance("api.binance.com")),
+    ("OKX", src_okx),
+    ("Bybit", src_bybit),
+    ("CryptoCompare", src_cryptocompare),
+    ("CoinGecko", src_coingecko),
+]
+
+
+def fetch_rates():
+    for name, fn in SOURCES:
+        try:
+            raw = fn()
+            coins = []
+            for sym, cname in COINS:
+                d = raw.get(sym)
+                if d and d.get("price"):
+                    coins.append(dict(d, sym=sym, name=cname))
+            if len(coins) >= 3:
+                return name, coins
+        except Exception:
+            continue
+    return None, None
+
+
+def fx_open_er():
+    r = http_json("https://open.er-api.com/v6/latest/USD")["rates"]
+    return {c: float(r[c]) for c in FX_CODES if c in r}
+
+
+def fx_fawaz():
+    r = http_json("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api"
+                  "@latest/v1/currencies/usd.json")["usd"]
+    return {c: float(r[c.lower()]) for c in FX_CODES if c.lower() in r}
+
+
+def fx_cbr():
+    v = http_json("https://www.cbr-xml-daily.ru/daily_json.js")["Valute"]
+    rub_per_usd = v["USD"]["Value"] / v["USD"]["Nominal"]
+    out = {"USD": 1.0, "RUB": rub_per_usd}
+    for c in FX_CODES:
+        if c in v:
+            out[c] = rub_per_usd / (v[c]["Value"] / v[c]["Nominal"])
+    return out
+
+
+FX_SOURCES = [fx_open_er, fx_fawaz, fx_cbr]
+
+
+def refresh_fx():
+    for fn in FX_SOURCES:
+        try:
+            rates = fn()
+            if rates and len(rates) >= 3:
+                rates["USD"] = 1.0
+                CACHE["fx"].update(rates)
+                CACHE["fx_ts"] = time.time()
+                return
+        except Exception:
+            continue
+
+
+def load_icon(sym, coin):
+    urls = []
+    if coin.get("image"):
+        urls.append(coin["image"])
+    for s in (c.lower() for c in candidates(sym)):
+        urls.append("https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons"
+                    f"@master/128/color/{s}.png")
+        urls.append(f"https://assets.coincap.io/assets/icons/{s}@2x.png")
+    bmp = None
+    for u in urls:
+        try:
+            data = http_get(u, 6)
+            raw = BitmapFactory.decodeByteArray(data, 0, len(data))
+            if raw is not None:
+                bmp = Bitmap.createScaledBitmap(raw, 96, 96, True)
+                break
+        except Exception:
+            continue
+    with ICON_LOCK:
+        waiters = ICON_WAITERS.pop(sym, [])
+        if bmp is not None:
+            ICON_CACHE[sym] = bmp
+        else:
+            ICON_FAILED.add(sym)
+    if bmp is not None:
+        for cb in waiters:
+            run_on_ui_thread(lambda cb=cb: cb(bmp))
+
+
+def request_icon(sym, coin, apply):
+    with ICON_LOCK:
+        bmp = ICON_CACHE.get(sym)
+        if bmp is None:
+            if sym in ICON_FAILED:
+                return
+            waiters = ICON_WAITERS.get(sym)
+            if waiters is not None:
+                waiters.append(apply)
+                return
+            ICON_WAITERS[sym] = [apply]
+    if bmp is not None:
+        apply(bmp)
+    else:
+        threading.Thread(target=load_icon, args=(sym, coin),
+                         daemon=True).start()
+
+
+def drop_icon_waiters():
+    with ICON_LOCK:
+        for waiters in ICON_WAITERS.values():
+            waiters.clear()
+
+
+def dp(v):
+    return AndroidUtilities.dp(float(v))
+
+
+def to_int(c):
+    c &= 0xFFFFFFFF
+    return c - (1 << 32) if c > 0x7FFFFFFF else c
+
+
+def alpha(color, a):
+    return to_int((color & 0x00FFFFFF) | (int(a * 255) << 24))
+
+
+def shape(color, radius):
+    d = GradientDrawable()
+    d.setColor(to_int(color))
+    d.setCornerRadius(float(dp(radius)))
+    return d
+
+
+def oval(color):
+    d = GradientDrawable()
+    d.setShape(GradientDrawable.OVAL)
+    d.setColor(to_int(color))
+    return d
+
+
+def lp(w=WRAP, h=WRAP, l=0, t=0, r=0, b=0, weight=None):
+    p = (LinearLayout.LayoutParams(w, h, weight) if weight is not None
+         else LinearLayout.LayoutParams(w, h))
+    p.setMargins(dp(l), dp(t), dp(r), dp(b))
+    return p
+
+
+def text(ctx, s, size, color, bold=False):
+    t = TextView(ctx)
+    t.setText(s)
+    t.setTextSize(float(size))
+    t.setTextColor(to_int(color))
+    if bold:
+        t.setTypeface(Typeface.DEFAULT_BOLD)
+    return t
+
+
+def num(v, dec, ru):
+    s = f"{v:,.{dec}f}"
+    if ru:
+        s = s.replace(",", NBSP).replace(".", ",")
+    return s
+
+
+class Click(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        self.fn()
+
+
+class KeyL(dynamic_proxy(DialogInterface.OnKeyListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onKey(self, d, code, ev):
+        return bool(self.fn(code, ev))
+
+
+class DismissL(dynamic_proxy(DialogInterface.OnDismissListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onDismiss(self, d):
+        self.fn()
+
+
+def make_icon(ctx, sym, size, coin):
+    box = FrameLayout(ctx)
+    letter = text(ctx, sym[:1], size * 0.4, Color.WHITE, True)
+    letter.setGravity(Gravity.CENTER)
+    letter.setBackground(oval(PALETTE[sum(map(ord, sym)) % len(PALETTE)]))
+    box.addView(letter, FrameLayout.LayoutParams(dp(size), dp(size)))
+
+    iv = ImageView(ctx)
+    iv.setScaleType(ImageView.ScaleType.CENTER_CROP)
+    iv.setBackground(oval(0xFFFFFFFF))
+    iv.setOutlineProvider(ViewOutlineProvider.BACKGROUND)
+    iv.setClipToOutline(True)
+    iv.setVisibility(View.INVISIBLE)
+    box.addView(iv, FrameLayout.LayoutParams(dp(size), dp(size)))
+
+    def apply(bmp):
+        iv.setImageBitmap(bmp)
+        iv.setVisibility(View.VISIBLE)
+
+    request_icon(sym, coin, apply)
+    return box
+
+
+class CryptoRatesPlugin(BasePlugin):
+    dialog = None
+
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text="Курс криптовалют",
+            icon="msg_stats",
+            on_click=lambda ctx: run_on_ui_thread(self.show_overlay),
+        ))
+
+    def on_plugin_unload(self):
+        if self.dialog is not None:
+            run_on_ui_thread(self.dialog.dismiss)
+        drop_icon_waiters()
+        ICON_CACHE.clear()
+        ICON_FAILED.clear()
+        CACHE.update(coins=None, src=None, time=None, fx={"USD": 1.0}, fx_ts=0.0)
+
+    def show_overlay(self):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return
+        ICON_FAILED.clear()
+
+        bg = Theme.getColor(Theme.key_dialogBackground)
+        on_bg = Theme.getColor(Theme.key_dialogTextBlack)
+        on_var = Theme.getColor(Theme.key_dialogTextGray2)
+        primary = Theme.getColor(Theme.key_featuredStickers_addButton)
+
+        saved = str(self.get_setting("currency", "USD"))
+        ui = {"view": "list", "sel": None, "alive": True, "loading": False,
+              "stale": False, "cur": saved if saved in CUR_META else "USD"}
+
+        dialog = Dialog(activity)
+        dialog.requestWindowFeature(1)
+        self.dialog = dialog
+
+        card = LinearLayout(activity)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card.setBackground(shape(bg, 28))
+        card.setPadding(dp(20), dp(22), dp(20), dp(16))
+
+        header = LinearLayout(activity)
+        header.setGravity(Gravity.CENTER_VERTICAL)
+        header.setPadding(0, 0, 0, dp(12))
+
+        back = FrameLayout(activity)
+        back.setBackground(oval(alpha(primary, 0.12)))
+        back.setVisibility(View.GONE)
+        arrow = ImageView(activity)
+        arrow.setImageResource(activity.getResources().getIdentifier(
+            "msg_arrow_back", "drawable", activity.getPackageName()))
+        arrow.setColorFilter(to_int(primary), PorterDuff.Mode.SRC_IN)
+        arrow.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+        arrow.setPadding(dp(9), dp(9), dp(9), dp(9))
+        back.addView(arrow, FrameLayout.LayoutParams(dp(38), dp(38)))
+        header.addView(back, lp(dp(38), dp(38), r=12))
+
+        titles = LinearLayout(activity)
+        titles.setOrientation(LinearLayout.VERTICAL)
+        title = text(activity, "Курс криптовалют", 22, on_bg, True)
+        subtitle = text(activity, "Загрузка…", 13, on_var)
+        titles.addView(title)
+        titles.addView(subtitle)
+        header.addView(titles)
+        card.addView(header, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        chips_scroll = HorizontalScrollView(activity)
+        chips_scroll.setHorizontalScrollBarEnabled(False)
+        chips_row = LinearLayout(activity)
+        chips_scroll.addView(chips_row)
+        chip_views = {}
+        for code, sym, _, _ in CURRENCIES:
+            tv = text(activity, code if sym == code else f"{sym} {code}",
+                      13, primary, True)
+            tv.setGravity(Gravity.CENTER)
+            tv.setPadding(dp(14), dp(7), dp(14), dp(7))
+            tv.setOnClickListener(Click(lambda c=code: pick_currency(c)))
+            chips_row.addView(tv, lp(r=8))
+            chip_views[code] = tv
+        card.addView(chips_scroll, lp(MATCH, WRAP, b=12))
+
+        scroll = ScrollView(activity)
+        scroll.setVerticalScrollBarEnabled(False)
+        body = LinearLayout(activity)
+        body.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(body)
+        card.addView(scroll, LinearLayout.LayoutParams(
+            MATCH, int(AndroidUtilities.displaySize.y * 0.46)))
+
+        row = LinearLayout(activity)
+        row.setGravity(Gravity.END)
+        row.setPadding(0, dp(14), 0, 0)
+
+        def button(label, filled):
+            b = text(activity, label, 14,
+                     Color.WHITE if filled else primary, True)
+            b.setGravity(Gravity.CENTER)
+            b.setPadding(dp(22), dp(10), dp(22), dp(10))
+            b.setBackground(shape(primary, 20) if filled
+                            else shape(alpha(primary, 0.12), 20))
+            row.addView(b, lp(l=8))
+            return b
+
+        refresh_btn = button("Обновить", False)
+        close_btn = button("Закрыть", True)
+        card.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        def cur_info():
+            code = ui["cur"]
+            rate = CACHE["fx"].get(code)
+            if rate is None:
+                code, rate = "USD", 1.0
+            return (code, rate) + CUR_META[code]
+
+        def wrap_money(s, sym, pre):
+            return f"{sym}{s}" if pre else f"{s}{NBSP}{sym}"
+
+        def money(v):
+            _, rate, sym, pre, ru = cur_info()
+            x = v * rate
+            dec = 0 if x >= 1e6 else 2 if x >= 1 else 4 if x >= 0.01 else 6
+            return wrap_money(num(x, dec, ru), sym, pre)
+
+        def money_big(v):
+            if not v:
+                return "—"
+            _, rate, sym, pre, ru = cur_info()
+            x = v * rate
+            units = (((1e12, "трлн"), (1e9, "млрд"), (1e6, "млн"), (1e3, "тыс."))
+                     if ru else
+                     ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")))
+            s = num(x, 0, ru)
+            for lim, suf in units:
+                if x >= lim:
+                    s = num(x / lim, 2, ru) + (NBSP if ru else "") + suf
+                    break
+            return wrap_money(s, sym, pre)
+
+        def style_chips():
+            for code, tv in chip_views.items():
+                sel = code == ui["cur"]
+                tv.setTextColor(to_int(Color.WHITE if sel else primary))
+                tv.setBackground(
+                    shape(primary if sel else alpha(primary, 0.12), 16))
+
+        def update_subtitle():
+            code = cur_info()[0]
+            if ui["loading"]:
+                s = "Обновление…"
+            elif not CACHE["coins"]:
+                s = "Не удалось загрузить"
+            elif ui["stale"]:
+                s = "Нет сети · данные от " + CACHE["time"]
+            elif code != ui["cur"]:
+                s = f"Курс {ui['cur']} недоступен · показан USD"
+            else:
+                s = f"{CACHE['src']} · {code} · {CACHE['time']}"
+            subtitle.setText(s)
+
+        def stat_row(parent, label, value, color=None):
+            r = LinearLayout(activity)
+            r.setPadding(0, dp(6), 0, dp(6))
+            r.addView(text(activity, label, 14, on_var),
+                      lp(0, WRAP, weight=1.0))
+            r.addView(text(activity, value, 14, color or on_bg, True))
+            parent.addView(r, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        def change_chip(ch, size=12):
+            col = GREEN if ch >= 0 else RED
+            chip = text(activity, f"{'▲' if ch >= 0 else '▼'} {abs(ch):.2f}%",
+                        size, col, True)
+            chip.setPadding(dp(8), dp(2), dp(8), dp(2))
+            chip.setBackground(shape(alpha(col, 0.14), 10))
+            return chip
+
+        def render_list():
+            ui["view"] = "list"
+            back.setVisibility(View.GONE)
+            title.setText("Курс криптовалют")
+            body.removeAllViews()
+            coins = CACHE["coins"]
+            if not coins:
+                p = text(activity,
+                         "Загрузка…" if ui["loading"]
+                         else "Не удалось получить данные.\nНажми «Обновить»",
+                         14, on_var)
+                p.setGravity(Gravity.CENTER)
+                p.setPadding(0, dp(30), 0, dp(30))
+                body.addView(p, LinearLayout.LayoutParams(MATCH, WRAP))
+                return
+            for c in coins:
+                body.addView(
+                    self.coin_row(activity, c, on_bg, on_var, change_chip,
+                                  money(c["price"]),
+                                  lambda s=c["sym"]: open_detail(s)),
+                    lp(MATCH, WRAP, b=8))
+
+        def render_detail():
+            sym = ui["sel"]
+            c = next((x for x in (CACHE["coins"] or [])
+                      if x["sym"] == sym), None)
+            if c is None:
+                render_list()
+                return
+            ui["view"] = "detail"
+            back.setVisibility(View.VISIBLE)
+            title.setText(c["name"])
+            body.removeAllViews()
+            code, rate = cur_info()[:2]
+
+            top = LinearLayout(activity)
+            top.setOrientation(LinearLayout.VERTICAL)
+            top.setGravity(Gravity.CENTER_HORIZONTAL)
+            top.addView(make_icon(activity, sym, 72, c), lp(dp(72), dp(72)))
+            top.addView(text(activity, f"{sym} / {code}", 13, on_var, True),
+                        lp(t=10))
+            top.addView(text(activity, money(c["price"]), 32, on_bg, True),
+                        lp(t=2))
+            top.addView(change_chip(c["chg"], 14), lp(t=6, b=16))
+            body.addView(top, LinearLayout.LayoutParams(MATCH, WRAP))
+
+            rng = LinearLayout(activity)
+            rng.setOrientation(LinearLayout.VERTICAL)
+            rng.setPadding(dp(16), dp(14), dp(16), dp(14))
+            rng.setBackground(shape(alpha(on_bg, 0.06), 20))
+            rng.addView(text(activity, "Диапазон за 24 часа", 13, on_var, True))
+            hi, lo = c.get("high") or 0, c.get("low") or 0
+            if hi > lo:
+                pos = min(1.0, max(0.02, (c["price"] - lo) / (hi - lo)))
+                track = LinearLayout(activity)
+                track.setBackground(shape(alpha(primary, 0.18), 4))
+                fill = View(activity)
+                fill.setBackground(shape(primary, 4))
+                track.addView(fill,
+                              LinearLayout.LayoutParams(0, dp(8), float(pos)))
+                track.addView(View(activity), LinearLayout.LayoutParams(
+                    0, dp(8), float(1.0 - pos)))
+                rng.addView(track, lp(MATCH, dp(8), t=12, b=8))
+                labels = LinearLayout(activity)
+                labels.addView(text(activity, money(lo), 13, on_bg, True),
+                               lp(0, WRAP, weight=1.0))
+                labels.addView(text(activity, money(hi), 13, on_bg, True))
+                rng.addView(labels, LinearLayout.LayoutParams(MATCH, WRAP))
+            body.addView(rng, lp(MATCH, WRAP, b=10))
+
+            stats = LinearLayout(activity)
+            stats.setOrientation(LinearLayout.VERTICAL)
+            stats.setPadding(dp(16), dp(8), dp(16), dp(8))
+            stats.setBackground(shape(alpha(on_bg, 0.06), 20))
+            stat_row(stats, "Изменение за 24ч", f"{c['chg']:+.2f}%",
+                     GREEN if c["chg"] >= 0 else RED)
+            stat_row(stats, "Объём за 24ч", money_big(c.get("vol")))
+            if c.get("cap"):
+                stat_row(stats, "Капитализация", money_big(c["cap"]))
+            if code != "USD":
+                stat_row(stats, "Курс",
+                         f"1 USD = {rate:.2f} {code}" if rate >= 1
+                         else f"1 USD = {rate:.4f} {code}")
+            stat_row(stats, "Источник", CACHE["src"] or "—")
+            body.addView(stats, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        def render():
+            if ui["view"] == "detail":
+                render_detail()
+            else:
+                render_list()
+            update_subtitle()
+
+        def switch(fn):
+            body.setAlpha(0.0)
+            fn()
+            scroll.scrollTo(0, 0)
+            body.animate().alpha(1.0).setDuration(160).start()
+
+        def open_detail(sym):
+            ui["sel"] = sym
+            switch(render_detail)
+
+        def go_back():
+            switch(render_list)
+
+        def pick_currency(code):
+            ui["cur"] = code
+            self.set_setting("currency", code)
+            style_chips()
+            render()
+            if code != "USD" and code not in CACHE["fx"]:
+                load()
+
+        def load():
+            if ui["loading"]:
+                return
+            ui["loading"] = True
+            update_subtitle()
+            requested = ui["cur"]
+
+            def work():
+                coins = None
+                try:
+                    fx_thread = None
+                    if requested != "USD" and (
+                            requested not in CACHE["fx"]
+                            or time.time() - CACHE["fx_ts"] > FX_TTL):
+                        fx_thread = threading.Thread(target=refresh_fx,
+                                                     daemon=True)
+                        fx_thread.start()
+                    name, coins = fetch_rates()
+                    if coins:
+                        CACHE.update(coins=coins, src=name,
+                                     time=time.strftime("%H:%M:%S"))
+                    if fx_thread is not None:
+                        fx_thread.join(15)
+                finally:
+                    run_on_ui_thread(lambda: done(coins, requested))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def done(coins, requested):
+            ui["loading"] = False
+            ui["stale"] = coins is None
+            if not ui["alive"]:
+                return
+            render()
+            cur = ui["cur"]
+            if (coins is not None and cur != "USD"
+                    and cur not in CACHE["fx"] and cur != requested):
+                load()
+
+        def on_key(code, ev):
+            if (code == KeyEvent.KEYCODE_BACK
+                    and ev.getAction() == KeyEvent.ACTION_UP
+                    and ui["view"] == "detail"):
+                go_back()
+                return True
+            return False
+
+        def on_dismiss():
+            ui["alive"] = False
+            self.dialog = None
+            drop_icon_waiters()
+
+        close_btn.setOnClickListener(Click(dialog.dismiss))
+        refresh_btn.setOnClickListener(Click(load))
+        back.setOnClickListener(Click(go_back))
+        dialog.setOnKeyListener(KeyL(on_key))
+        dialog.setOnDismissListener(DismissL(on_dismiss))
+
+        dialog.setContentView(card)
+        win = dialog.getWindow()
+        win.setBackgroundDrawable(ColorDrawable(0))
+        win.setDimAmount(0.55)
+        win.setLayout(min(dp(380), AndroidUtilities.displaySize.x - dp(32)),
+                      WRAP)
+
+        card.setAlpha(0.0)
+        card.setScaleX(0.92)
+        card.setScaleY(0.92)
+        dialog.show()
+        card.animate().alpha(1.0).scaleX(1.0).scaleY(1.0) \
+            .setDuration(260).setInterpolator(DecelerateInterpolator()).start()
+
+        style_chips()
+        render()
+        load()
+
+    def coin_row(self, ctx, c, on_bg, on_var, chip_fn, price_str, on_click):
+        item = LinearLayout(ctx)
+        item.setGravity(Gravity.CENTER_VERTICAL)
+        item.setPadding(dp(12), dp(10), dp(14), dp(10))
+        item.setBackground(shape(alpha(on_bg, 0.06), 18))
+        item.setOnClickListener(Click(on_click))
+
+        item.addView(make_icon(ctx, c["sym"], 40, c), lp(dp(40), dp(40), r=12))
+
+        left = LinearLayout(ctx)
+        left.setOrientation(LinearLayout.VERTICAL)
+        left.addView(text(ctx, c["sym"], 16, on_bg, True))
+        left.addView(text(ctx, c["name"], 12, on_var))
+        item.addView(left, lp(0, WRAP, weight=1.0))
+
+        right = LinearLayout(ctx)
+        right.setOrientation(LinearLayout.VERTICAL)
+        right.setGravity(Gravity.END)
+        right.addView(text(ctx, price_str, 16, on_bg, True))
+        right.addView(chip_fn(c["chg"]), lp(t=4))
+        item.addView(right)
+        return item
