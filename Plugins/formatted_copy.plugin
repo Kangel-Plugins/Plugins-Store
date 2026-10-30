@@ -1,18 +1,54 @@
 from datetime import datetime
 import re
 from typing import Any, List
-from base_plugin import BasePlugin, MethodHook
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
 from hook_utils import find_class, get_private_field
 from java.lang import String
+from android.view import View
 from ui.settings import Header, Switch
 __id__ = 'formatted_copy'
 __name__ = 'formatted copy'
-__description__ = 'копирует выделенные сообщения с датой, временем, автором, медиа-маркерами и цитатами ответов.'
+__description__ = 'форматирование копируемых сообщений'
 __author__ = '@meatdisk'
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 __icon__ = 'exteraPlugins/1'
 __app_version__ = '>=12.10.6'
-__sdk_version__ = '>=1.4.4.3'
+__category__ = ["chats"]
+__sdk_version__ = '>=1.4.3.10'
+
+# Native clipboard results sometimes include generic labels that the plugin
+# already renders itself. Keep this lookup immutable and build it only once.
+GENERIC_MEDIA_LABELS = {
+    '[фотография]': frozenset((
+        'фото', 'фотография', 'фотография загружена', 'изображение',
+        'photo', 'picture', 'image', 'image file', 'photo file',
+    )),
+    '[гиф]': frozenset((
+        'гиф', 'гифка', 'анимация', 'gif', 'animation', 'animated gif',
+    )),
+    '[видео]': frozenset((
+        'видео', 'видеозапись', 'video', 'video file',
+    )),
+    '[аудио]': frozenset((
+        'аудио', 'аудиофайл', 'музыка', 'audio', 'audio file', 'music',
+    )),
+    '[голосовое сообщение]': frozenset((
+        'голосовое сообщение', 'аудиосообщение', 'voice message', 'audio message',
+    )),
+    '[видеосообщение]': frozenset((
+        'видеосообщение', 'круглое видео', 'video message', 'round video message',
+    )),
+    '[документ]': frozenset((
+        'документ', 'файл', 'document', 'file', 'file attachment',
+    )),
+    '[контакт]': frozenset(('контакт', 'contact')),
+    '[геопозиция]': frozenset((
+        'геопозиция', 'местоположение', 'location', 'location shared',
+    )),
+    '[опрос]': frozenset(('опрос', 'poll')),
+    '[стикер]': frozenset(('стикер', 'sticker')),
+    '[медиа]': frozenset(('медиа', 'вложение', 'attachment', 'media')),
+}
 
 class GetMessageContentHook(MethodHook):
 
@@ -35,7 +71,8 @@ class GetMessageContentHook(MethodHook):
         except Exception as exc:
             self.plugin._log_error('formatting getMessageContent', exc)
 
-class SelectionCopyabilityHook(MethodHook):
+class SelectedMessageHook(MethodHook):
+    """Make selected media eligible for the native Copy action."""
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -43,13 +80,12 @@ class SelectionCopyabilityHook(MethodHook):
     def after_hooked_method(self, param):
         try:
             if param.args:
-                message = param.args[0]
-                if self.plugin._looks_like_message(message):
-                    self.plugin._sync_copyable_selection(param.thisObject, message)
+                self.plugin._sync_copyable_selection(param.thisObject, param.args[0])
         except Exception as exc:
-            self.plugin._log_error('updating copyable selection', exc)
+            self.plugin._log_error('updating selected messages', exc)
 
-class SingleCopyHook(MethodHook):
+
+class SelectedCopyHook(MethodHook):
 
     def __init__(self, plugin, copy_option):
         self.plugin = plugin
@@ -60,17 +96,24 @@ class SingleCopyHook(MethodHook):
             if not param.args or self.plugin._to_int(param.args[0], -999999) != self.copy_option:
                 return
             activity = param.thisObject
-            message = get_private_field(activity, 'selectedObject')
-            if message is None or not self.plugin._looks_like_message(message):
+            messages = self.plugin._selected_copy_messages(activity)
+            if not messages:
+                message = get_private_field(activity, 'selectedObject')
+                if message is not None and self.plugin._looks_like_message(message):
+                    if not self.plugin._is_protected_message(activity, message):
+                        messages = [message]
+            if not messages:
                 return
-            if self.plugin._is_protected_message(activity, message):
-                return
-            self.plugin._single_copy_override = self.plugin._format_message(activity, message, native_result=None)
+            formatted = [
+                self.plugin._format_message(activity, message, native_result=None)
+                for message in messages
+            ]
+            self.plugin._clipboard_override = '\n\n'.join(text for text in formatted if text)
         except Exception as exc:
-            self.plugin._log_error('preparing single-message copy', exc)
+            self.plugin._log_error('preparing selected-message copy', exc)
 
     def after_hooked_method(self, param):
-        self.plugin._single_copy_override = None
+        self.plugin._clipboard_override = None
 
 class ClipboardHook(MethodHook):
 
@@ -81,10 +124,10 @@ class ClipboardHook(MethodHook):
         try:
             if not param.args or param.args[0] is None:
                 return
-            override = self.plugin._single_copy_override
+            override = self.plugin._clipboard_override
             if override:
                 param.args[0] = String(override)
-                self.plugin._single_copy_override = None
+                self.plugin._clipboard_override = None
                 return
         except Exception as exc:
             self.plugin._log_error('formatting clipboard payload', exc)
@@ -92,30 +135,155 @@ class ClipboardHook(MethodHook):
 class FormattedCopyPlugin(BasePlugin):
 
     def on_plugin_load(self):
-        self._single_copy_override = None
-        chat_class = find_class('org.telegram.ui.ChatActivity')
-        utilities_class = find_class('org.telegram.messenger.AndroidUtilities')
-        if chat_class is None:
-            self._log_error('loading', 'ChatActivity class not found')
+        self._clipboard_override = None
+        self._copy_menu_item_id = None
+        # Telegram does not expose its native Copy action for media-only audio
+        # messages on many builds. Add a plugin-owned action that writes our
+        # formatted representation directly to the clipboard.
+        try:
+            self._copy_menu_item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text='Копировать как текст',
+                    on_click=self._handle_formatted_copy,
+                    icon='msg_copy',
+                    priority=100,
+                )
+            )
+            self.log('formatted copy: message context copy action registered')
+        except Exception as exc:
+            self._log_error('registering formatted-copy menu item', exc)
+        try:
+            chat_class = find_class('org.telegram.ui.ChatActivity')
+        except Exception as exc:
+            self._log_error('finding ChatActivity', exc)
             return
-        self._register(chat_class, 'getMessageContent', GetMessageContentHook(self))
-        self._register(chat_class, 'addToSelectedMessages', SelectionCopyabilityHook(self))
+        try:
+            utilities_class = find_class('org.telegram.messenger.AndroidUtilities')
+        except Exception as exc:
+            utilities_class = None
+            self._log_error('finding AndroidUtilities', exc)
+        if chat_class is None:
+            self._log_error('loading', 'ChatActivity class not found; this app build is not supported')
+            return
+
+        # The stock selection toolbar may exclude media-only tracks from its Copy list.
+        # Restore eligibility when a message is selected, then format it through our
+        # existing clipboard hook.
+        self._register(chat_class, 'addToSelectedMessages', SelectedMessageHook(self))
+        content_hooked = self._register(chat_class, 'getMessageContent', GetMessageContentHook(self))
         try:
             copy_option = self._read_copy_option(chat_class)
-            self._register(chat_class, 'processSelectedOption', SingleCopyHook(self, copy_option))
+            if copy_option is None:
+                self._log_error('hooking selected-message copy', 'OPTION_COPY not found; relying on getMessageContent hook')
+            else:
+                self._register(chat_class, 'processSelectedOption', SelectedCopyHook(self, copy_option))
         except Exception as exc:
-            self._log_error('hooking single-message copy', exc)
+            self._log_error('hooking selected-message copy', exc)
+        clipboard_hooked = False
         if utilities_class is not None:
-            self._register(utilities_class, 'addToClipboard', ClipboardHook(self))
+            clipboard_hooked = self._register(utilities_class, 'addToClipboard', ClipboardHook(self))
         else:
             self._log_error('hooking clipboard', 'AndroidUtilities class not found')
+        if not content_hooked and not clipboard_hooked:
+            self._log_error('loading', 'no copy hooks found; please send the app version and plugin log')
         self.log('formatted copy loaded')
+
+    def _handle_formatted_copy(self, context):
+        # Copy a message (including media-only tracks/photos) as formatted text.
+        try:
+            message = None
+            activity = None
+            grouped = None
+            try:
+                message = context.get('message') if context is not None else None
+                activity = context.get('fragment') if context is not None else None
+                grouped = context.get('groupedMessages') if context is not None else None
+            except Exception:
+                message = self._field(context, 'message')
+                activity = self._field(context, 'fragment')
+                grouped = self._field(context, 'groupedMessages')
+
+            if message is None or not self._looks_like_message(message):
+                self._log_error('formatted copy menu action', 'message object missing from menu context')
+                return
+
+            messages = []
+            group_messages = self._field(grouped, 'messages')
+            if group_messages is not None:
+                try:
+                    messages = [item for item in self._java_items(group_messages) if self._looks_like_message(item)]
+                except Exception:
+                    messages = []
+            if not messages:
+                messages = [message]
+
+            # A group can surface duplicate references on some client forks.
+            unique_messages = []
+            seen = set()
+            for item in messages:
+                if self._is_protected_message(activity, item):
+                    continue
+                owner = self._field(item, 'messageOwner')
+                raw_id = self._call(item, 'getId')
+                if raw_id is None:
+                    raw_id = self._field(owner, 'id')
+                dialog_id = self._to_int(self._call(item, 'getDialogId'), 0)
+                try:
+                    identity = (dialog_id, int(raw_id))
+                except Exception:
+                    identity = None
+                if identity is not None and identity in seen:
+                    continue
+                if identity is not None:
+                    seen.add(identity)
+                unique_messages.append(item)
+
+            if not unique_messages:
+                self._log_error('formatted copy menu action', 'message is protected or unavailable')
+                return
+
+            formatted = [
+                self._format_message(activity, item, native_result=None)
+                for item in unique_messages
+            ]
+            payload = '\n\n'.join(value for value in formatted if value)
+            if not payload.strip():
+                self._log_error('formatted copy menu action', 'formatted text is empty')
+                return
+
+            utilities_class = find_class('org.telegram.messenger.AndroidUtilities')
+            if utilities_class is None:
+                self._log_error('formatted copy menu action', 'AndroidUtilities class not found')
+                return
+            clipboard_method = getattr(utilities_class, 'addToClipboard', None)
+            if not callable(clipboard_method):
+                self._log_error('formatted copy menu action', 'AndroidUtilities.addToClipboard not found')
+                return
+            clipboard_method(String(payload))
+            self.log('formatted copy: copied message as text')
+        except Exception as exc:
+            self._log_error('formatted copy menu action', exc)
 
     def _register(self, cls, method_name, hook):
         try:
-            self.hook_all_methods(cls, method_name, hook)
+            handles = self.hook_all_methods(cls, method_name, hook)
+            if handles is None:
+                self.log('formatted copy: hook status unavailable for ' + method_name)
+                return True
+            try:
+                count = len(handles)
+            except Exception:
+                count = -1
+            if count == 0:
+                self._log_error('hooking ' + method_name, 'no matching method overloads on this app build')
+                return False
+            if count > 0:
+                self.log('formatted copy: hooked {} overload(s) of {}'.format(count, method_name))
+            return True
         except Exception as exc:
             self._log_error('hooking ' + method_name, exc)
+            return False
 
     def create_settings(self) -> List[Any]:
         return [
@@ -227,41 +395,108 @@ class FormattedCopyPlugin(BasePlugin):
             return True
         return self._is_chat_protected(activity)
 
+    def _selected_copy_messages(self, activity):
+        """Collect all selected messages, including media excluded by stock Copy."""
+        # selectedMessagesIds is the complete selection. selectedMessagesCanCopyIds
+        # is only Telegram's pre-filtered subset and may omit music-only messages.
+        arrays = self._field(activity, 'selectedMessagesIds')
+        if arrays is None:
+            arrays = self._field(activity, 'selectedMessagesCanCopyIds')
+        if arrays is None:
+            return []
+
+        messages = []
+        seen = set()
+        for group in self._java_items(arrays):
+            try:
+                count = int(group.size())
+            except Exception:
+                continue
+            for index in range(count):
+                message = None
+                try:
+                    message = group.valueAt(index)
+                except Exception:
+                    try:
+                        message_id = group.keyAt(index)
+                        message = group.get(message_id)
+                    except Exception:
+                        pass
+                if not self._looks_like_message(message):
+                    continue
+                if self._is_protected_message(activity, message):
+                    continue
+                owner = self._field(message, 'messageOwner')
+                raw_id = self._call(message, 'getId')
+                if raw_id is None:
+                    raw_id = self._field(owner, 'id')
+                dialog_id = self._to_int(self._call(message, 'getDialogId'), 0)
+                try:
+                    identity = (dialog_id, int(raw_id))
+                except Exception:
+                    identity = None
+                if identity is not None and identity in seen:
+                    continue
+                if identity is not None:
+                    seen.add(identity)
+                messages.append(message)
+
+        def sort_key(message):
+            owner = self._field(message, 'messageOwner')
+            timestamp = self._to_int(self._field(owner, 'date'), 0)
+            if timestamp <= 0:
+                timestamp = self._to_int(self._field(message, 'date'), 0)
+            message_id = self._to_int(self._call(message, 'getId'), 0)
+            return (timestamp if timestamp > 0 else 2 ** 62, message_id)
+
+        try:
+            messages.sort(key=sort_key)
+        except Exception:
+            pass
+        return messages
+
     def _sync_copyable_selection(self, activity, message):
+        """Add/remove a selected message in exteraGram's native Copy-eligible map."""
+        if not self._looks_like_message(message):
+            return
         selected_arrays = self._field(activity, 'selectedMessagesIds')
         copy_arrays = self._field(activity, 'selectedMessagesCanCopyIds')
         if selected_arrays is None or copy_arrays is None:
             return
-        owner = self._field(message, 'messageOwner')
-        raw_id = self._call(message, 'getId')
-        if raw_id is None:
-            raw_id = self._field(owner, 'id')
+
+        message_id = self._to_int(self._call(message, 'getId'), -1)
+        if message_id == 0:
+            return
+
+        dialog_id = self._to_int(self._field(activity, 'dialog_id'), 0)
+        message_dialog_id = self._to_int(self._call(message, 'getDialogId'), dialog_id)
+        index = 0 if message_dialog_id == dialog_id else 1
         try:
-            message_id = int(raw_id)
+            selected_map = selected_arrays[index]
+            copy_map = copy_arrays[index]
         except Exception:
             return
-        current_dialog_id = self._to_int(self._field(activity, 'dialog_id'), 0)
-        message_dialog_id = self._to_int(self._call(message, 'getDialogId'), current_dialog_id)
-        array_index = 0 if message_dialog_id == current_dialog_id else 1
-        selected_map = selected_arrays[array_index]
-        copy_map = copy_arrays[array_index]
+
+        is_selected = False
         try:
             is_selected = selected_map.indexOfKey(message_id) >= 0
         except Exception:
             try:
                 is_selected = selected_map.get(message_id) is not None
             except Exception:
-                is_selected = False
-        if is_selected and (not self._is_protected_message(activity, message)):
-            copy_map.put(message_id, message)
-        else:
-            try:
-                copy_map.remove(message_id)
-            except Exception:
                 pass
+
+        try:
+            if is_selected and not self._is_protected_message(activity, message):
+                copy_map.put(message_id, message)
+            else:
+                copy_map.remove(message_id)
+        except Exception as exc:
+            self._log_error('updating copy-eligible message map', exc)
         self._refresh_copy_button(activity, copy_arrays)
 
     def _refresh_copy_button(self, activity, copy_arrays):
+        """Keep the native Copy toolbar action visible for selected media."""
         try:
             action_bar = self._field(activity, 'actionBar')
             copy_id = self._to_int(self._field(activity, 'copy'), -1)
@@ -273,9 +508,9 @@ class FormattedCopyPlugin(BasePlugin):
             item = self._call(action_mode, 'getItem', copy_id)
             if item is None:
                 return
-            copy_count = int(copy_arrays[0].size()) + int(copy_arrays[1].size())
-            visible = copy_count > 0 and (not self._is_chat_protected(activity))
-            self._call(item, 'setVisibility', 0 if visible else 8)
+            can_copy_count = int(copy_arrays[0].size()) + int(copy_arrays[1].size())
+            visible = can_copy_count > 0 and not self._is_chat_protected(activity)
+            self._call(item, 'setVisibility', View.VISIBLE if visible else View.GONE)
         except Exception as exc:
             self._log_error('refreshing Copy button', exc)
 
@@ -342,53 +577,179 @@ class FormattedCopyPlugin(BasePlugin):
                 return name.replace('\n', ' ')
         return 'неизвестный автор'
 
-    def _sticker_text(self, message):
-        emoji = self._text(self._call(message, 'getStickerEmoji')).strip()
-        if emoji:
-            return emoji
+    def _is_sticker_message(self, message):
+        """Recognize stickers before audio helpers can mislabel them as tracks."""
+        if message is None:
+            return False
+        if (
+            bool(self._call(message, 'isSticker'))
+            or bool(self._call(message, 'isAnimatedSticker'))
+            or self._to_int(self._field(message, 'type'), -1) in (13, 15)
+        ):
+            return True
+
+        owner = self._field(message, 'messageOwner')
+        media = self._field(owner, 'media')
+        if 'sticker' in self._simple_class_name(media).lower():
+            return True
+
         document = self._call(message, 'getDocument')
         if document is None:
-            owner = self._field(message, 'messageOwner')
-            media = self._field(owner, 'media')
             document = self._field(media, 'document')
-        attributes = self._field(document, 'attributes')
-        for attribute in self._java_items(attributes):
-            if 'sticker' in self._simple_class_name(attribute).lower():
-                alt = self._text(self._field(attribute, 'alt', '')).strip()
-                if alt:
-                    return alt
-        return ''
+        if document is None:
+            return False
 
-    def _voice_transcription(self, message):
+        attributes = self._field(document, 'attributes')
+        filename = self._text(self._call(message, 'getDocumentName')).strip()
+        mime = self._text(self._field(document, 'mime_type', '')).strip().lower()
+        for attribute in self._java_items(attributes):
+            class_name = self._simple_class_name(attribute).lower()
+            if 'sticker' in class_name or 'customemoji' in class_name:
+                return True
+            if not filename and ('filename' in class_name or 'file_name' in class_name):
+                filename = self._text(self._field(attribute, 'file_name', '')).strip()
+
+        # Some client builds expose sticker.webp only as a generic document,
+        # without a working isSticker() result or a readable sticker attribute.
+        # Keep this narrow so regular image documents are not classified as stickers.
+        if filename.rsplit('/', 1)[-1].lower() == 'sticker.webp' and mime in ('image/webp', 'application/octet-stream', ''):
+            return True
+        return mime == 'application/x-tgsticker'
+
+    def _voice_transcription_open(self, message):
         owner = self._field(message, 'messageOwner')
-        is_voice = bool(self._call(message, 'isVoice')) or self._to_int(self._field(message, 'type'), -1) == 2
-        is_round = bool(self._call(message, 'isRoundVideo')) or self._to_int(self._field(message, 'type'), -1) == 5
-        if not (is_voice or is_round):
-            return ''
         opened = bool(self._call(message, 'isVoiceTranscriptionOpen'))
         if not opened:
-            opened = bool(self._field(owner, 'voiceTranscriptionOpen', False))
-        if not opened:
+            for obj in (message, owner):
+                for field_name in ('voiceTranscriptionOpen', 'transcriptionOpen', 'voice_transcription_open'):
+                    if bool(self._field(obj, field_name, False)):
+                        opened = True
+                        break
+                if opened:
+                    break
+        return opened
+
+    def _voice_transcription(self, message):
+        message_type = self._to_int(self._field(message, 'type'), -1)
+        is_voice = bool(self._call(message, 'isVoice')) or message_type == 2
+        is_round = bool(self._call(message, 'isRoundVideo')) or message_type == 5
+        if not (is_voice or is_round) or not self._voice_transcription_open(message):
             return ''
-        transcript = self._text(self._call(message, 'getVoiceTranscription')).strip()
+        owner = self._field(message, 'messageOwner')
+        transcript = ''
+        for method_name in ('getVoiceTranscription', 'getTranscription', 'getTranscriptionText'):
+            transcript = self._text(self._call(message, method_name)).strip()
+            if transcript:
+                break
         if not transcript:
-            transcript = self._text(self._field(owner, 'voiceTranscription', '')).strip()
+            for obj in (message, owner):
+                for field_name in ('voiceTranscription', 'transcription', 'transcribedText', 'voice_transcription'):
+                    transcript = self._text(self._field(obj, field_name, '')).strip()
+                    if transcript:
+                        break
+                if transcript:
+                    break
         return transcript
+
+    def _music_details(self, message):
+        """Read music title/performer using Telegram helpers and TL document fields."""
+        if self._is_sticker_message(message):
+            return None
+        owner = self._field(message, 'messageOwner')
+        media = self._field(owner, 'media')
+        document = self._call(message, 'getDocument')
+        if document is None:
+            document = self._field(media, 'document')
+
+        message_type = self._to_int(self._field(message, 'type'), -1)
+        is_voice = bool(self._call(message, 'isVoice')) or message_type == 2
+        is_round = bool(self._call(message, 'isRoundVideo')) or message_type == 5
+        if is_voice or is_round:
+            return None
+
+        is_music = bool(self._call(message, 'isMusic')) or message_type == 14
+        title = ''
+        performer = ''
+        filename = self._text(self._call(message, 'getDocumentName')).strip()
+        mime = self._text(self._field(document, 'mime_type', '')).lower()
+        attributes = self._field(document, 'attributes')
+        audio_attribute_found = False
+
+        # The TL document attributes are the canonical metadata source. On
+        # Telegram-based clients the class is normally TL_documentAttributeAudio;
+        # do not depend on MessageObject.type alone to recognize a music file.
+        for attribute in self._java_items(attributes):
+            class_name = self._simple_class_name(attribute).lower()
+            attr_title = self._text(self._field(attribute, 'title', '')).strip()
+            attr_performer = self._text(self._field(attribute, 'performer', '')).strip()
+            attr_voice_value = self._field(attribute, 'voice', None)
+            attr_voice = bool(attr_voice_value) if attr_voice_value is not None else False
+
+            if 'filename' in class_name or 'file_name' in class_name:
+                attr_filename = self._text(self._field(attribute, 'file_name', '')).strip()
+                if attr_filename and not filename:
+                    filename = attr_filename
+
+            has_audio_shape = (
+                'audio' in class_name
+                or bool(attr_title)
+                or bool(attr_performer)
+                or (self._field(attribute, 'duration') is not None and attr_voice_value is not None)
+            )
+            if not has_audio_shape or attr_voice:
+                continue
+
+            audio_attribute_found = True
+            if attr_title and not title:
+                title = attr_title
+            if attr_performer and not performer:
+                performer = attr_performer
+
+        # Use the client's own helpers as a second source. The boolean overloads
+        # with unknown=False avoid inserting localized "unknown artist/title"
+        # placeholders when the document does not actually contain that metadata.
+        if not title:
+            for method_name in ('getMusicTitle', 'getAudioTitle'):
+                value = self._text(self._call(message, method_name, False)).strip()
+                if value:
+                    title = value
+                    break
+        if not performer:
+            for method_name in ('getMusicAuthor', 'getMusicPerformer', 'getAudioAuthor'):
+                value = self._text(self._call(message, method_name, False)).strip()
+                if value:
+                    performer = value
+                    break
+
+        # If the document has no title attribute/helper value, use its filename
+        # before attempting any UI-facing fallback that might say "unknown track".
+        if not title and filename:
+            title = filename
+
+        # Only treat this as a music/audio record when the message or its document
+        # provides a real track signal. An empty title is still useful as [трек].
+        if not is_music and not audio_attribute_found and not mime.startswith('audio/'):
+            return None
+        title = title.replace('\n', ' ').strip()
+        performer = performer.replace('\n', ' ').strip()
+        title = re.sub(r'\s+', ' ', title)
+        performer = re.sub(r'\s+', ' ', performer)
+        return title, performer
 
     def _media_marker(self, message):
         message_type = self._to_int(self._field(message, 'type'), -1)
+        if self._is_sticker_message(message):
+            return '[стикер]'
         if bool(self._call(message, 'isVoice')) or message_type == 2:
             return '[голосовое сообщение]'
         if bool(self._call(message, 'isRoundVideo')) or message_type == 5:
             return '[видеосообщение]'
-        if bool(self._call(message, 'isSticker')) or bool(self._call(message, 'isAnimatedSticker')) or message_type in (13, 15):
-            return '[стикер]'
         if bool(self._call(message, 'isNewGif')) or bool(self._call(message, 'isGif')) or message_type == 8:
             return '[гиф]'
         if bool(self._call(message, 'isPhoto')) or message_type in (1, 11, 21):
-            return '[фото]'
+            return '[фотография]'
         if bool(self._call(message, 'isMusic')) or message_type == 14:
-            return '[аудио]'
+            return '[трек]'
         if bool(self._call(message, 'isVideo')) or message_type == 3:
             return '[видео]'
         if bool(self._call(message, 'isPoll')) or message_type == 17:
@@ -412,7 +773,7 @@ class FormattedCopyPlugin(BasePlugin):
         media = self._field(owner, 'media')
         media_class = self._simple_class_name(media).lower()
         if 'photo' in media_class:
-            return '[фото]'
+            return '[фотография]'
         if 'poll' in media_class:
             return '[опрос]'
         if 'geo' in media_class or 'venue' in media_class:
@@ -435,9 +796,7 @@ class FormattedCopyPlugin(BasePlugin):
     def _strip_generic_media_labels(self, body, marker):
         if not body or not body.strip():
             return ''
-        generic_labels = {'[фото]': {'фото', 'фотография', 'фотография загружена', 'изображение', 'photo', 'picture', 'image', 'image file', 'photo file'}, '[гиф]': {'гиф', 'гифка', 'анимация', 'gif', 'animation', 'animated gif'}, '[видео]': {'видео', 'видеозапись', 'video', 'video file'}, '[аудио]': {'аудио', 'аудиофайл', 'музыка', 'audio', 'audio file', 'music'}, '[голосовое сообщение]': {'голосовое сообщение', 'аудиосообщение', 'voice message', 'audio message'}, '[видеосообщение]': {'видеосообщение', 'круглое видео', 'video message', 'round video message'}, '[документ]': {'документ', 'файл', 'document', 'file', 'file attachment'}, '[контакт]': {'контакт', 'contact'}, '[геопозиция]': {'геопозиция', 'местоположение', 'location', 'location shared'}, '[опрос]': {'опрос', 'poll'}, '[стикер]': {'стикер', 'sticker'}, '[медиа]': {'медиа', 'вложение', 'attachment', 'media'}}
-        labels = generic_labels.get(marker, set())
-        labels = {self._normalized_label(label) for label in labels}
+        labels = GENERIC_MEDIA_LABELS.get(marker, ())
         lines = body.splitlines()
         kept = []
         for line in lines:
@@ -452,45 +811,76 @@ class FormattedCopyPlugin(BasePlugin):
 
     def _body(self, message, native_result=None, author=''):
         owner = self._field(message, 'messageOwner')
+        restriction_reason = self._field(owner, 'restriction_reason')
+        is_restricted = False
+        if restriction_reason is not None:
+            try:
+                is_restricted = int(restriction_reason.size()) > 0
+            except Exception:
+                is_restricted = bool(restriction_reason)
+        if is_restricted:
+            restricted_body = self._text(native_result)
+            native_prefix = author + ':\n'
+            if restricted_body.startswith(native_prefix):
+                restricted_body = restricted_body[len(native_prefix):]
+            return restricted_body.strip() or '[ограниченное сообщение]'
+
+        # Handle sticker documents before music title/author fallbacks. Some
+        # client builds expose sticker.webp through generic document helpers.
+        if self._is_sticker_message(message):
+            return '[стикер]'
+
+        message_type = self._to_int(self._field(message, 'type'), -1)
+        is_round = bool(self._call(message, 'isRoundVideo')) or message_type == 5
+        is_voice = bool(self._call(message, 'isVoice')) or message_type == 2
+        voice_open = (is_voice or is_round) and self._voice_transcription_open(message)
         transcript = self._voice_transcription(message)
         if transcript:
-            return transcript
+            label = '[видеосообщение с открытой расшифровкой]' if is_round else '[голосовое сообщение с открытой расшифровкой]'
+            return label + '\n' + transcript
+
         raw_text = self._text(self._field(owner, 'message', ''))
         caption = self._text(self._field(message, 'caption', ''))
         message_text = self._text(self._field(message, 'messageText', ''))
-        body_is_authored_text = bool(raw_text.strip())
+        body_is_authored_text = bool(raw_text.strip() or caption.strip())
         if raw_text.strip():
             body = raw_text
         elif caption.strip():
             body = caption
         else:
             body = message_text
-        restriction_reason = self._field(owner, 'restriction_reason')
-        if restriction_reason is not None:
-            try:
-                restricted = int(restriction_reason.size()) > 0
-            except Exception:
-                restricted = bool(restriction_reason)
-            if restricted:
-                body = self._text(native_result)
-                native_prefix = author + ':\n'
-                if body.startswith(native_prefix):
-                    body = body[len(native_prefix):]
         if not body.strip():
             body = self._text(native_result)
             native_prefix = author + ':\n'
             if body.startswith(native_prefix):
                 body = body[len(native_prefix):]
+
+        music = self._music_details(message)
+        if music is not None:
+            title, performer = music
+            track_name = ' - '.join(part for part in (title, performer) if part)
+            track_line = '[трек]' + ((' ' + track_name) if track_name else '')
+            # Keep a real caption, but replace generic media placeholders with metadata.
+            if body_is_authored_text and body.strip():
+                return body.rstrip() + '\n' + track_line
+            return track_line
+
         marker = self._media_marker(message)
+        if voice_open and marker in ('[голосовое сообщение]', '[видеосообщение]'):
+            label = '[видеосообщение с открытой расшифровкой]' if is_round else '[голосовое сообщение с открытой расшифровкой]'
+            cleaned = self._strip_generic_media_labels(body, marker)
+            return label + ('\n' + cleaned if cleaned else '')
         if marker and (not body_is_authored_text):
             body = self._strip_generic_media_labels(body, marker)
-        if marker == '[стикер]':
-            sticker_text = self._sticker_text(message)
-            if not body.strip() and sticker_text:
-                body = sticker_text
-            if body.strip():
-                return body.strip()
-            return sticker_text or '[стикер]'
+        if marker == '[фотография]':
+            # Put the photo marker first, then the actual caption/text.
+            cleaned_body = body.strip()
+            if cleaned_body:
+                if cleaned_body.startswith(marker):
+                    return cleaned_body
+                cleaned_body = cleaned_body.replace(marker, '').strip()
+                return marker + ('\n' + cleaned_body if cleaned_body else '')
+            return marker
         if marker:
             if body.strip():
                 if marker not in body:
@@ -504,21 +894,50 @@ class FormattedCopyPlugin(BasePlugin):
         return '[сообщение без текста]'
 
     def _reply_details(self, activity, message):
+        """Return reply context in a compact form, including source message time."""
         owner = self._field(message, 'messageOwner')
         reply_object = self._field(message, 'replyMessageObject')
+        current_timestamp = self._to_int(self._field(owner, 'date'), 0)
+        if current_timestamp <= 0:
+            current_timestamp = self._to_int(self._field(message, 'date'), 0)
+
         if reply_object is not None and self._looks_like_message(reply_object):
             quoted_author = self._author(activity, reply_object)
             quoted_text = self._body(reply_object, native_result=None, author=quoted_author)
-            quoted_text = ' '.join(self._text(quoted_text).splitlines()).strip()
-            return (True, quoted_author, quoted_text or '[сообщение без текста]')
+            # Keep the quote on one line so long messages do not overwhelm a chat export.
+            quoted_text = ' '.join(self._text(quoted_text).split()).strip()
+            if not quoted_text:
+                quoted_text = '[сообщение без текста]'
+
+            # For long quotes, preserve both ends instead of copying an entire essay
+            # into every reply. Short quotes remain complete.
+            quote_limit = 180
+            if len(quoted_text) > quote_limit:
+                head_length = 115
+                tail_length = 55
+                quoted_text = quoted_text[:head_length].rstrip() + ' … ' + quoted_text[-tail_length:].lstrip()
+
+            quoted_owner = self._field(reply_object, 'messageOwner')
+            quoted_timestamp = self._to_int(self._field(quoted_owner, 'date'), 0)
+            if quoted_timestamp <= 0:
+                quoted_timestamp = self._to_int(self._field(reply_object, 'date'), 0)
+            quoted_time = ''
+            if quoted_timestamp > 0:
+                try:
+                    # Replies always show the full date and time, even on the same day.
+                    quoted_time = datetime.fromtimestamp(quoted_timestamp).strftime('%d/%m/%Y %H:%M:%S')
+                except Exception:
+                    quoted_time = ''
+            return (True, quoted_author, quoted_text, quoted_time)
+
         reply_header = self._field(owner, 'reply_to')
         reply_id = self._to_int(self._field(reply_header, 'reply_to_msg_id'), 0)
         if reply_header is not None or reply_id > 0:
             quoted_author = self._text(self._field(message, 'customReplyName', '')).strip()
             if not quoted_author:
                 quoted_author = 'неизвестный автор'
-            return (True, quoted_author.replace('\n', ' '), '[исходное сообщение недоступно]')
-        return (False, '', '')
+            return (True, quoted_author.replace('\n', ' '), '[исходное сообщение недоступно]', '')
+        return (False, '', '', '')
 
     def _format_message(self, activity, message, native_result=None):
         owner = self._field(message, 'messageOwner')
@@ -537,17 +956,38 @@ class FormattedCopyPlugin(BasePlugin):
         timestamp_prefix = ''
         if bool(self.get_setting('copy_timestamp_enabled', True)):
             timestamp_prefix = '[' + date_text + '] '
-        is_reply, quoted_author, quoted_text = self._reply_details(activity, message)
+        is_reply, quoted_author, quoted_text, quoted_time = self._reply_details(activity, message)
         if is_reply:
-            quote_line = '↳ ' + quoted_author + ': ' + quoted_text
-            return timestamp_prefix + author + ':\n' + quote_line + '\n└ ' + body
+            # Keep reply context on one compact line: the arrow introduces the
+            # original message, including its timestamp and author. The next
+            # line is the reply author's own text.
+            quote_heading = '↳'
+            if quoted_time:
+                quote_heading += ' [' + quoted_time + ']'
+            quote_heading += ' ' + quoted_author + ': ' + quoted_text
+
+            # Use an em dash as a lightweight separator, but do not duplicate a
+            # dash/hyphen that the original reply text already starts with.
+            reply_body = body
+            first_visible = reply_body.lstrip()
+            if not first_visible.startswith(('-', '\u2013', '\u2014')):
+                reply_body = '— ' + reply_body
+            return timestamp_prefix + author + ':\n' + quote_heading + '\n' + reply_body
         return timestamp_prefix + author + ':\n' + body
 
     @staticmethod
     def _read_copy_option(chat_class):
-        try:
-            field = chat_class.getDeclaredField('OPTION_COPY')
-            field.setAccessible(True)
-            return int(field.get(None))
-        except Exception:
-            return 3
+        current = chat_class
+        while current is not None:
+            try:
+                field = current.getDeclaredField('OPTION_COPY')
+                field.setAccessible(True)
+                return int(field.get(None))
+            except Exception:
+                try:
+                    current = current.getSuperclass()
+                except Exception:
+                    current = None
+        # Do not guess an action id on forks: a wrong value may intercept
+        # an unrelated action. The getMessageContent hook remains available.
+        return None
