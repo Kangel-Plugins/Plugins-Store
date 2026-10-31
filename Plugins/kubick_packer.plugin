@@ -1,0 +1,1908 @@
+import base64
+import bz2
+import gzip
+import html as _html
+import importlib.util
+import io
+import json
+import lzma
+import os
+import re
+import shutil
+import tarfile
+import threading
+import time
+import xml.etree.ElementTree as ET
+import zipfile
+from html.parser import HTMLParser
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook
+from ui.settings import Header, Switch, Input, Divider
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import run_on_ui_thread, OnClickListener
+from client_utils import get_last_fragment, get_client
+from file_utils import ensure_dir_exists, get_cache_dir
+from hook_utils import find_class, get_private_field
+from java import jclass, dynamic_proxy
+from java.lang import Runnable
+from android.widget import LinearLayout, TextView, ScrollView, EditText
+from android.util import TypedValue
+from android.text import InputType
+from org.telegram.messenger import AndroidUtilities, R
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import LayoutHelper
+
+__id__ = "kubick_packer"
+__name__ = "Упаковщик"
+__description__ = (
+    "Упаковывает текст, фото и видео в любые файлы и отправляет в чат.\n"
+    "Текст: txt, md, html, rtf, pdf, docx, json, xml, csv, код, zip, base64 и свой формат.\n"
+    "Фото: jpg, png, webp, pdf, html, svg, zip, base64 и свой формат.\n"
+    "Видео и файлы: как есть, zip, свой формат.\n"
+    "Распаковка: «Распаковать файл» в меню «Плагины» разбирает всё, что умеет упаковывать плагин: "
+    "zip/tar/gz/bz2/xz, base64/hex/data URI, docx, rtf, html, svg, pdf, json/xml-обёртки, фото и видео "
+    "с любым расширением. Фото и видео приходят как фото и видео.\n\n"
+    "Кнопка «Упаковать в файл» есть в меню долгого нажатия на «Отправить» и в меню сообщения "
+    "(Плагины). Команда: .pack формат текст"
+)
+__author__ = "@the_kubick"
+__version__ = "1.2.0"
+__icon__ = "sPluginIDE/9"
+__min_version__ = "12.10.6"
+
+
+# ============================ PURE HELPERS BEGIN ============================
+
+def _as_int(v, d=0):
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(str(v))
+        except Exception:
+            return d
+
+
+def _clean_xml(s):
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+
+
+def safe_base(name, default="packed"):
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", str(name or "").strip())[:40]
+    return name or default
+
+
+def safe_ext(ext, default="txt"):
+    ext = re.sub(r"[^A-Za-z0-9_-]", "", str(ext or "").lstrip("."))[:12]
+    return ext or default
+
+
+def html_page(text):
+    head = text.lstrip()[:200].lower()
+    looks_html = head.startswith("<!doctype") or head.startswith("<html") or re.search(
+        r"<(html|body|head|div|p|h[1-6]|table|ul|ol|span|a|img|br|style|script)\b", text, re.I)
+    if looks_html:
+        return text
+    body = _html.escape(text).replace("\n", "<br>\n")
+    return (
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>Text</title>\n<style>body{font-family:sans-serif;max-width:720px;margin:24px auto;"
+        "padding:0 16px;line-height:1.5;word-wrap:break-word}</style>\n</head>\n<body>\n"
+        + body + "\n</body>\n</html>\n"
+    )
+
+
+def rtf_bytes(text):
+    out = []
+    for ch in text.replace("\r\n", "\n"):
+        o = ord(ch)
+        if ch == "\n":
+            out.append("\\par\n")
+        elif ch == "\t":
+            out.append("\\tab ")
+        elif ch in "\\{}":
+            out.append("\\" + ch)
+        elif o < 128:
+            if o >= 32:
+                out.append(ch)
+        else:
+            units = [o]
+            if o > 0xFFFF:
+                o -= 0x10000
+                units = [0xD800 + (o >> 10), 0xDC00 + (o & 0x3FF)]
+            for u in units:
+                out.append("\\u%d?" % (u - 65536 if u > 32767 else u))
+    rtf = "{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl{\\f0\\fnil Arial;}}\\f0\\fs24 " + "".join(out) + "}"
+    return rtf.encode("ascii")
+
+
+def docx_bytes(text):
+    paras = "".join(
+        '<w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % _html.escape(_clean_xml(line), quote=False)
+        for line in text.replace("\r\n", "\n").split("\n")
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        + paras +
+        '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1134" w:right="850" w:bottom="1134" w:left="1701" w:header="708" w:footer="708" w:gutter="0"/>'
+        '</w:sectPr></w:body></w:document>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/></Relationships>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+    return buf.getvalue()
+
+
+def svg_text_bytes(text):
+    if text.lstrip().lower().startswith("<svg") or text.lstrip().lower().startswith("<?xml"):
+        return text.encode("utf-8")
+    lines = _clean_xml(text.replace("\r\n", "\n")).split("\n")
+    width = max(240, min(1600, max(len(l) for l in lines) * 9 + 40))
+    height = len(lines) * 24 + 40
+    rows = "".join(
+        '<text x="20" y="%d" xml:space="preserve">%s</text>' % (36 + i * 24, _html.escape(l, quote=False))
+        for i, l in enumerate(lines)
+    )
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
+        'font-family="sans-serif" font-size="16"><rect width="100%%" height="100%%" fill="#ffffff"/>'
+        '<g fill="#111111">%s</g></svg>' % (width, height, width, height, rows)
+    )
+    return svg.encode("utf-8")
+
+
+def zip_bytes(inner_name, data):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(inner_name, data)
+    return buf.getvalue()
+
+
+def b64_wrap(data):
+    raw = base64.b64encode(data).decode("ascii")
+    return "\n".join(raw[i:i + 76] for i in range(0, len(raw), 76)).encode("ascii")
+
+
+def hex_dump(data):
+    h = data.hex()
+    return "\n".join(h[i:i + 32] for i in range(0, len(h), 32)).encode("ascii")
+
+
+def sniff_image_mime(data):
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg", "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if data[:4] == b"GIF8":
+        return "image/gif", "gif"
+    return "application/octet-stream", "bin"
+
+
+def text_to_bytes(text, ext, base="packed"):
+    e = ext.lower()
+    if e in ("html", "htm"):
+        return html_page(text).encode("utf-8")
+    if e == "json":
+        try:
+            json.loads(text)
+            return text.encode("utf-8")
+        except Exception:
+            return json.dumps({"text": text}, ensure_ascii=False, indent=2).encode("utf-8")
+    if e == "xml":
+        if text.lstrip().startswith("<"):
+            return text.encode("utf-8")
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<text>%s</text>\n'
+                % _html.escape(_clean_xml(text), quote=False)).encode("utf-8")
+    if e == "rtf":
+        return rtf_bytes(text)
+    if e == "docx":
+        return docx_bytes(text)
+    if e == "svg":
+        return svg_text_bytes(text)
+    if e == "zip":
+        return zip_bytes(base + ".txt", text.encode("utf-8"))
+    if e == "b64":
+        return b64_wrap(text.encode("utf-8"))
+    if e == "hex":
+        return hex_dump(text.encode("utf-8"))
+    return text.encode("utf-8")
+
+
+def image_html(data, mime):
+    b64 = base64.b64encode(data).decode("ascii")
+    return (
+        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>Image</title>\n<style>body{margin:0;background:#111;display:flex;"
+        "justify-content:center}img{max-width:100%%;height:auto}</style>\n</head>\n<body>\n"
+        '<img src="data:%s;base64,%s">\n</body>\n</html>\n' % (mime, b64)
+    ).encode("utf-8")
+
+
+def image_svg(data, mime, w, h):
+    b64 = base64.b64encode(data).decode("ascii")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'width="%d" height="%d" viewBox="0 0 %d %d">'
+        '<image width="%d" height="%d" xlink:href="data:%s;base64,%s"/></svg>'
+        % (w, h, w, h, w, h, mime, b64)
+    ).encode("utf-8")
+
+
+MAX_UNPACK_TOTAL = 600 * 1048576
+TG_MAX_FILE = 2000 * 1048576
+PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
+VIDEO_EXTS = {"mp4", "mov", "m4v", "webm", "mkv", "3gp"}
+AUDIO_EXTS = {"mp3", "m4a", "ogg", "oga", "opus", "wav", "flac", "aac"}
+
+
+class NeedPassword(Exception):
+    pass
+
+
+class WrongPassword(Exception):
+    pass
+
+
+class UnsupportedArchive(Exception):
+    pass
+
+
+def safe_member_name(name):
+    name = str(name).replace("\\", "/").split("/")[-1].strip()
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)[:80]
+    return name or "file"
+
+
+def unique_path(out_dir, name):
+    name = safe_member_name(name)
+    path = os.path.join(out_dir, name)
+    if not os.path.exists(path):
+        return path
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    i = 2
+    while True:
+        cand = os.path.join(out_dir, "%s_%d%s" % (stem, i, ("." + ext) if ext else ""))
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def detect_archive(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except Exception:
+        return None
+    if head[:4] == b"Rar!":
+        return "rar"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    try:
+        if zipfile.is_zipfile(path):
+            return "zip"
+    except Exception:
+        pass
+    try:
+        if tarfile.is_tarfile(path):
+            return "tar"
+    except Exception:
+        pass
+    if head[:2] == b"\x1f\x8b":
+        return "gz"
+    if head[:3] == b"BZh":
+        return "bz2"
+    if head[:6] == b"\xfd7zXZ\x00":
+        return "xz"
+    return None
+
+
+def _copy_limited(src, out, budget):
+    while True:
+        chunk = src.read(1 << 20)
+        if not chunk:
+            break
+        budget[0] -= len(chunk)
+        if budget[0] < 0:
+            raise UnsupportedArchive("после распаковки больше %d МБ" % (MAX_UNPACK_TOTAL // 1048576))
+        out.write(chunk)
+
+
+def _caption_for(member_name):
+    n = str(member_name).replace("\\", "/").strip("/")
+    return n if "/" in n else ""
+
+
+def extract_archive(path, kind, out_dir, max_files=30, password=None, orig_name=None):
+    os.makedirs(out_dir, exist_ok=True)
+    budget = [MAX_UNPACK_TOTAL]
+    items = []
+    if kind == "zip":
+        with zipfile.ZipFile(path) as zf:
+            infos = [i for i in zf.infolist() if not i.filename.endswith("/") and i.file_size > 0]
+            total = len(infos)
+            pwd = password.encode("utf-8") if password else None
+            if pwd is None and any(i.flag_bits & 0x1 for i in infos[:max_files]):
+                raise NeedPassword()
+            for info in infos:
+                if len(items) >= max_files:
+                    break
+                if info.file_size > TG_MAX_FILE:
+                    continue
+                dst = unique_path(out_dir, info.filename)
+                try:
+                    with zf.open(info, pwd=pwd) as src, open(dst, "wb") as out:
+                        _copy_limited(src, out, budget)
+                except RuntimeError as e:
+                    if "password" in str(e).lower():
+                        raise WrongPassword()
+                    raise
+                items.append((dst, _caption_for(info.filename)))
+        return items, total
+    if kind == "tar":
+        with tarfile.open(path) as tf:
+            members = [m for m in tf.getmembers() if m.isfile() and m.size > 0]
+            total = len(members)
+            for m in members:
+                if len(items) >= max_files:
+                    break
+                if m.size > TG_MAX_FILE:
+                    continue
+                dst = unique_path(out_dir, m.name)
+                src = tf.extractfile(m)
+                if src is None:
+                    continue
+                with src, open(dst, "wb") as out:
+                    _copy_limited(src, out, budget)
+                items.append((dst, _caption_for(m.name)))
+        return items, total
+    if kind in ("gz", "bz2", "xz"):
+        opener = {"gz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[kind]
+        stem = re.sub(r"\.(gz|bz2|xz|lzma)$", "", orig_name or "", flags=re.I) or "unpacked"
+        dst = unique_path(out_dir, stem)
+        with opener(path, "rb") as src, open(dst, "wb") as out:
+            _copy_limited(src, out, budget)
+        return [(dst, "")], 1
+    raise UnsupportedArchive("формат не поддерживается")
+
+
+def sniff_ext(data):
+    if data[:4] == b"%PDF":
+        return "pdf"
+    if data[:2] == b"PK":
+        return "zip"
+    if data[4:8] == b"ftyp":
+        return "mp4"
+    if data[:3] == b"ID3" or data[:2] == b"\xff\xfb":
+        return "mp3"
+    if data[:4] == b"OggS":
+        return "ogg"
+    return sniff_image_mime(data)[1]
+
+
+def decode_text_payload(path, force=False):
+    try:
+        size = os.path.getsize(path)
+        if size > 30 * 1048576 or size < 8:
+            return None
+        with open(path, "rb") as f:
+            text = f.read().decode("ascii").strip()
+    except Exception:
+        return None
+    m = re.match(r"^data:[\w./+-]*;base64,(.+)$", text, re.S)
+    if not m and not force:
+        return None
+    payload = re.sub(r"\s+", "", m.group(1) if m else text)
+    if len(payload) >= 8 and len(payload) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", payload):
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            pass
+    if len(payload) >= 8 and len(payload) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", payload):
+        try:
+            return bytes.fromhex(payload)
+        except Exception:
+            pass
+    return None
+
+
+def media_kind(path):
+    base = os.path.basename(path)
+    ext = base.rsplit(".", 1)[1].lower() if "." in base else ""
+    if ext in PHOTO_EXTS:
+        return "photo"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if not ext:
+        try:
+            with open(path, "rb") as f:
+                mime, e = sniff_image_mime(f.read(16))
+            if mime.startswith("image/") and e != "gif":
+                return "photo"
+        except Exception:
+            pass
+    return "document"
+
+
+# ------------------------ универсальная распаковка ------------------------
+
+def sniff_type(head):
+    if head[:4] == b"Rar!":
+        return "rar"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        return "zip"
+    if head[:2] == b"\x1f\x8b":
+        return "gz"
+    if head[:3] == b"BZh":
+        return "bz2"
+    if head[:6] == b"\xfd7zXZ\x00":
+        return "xz"
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if head[:2] == b"\xff\xd8":
+        return "jpg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return "avi"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"GIF8":
+        return "gif"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if head[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    if head[:2] == b"BM" and len(head) >= 14 and head[6:10] == b"\x00\x00\x00\x00":
+        return "bmp"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"M4A ", b"M4B "):
+            return "m4a"
+        if brand.startswith(b"3gp"):
+            return "3gp"
+        if brand == b"qt  ":
+            return "mov"
+        return "mp4"
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return "mkv" if b"matroska" in head[:64] else "webm"
+    if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "mp3"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    return None
+
+
+IMAGE_TYPES = {"jpg", "png", "webp", "gif", "bmp", "ico", "tiff"}
+MEDIA_TYPES = {"mp4", "mov", "3gp", "m4a", "webm", "mkv", "avi", "mp3", "ogg", "wav", "flac"}
+
+
+def file_stem(name):
+    base = safe_member_name(name or "file")
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    if stem.lower().endswith(".tar"):
+        stem = stem[:-4]
+    return stem or "file"
+
+
+def _ext_of(name):
+    base = os.path.basename(name or "")
+    return base.rsplit(".", 1)[1].lower() if "." in base else ""
+
+
+def _is_text_bytes(data):
+    try:
+        s = data.decode("utf-8")
+    except Exception:
+        return False
+    if not s:
+        return False
+    bad = sum(1 for c in s if ord(c) < 32 and c not in "\r\n\t")
+    return bad / float(len(s)) < 0.01
+
+
+def rtf_to_text(rtf):
+    skip_words = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer", "listtable"}
+    out, stack, skipping = [], [], False
+    i, n = 0, len(rtf)
+    while i < n:
+        c = rtf[i]
+        if c == "{":
+            stack.append(skipping)
+            if rtf[i + 1:i + 3] == "\\*":
+                skipping = True
+            i += 1
+        elif c == "}":
+            if stack:
+                skipping = stack.pop()
+            i += 1
+        elif c == "\\":
+            i += 1
+            if i >= n:
+                break
+            d = rtf[i]
+            if d in "\\{}":
+                if not skipping:
+                    out.append(d)
+                i += 1
+            elif d == "'":
+                hx = rtf[i + 1:i + 3]
+                i += 3
+                if not skipping:
+                    try:
+                        out.append(bytes([int(hx, 16)]).decode("cp1252"))
+                    except Exception:
+                        pass
+            elif d.isalpha():
+                j = i
+                while j < n and rtf[j].isalpha():
+                    j += 1
+                word = rtf[i:j]
+                k = j
+                if k < n and rtf[k] in "-0123456789":
+                    k += 1
+                    while k < n and rtf[k].isdigit():
+                        k += 1
+                param = rtf[j:k]
+                i = k
+                if i < n and rtf[i] == " ":
+                    i += 1
+                if word in skip_words:
+                    skipping = True
+                elif not skipping:
+                    if word in ("par", "line"):
+                        out.append("\n")
+                    elif word == "tab":
+                        out.append("\t")
+                    elif word == "u" and param:
+                        u = int(param)
+                        out.append(chr(u + 65536 if u < 0 else u))
+                        if i < n and rtf[i] != "\\":
+                            i += 1
+            else:
+                i += 1
+        else:
+            if not skipping and c not in "\r\n":
+                out.append(c)
+            i += 1
+    text = "".join(out)
+    try:
+        text = text.encode("utf-16", "surrogatepass").decode("utf-16")
+    except Exception:
+        pass
+    return text
+
+
+class _HtmlToText(HTMLParser):
+    BLOCK = {"p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "table", "ul", "ol", "section", "article"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+        self.skip = 0
+        self.after_br = False
+
+    def _newline(self):
+        if self.out and not self.out[-1].endswith("\n"):
+            self.out.append("\n")
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "title"):
+            self.skip += 1
+        elif tag == "br":
+            self.out.append("\n")
+            self.after_br = True
+        elif tag in self.BLOCK:
+            self._newline()
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "title"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self._newline()
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        if self.after_br and data.startswith("\n"):
+            data = data[1:]
+        if data:
+            self.after_br = False
+            self.out.append(data)
+
+
+def html_to_text(src):
+    p = _HtmlToText()
+    p.feed(src)
+    p.close()
+    text = "".join(p.out)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip("\n")
+
+
+_DATA_URI_RE = re.compile(r"data:([\w.+-]+/[\w.+-]+);base64,([A-Za-z0-9+/=\s]+)")
+
+
+def extract_data_uris(text, limit=50):
+    found = []
+    for m in _DATA_URI_RE.finditer(text):
+        try:
+            found.append((m.group(1), base64.b64decode(re.sub(r"\s+", "", m.group(2)))))
+        except Exception:
+            continue
+        if len(found) >= limit:
+            break
+    return found
+
+
+def svg_plain_text(src):
+    try:
+        root = ET.fromstring(src.encode("utf-8") if isinstance(src, str) else src)
+    except Exception:
+        return ""
+    lines = []
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
+        if tag == "text":
+            lines.append("".join(el.itertext()))
+    return "\n".join(lines)
+
+
+def docx_extract(path, out_dir, stem, max_files):
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    items = []
+    with zipfile.ZipFile(path) as zf:
+        root = ET.fromstring(zf.read("word/document.xml"))
+        lines = []
+        for p in root.iter(ns + "p"):
+            parts = []
+            for el in p.iter():
+                if el.tag == ns + "t":
+                    parts.append(el.text or "")
+                elif el.tag == ns + "tab":
+                    parts.append("\t")
+                elif el.tag in (ns + "br", ns + "cr"):
+                    parts.append("\n")
+            lines.append("".join(parts))
+        text = "\n".join(lines)
+        if text.strip():
+            dst = unique_path(out_dir, stem + ".txt")
+            with open(dst, "wb") as f:
+                f.write(text.encode("utf-8"))
+            items.append((dst, "", True))
+        for name in [n for n in zf.namelist() if n.startswith("word/media/") and not n.endswith("/")]:
+            if len(items) >= max_files:
+                break
+            dst = unique_path(out_dir, name)
+            with zf.open(name) as src, open(dst, "wb") as out:
+                out.write(src.read())
+            items.append((dst, "", False))
+    return items
+
+
+def decode_payload_text(text, force=False, hint=None):
+    t = text.strip()
+    if len(t) < 8:
+        return None
+    m = re.match(r"^data:[\w./+-]*(?:;[\w=.+-]+)*;base64,(.+)$", t, re.S)
+    if m:
+        payload, hint, force = re.sub(r"\s+", "", m.group(1)), "b64", True
+    else:
+        if any(re.search(r"[ \t]", ln.strip()) for ln in t.splitlines()):
+            return None
+        payload = re.sub(r"\s+", "", t)
+    pure_hex = re.fullmatch(r"[0-9a-fA-F]+", payload) is not None
+    order = ["hex", "b64"] if (hint == "hex" or (hint is None and pure_hex)) else ["b64", "hex"]
+
+    def accept(data):
+        if force or sniff_type(data[:4096]) is not None:
+            return True
+        return _is_text_bytes(data)
+
+    for kind in order:
+        data = None
+        try:
+            if kind == "hex" and len(payload) % 2 == 0 and pure_hex:
+                data = bytes.fromhex(payload)
+            elif kind == "b64" and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", payload):
+                data = base64.b64decode(payload + "=" * (-len(payload) % 4), validate=True)
+        except Exception:
+            data = None
+        if data and accept(data):
+            return data
+    return None
+
+
+def unpack_any(path, orig_name, out_dir, max_files=30, password=None, hooks=None, depth=0):
+    """Возвращает (items, total); items = [(путь, подпись, это_текст)]."""
+    hooks = hooks or {}
+    os.makedirs(out_dir, exist_ok=True)
+    name = orig_name or os.path.basename(path)
+    stem = file_stem(name)
+    name_ext = _ext_of(name) or _ext_of(path)
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    kind = sniff_type(head)
+
+    if kind in ("rar", "7z"):
+        raise UnsupportedArchive("%s не поддерживается, нужны zip, tar, gz, bz2 или xz" % kind.upper())
+
+    tar_ok = False
+    try:
+        tar_ok = tarfile.is_tarfile(path)
+    except Exception:
+        pass
+    if tar_ok:
+        items, total = extract_archive(path, "tar", out_dir, max_files, password, name)
+        return [(p, c, False) for p, c in items], total
+    if kind == "zip":
+        with zipfile.ZipFile(path) as zf:
+            is_docx = "word/document.xml" in zf.namelist()
+        if is_docx:
+            items = docx_extract(path, out_dir, stem, max_files)
+            if items:
+                return items, len(items)
+        items, total = extract_archive(path, "zip", out_dir, max_files, password, name)
+        return [(p, c, False) for p, c in items], total
+    if kind in ("gz", "bz2", "xz"):
+        items, total = extract_archive(path, kind, out_dir, max_files, password, name)
+        return [(p, c, False) for p, c in items], total
+    if kind == "pdf":
+        hook = hooks.get("pdf")
+        if hook is None:
+            raise UnsupportedArchive("PDF можно распаковать только на устройстве")
+        items, total = hook(path, out_dir, max_files)
+        return items, total
+    if kind in IMAGE_TYPES:
+        if kind in ("bmp", "ico", "tiff") and hooks.get("image"):
+            dst = unique_path(out_dir, stem + ".jpg")
+            if hooks["image"](path, dst):
+                return [(dst, "", False)], 1
+        dst = unique_path(out_dir, "%s.%s" % (stem, kind))
+        shutil.copyfile(path, dst)
+        return [(dst, "", False)], 1
+    if kind in MEDIA_TYPES:
+        dst = unique_path(out_dir, "%s.%s" % (stem, kind))
+        shutil.copyfile(path, dst)
+        return [(dst, "", False)], 1
+
+    # дальше — текстовое содержимое
+    size = os.path.getsize(path)
+    if size > 30 * 1048576:
+        raise UnsupportedArchive("не удалось определить содержимое файла")
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:3] == b"\xef\xbb\xbf":
+        raw = raw[3:]
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            raw = raw.decode("utf-16").encode("utf-8")
+        except Exception:
+            pass
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        return [], 0
+
+    def text_item(s):
+        dst = unique_path(out_dir, stem + ".txt")
+        with open(dst, "wb") as f:
+            f.write(s.encode("utf-8"))
+        return [(dst, "", True)], 1
+
+    if text.lstrip().startswith("{\\rtf"):
+        return text_item(rtf_to_text(text))
+
+    hint = "hex" if name_ext == "hex" else ("b64" if name_ext in ("b64", "base64") else None)
+    payload = decode_payload_text(text, force=hint is not None, hint=hint) if depth < 3 else None
+    if payload is not None:
+        sub_dir = os.path.join(out_dir, "step%d" % (depth + 1))
+        os.makedirs(sub_dir, exist_ok=True)
+        ext = sniff_type(payload[:4096]) or ("txt" if _is_text_bytes(payload) else "bin")
+        dec = unique_path(sub_dir, "%s.%s" % (stem, ext))
+        with open(dec, "wb") as f:
+            f.write(payload)
+        items, total = unpack_any(dec, os.path.basename(dec), sub_dir, max_files, password, hooks, depth + 1)
+        if items:
+            return items, total
+        return [(dec, "", False)], 1
+
+    head_text = text[:2000].lower()
+    items = []
+    if "<svg" in head_text:
+        for i, (mime, data) in enumerate(extract_data_uris(text), 1):
+            dst = unique_path(out_dir, "%s_%d.%s" % (stem, i, sniff_image_mime(data)[1]))
+            with open(dst, "wb") as f:
+                f.write(data)
+            items.append((dst, "", False))
+        t = svg_plain_text(text)
+        if t.strip():
+            items += text_item(t)[0]
+        if items:
+            return items, len(items)
+    if re.search(r"<\s*(!doctype\s+html|html|body|img|div|p|br)\b", head_text):
+        for i, (mime, data) in enumerate(extract_data_uris(text), 1):
+            ext = sniff_type(data[:4096]) or sniff_image_mime(data)[1]
+            dst = unique_path(out_dir, "%s_%d.%s" % (stem, i, ext))
+            with open(dst, "wb") as f:
+                f.write(data)
+            items.append((dst, "", False))
+        t = html_to_text(_DATA_URI_RE.sub("", text))
+        if t.strip():
+            items += text_item(t)[0]
+        if items:
+            return items, len(items)
+    if text.lstrip().startswith("<"):
+        try:
+            root = ET.fromstring(text.encode("utf-8"))
+            if root.tag == "text":
+                return text_item("".join(root.itertext()))
+        except Exception:
+            pass
+    if text.lstrip().startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and list(obj.keys()) == ["text"] and isinstance(obj["text"], str):
+                return text_item(obj["text"])
+        except Exception:
+            pass
+    if _is_text_bytes(raw):
+        return text_item(text)
+    return [], 0
+
+
+# ============================= PURE HELPERS END =============================
+
+
+# ------------------------------- форматы ---------------------------------
+
+TEXT_SECTIONS = [
+    ("Документы", [("txt", "Текстовый файл"), ("md", "Markdown"), ("html", "Веб-страница"),
+                   ("rtf", "Rich Text"), ("pdf", "PDF-документ"), ("docx", "Word (docx)")]),
+    ("Данные", [("json", "JSON"), ("xml", "XML"), ("csv", "CSV"), ("yaml", "YAML"), ("ini", "INI"),
+                ("log", "Лог"), ("svg", "SVG-картинка с текстом"), ("srt", "Субтитры"),
+                ("vcf", "Контакт vCard"), ("ics", "Календарь iCalendar")]),
+    ("Код", [("py", "Python"), ("js", "JavaScript"), ("ts", "TypeScript"), ("java", "Java"),
+             ("kt", "Kotlin"), ("c", "C"), ("cpp", "C++"), ("h", "Заголовок C/C++"), ("cs", "C#"),
+             ("go", "Go"), ("rs", "Rust"), ("php", "PHP"), ("rb", "Ruby"), ("swift", "Swift"),
+             ("lua", "Lua"), ("dart", "Dart"), ("sh", "Shell"), ("bat", "Batch"),
+             ("ps1", "PowerShell"), ("sql", "SQL"), ("css", "CSS"), ("tex", "LaTeX"),
+             ("plugin", "Плагин exteraGram")]),
+    ("Архивы и кодировки", [("zip", "ZIP-архив"), ("b64", "Base64"), ("hex", "HEX")]),
+]
+
+
+def photo_sections():
+    imgs = [("jpg", "JPEG"), ("png", "PNG"), ("webp", "WebP")]
+    try:
+        if importlib.util.find_spec("PIL") is not None:
+            imgs += [("bmp", "BMP"), ("gif", "GIF"), ("tiff", "TIFF"), ("ico", "ICO")]
+    except Exception:
+        pass
+    return [
+        ("Изображения", imgs),
+        ("Документы", [("pdf", "PDF-документ"), ("html", "Веб-страница со вставкой"),
+                       ("svg", "SVG со вставкой")]),
+        ("Архивы и кодировки", [("zip", "ZIP-архив"), ("b64", "Base64 (текст)"),
+                                ("datauri", "Data URI (текст)")]),
+        ("Без изменений", [("raw", "Исходный файл как документ")]),
+    ]
+
+
+BINARY_SECTIONS = [
+    ("Без изменений", [("raw", "Исходный файл как документ")]),
+    ("Архивы и кодировки", [("zip", "ZIP-архив"), ("b64", "Base64 (файлы до 8 МБ)")]),
+]
+
+KIND_TITLES = {"text": "Текст", "photo": "Фото", "video": "Видео", "file": "Файл"}
+
+
+def _ext_label(fid):
+    return {"raw": "", "datauri": ".txt"}.get(fid, "." + fid)
+
+
+class PackerPlugin(BasePlugin):
+
+    # ------------------------------------------------------------ жизнь
+    def on_plugin_load(self):
+        self._unhooks = []
+        self._update_message_menu()
+        try:
+            self.add_on_send_message_hook()
+        except Exception as e:
+            self.log("[packer] хук отправки: %s" % e)
+        self._hook_send_menu()
+
+    def on_plugin_unload(self):
+        for item_id in ("kubick_packer_message", "kubick_packer_unpack"):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+        for h in list(getattr(self, "_unhooks", [])):
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    # ----------------------------------------------------------- меню
+    def _update_message_menu(self):
+        try:
+            self.remove_menu_item("kubick_packer_message")
+        except Exception:
+            pass
+        try:
+            self.remove_menu_item("kubick_packer_unpack")
+        except Exception:
+            pass
+        if self.get_setting("show_message_menu", True):
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Упаковать в файл",
+                    icon="msg_download",
+                    item_id="kubick_packer_message",
+                    condition="message != null",
+                    on_click=self._on_message_click,
+                ))
+            except Exception as e:
+                self.log("[packer] меню сообщения: %s" % e)
+        if self.get_setting("show_unpack_menu", True):
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Распаковать файл",
+                    icon="msg_openin",
+                    item_id="kubick_packer_unpack",
+                    condition="message != null",
+                    on_click=self._on_unpack_click,
+                ))
+            except Exception as e:
+                self.log("[packer] меню распаковки: %s" % e)
+
+    def _hook_send_menu(self):
+        plugin = self
+
+        class RunnableImpl(dynamic_proxy(Runnable)):
+            def __init__(self, func):
+                super().__init__()
+                self.func = func
+
+            def run(self):
+                try:
+                    self.func()
+                except Exception as e:
+                    plugin.log("[packer] кнопка: %s" % e)
+
+        class _SendMenuHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    if not plugin.get_setting("show_send_button", True):
+                        return
+                    item_options = param.args[0]
+                    if not item_options:
+                        return
+                    fragment = get_last_fragment()
+                    if not fragment:
+                        return
+                    text = plugin._input_text(fragment)
+                    if not text.strip():
+                        return
+                    preview = None
+                    try:
+                        preview = getattr(param, "thisObject", None)
+                    except Exception:
+                        preview = None
+
+                    def action():
+                        plugin._close_menu(preview, item_options)
+                        src = plugin._text_source_from_fragment(fragment, text)
+                        run_on_ui_thread(lambda: plugin._open_chooser(src), 250)
+
+                    icon = 0
+                    for name in ("msg_download", "msg_openin", "msg_addbot", "msg_send"):
+                        icon = getattr(R.drawable, name, 0)
+                        if icon:
+                            break
+                    if icon:
+                        item_options.add(icon, "Упаковать в файл", RunnableImpl(action))
+                except Exception as e:
+                    plugin.log("[packer] меню отправки: %s" % e)
+
+        try:
+            JClass = find_class("java.lang.Class")
+            preview_cls = JClass.forName("org.telegram.ui.MessageSendPreview")
+            options_cls = JClass.forName("org.telegram.ui.Components.ItemOptions")
+            method = preview_cls.getDeclaredMethod("setItemOptions", options_cls)
+            method.setAccessible(True)
+            handle = self.hook_method(method, _SendMenuHook())
+            if handle:
+                self._unhooks.append(handle)
+        except Exception as e:
+            self.log("[packer] не удалось повесить хук меню отправки: %s" % e)
+
+    def _close_menu(self, preview, item_options):
+        def _do():
+            try:
+                if preview is not None:
+                    for n in ("dismiss", "dismissInternal", "hide"):
+                        if hasattr(preview, n):
+                            getattr(preview, n)()
+                            break
+            except Exception:
+                pass
+            for n in ("dismissFast", "dismiss", "hide"):
+                try:
+                    if hasattr(item_options, n):
+                        getattr(item_options, n)()
+                except Exception:
+                    pass
+        run_on_ui_thread(_do)
+
+    # ----------------------------------------------- источники данных
+    def _input_text(self, fragment):
+        try:
+            enter_view = get_private_field(fragment, "chatActivityEnterView")
+            if enter_view is not None:
+                field = enter_view.getEditField()
+                if field is not None and field.getText() is not None:
+                    return str(field.getText().toString())
+        except Exception:
+            pass
+        return ""
+
+    def _clear_input(self, fragment):
+        try:
+            enter_view = get_private_field(fragment, "chatActivityEnterView")
+            if enter_view is not None:
+                try:
+                    enter_view.setFieldText("")
+                    return
+                except Exception:
+                    pass
+                enter_view.getEditField().setText("")
+        except Exception:
+            pass
+
+    def _text_source_from_fragment(self, fragment, text):
+        try:
+            account = int(fragment.getCurrentAccount())
+        except Exception:
+            account = 0
+        return {
+            "kind": "text", "text": text, "path": None,
+            "account": account, "dialog_id": _as_int(fragment.getDialogId(), 0),
+            "on_sent": lambda: self._clear_input(fragment),
+        }
+
+    def _kind(self, mo):
+        try:
+            if mo.isVideo() or mo.isRoundVideo() or mo.isGif():
+                return "video"
+        except Exception:
+            pass
+        try:
+            if mo.isPhoto():
+                return "photo"
+        except Exception:
+            pass
+        try:
+            if mo.getDocument() is not None:
+                return "file"
+        except Exception:
+            pass
+        return "text"
+
+    def _media_path(self, mo, account):
+        fl = jclass("org.telegram.messenger.FileLoader").getInstance(account)
+        candidates = []
+        try:
+            candidates.append(fl.getPathToMessage(mo.messageOwner))
+        except Exception:
+            pass
+        try:
+            doc = mo.getDocument()
+            if doc is not None:
+                candidates.append(fl.getPathToAttach(doc, True))
+        except Exception:
+            pass
+        for f in candidates:
+            try:
+                if f is not None and f.exists() and int(f.length()) > 0:
+                    return str(f.getAbsolutePath())
+            except Exception:
+                pass
+        return None
+
+    def _on_message_click(self, context):
+        try:
+            mo = context.get("message")
+            if mo is None:
+                return
+            account = _as_int(context.get("account"), 0) or _as_int(getattr(mo, "currentAccount", 0), 0)
+            dialog_id = _as_int(context.get("dialog_id"), 0)
+            if not dialog_id:
+                try:
+                    dialog_id = _as_int(mo.getDialogId(), 0)
+                except Exception:
+                    dialog_id = 0
+            kind = self._kind(mo)
+            src = {"kind": kind, "text": "", "path": None, "account": account,
+                   "dialog_id": dialog_id, "on_sent": None}
+            if kind == "text":
+                text = ""
+                try:
+                    cap = getattr(mo, "caption", None)
+                    if cap:
+                        text = str(cap)
+                except Exception:
+                    pass
+                if not text:
+                    mt = getattr(mo, "messageText", None)
+                    text = str(mt) if mt else ""
+                if not text.strip():
+                    self._toast("В сообщении нет текста", "error")
+                    return
+                src["text"] = text
+            else:
+                path = self._media_path(mo, account)
+                if not path:
+                    self._toast("Сначала скачайте или откройте файл", "error")
+                    return
+                src["path"] = path
+            run_on_ui_thread(lambda: self._open_chooser(src))
+        except Exception as e:
+            self.log("[packer] сообщение: %s" % e)
+            self._toast("Не удалось открыть упаковщик", "error")
+
+    # ---------------------------------------------------------- диалоги
+    def _ctx(self):
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if act is not None:
+                return act
+        except Exception:
+            pass
+        from org.telegram.ui import LaunchActivity
+        return LaunchActivity.instance
+
+    def _toast(self, text, kind="info"):
+        def _show():
+            try:
+                if kind == "error":
+                    BulletinHelper.show_error(text)
+                elif kind == "success":
+                    BulletinHelper.show_success(text)
+                else:
+                    BulletinHelper.show_info(text)
+            except Exception:
+                pass
+        run_on_ui_thread(_show)
+
+    def _sections_for(self, kind):
+        if kind == "text":
+            return TEXT_SECTIONS
+        if kind == "photo":
+            return photo_sections()
+        return BINARY_SECTIONS
+
+    def _open_chooser(self, src):
+        try:
+            context = self._ctx()
+            kind = src["kind"]
+            text_color = Theme.getColor(Theme.key_dialogTextBlack)
+            gray = Theme.getColor(Theme.key_dialogTextGray3)
+            blue = Theme.getColor(Theme.key_dialogTextBlue)
+            dp = AndroidUtilities.dp
+
+            builder = AlertDialogBuilder(context)
+            builder.set_title("Упаковать в файл")
+            content = LinearLayout(context)
+            content.setOrientation(LinearLayout.VERTICAL)
+            content.setPadding(dp(24), 0, dp(24), dp(8))
+
+            info = KIND_TITLES.get(kind, "Файл")
+            if kind == "text":
+                info += " · %d симв." % len(src["text"])
+            elif src.get("path"):
+                try:
+                    info += " · %.1f МБ" % (os.path.getsize(src["path"]) / 1048576.0)
+                except Exception:
+                    pass
+            info_view = TextView(context)
+            info_view.setText(info)
+            info_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            info_view.setTextColor(gray)
+            content.addView(info_view, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 4))
+
+            name_edit = EditText(context)
+            name_edit.setHint("Имя файла")
+            name_edit.setText(str(self.get_setting("default_name", "packed") or "packed"))
+            name_edit.setSingleLine(True)
+            name_edit.setInputType(InputType.TYPE_CLASS_TEXT)
+            name_edit.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            name_edit.setTextColor(text_color)
+            name_edit.setHintTextColor(gray)
+            content.addView(name_edit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+
+            def current_base():
+                return safe_base(str(name_edit.getText()))
+
+            def choose(fid):
+                base = current_base()
+                try:
+                    builder.dismiss()
+                except Exception:
+                    pass
+                self._pack_async(src, fid, base, None)
+
+            def choose_custom(v=None):
+                base = current_base()
+                try:
+                    builder.dismiss()
+                except Exception:
+                    pass
+                run_on_ui_thread(lambda: self._open_custom(src, base), 120)
+
+            def make_row(label, handler, color=None, size=16, top=10):
+                row = TextView(context)
+                row.setText(label)
+                row.setTextSize(TypedValue.COMPLEX_UNIT_DIP, size)
+                row.setTextColor(color if color is not None else text_color)
+                row.setPadding(0, dp(top), 0, dp(10))
+                if handler is not None:
+                    row.setClickable(True)
+                    row.setOnClickListener(OnClickListener(handler))
+                return row
+
+            lst = LinearLayout(context)
+            lst.setOrientation(LinearLayout.VERTICAL)
+            for title, items in self._sections_for(kind):
+                lst.addView(make_row(title.upper(), None, blue, 12, 16),
+                            LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+                for fid, label in items:
+                    ext = _ext_label(fid)
+                    caption = ("%s    %s" % (ext, label)) if ext else label
+                    lst.addView(make_row(caption, lambda v, f=fid: choose(f)),
+                                LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+            lst.addView(make_row("\u270E  Свой формат…", choose_custom, blue, 16, 16),
+                        LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+            scroll = ScrollView(context)
+            scroll.addView(lst)
+            content.addView(scroll, LayoutHelper.createLinear(-1, 320, 0, 0, 8, 0, 0))
+
+            builder.set_view(content)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log("[packer] диалог: %s" % e)
+            self._toast("Не удалось открыть выбор формата", "error")
+
+    def _open_custom(self, src, base):
+        try:
+            context = self._ctx()
+            builder = AlertDialogBuilder(context)
+            builder.set_title("Свой формат")
+            dp = AndroidUtilities.dp
+            box = LinearLayout(context)
+            box.setOrientation(LinearLayout.VERTICAL)
+            box.setPadding(dp(24), 0, dp(24), dp(8))
+            edit = EditText(context)
+            edit.setHint("Расширение, например dat, bin, exe, apk")
+            edit.setSingleLine(True)
+            edit.setInputType(InputType.TYPE_CLASS_TEXT)
+            edit.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+            edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+            box.addView(edit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+
+            def ok(b, w):
+                ext = str(edit.getText()).strip().lstrip(".")
+                if not re.match(r"^[A-Za-z0-9_-]{1,12}$", ext):
+                    self._toast("Расширение: латиница, цифры, - и _, до 12 символов", "error")
+                    return
+                b.dismiss()
+                self._pack_async(src, "custom", base, ext)
+
+            builder.set_view(box)
+            builder.set_positive_button("Упаковать", ok)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log("[packer] свой формат: %s" % e)
+
+    # ------------------------------------------------------------ работа
+    def _out_dir(self):
+        d = os.path.join(str(get_cache_dir()), "kubick_packer")
+        ensure_dir_exists(d)
+        try:
+            now = time.time()
+            for n in os.listdir(d):
+                p = os.path.join(d, n)
+                if os.path.isfile(p) and now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+                elif os.path.isdir(p) and n.startswith("unpack_") and now - os.path.getmtime(p) > 3 * 3600:
+                    shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+        return d
+
+    def _pack_async(self, src, fid, base, ext):
+        self._toast("Упаковываю…")
+
+        def work():
+            try:
+                path = self._build(src, fid, base, ext)
+                self._send(src, path)
+            except Exception as e:
+                self.log("[packer] упаковка: %s" % e)
+                self._toast("Не удалось упаковать: %s" % e, "error")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send(self, src, path):
+        def go():
+            try:
+                client = get_client(src["account"])
+                client.send_document(_as_int(src["dialog_id"], 0), path, "")
+                self._toast("Файл отправлен", "success")
+                cb = src.get("on_sent")
+                if cb:
+                    cb()
+            except Exception as e:
+                self.log("[packer] отправка: %s" % e)
+                self._toast("Не удалось отправить: %s" % e, "error")
+        run_on_ui_thread(go)
+
+    def _build(self, src, fid, base, ext):
+        out_dir = self._out_dir()
+        base = safe_base(base)
+        kind = src["kind"]
+        custom = False
+        if fid == "custom":
+            fid = safe_ext(ext)
+            if kind == "photo":
+                known = {"jpg", "png", "webp", "pdf", "html", "svg", "zip", "b64"}
+                try:
+                    if importlib.util.find_spec("PIL") is not None:
+                        known |= {"bmp", "gif", "tiff", "ico"}
+                except Exception:
+                    pass
+                custom = fid not in known
+            elif kind == "text":
+                custom = False
+            else:
+                custom = fid not in ("zip", "b64")
+        if kind == "text":
+            return self._build_text(src["text"], fid, base, out_dir, custom)
+        if kind == "photo":
+            return self._build_photo(src["path"], fid, base, out_dir, custom)
+        return self._build_binary(src["path"], fid, base, out_dir, custom)
+
+    @staticmethod
+    def _write(out_dir, name, data):
+        path = os.path.join(out_dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    # ---- текст
+    def _build_text(self, text, fid, base, out_dir, custom):
+        ext = {"datauri": "txt"}.get(fid, fid)
+        if fid == "pdf" and not custom:
+            path = os.path.join(out_dir, base + ".pdf")
+            self._text_to_pdf(text, path)
+            return path
+        if custom:
+            return self._write(out_dir, "%s.%s" % (base, safe_ext(fid)), text.encode("utf-8"))
+        return self._write(out_dir, "%s.%s" % (base, safe_ext(ext)), text_to_bytes(text, fid, base))
+
+    def _text_to_pdf(self, text, out_path):
+        PdfDocument = jclass("android.graphics.pdf.PdfDocument")
+        PageBuilder = jclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+        TextPaint = jclass("android.text.TextPaint")
+        StaticLayout = jclass("android.text.StaticLayout")
+        Paint = jclass("android.graphics.Paint")
+        Color = jclass("android.graphics.Color")
+        FileOutputStream = jclass("java.io.FileOutputStream")
+
+        page_w, page_h, margin = 595, 842, 40
+        width = page_w - 2 * margin
+        content_h = page_h - 2 * margin
+        paint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+        paint.setTextSize(12.0)
+        paint.setColor(Color.BLACK)
+        text = _clean_xml(text.replace("\r\n", "\n"))
+        layout = StaticLayout.Builder.obtain(text, 0, len(text), paint, width).setLineSpacing(0.0, 1.15).build()
+        total = int(layout.getLineCount())
+
+        doc = PdfDocument()
+        try:
+            i, page_no = 0, 1
+            while i < total:
+                top = int(layout.getLineTop(i))
+                j = i
+                while j < total and int(layout.getLineBottom(j)) - top <= content_h:
+                    j += 1
+                if j == i:
+                    j = i + 1
+                bottom = int(layout.getLineBottom(j - 1))
+                page = doc.startPage(PageBuilder(page_w, page_h, page_no).create())
+                canvas = page.getCanvas()
+                canvas.save()
+                canvas.translate(float(margin), float(margin - top))
+                canvas.clipRect(0.0, float(top), float(width), float(bottom))
+                layout.draw(canvas)
+                canvas.restore()
+                doc.finishPage(page)
+                i, page_no = j, page_no + 1
+            fos = FileOutputStream(out_path)
+            try:
+                doc.writeTo(fos)
+            finally:
+                fos.close()
+        finally:
+            doc.close()
+
+    # ---- фото
+    def _decode(self, path, max_side=4096):
+        BitmapFactory = jclass("android.graphics.BitmapFactory")
+        opts = BitmapFactory.Options()
+        opts.inJustDecodeBounds = True
+        BitmapFactory.decodeFile(path, opts)
+        w, h = int(opts.outWidth), int(opts.outHeight)
+        sample = 1
+        while max(w, h) // sample > max_side:
+            sample *= 2
+        opts2 = BitmapFactory.Options()
+        opts2.inSampleSize = sample
+        bmp = BitmapFactory.decodeFile(path, opts2)
+        if bmp is None:
+            raise RuntimeError("не удалось прочитать изображение")
+        return bmp
+
+    def _compress(self, bmp, fmt, quality, out_path):
+        CF = jclass("android.graphics.Bitmap$CompressFormat")
+        FileOutputStream = jclass("java.io.FileOutputStream")
+        if fmt == "webp":
+            cf = getattr(CF, "WEBP_LOSSY", None) or getattr(CF, "WEBP")
+        else:
+            cf = getattr(CF, fmt.upper())
+        fos = FileOutputStream(out_path)
+        try:
+            bmp.compress(cf, quality, fos)
+        finally:
+            fos.close()
+
+    def _build_photo(self, path, fid, base, out_dir, custom):
+        with open(path, "rb") as f:
+            data = f.read()
+        mime, src_ext = sniff_image_mime(data)
+        if custom:
+            return self._write(out_dir, "%s.%s" % (base, safe_ext(fid)), data)
+        if fid == "raw":
+            return self._write(out_dir, "%s.%s" % (base, src_ext), data)
+        if fid in ("jpg", "png", "webp"):
+            bmp = self._decode(path)
+            out = os.path.join(out_dir, "%s.%s" % (base, fid))
+            self._compress(bmp, "jpeg" if fid == "jpg" else fid, 95, out)
+            return out
+        if fid in ("bmp", "gif", "tiff", "ico"):
+            from PIL import Image
+            img = Image.open(path)
+            out = os.path.join(out_dir, "%s.%s" % (base, fid))
+            if fid == "ico":
+                img.thumbnail((256, 256))
+                img.convert("RGBA").save(out, format="ICO")
+            elif fid == "gif":
+                img.convert("RGB").save(out, format="GIF")
+            else:
+                img.convert("RGB").save(out, format={"bmp": "BMP", "tiff": "TIFF"}[fid])
+            return out
+        if fid == "pdf":
+            out = os.path.join(out_dir, base + ".pdf")
+            self._image_to_pdf(path, out)
+            return out
+        if fid == "html":
+            return self._write(out_dir, base + ".html", image_html(data, mime))
+        if fid == "svg":
+            w, h = self._bounds(path)
+            return self._write(out_dir, base + ".svg", image_svg(data, mime, w, h))
+        if fid == "zip":
+            return self._write(out_dir, base + ".zip", zip_bytes("%s.%s" % (base, src_ext), data))
+        if fid == "b64":
+            return self._write(out_dir, base + ".b64", b64_wrap(data))
+        if fid == "datauri":
+            uri = "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))
+            return self._write(out_dir, base + ".txt", uri.encode("ascii"))
+        raise RuntimeError("неизвестный формат: %s" % fid)
+
+    def _bounds(self, path):
+        BitmapFactory = jclass("android.graphics.BitmapFactory")
+        opts = BitmapFactory.Options()
+        opts.inJustDecodeBounds = True
+        BitmapFactory.decodeFile(path, opts)
+        return int(opts.outWidth), int(opts.outHeight)
+
+    def _image_to_pdf(self, path, out_path):
+        PdfDocument = jclass("android.graphics.pdf.PdfDocument")
+        PageBuilder = jclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+        Bitmap = jclass("android.graphics.Bitmap")
+        FileOutputStream = jclass("java.io.FileOutputStream")
+        bmp = self._decode(path, 2000)
+        w, h = int(bmp.getWidth()), int(bmp.getHeight())
+        doc = PdfDocument()
+        try:
+            page = doc.startPage(PageBuilder(w, h, 1).create())
+            page.getCanvas().drawBitmap(bmp, 0.0, 0.0, None)
+            doc.finishPage(page)
+            fos = FileOutputStream(out_path)
+            try:
+                doc.writeTo(fos)
+            finally:
+                fos.close()
+        finally:
+            doc.close()
+
+    # ---- видео и файлы
+    def _build_binary(self, path, fid, base, out_dir, custom):
+        orig = os.path.basename(path)
+        orig_ext = orig.rsplit(".", 1)[1] if "." in orig else "bin"
+        if custom:
+            ext = safe_ext(fid)
+        elif fid == "raw":
+            ext = safe_ext(orig_ext, "bin")
+        else:
+            ext = None
+        if ext:
+            out = os.path.join(out_dir, "%s.%s" % (base, ext))
+            import shutil
+            shutil.copyfile(path, out)
+            return out
+        if fid == "zip":
+            out = os.path.join(out_dir, base + ".zip")
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                z.write(path, "%s.%s" % (base, safe_ext(orig_ext, "bin")))
+            return out
+        if fid == "b64":
+            if os.path.getsize(path) > 8 * 1048576:
+                raise RuntimeError("файл больше 8 МБ")
+            with open(path, "rb") as f:
+                return self._write(out_dir, base + ".b64", b64_wrap(f.read()))
+        raise RuntimeError("неизвестный формат: %s" % fid)
+
+    # ------------------------------------------------------- распаковка
+    def _doc_filename(self, mo):
+        try:
+            doc = mo.getDocument()
+            for a in doc.attributes:
+                n = getattr(a, "file_name", None)
+                if n:
+                    return str(n)
+        except Exception:
+            pass
+        return None
+
+    def _unpack_limit(self):
+        n = _as_int(self.get_setting("unpack_max_files", "30"), 30)
+        return max(1, min(200, n))
+
+    def _on_unpack_click(self, context):
+        try:
+            mo = context.get("message")
+            if mo is None:
+                return
+            account = _as_int(context.get("account"), 0) or _as_int(getattr(mo, "currentAccount", 0), 0)
+            dialog_id = _as_int(context.get("dialog_id"), 0)
+            if not dialog_id:
+                try:
+                    dialog_id = _as_int(mo.getDialogId(), 0)
+                except Exception:
+                    dialog_id = 0
+            kind = self._kind(mo)
+            if kind in ("photo", "video"):
+                self._toast("Это уже фото или видео, распаковывать нечего", "error")
+                return
+            src = {"kind": "file", "text": "", "path": None, "account": account,
+                   "dialog_id": dialog_id, "on_sent": None}
+            path = self._media_path(mo, account)
+            name = self._doc_filename(mo)
+            if not path:
+                text = ""
+                try:
+                    cap = getattr(mo, "caption", None)
+                    text = str(cap) if cap else ""
+                except Exception:
+                    pass
+                if not text:
+                    mt = getattr(mo, "messageText", None)
+                    text = str(mt) if mt else ""
+                if kind == "text" and text.strip():
+                    path = os.path.join(self._out_dir(), "message_%d.txt" % int(time.time() * 1000))
+                    with open(path, "wb") as f:
+                        f.write(text.encode("utf-8"))
+                    name = "message.txt"
+                elif kind == "text":
+                    self._toast("Это не файл и не текст", "error")
+                    return
+                else:
+                    self._toast("Сначала скачайте файл", "error")
+                    return
+            self._unpack_async(src, path, name)
+        except Exception as e:
+            self.log("[packer] распаковка: %s" % e)
+            self._toast("Не удалось начать распаковку", "error")
+
+    def _unpack_async(self, src, path, orig_name, password=None):
+        self._toast("Распаковываю…")
+
+        def work():
+            try:
+                self._unpack(src, path, orig_name, password)
+            except NeedPassword:
+                run_on_ui_thread(lambda: self._ask_password(src, path, orig_name, False))
+            except WrongPassword:
+                self._toast("Неверный пароль", "error")
+                run_on_ui_thread(lambda: self._ask_password(src, path, orig_name, True))
+            except UnsupportedArchive as e:
+                self._toast("Не удалось распаковать: %s" % e, "error")
+            except Exception as e:
+                self.log("[packer] распаковка: %s" % e)
+                self._toast("Не удалось распаковать: %s" % e, "error")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _unpack(self, src, path, orig_name, password):
+        root = os.path.join(self._out_dir(), "unpack_%d" % int(time.time() * 1000))
+        os.makedirs(root, exist_ok=True)
+        limit = self._unpack_limit()
+        hooks = {"pdf": self._pdf_pages, "image": self._image_to_jpeg}
+        items, total = unpack_any(path, orig_name, root, limit, password, hooks)
+        if not items:
+            raise UnsupportedArchive("в файле нечего распаковывать")
+        sent, fallback = 0, 0
+        for fpath, caption, as_text in items:
+            done = threading.Event()
+            result = []
+
+            def go(p=fpath, c=caption, t=as_text):
+                try:
+                    result.append(self._send_text(src, p) if t else self._send_smart(src, p, c))
+                except Exception as e:
+                    self.log("[packer] отправка из файла: %s" % e)
+                finally:
+                    done.set()
+
+            run_on_ui_thread(go)
+            done.wait(20)
+            if result:
+                sent += 1
+                if result[0] == "send_document" and not as_text and media_kind(fpath) != "document":
+                    fallback += 1
+            time.sleep(0.7)
+        msg = "Распаковано и отправлено: %d из %d" % (sent, total)
+        if total > len(items):
+            msg += " (лимит %d файлов, меняется в настройках)" % limit
+        if fallback:
+            msg += ". Часть медиа ушла документом"
+        self._toast(msg, "success" if sent else "error")
+
+    def _send_text(self, src, path):
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            text = data.decode("utf-8")
+        except Exception:
+            text = None
+        if text is not None and 0 < len(text) <= 4000 and self.get_setting("text_as_message", True):
+            client = get_client(src["account"])
+            peer = _as_int(src["dialog_id"], 0)
+            for name in ("send_message", "send_text"):
+                fn = getattr(client, name, None)
+                if fn is None:
+                    continue
+                for args in ((peer, text), ({"peer": peer, "message": text},)):
+                    try:
+                        fn(*args)
+                        return "message"
+                    except Exception:
+                        continue
+        return self._send_smart(src, path, "")
+
+    def _image_to_jpeg(self, path, out_path):
+        try:
+            bmp = self._decode(path)
+            self._compress(bmp, "jpeg", 95, out_path)
+            return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        except Exception as e:
+            self.log("[packer] конвертация изображения: %s" % e)
+            return False
+
+    def _pdf_pages(self, path, out_dir, max_pages):
+        ParcelFileDescriptor = jclass("android.os.ParcelFileDescriptor")
+        JFile = jclass("java.io.File")
+        PdfRenderer = jclass("android.graphics.pdf.PdfRenderer")
+        PageCls = jclass("android.graphics.pdf.PdfRenderer$Page")
+        Bitmap = jclass("android.graphics.Bitmap")
+        Config = jclass("android.graphics.Bitmap$Config")
+        Color = jclass("android.graphics.Color")
+        pfd = ParcelFileDescriptor.open(JFile(path), ParcelFileDescriptor.MODE_READ_ONLY)
+        items, total = [], 0
+        try:
+            renderer = PdfRenderer(pfd)
+            try:
+                total = int(renderer.getPageCount())
+                for i in range(min(total, max_pages)):
+                    page = renderer.openPage(i)
+                    try:
+                        w, h = int(page.getWidth()), int(page.getHeight())
+                        long_side = max(w, h, 1)
+                        scale = 1.0 if long_side >= 1200 else min(3.0, 1800.0 / long_side)
+                        bmp = Bitmap.createBitmap(max(1, int(w * scale)), max(1, int(h * scale)), Config.ARGB_8888)
+                        bmp.eraseColor(Color.WHITE)
+                        page.render(bmp, None, None, PageCls.RENDER_MODE_FOR_DISPLAY)
+                    finally:
+                        page.close()
+                    dst = unique_path(out_dir, "page_%02d.jpg" % (i + 1))
+                    self._compress(bmp, "jpeg", 92, dst)
+                    items.append((dst, "Страница %d из %d" % (i + 1, total), False))
+            finally:
+                renderer.close()
+        finally:
+            pfd.close()
+        return items, total
+
+    def _send_smart(self, src, path, caption=""):
+        client = get_client(src["account"])
+        peer = _as_int(src["dialog_id"], 0)
+        method = {"photo": "send_photo", "video": "send_video", "audio": "send_audio"}.get(media_kind(path))
+        if method:
+            fn = getattr(client, method, None)
+            if fn is not None:
+                try:
+                    fn(peer, path, caption)
+                    return method
+                except Exception as e:
+                    self.log("[packer] %s не сработал, шлю документом: %s" % (method, e))
+        client.send_document(peer, path, caption)
+        return "send_document"
+
+    def _ask_password(self, src, path, orig_name, again):
+        try:
+            context = self._ctx()
+            dp = AndroidUtilities.dp
+            builder = AlertDialogBuilder(context)
+            builder.set_title("Пароль от архива" if not again else "Неверный пароль, ещё раз")
+            box = LinearLayout(context)
+            box.setOrientation(LinearLayout.VERTICAL)
+            box.setPadding(dp(24), 0, dp(24), dp(8))
+            edit = EditText(context)
+            edit.setHint("Пароль")
+            edit.setSingleLine(True)
+            edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD)
+            edit.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+            edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+            box.addView(edit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+
+            def ok(b, w):
+                pwd = str(edit.getText())
+                b.dismiss()
+                if pwd:
+                    self._unpack_async(src, path, orig_name, pwd)
+
+            builder.set_view(box)
+            builder.set_positive_button("Распаковать", ok)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log("[packer] пароль: %s" % e)
+
+    # ------------------------------------------ команда .pack формат текст
+    def on_send_message_hook(self, account, params):
+        try:
+            if not self.get_setting("enable_command", True):
+                return HookResult()
+            msg = getattr(params, "message", None)
+            if not isinstance(msg, str):
+                return HookResult()
+            m = re.match(r"^\.pack\s+([A-Za-z0-9_-]{1,12})\s+([\s\S]+)$", msg.strip())
+            if not m:
+                return HookResult()
+            ext, text = m.group(1).lower(), m.group(2)
+            src = {"kind": "text", "text": text, "path": None, "account": account,
+                   "dialog_id": _as_int(getattr(params, "peer", 0), 0), "on_sent": None}
+            base = safe_base(self.get_setting("default_name", "packed"))
+            self._pack_async(src, "custom", base, ext)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self.log("[packer] команда: %s" % e)
+            return HookResult()
+
+    # ---------------------------------------------------------- настройки
+    def create_settings(self):
+        return [
+            Header(text="Упаковщик"),
+            Switch(
+                key="show_send_button", text="Кнопка в меню отправки", default=True,
+                subtext="«Упаковать в файл» при долгом нажатии на «Отправить», когда в поле есть текст",
+                icon="msg_download",
+            ),
+            Switch(
+                key="show_message_menu", text="Кнопка в меню сообщения", default=True,
+                subtext="«Упаковать в файл» в разделе «Плагины» у сообщений, фото и видео",
+                icon="msg_download",
+                on_change=lambda value: (
+                    self.set_setting("show_message_menu", value),
+                    run_on_ui_thread(self._update_message_menu),
+                ),
+            ),
+            Switch(
+                key="enable_command", text="Команда .pack", default=True,
+                subtext="Например: .pack html Привет, мир. Отправит файл сразу",
+                icon="msg_edit",
+            ),
+            Switch(
+                key="show_unpack_menu", text="Кнопка «Распаковать файл»", default=True,
+                subtext="В меню сообщения (Плагины) у архивов: zip, tar, gz, bz2, xz, base64",
+                icon="msg_openin",
+                on_change=lambda value: (
+                    self.set_setting("show_unpack_menu", value),
+                    run_on_ui_thread(self._update_message_menu),
+                ),
+            ),
+            Switch(
+                key="text_as_message", text="Текст из файла — сообщением", default=True,
+                subtext="Если из файла получился текст до 4000 символов, он придёт сообщением, иначе файлом .txt",
+                icon="msg_edit",
+            ),
+            Divider(),
+            Header(text="Файлы"),
+            Input(
+                key="default_name", text="Имя файла по умолчанию", default="packed",
+                subtext="Можно изменить в окне выбора формата", icon="msg_edit",
+            ),
+            Input(
+                key="unpack_max_files", text="Максимум файлов при распаковке", default="30",
+                subtext="От 1 до 200. Файлы отправляются по одному с паузой", icon="msg_edit",
+            ),
+            Divider(text="Упаковщик v%s // %s" % (__version__, __author__)),
+        ]
