@@ -2,27 +2,198 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
+import threading
 import time
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-from android.content import Intent
 from android.net import Uri
-from android_utils import log, run_on_ui_thread
+from android_utils import log as android_log, run_on_ui_thread
+from babel import Locale
 from base_plugin import BasePlugin
-from client_utils import PLUGINS_QUEUE, get_user_config, run_on_queue, send_document, send_message
-from java import jclass
+from client_utils import PLUGINS_QUEUE, get_last_fragment, get_messages_controller, get_notification_center, get_user_config, run_on_queue, send_document, send_message, send_request
+from file_utils import get_cache_dir, get_plugins_dir
+from java import dynamic_proxy, jclass
+from java.lang import Integer
+from java.util import ArrayList
+from org.telegram.messenger import ChatObject, MessageObject, MessagesController, NotificationCenter, NotificationsController, UserConfig
 from org.telegram.tgnet import TLRPC
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, Header, Selector, Switch, Text
 
 __id__ = "proxy_sub"
 __name__ = "Proxy Sub"
-__description__ = "Загружает список прокси MTProto и WebProxy из удалённого источника и добавляет их в ваш клиент.\n\nВозможности:\n • Выбор источника (GitVerse / GitHub) с автофоллбэком\n • Фильтрация типов прокси через настройки плагина\n • Экспорт текущего списка прокси в Избранное (сообщением или файлом, если список большой)"
+__description__ = "Загружает списки прокси MTProto и WebProxy из удалённого источника и добавляет их в клиент.\n\nВозможности:\n • Фильтрация по протоколам и странам со счётчиками\n • Экспорт прокси (MTProto, WebProxy, SOCKS) в Избранное сообщением или файлом\n • Запись логов ошибок плагина и их автоматическая отправка на форум akresLogs каждый час (по желанию)"
 __author__ = "@akresik"
-__version__ = "2.0.0"
-__min_version__ = "12.10.5"
+__version__ = "4.0.0"
+__min_version__ = "12.10.6"
 __icon__ = "OliverEmoji/21"
+__requirements__ = "babel"
+__category__ = ["privacy", "tools"]
+
+FORUM_USERNAME = "akresLogs"
+FORUM_CHAT_ID = -1003997848791
+LOGS_TOPIC_ID = 49
+MAX_LOG_LINES = 1000
+SEND_TIMEOUT = 90
+RESOLVE_TIMEOUT = 20
+DIALOG_TIMEOUT = 180
+DELETE_BATCH_SIZE = 100
+LOG_FILE_RE = re.compile(rf"^{re.escape(__id__)}_[0-9a-f]{{7}}\.log$")
+
+JOIN_TEXT_AUTO = (
+    f"После включения этого ползунка вы автоматически подпишетесь на форум {FORUM_USERNAME}. "
+    "Он будет скрыт в архиве.\n\n"
+    "В логи не попадает никакая личная информация. В любой момент вы можете отключить отправку, "
+    "а также удалить отправленные логи кнопкой ниже.\n\n"
+    "Если вы включите отправку, то поможете быстрее исправлять баги в будущем."
+)
+JOIN_TEXT_MANUAL = (
+    f"Чтобы отправить логи, вы автоматически подпишетесь на форум {FORUM_USERNAME}. "
+    "Он будет скрыт в архиве.\n\n"
+    "В логи не попадает никакая личная информация. Отправленные логи можно в любой момент удалить кнопкой в настройках."
+)
+
+class LogStore:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.enabled = False
+        self.count = None
+
+    def path(self):
+        return os.path.join(get_plugins_dir(), f"{__id__}.log")
+
+    def _read_unlocked(self):
+        try:
+            with open(self.path(), "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+
+    def _write_unlocked(self, text):
+        with open(self.path(), "w", encoding="utf-8") as f:
+            f.write(text)
+        self.count = text.count("\n")
+
+    def write(self, text):
+        if not self.enabled:
+            return
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            lines = [f"{stamp} {line}" for line in (str(text).splitlines() or [""])]
+            with self.lock:
+                if self.count is None:
+                    self.count = self._read_unlocked().count("\n")
+                with open(self.path(), "a", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                self.count += len(lines)
+                if self.count > MAX_LOG_LINES:
+                    kept = self._read_unlocked().splitlines()[-MAX_LOG_LINES:]
+                    self._write_unlocked("\n".join(kept) + "\n")
+        except Exception as e:
+            android_log(f"[PS] log store write error: {e}")
+
+    def read(self):
+        with self.lock:
+            return self._read_unlocked()
+
+    def consume(self, sent):
+        with self.lock:
+            current = self._read_unlocked()
+            if current.startswith(sent):
+                rest = current[len(sent):]
+            else:
+                tail = "\n".join([l for l in sent.splitlines() if l][-3:]) + "\n"
+                idx = current.rfind(tail)
+                rest = current[idx + len(tail):] if idx >= 0 else current
+            self._write_unlocked(rest)
+
+STORE = LogStore()
+
+def log(message):
+    android_log(message)
+    STORE.write(message)
+
+def run_on_ui_sync(fn, timeout=5):
+    done = threading.Event()
+    ok = []
+
+    def task():
+        try:
+            fn()
+            ok.append(True)
+        except Exception as e:
+            log(f"[PS] ui task error: {e}")
+        finally:
+            done.set()
+
+    run_on_ui_thread(task)
+    done.wait(timeout)
+    return bool(ok)
+
+def to_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return int(str(value))
+
+def message_file_names(msg):
+    names = []
+    try:
+        document = getattr(getattr(msg, "media", None), "document", None)
+        attributes = getattr(document, "attributes", None)
+        if attributes is not None:
+            for attribute in [attributes.get(i) for i in range(attributes.size())]:
+                name = getattr(attribute, "file_name", None)
+                if name:
+                    names.append(str(name))
+    except Exception as e:
+        android_log(f"[PS] message_file_names error: {e}")
+    return names
+
+class LogSendWatcher(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def didReceivedNotification(self, id, account, args):
+        try:
+            if not self.armed:
+                return
+            if id == NotificationCenter.messageSendError:
+                self.error = "Telegram не смог доставить файл (ошибка отправки сообщения)"
+                self.armed = False
+                self.event.set()
+                return
+            if id != NotificationCenter.messageReceivedByServer:
+                return
+            msg = args[2]
+            dialog = to_int(args[3]) if len(args) > 3 else to_int(msg.dialog_id)
+            if dialog != self.peer or self.file_name not in message_file_names(msg):
+                return
+            reply = getattr(msg, "reply_to", None)
+            self.info = (
+                f"reply_to_msg_id={getattr(reply, 'reply_to_msg_id', None)}, "
+                f"reply_to_top_id={getattr(reply, 'reply_to_top_id', None)}, "
+                f"forum_topic={getattr(reply, 'forum_topic', None)}"
+            )
+            self.ok = True
+            self.armed = False
+            self.event.set()
+        except Exception as e:
+            android_log(f"[PS] log watcher error: {e}")
+
+def make_log_watcher(peer, file_name):
+    watcher = LogSendWatcher()
+    watcher.peer = peer
+    watcher.file_name = file_name
+    watcher.ok = False
+    watcher.error = None
+    watcher.info = ""
+    watcher.armed = True
+    watcher.event = threading.Event()
+    return watcher
+
+_COUNTRIES = None
+_PROTOCOLS = None
 
 def _parse_entry(entry):
     server = entry.get("server")
@@ -48,6 +219,31 @@ def _build_uri(p):
         return f"tg://webproxy?server={p['server']}&secret={p['secret']}"
     return f"tg://proxy?server={p['server']}&port={p['port']}&secret={p['secret']}"
 
+def _proto_setting_key(p):
+    if p["type"] == "web":
+        return "web_" + p["via"].replace("-", "_")
+    return "mtproto_" + p["subtype"]
+
+def _entry_country(entry):
+    v = entry.get("country")
+    if isinstance(v, str) and len(v.strip()) == 2 and v.strip().isalpha():
+        return v.strip().upper()
+    return None
+
+def _country_flag(code):
+    return "".join(chr(0x1F1E6 + ord(c) - 65) for c in code)
+
+def _country_name(code):
+    try:
+        return Locale("ru").territories.get(code) or code
+    except Exception:
+        return code
+
+def _country_sorted():
+    items = [(code, cnt, _country_name(code)) for code, cnt in (_COUNTRIES or {}).items()]
+    items.sort(key=lambda x: (-x[1], x[2].lower()))
+    return items
+
 def _mtp_sort_key(e):
     try:
         ip_key = (0, int(ipaddress.ip_address(e["addr"])))
@@ -59,78 +255,667 @@ def _web_sort_key(line):
     p = parse_qs(urlparse(line).query)
     return (p.get("server", [""])[0], p.get("secret", [""])[0])
 
+def _socks_line(e):
+    line = f"tg://socks?server={e['addr']}&port={e['port']}"
+    if e["user"]:
+        line += f"&user={e['user']}"
+    if e["pass"]:
+        line += f"&pass={e['pass']}"
+    return line
+
+def _jget(obj, names, attrs=()):
+    for n in names:
+        try:
+            v = getattr(obj, n)()
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    for a in attrs:
+        try:
+            v = getattr(obj, a)
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    return ""
+
+def _proxy_env():
+    SC = jclass("org.telegram.messenger.SharedConfig")
+    PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+    SC.loadProxyList()
+    return SC, PC
+
 class ProxyManagerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            self.send_lock = threading.Lock()
+            self.sched_stop = threading.Event()
+            self.auto_confirming = False
+            STORE.enabled = bool(self.get_setting("log_enabled", False))
+            threading.Thread(target=self.run_scheduler, daemon=True).start()
+        except Exception as e:
+            log(f"[PS] on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            self.sched_stop.set()
+            STORE.enabled = False
+        except Exception as e:
+            log(f"[PS] on_plugin_unload error: {e}")
+
+    def get_bool(self, key):
+        try:
+            return bool(self.get_setting(key, False))
+        except Exception as e:
+            log(f"[PS] get_bool error: {e}")
+            return False
+
+    def on_log_toggle(self, value):
+        try:
+            if value:
+                STORE.enabled = True
+            else:
+                STORE.enabled = False
+                if self.get_bool("auto_send"):
+                    self.set_setting("auto_send", False, reload_settings=True)
+                    self.notify("Автоотправка тоже отключена")
+        except Exception as e:
+            log(f"[PS] on_log_toggle error: {e}")
+
+    def on_auto_toggle(self, value):
+        try:
+            if not value:
+                return
+            threading.Thread(target=self.enable_auto_send, daemon=True).start()
+        except Exception as e:
+            log(f"[PS] on_auto_toggle error: {e}")
+
+    def enable_auto_send(self):
+        self.auto_confirming = True
+        try:
+            if self.ensure_member(JOIN_TEXT_AUTO, always_ask=True):
+                if not self.get_bool("log_enabled"):
+                    STORE.enabled = True
+                    self.set_setting("log_enabled", True, reload_settings=True)
+                    self.notify("Запись логов включена автоматически")
+            else:
+                self.set_setting("auto_send", False, reload_settings=True)
+        except Exception as e:
+            log(f"[PS] enable_auto_send error: {e}")
+            self.notify(f"Не удалось включить автоотправку: {e}", "error")
+            self.set_setting("auto_send", False, reload_settings=True)
+        finally:
+            self.auto_confirming = False
+
+    def on_force_send_click(self, view=None):
+        try:
+            threading.Thread(target=self.manual_send, daemon=True).start()
+        except Exception as e:
+            log(f"[PS] on_force_send_click error: {e}")
+
+    def manual_send(self):
+        try:
+            if not STORE.read().strip():
+                self.notify("Логов нет")
+                return
+            if not self.ensure_member(JOIN_TEXT_MANUAL):
+                return
+            self.notify("Отправляем логи...")
+            self.send_logs(True)
+        except Exception as e:
+            log(f"[PS] manual_send error: {e}")
+            self.notify(f"Логи не отправлены: {e}. Файл сохранён", "error")
+
+    def run_scheduler(self):
+        while not self.sched_stop.is_set():
+            try:
+                now = time.localtime()
+                wait = (59 - now.tm_min) * 60 + (60 - now.tm_sec) + 1
+                if self.sched_stop.wait(wait):
+                    break
+                if self.get_bool("log_enabled") and self.get_bool("auto_send") and not self.auto_confirming:
+                    self.send_logs(False)
+            except Exception as e:
+                log(f"[PS] run_scheduler error: {e}")
+                self.sched_stop.wait(60)
+
+    def rpc(self, req, timeout=30):
+        account = UserConfig.selectedAccount
+        while True:
+            done = threading.Event()
+            box = {}
+
+            def callback(response, error):
+                box["response"], box["error"] = response, error
+                done.set()
+
+            send_request(req, callback, account=account)
+            if not done.wait(timeout):
+                raise RuntimeError("таймаут запроса к Telegram")
+            error = box["error"]
+            if not error:
+                return box["response"]
+            text = str(getattr(error, "text", error))
+            if text.startswith("FLOOD_WAIT_"):
+                time.sleep(int(text.rsplit("_", 1)[1]))
+                continue
+            raise RuntimeError(text)
+
+    def apply_updates(self, response):
+        try:
+            updates = response
+            if not isinstance(updates, TLRPC.Updates):
+                updates = getattr(response, "updates", None)
+            if not isinstance(updates, TLRPC.Updates):
+                return
+            controller = get_messages_controller(UserConfig.selectedAccount)
+            run_on_ui_sync(lambda: controller.processUpdates(updates, False))
+        except Exception as e:
+            log(f"[PS] apply_updates error: {e}")
+
+    def fetch_forum_chat(self):
+        req = TLRPC.TL_contacts_resolveUsername()
+        req.username = FORUM_USERNAME
+        response = self.rpc(req, RESOLVE_TIMEOUT)
+        raw = response.chats
+        chats = [raw.get(i) for i in range(raw.size())]
+        if not chats:
+            raise RuntimeError(f"форум {FORUM_USERNAME} не найден")
+        try:
+            controller = get_messages_controller(UserConfig.selectedAccount)
+            run_on_ui_sync(lambda: controller.putChats(raw, False))
+        except Exception as e:
+            log(f"[PS] putChats error: {e}")
+        return chats[0]
+
+    def is_member(self, chat):
+        try:
+            return not ChatObject.isNotInChat(chat)
+        except Exception:
+            return not (getattr(chat, "left", False) or getattr(chat, "kicked", False))
+
+    def ask_confirm(self, title, message, yes_text, no_text, red=False):
+        decision = {"ok": False}
+        done = threading.Event()
+
+        def show():
+            try:
+                builder = AlertDialogBuilder(get_last_fragment().getParentActivity())
+                builder.set_title(title)
+                builder.set_message(message)
+
+                def on_yes(bld, which):
+                    decision["ok"] = True
+                    bld.dismiss()
+                    done.set()
+
+                def on_no(bld, which):
+                    bld.dismiss()
+                    done.set()
+
+                builder.set_positive_button(yes_text, on_yes)
+                builder.set_negative_button(no_text, on_no)
+                builder.show()
+                if red:
+                    builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            except Exception as e:
+                log(f"[PS] ask_confirm error: {e}")
+                done.set()
+
+        run_on_ui_thread(show)
+        done.wait(DIALOG_TIMEOUT)
+        return decision["ok"]
+
+    def ensure_member(self, join_text, always_ask=False):
+        chat = self.fetch_forum_chat()
+        member = self.is_member(chat)
+        if member and not always_ask:
+            return True
+        if not self.ask_confirm("Подписка на форум", join_text, "Продолжить", "Отмена"):
+            return False
+        if member:
+            return True
+        peer = -abs(to_int(chat.id))
+        controller = get_messages_controller(UserConfig.selectedAccount)
+        join = TLRPC.TL_channels_joinChannel()
+        join.channel = MessagesController.getInputChannel(chat)
+        self.apply_updates(self.rpc(join))
+        try:
+            folder_peer = TLRPC.TL_inputFolderPeer()
+            folder_peer.peer = controller.getInputPeer(peer)
+            folder_peer.folder_id = 1
+            archive = TLRPC.TL_folders_editPeerFolders()
+            archive.folder_peers.add(folder_peer)
+            self.apply_updates(self.rpc(archive))
+        except Exception as e:
+            log(f"[PS] archive error: {e}")
+
+        def mute():
+            center = NotificationsController.getInstance(UserConfig.selectedAccount)
+            try:
+                center.muteDialog(peer, 0, True)
+            except TypeError:
+                center.muteDialog(peer, True)
+
+        if not run_on_ui_sync(mute):
+            log("[PS] не удалось отключить уведомления форума")
+        return True
+
+    def resolve_forum_peer(self):
+        if FORUM_CHAT_ID:
+            chat_id = abs(int(FORUM_CHAT_ID))
+            if chat_id > 10 ** 12:
+                chat_id = int(str(chat_id)[3:])
+            return -chat_id
+        cached = str(self.get_setting("forum_peer", "") or "").strip()
+        if cached:
+            return int(cached)
+        chat = self.fetch_forum_chat()
+        peer = -abs(to_int(chat.id))
+        self.set_setting("forum_peer", str(peer))
+        return peer
+
+    def on_delete_logs_click(self, view=None):
+        try:
+            threading.Thread(target=self.delete_logs_flow, daemon=True).start()
+        except Exception as e:
+            log(f"[PS] on_delete_logs_click error: {e}")
+
+    def delete_logs_flow(self):
+        try:
+            if not self.ask_confirm(
+                "Удаление логов",
+                f"Удалить все отправленные вами файлы логов на форуме {FORUM_USERNAME} и отписаться от него? Автоматическая отправка будет выключена. Это действие необратимо.",
+                "Удалить", "Отмена", red=True,
+            ):
+                return
+            chat = self.fetch_forum_chat()
+            if not self.is_member(chat):
+                self.notify("Вы не подписаны на форум, отправленных логов нет")
+                if self.get_bool("auto_send"):
+                    self.set_setting("auto_send", False, reload_settings=True)
+                return
+            deleted = self.delete_own_messages(-abs(to_int(chat.id)))
+            leave = TLRPC.TL_channels_leaveChannel()
+            leave.channel = MessagesController.getInputChannel(chat)
+            self.apply_updates(self.rpc(leave))
+            if self.get_bool("auto_send"):
+                self.set_setting("auto_send", False, reload_settings=True)
+            if deleted:
+                self.notify("Все отправленные логи были удалены, вы отписались от форума", "success")
+            else:
+                self.notify("Отправленных логов нет, вы отписались от форума", "success")
+        except Exception as e:
+            log(f"[PS] delete_logs_flow error: {e}")
+            self.notify(f"Не удалось удалить логи: {e}", "error")
+
+    def build_own_search(self, peer, limit, offset_id=0, max_date=0):
+        account = UserConfig.selectedAccount
+        controller = get_messages_controller(account)
+        req = TLRPC.TL_messages_search()
+        req.peer = controller.getInputPeer(peer)
+        req.q = ""
+        req.filter = TLRPC.TL_inputMessagesFilterEmpty()
+        req.limit = limit
+        req.offset_id = offset_id
+        req.max_date = max_date
+        req.from_id = controller.getInputPeer(get_user_config(account).getClientUserId())
+        req.flags |= 1
+        return req
+
+    def delete_batch(self, peer, ids_list):
+        controller = get_messages_controller(UserConfig.selectedAccount)
+        ids = ArrayList()
+        for message_id in ids_list:
+            ids.add(Integer(message_id))
+        done = threading.Event()
+        errors = []
+
+        def task():
+            try:
+                controller.deleteMessages(ids, None, None, peer, 0, True, 0)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                done.set()
+
+        run_on_ui_thread(task)
+        done.wait()
+        if errors:
+            raise errors[0]
+
+    def scan_own_logs(self, peer):
+        seen = set()
+        max_date = 0
+        while True:
+            before = len(seen)
+            window_min_date = None
+            offset_id = 0
+            while True:
+                response = self.rpc(self.build_own_search(peer, DELETE_BATCH_SIZE, offset_id, max_date), 60)
+                batch = [response.messages.get(i) for i in range(response.messages.size())]
+                if not batch:
+                    break
+                ids = []
+                for m in batch:
+                    if isinstance(m, TLRPC.TL_messageEmpty) or m.id <= 0:
+                        continue
+                    if window_min_date is None or m.date < window_min_date:
+                        window_min_date = m.date
+                    if m.id in seen:
+                        continue
+                    seen.add(m.id)
+                    if any(LOG_FILE_RE.match(name) for name in message_file_names(m)):
+                        ids.append(m.id)
+                if ids:
+                    yield ids
+                new_offset = min(m.id for m in batch)
+                if offset_id != 0 and new_offset >= offset_id:
+                    break
+                offset_id = new_offset
+            if len(seen) == before or window_min_date is None:
+                break
+            max_date = window_min_date
+
+    def delete_own_messages(self, peer):
+        deleted = 0
+        for ids in self.scan_own_logs(peer):
+            self.delete_batch(peer, ids)
+            deleted += len(ids)
+            time.sleep(1)
+        for _ in range(5):
+            time.sleep(2)
+            left = [message_id for ids in self.scan_own_logs(peer) for message_id in ids]
+            if not left:
+                return deleted
+            self.delete_batch(peer, left)
+            deleted += len(left)
+        raise RuntimeError("не все файлы логов удалось удалить, отписка отменена")
+
+    def mark_topic_root(self, root):
+        try:
+            root.isTopicMainMessage = True
+        except Exception as e:
+            log(f"[PS] isTopicMainMessage недоступно: {e}")
+        return root
+
+    def make_topic_root(self, peer):
+        account = UserConfig.selectedAccount
+        try:
+            topics = get_messages_controller(UserConfig.selectedAccount).getTopicsController()
+            topic = topics.findTopic(-peer, LOGS_TOPIC_ID)
+            start = getattr(topic, "topicStartMessage", None) if topic is not None else None
+            if start is not None:
+                return self.mark_topic_root(MessageObject(account, start, False, False))
+        except Exception as e:
+            log(f"[PS] make_topic_root cache error: {e}")
+        try:
+            msg = TLRPC.TL_messageService()
+            msg.id = LOGS_TOPIC_ID
+            msg.dialog_id = peer
+            msg.date = int(time.time())
+            msg.peer_id = TLRPC.TL_peerChannel()
+            msg.peer_id.channel_id = -peer
+            msg.action = TLRPC.TL_messageActionTopicCreate()
+            msg.action.title = "logs"
+            return self.mark_topic_root(MessageObject(account, msg, False, False))
+        except Exception as e:
+            log(f"[PS] make_topic_root service error: {e}")
+        msg = TLRPC.TL_message()
+        msg.id = LOGS_TOPIC_ID
+        msg.dialog_id = peer
+        msg.date = int(time.time())
+        msg.message = ""
+        msg.peer_id = TLRPC.TL_peerChannel()
+        msg.peer_id.channel_id = -peer
+        return self.mark_topic_root(MessageObject(account, msg, False, False))
+
+    def send_document_to_topic(self, peer, path):
+        root = self.make_topic_root(peer)
+        send_document(peer, path, replyToMsg=root, replyToTopMsg=root)
+
+    def send_logs(self, manual):
+        if not self.send_lock.acquire(False):
+            if manual:
+                self.notify("Отправка логов уже идёт")
+            return
+        watcher = None
+        center = None
+        path = None
+        try:
+            content = STORE.read()
+            if not content.strip():
+                if manual:
+                    self.notify("Логов нет")
+                return
+            peer = self.resolve_forum_peer()
+            suffix = hashlib.sha1(f"{content}{time.time()}".encode("utf-8")).hexdigest()[:7]
+            file_name = f"{__id__}_{suffix}.log"
+            path = os.path.join(get_cache_dir(), file_name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            center = get_notification_center(UserConfig.selectedAccount)
+            watcher = make_log_watcher(peer, file_name)
+            if not run_on_ui_sync(lambda: (
+                center.addObserver(watcher, NotificationCenter.messageReceivedByServer),
+                center.addObserver(watcher, NotificationCenter.messageSendError),
+            )):
+                raise RuntimeError("не удалось подписаться на события сообщений")
+
+            self.send_document_to_topic(peer, path)
+            if not watcher.event.wait(SEND_TIMEOUT):
+                raise RuntimeError("таймаут: Telegram не подтвердил отправку файла")
+            if not watcher.ok:
+                raise RuntimeError(watcher.error or "неизвестная ошибка отправки")
+
+            STORE.consume(content)
+            if manual:
+                self.notify("Логи отправлены, локальный файл очищен", "success")
+        except Exception as e:
+            log(f"[PS] send_logs error: {e}")
+            self.notify(f"Логи не отправлены: {e}. Файл сохранён", "error")
+        finally:
+            if watcher is not None:
+                watcher.armed = False
+                if center is not None:
+                    run_on_ui_thread(lambda: (
+                        center.removeObserver(watcher, NotificationCenter.messageReceivedByServer),
+                        center.removeObserver(watcher, NotificationCenter.messageSendError),
+                    ))
+            if path:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            self.send_lock.release()
+
+    def notify(self, text, kind="info"):
+        try:
+            if kind == "error":
+                log(f"[PS] ошибка: {text}")
+            if kind == "error":
+                BulletinHelper.show_error(text)
+            elif kind == "success":
+                BulletinHelper.show_success(text)
+            else:
+                BulletinHelper.show_info(text)
+        except Exception as e:
+            log(f"[PS] notify error: {e}")
+
     def create_settings(self):
         return [
+            Header(text="Что получать"),
+        ] + ([
+            Text(text="Список протоколов и стран", icon="msg_retry", accent=True, on_click=lambda v: self._fetch_stats()),
+        ] if _PROTOCOLS is None else [
+            Switch(key="filter_enabled", text="Фильтр", icon="msg_folders", default=True, on_change=lambda v: self.set_setting("filter_reload", time.time(), reload_settings=True)),
+        ]) + ([
+            Selector(key="fetch_mode", text="Способ получения", icon="msg_list", default=0, items=["Протокол", "Страна"], on_change=lambda i: self.set_setting("fetch_mode_reload", i, reload_settings=True)),
+        ] + self._stats_settings() if self._filter_on() else []) + [
+            Divider(text="Выберите типы прокси, которые хотите получать. Подробную информацию о получаемых прокси и протоколах можно просмотреть на [сайте](https://proxy.akres.xyz)." + ("" if self._filter_on() else " Без фильтра при получении будут добавлены все доступные прокси.")),
             Header(text="Действия"),
             Text(text="Получить новый список", icon="msg_download", on_click=lambda v: self._fetch_proxies()),
             Text(text="Экспортировать прокси", icon="msg_share", on_click=lambda v: self._export_proxies()),
-            Divider(text="Выберите ниже типы прокси, которые хотите получать. Подробную информацию о получаемых прокси и протоколах можно просмотреть на [сайте](https://proxy.akres.xyz), если не открывается — попробуйте [зеркало](https://akres.gitverse.site/proxy)"),
-            Header(text="MTProto"),
-            Switch(key="mtproto_faketls", text="FakeTLS", default=True),
-            Switch(key="mtproto_padding", text="Padding", default=True),
-            Header(text="WebProxy"),
-            Switch(key="web_websocket", text="WebSocket", default=True),
-            Switch(key="web_websocket_lanes", text="WebSocket-Lanes", default=True),
-            Switch(key="web_https", text="HTTPS", default=True),
-            Switch(key="web_https_lanes", text="HTTPS-Lanes", default=True),
-            Header(text="Источник"),
-            Selector(key="proxy_source", text="Источник прокси", icon="msg_link", default=0, items=["GitVerse", "GitHub"]),
+            Text(text="Удалить все прокси", icon="msg_delete", red=True, on_click=lambda v: self._confirm_delete_all()),
+            Header(text="Логи"),
+            Switch(
+                key="log_enabled",
+                text="Запись логов",
+                default=False,
+                subtext="Пишет логи плагина в файл",
+                icon="msg_log",
+                on_change=self.on_log_toggle,
+            ),
+            Switch(
+                key="auto_send",
+                text="Автоматическая отправка",
+                default=False,
+                subtext=f"Каждый час в 00 отправляет файл на форум {FORUM_USERNAME}",
+                icon="msg_send",
+                on_change=self.on_auto_toggle,
+            ),
+            Text(
+                text="Отправить логи сейчас",
+                icon="msg_forward",
+                on_click=self.on_force_send_click,
+            ),
+            Text(
+                text="Удалить отправленные логи",
+                icon="msg_delete",
+                red=True,
+                on_click=self.on_delete_logs_click,
+            ),
         ]
 
-    def _open_url(self, url):
+    def _filter_on(self):
+        return _PROTOCOLS is not None and bool(self.get_setting("filter_enabled", True))
+
+    def _stats_settings(self):
+        if self.get_setting("fetch_mode", 0) == 1:
+            if not _COUNTRIES:
+                return [Text(text="В источнике нет данных о странах")]
+            items = [Header(text="Страна")]
+            for code, cnt, name in _country_sorted():
+                items.append(Switch(key=f"country_{code}", text=f"{_country_flag(code)} {name} ({cnt})", default=False))
+            return items
+        items = []
+        last = None
+        for key, label, group in [
+            ("mtproto_faketls", "FakeTLS", "MTProto"),
+            ("mtproto_padding", "Padding", "MTProto"),
+            ("web_websocket", "WebSocket", "WebProxy"),
+            ("web_websocket_lanes", "WebSocket-Lanes", "WebProxy"),
+            ("web_https", "HTTPS", "WebProxy"),
+            ("web_https_lanes", "HTTPS-Lanes", "WebProxy"),
+        ]:
+            cnt = _PROTOCOLS.get(key)
+            if not cnt:
+                continue
+            if group != last:
+                items.append(Header(text=group))
+                last = group
+            items.append(Switch(key=key, text=f"{label} ({cnt})", default=False))
+        return items
+
+    def _reset_filters(self):
+        keys = set(["mtproto_faketls", "mtproto_padding", "web_websocket", "web_websocket_lanes", "web_https", "web_https_lanes"])
+        for code in (_COUNTRIES or {}):
+            keys.add(f"country_{code}")
         try:
-            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
-            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(intent)
+            for k in list(self.export_settings().keys()):
+                if str(k).startswith("country_"):
+                    keys.add(k)
         except Exception as e:
-            log(f"[PS] open_url error: {e}")
+            log(f"[PS] export_settings failed: {e}")
+        for key in keys:
+            self.set_setting(key, False)
+
+    def _selection_error(self):
+        if not self._filter_on():
+            return None
+        if self.get_setting("fetch_mode", 0) == 1:
+            if _COUNTRIES and not any(self.get_setting(f"country_{c}", False) for c in _COUNTRIES):
+                return "Выберите хотя бы одну страну."
+        elif not any(self.get_setting(key, False) for key in ["mtproto_faketls", "mtproto_padding", "web_websocket", "web_websocket_lanes", "web_https", "web_https_lanes"]):
+            return "Выберите хотя бы один протокол."
+        return None
+
+    def _country_allowed(self, entry):
+        if not self._filter_on() or self.get_setting("fetch_mode", 0) != 1 or not _COUNTRIES:
+            return True
+        c = _entry_country(entry)
+        if not c:
+            return True
+        return self.get_setting(f"country_{c}", False)
 
     def _is_allowed(self, p):
-        if p["type"] == "mtproto":
-            if p["subtype"] == "faketls": return self.get_setting("mtproto_faketls", True)
-            if p["subtype"] == "padding": return self.get_setting("mtproto_padding", True)
-        if p["type"] == "web":
-            via = p["via"]
-            if via == "websocket": return self.get_setting("web_websocket", True)
-            if via == "websocket-lanes": return self.get_setting("web_websocket_lanes", True)
-            if via == "https": return self.get_setting("web_https", True)
-            if via == "https-lanes": return self.get_setting("web_https_lanes", True)
-        return True
+        if not self._filter_on() or self.get_setting("fetch_mode", 0) == 1:
+            return True
+        key = _proto_setting_key(p)
+        if key not in ["mtproto_faketls", "mtproto_padding", "web_websocket", "web_websocket_lanes", "web_https", "web_https_lanes"]:
+            return True
+        return self.get_setting(key, False)
+
+    def _load_entries(self):
+        try:
+            with urllib.request.urlopen("https://github.com/theakres/Proxy/raw/main/proxies.json", timeout=8) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            log(f"[PS] source failed: {e}")
+        return None
+
+    def _fetch_stats(self):
+        BulletinHelper.show_info("Загружаем списки протоколов и стран…")
+        run_on_queue(self._do_fetch_stats, PLUGINS_QUEUE)
+
+    def _do_fetch_stats(self):
+        entries = self._load_entries()
+        if entries is None:
+            return run_on_ui_thread(lambda: self.notify("Не удалось загрузить списки из источника", "error"))
+        countries = {}
+        protocols = {}
+        for entry in entries:
+            p = _parse_entry(entry)
+            if p is None:
+                continue
+            k = _proto_setting_key(p)
+            protocols[k] = protocols.get(k, 0) + 1
+            c = _entry_country(entry)
+            if c:
+                countries[c] = countries.get(c, 0) + 1
+        if not protocols:
+            return run_on_ui_thread(lambda: self.notify("В источнике нет прокси", "error"))
+        def done():
+            global _COUNTRIES, _PROTOCOLS
+            # 1) убираем старые ползунки из UI, 2) сбрасываем все значения, 3) строим страницу заново
+            _COUNTRIES = None
+            _PROTOCOLS = None
+            self.set_setting("stats_loaded_at", time.time(), reload_settings=True)
+            _COUNTRIES = countries
+            _PROTOCOLS = protocols
+            self._reset_filters()
+            run_on_ui_thread(lambda: self.set_setting("stats_reloaded_at", time.time(), reload_settings=True))
+        run_on_ui_thread(done)
 
     def _fetch_proxies(self):
+        error = self._selection_error()
+        if error:
+            return BulletinHelper.show_info(error)
         BulletinHelper.show_info("Загружаем список прокси…")
         run_on_queue(self._do_fetch, PLUGINS_QUEUE)
 
     def _do_fetch(self):
-        source_idx = self.get_setting("proxy_source", 0)
-        urls = [
-            "https://gitverse.ru/api/repos/Akres/Proxy/raw/branch/master/proxies.json",
-            "https://github.com/theakres/Proxy/raw/main/proxies.json",
-        ]
-        raw = None
-        for idx in [source_idx, 1 - source_idx]:
-            try:
-                with urllib.request.urlopen(urls[idx], timeout=8) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                break
-            except Exception as e:
-                log(f"[PS] source {idx} failed: {e}")
-        if raw is None:
-            return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить прокси из всех источников"))
-        try:
-            entries = json.loads(raw)
-        except Exception as e:
-            return run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка парсинга JSON: {e}"))
+        entries = self._load_entries()
+        if entries is None:
+            return run_on_ui_thread(lambda: self.notify("Не удалось загрузить прокси из источника", "error"))
         parsed = {}
         for entry in entries:
             p = _parse_entry(entry)
-            if p and self._is_allowed(p):
+            if p and self._is_allowed(p) and self._country_allowed(entry):
                 parsed[_proxy_key(p)] = p
-        SC = jclass("org.telegram.messenger.SharedConfig")
-        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
-        SC.loadProxyList()
+        _, PC = _proxy_env()
         existing = set()
         try:
             for i in range(PC.getProxyList().size()):
@@ -143,17 +928,15 @@ class ProxyManagerPlugin(BasePlugin):
                         existing.add(f"web:{addr}:{secret}")
                     else:
                         existing.add(f"mtproto:{addr}:{port}:{secret}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    log(f"[PS] read proxy entry error: {e}")
+        except Exception as e:
+            log(f"[PS] read proxy list error: {e}")
         ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
-        Uri = jclass("android.net.Uri")
         PS = jclass("org.telegram.utils.proxy.ProxySettings")
         added = duplicates = skipped = 0
         for key, p in parsed.items():
-            chk = f"web:{p['server']}:{p['secret']}" if p["type"] == "web" else f"mtproto:{p['server']}:{p['port']}:{p['secret']}"
-            if chk in existing:
+            if key in existing:
                 duplicates += 1
                 continue
             try:
@@ -162,7 +945,7 @@ class ProxyManagerPlugin(BasePlugin):
                     skipped += 1
                     continue
                 PC.addProxy(ProxyInfo(ps))
-                existing.add(chk)
+                existing.add(key)
                 added += 1
             except Exception as e:
                 log(f"[PS] addProxy error ({p['server']}): {e}")
@@ -172,43 +955,112 @@ class ProxyManagerPlugin(BasePlugin):
             msg += f" Пропущено: {skipped}."
         run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
 
+    def _confirm_delete_all(self):
+        try:
+            total = int(_proxy_env()[1].getProxyList().size())
+        except Exception as e:
+            log(f"[PS] count error: {e}")
+            total = -1
+        if total == 0:
+            return BulletinHelper.show_info("Нет прокси для удаления.")
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag else None
+        if not act:
+            return self.notify("Не удалось показать окно подтверждения", "error")
+        cnt_txt = f" ({total})" if total > 0 else ""
+        b = AlertDialogBuilder(act)
+        b.set_title("Удалить все прокси?")
+        b.set_message(f"После нажатия этой кнопки все прокси{cnt_txt} будут удалены. Рекомендуется сделать экспорт, если среди них есть нужные вам прокси.")
+        def on_ok(bld, which):
+            bld.dismiss()
+            run_on_queue(lambda: self._do_delete_all(total), PLUGINS_QUEUE)
+        b.set_positive_button("Удалить", on_ok)
+        b.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+        b.show()
+
+    def _do_delete_all(self, total):
+        try:
+            SC, PC = _proxy_env()
+            def left():
+                try:
+                    return PC.getProxyList().size()
+                except Exception:
+                    return -1
+            if left() == 0:
+                return run_on_ui_thread(lambda: BulletinHelper.show_info("Нет прокси для удаления."))
+            for owner in (PC, SC):
+                if left() == 0:
+                    break
+                try:
+                    owner.deleteAllProxies()
+                except Exception as e:
+                    log(f"[PS] deleteAllProxies failed: {e}")
+            if left() != 0:
+                pl = PC.getProxyList()
+                items = [pl.get(i) for i in range(pl.size())]
+                for info in items:
+                    for owner, name in ((SC, "deleteProxy"), (PC, "deleteProxy"), (PC, "removeProxy")):
+                        try:
+                            getattr(owner, name)(info)
+                            break
+                        except Exception:
+                            continue
+            try:
+                SC.loadProxyList()
+                nc = jclass("org.telegram.messenger.NotificationCenter")
+                nc.getGlobalInstance().postNotificationName(nc.proxySettingsChanged)
+            except Exception as e:
+                log(f"[PS] proxy list refresh error: {e}")
+            if left() == 0:
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Удалено прокси: {total}." if total > 0 else "Все прокси удалены."))
+            else:
+                run_on_ui_thread(lambda: self.notify("Не удалось удалить все прокси.", "error"))
+        except Exception as e:
+            log(f"[PS] delete all error: {e}")
+            run_on_ui_thread(lambda: self.notify(f"Ошибка удаления: {e}", "error"))
+
     def _export_proxies(self):
         run_on_queue(self._do_export, PLUGINS_QUEUE)
 
     def _do_export(self):
         try:
-            SC = jclass("org.telegram.messenger.SharedConfig")
-            PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
-            SC.loadProxyList()
+            _, PC = _proxy_env()
             pl = PC.getProxyList()
             if not pl or pl.size() == 0:
                 return run_on_ui_thread(lambda: BulletinHelper.show_info("Нет прокси для экспорта."))
-            faketls, padding, web = [], [], []
+            faketls, padding, web, socks = [], [], [], []
             for i in range(pl.size()):
                 try:
-                    s = pl.get(i).settings
+                    info = pl.get(i)
+                    s = info.settings
                     addr = str(s.getAddress())
                     port = int(s.getPort())
                     secret = str(s.getSecret()) if s.getSecret() else ""
                     if str(s.getType()) == "WEB":
                         web.append(f"tg://webproxy?server={addr}&secret={secret}")
+                    elif not secret:
+                        user = _jget(s, ("getUsername", "getUser")) or _jget(info, (), ("username",))
+                        pwd = _jget(s, ("getPassword", "getPass")) or _jget(info, (), ("password",))
+                        socks.append({"addr": addr, "port": port, "secret": "", "user": user, "pass": pwd})
                     else:
                         e = {"addr": addr, "port": port, "secret": secret,
                              "line": f"tg://proxy?server={addr}&port={port}&secret={secret}"}
                         (faketls if secret.startswith("ee") else padding).append(e)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"[PS] export entry error: {e}")
             faketls.sort(key=_mtp_sort_key)
             padding.sort(key=_mtp_sort_key)
             web.sort(key=_web_sort_key)
+            socks.sort(key=_mtp_sort_key)
             sections = []
             if faketls: sections.append("FakeTLS (MTP):\n" + "\n".join(e["line"] for e in faketls))
             if padding: sections.append("Padding (MTP):\n" + "\n".join(e["line"] for e in padding))
             if web: sections.append("WebProxy:\n" + "\n".join(web))
+            if socks: sections.append("SOCKS:\n" + "\n".join(_socks_line(e) for e in socks))
             if not sections:
-                return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сформировать список."))
+                return run_on_ui_thread(lambda: self.notify("Не удалось сформировать список.", "error"))
             txt = "\n\n".join(sections)
-            total = len(faketls) + len(padding) + len(web)
+            total = len(faketls) + len(padding) + len(web) + len(socks)
             entities = []
             offset = 0
             for section in sections:
@@ -239,4 +1091,4 @@ class ProxyManagerPlugin(BasePlugin):
                 run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {total} прокси файлом в Избранное."))
         except Exception as e:
             log(f"[PS] export error: {e}")
-            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка экспорта: {e}"))
+            run_on_ui_thread(lambda: self.notify(f"Ошибка экспорта: {e}", "error"))

@@ -1,0 +1,242 @@
+import hashlib
+import ipaddress
+import json
+import os
+import time
+import urllib.request
+from urllib.parse import parse_qs, urlparse
+
+from android.content import Intent
+from android.net import Uri
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import PLUGINS_QUEUE, get_user_config, run_on_queue, send_document, send_message
+from java import jclass
+from org.telegram.tgnet import TLRPC
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "proxy_sub"
+__name__ = "Proxy Sub"
+__description__ = "Загружает список прокси MTProto и WebProxy из удалённого источника и добавляет их в ваш клиент.\n\nВозможности:\n • Выбор источника (GitVerse / GitHub) с автофоллбэком\n • Фильтрация типов прокси через настройки плагина\n • Экспорт текущего списка прокси в Избранное (сообщением или файлом, если список большой)"
+__author__ = "@akresik"
+__version__ = "2.0.0"
+__min_version__ = "12.10.5"
+__icon__ = "OliverEmoji/21"
+
+def _parse_entry(entry):
+    server = entry.get("server")
+    if not server:
+        return None
+    secret = entry.get("secret", "")
+    via = entry.get("via")
+    if via:
+        return {"type": "web", "via": via, "server": server, "secret": secret}
+    port = entry.get("port")
+    if not port:
+        return None
+    subtype = "faketls" if secret.lower().startswith("ee") else "padding"
+    return {"type": "mtproto", "subtype": subtype, "server": server, "port": int(port), "secret": secret}
+
+def _proxy_key(p):
+    if p["type"] == "web":
+        return f"web:{p['server']}:{p['secret']}"
+    return f"mtproto:{p['server']}:{p['port']}:{p['secret']}"
+
+def _build_uri(p):
+    if p["type"] == "web":
+        return f"tg://webproxy?server={p['server']}&secret={p['secret']}"
+    return f"tg://proxy?server={p['server']}&port={p['port']}&secret={p['secret']}"
+
+def _mtp_sort_key(e):
+    try:
+        ip_key = (0, int(ipaddress.ip_address(e["addr"])))
+    except Exception:
+        ip_key = (1, e["addr"])
+    return (ip_key, e["port"], len(e["secret"]), e["secret"])
+
+def _web_sort_key(line):
+    p = parse_qs(urlparse(line).query)
+    return (p.get("server", [""])[0], p.get("secret", [""])[0])
+
+class ProxyManagerPlugin(BasePlugin):
+    def create_settings(self):
+        return [
+            Header(text="Действия"),
+            Text(text="Получить новый список", icon="msg_download", on_click=lambda v: self._fetch_proxies()),
+            Text(text="Экспортировать прокси", icon="msg_share", on_click=lambda v: self._export_proxies()),
+            Divider(text="Выберите ниже типы прокси, которые хотите получать. Подробную информацию о получаемых прокси и протоколах можно просмотреть на [сайте](https://proxy.akres.xyz), если не открывается — попробуйте [зеркало](https://akres.gitverse.site/proxy)"),
+            Header(text="MTProto"),
+            Switch(key="mtproto_faketls", text="FakeTLS", default=True),
+            Switch(key="mtproto_padding", text="Padding", default=True),
+            Header(text="WebProxy"),
+            Switch(key="web_websocket", text="WebSocket", default=True),
+            Switch(key="web_websocket_lanes", text="WebSocket-Lanes", default=True),
+            Switch(key="web_https", text="HTTPS", default=True),
+            Switch(key="web_https_lanes", text="HTTPS-Lanes", default=True),
+            Header(text="Источник"),
+            Selector(key="proxy_source", text="Источник прокси", icon="msg_link", default=0, items=["GitVerse", "GitHub"]),
+        ]
+
+    def _open_url(self, url):
+        try:
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+        except Exception as e:
+            log(f"[PS] open_url error: {e}")
+
+    def _is_allowed(self, p):
+        if p["type"] == "mtproto":
+            if p["subtype"] == "faketls": return self.get_setting("mtproto_faketls", True)
+            if p["subtype"] == "padding": return self.get_setting("mtproto_padding", True)
+        if p["type"] == "web":
+            via = p["via"]
+            if via == "websocket": return self.get_setting("web_websocket", True)
+            if via == "websocket-lanes": return self.get_setting("web_websocket_lanes", True)
+            if via == "https": return self.get_setting("web_https", True)
+            if via == "https-lanes": return self.get_setting("web_https_lanes", True)
+        return True
+
+    def _fetch_proxies(self):
+        BulletinHelper.show_info("Загружаем список прокси…")
+        run_on_queue(self._do_fetch, PLUGINS_QUEUE)
+
+    def _do_fetch(self):
+        source_idx = self.get_setting("proxy_source", 0)
+        urls = [
+            "https://gitverse.ru/api/repos/Akres/Proxy/raw/branch/master/proxies.json",
+            "https://github.com/theakres/Proxy/raw/main/proxies.json",
+        ]
+        raw = None
+        for idx in [source_idx, 1 - source_idx]:
+            try:
+                with urllib.request.urlopen(urls[idx], timeout=8) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                break
+            except Exception as e:
+                log(f"[PS] source {idx} failed: {e}")
+        if raw is None:
+            return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить прокси из всех источников"))
+        try:
+            entries = json.loads(raw)
+        except Exception as e:
+            return run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка парсинга JSON: {e}"))
+        parsed = {}
+        for entry in entries:
+            p = _parse_entry(entry)
+            if p and self._is_allowed(p):
+                parsed[_proxy_key(p)] = p
+        SC = jclass("org.telegram.messenger.SharedConfig")
+        PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+        SC.loadProxyList()
+        existing = set()
+        try:
+            for i in range(PC.getProxyList().size()):
+                try:
+                    s = PC.getProxyList().get(i).settings
+                    addr = str(s.getAddress())
+                    port = int(s.getPort())
+                    secret = str(s.getSecret()) if s.getSecret() else ""
+                    if str(s.getType()) == "WEB":
+                        existing.add(f"web:{addr}:{secret}")
+                    else:
+                        existing.add(f"mtproto:{addr}:{port}:{secret}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+        Uri = jclass("android.net.Uri")
+        PS = jclass("org.telegram.utils.proxy.ProxySettings")
+        added = duplicates = skipped = 0
+        for key, p in parsed.items():
+            chk = f"web:{p['server']}:{p['secret']}" if p["type"] == "web" else f"mtproto:{p['server']}:{p['port']}:{p['secret']}"
+            if chk in existing:
+                duplicates += 1
+                continue
+            try:
+                ps = PS.fromUri(Uri.parse(_build_uri(p)))
+                if ps is None:
+                    skipped += 1
+                    continue
+                PC.addProxy(ProxyInfo(ps))
+                existing.add(chk)
+                added += 1
+            except Exception as e:
+                log(f"[PS] addProxy error ({p['server']}): {e}")
+                skipped += 1
+        msg = f"Добавлено: {added}. Уже было: {duplicates}."
+        if skipped:
+            msg += f" Пропущено: {skipped}."
+        run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+
+    def _export_proxies(self):
+        run_on_queue(self._do_export, PLUGINS_QUEUE)
+
+    def _do_export(self):
+        try:
+            SC = jclass("org.telegram.messenger.SharedConfig")
+            PC = jclass("com.exteragram.messenger.proxy.ProxyController").getInstance()
+            SC.loadProxyList()
+            pl = PC.getProxyList()
+            if not pl or pl.size() == 0:
+                return run_on_ui_thread(lambda: BulletinHelper.show_info("Нет прокси для экспорта."))
+            faketls, padding, web = [], [], []
+            for i in range(pl.size()):
+                try:
+                    s = pl.get(i).settings
+                    addr = str(s.getAddress())
+                    port = int(s.getPort())
+                    secret = str(s.getSecret()) if s.getSecret() else ""
+                    if str(s.getType()) == "WEB":
+                        web.append(f"tg://webproxy?server={addr}&secret={secret}")
+                    else:
+                        e = {"addr": addr, "port": port, "secret": secret,
+                             "line": f"tg://proxy?server={addr}&port={port}&secret={secret}"}
+                        (faketls if secret.startswith("ee") else padding).append(e)
+                except Exception:
+                    pass
+            faketls.sort(key=_mtp_sort_key)
+            padding.sort(key=_mtp_sort_key)
+            web.sort(key=_web_sort_key)
+            sections = []
+            if faketls: sections.append("FakeTLS (MTP):\n" + "\n".join(e["line"] for e in faketls))
+            if padding: sections.append("Padding (MTP):\n" + "\n".join(e["line"] for e in padding))
+            if web: sections.append("WebProxy:\n" + "\n".join(web))
+            if not sections:
+                return run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сформировать список."))
+            txt = "\n\n".join(sections)
+            total = len(faketls) + len(padding) + len(web)
+            entities = []
+            offset = 0
+            for section in sections:
+                bold = TLRPC.TL_messageEntityBold()
+                bold.offset = offset
+                bold.length = section.index("\n")
+                entities.append(bold)
+                offset += len(section.encode("utf-16-le")) // 2 + 2
+            q = TLRPC.TL_messageEntityBlockquote()
+            q.collapsed = True
+            q.offset = 0
+            q.length = len(txt.encode("utf-16-le")) // 2
+            entities.append(q)
+            peer = get_user_config().getClientUserId()
+            if len(txt.encode("utf-16-le")) // 2 <= 4096:
+                send_message({"peer": peer, "message": txt, "entities": entities})
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {total} прокси в Избранное."))
+            else:
+                suffix = hashlib.sha1(str(time.time()).encode()).hexdigest()[:7]
+                fname = f"proxy-{suffix}.txt"
+                fpath = os.path.join(
+                    jclass("org.telegram.messenger.ApplicationLoader").applicationContext.getCacheDir().getAbsolutePath(),
+                    fname
+                )
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                send_document(peer, fpath)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Экспортировано {total} прокси файлом в Избранное."))
+        except Exception as e:
+            log(f"[PS] export error: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка экспорта: {e}"))
