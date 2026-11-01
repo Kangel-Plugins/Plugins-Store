@@ -1,0 +1,4177 @@
+import weakref
+import time
+from typing import Any, List
+from base_plugin import BasePlugin, MethodHook
+try:
+    from base_plugin import HookFilter, hook_filters
+except Exception:
+    HookFilter = None
+    hook_filters = None
+from hook_utils import find_class, get_private_field as _raw_get_private_field
+from client_utils import get_messages_controller, get_last_fragment
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Switch, Text, Divider, Input
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from java import jclass
+try:
+    from java import jint
+except Exception:
+    jint = None
+try:
+    from java import jarray
+except Exception:
+    jarray = None
+from java.util import ArrayList as JavaArrayList
+from java.lang import Boolean, Integer
+__id__ = 'subfolders'
+__name__ = 'Subfolders'
+__description__ = 'Nested folders (subfolders) for chats: "Work" → "Project A" / "Project B"'
+__version__ = '1.8.0'
+__author__ = '@chestertech'
+__icon__ = 'msg_folders'
+__min_version__ = '12.10.6'
+__category__ = ["appearance","chats"]
+DEFAULT_SEPARATOR = '/'
+PARENT_CONTENT_CHECK_ENABLED = True
+CLICK_DEDUP_MS = 800
+NOTIFY_DELAY_MS = 16
+_FILTERS_GENERATION = [0]
+
+def get_private_field(obj, name):
+    return _raw_get_private_field(obj, name)
+
+def _get_activity():
+    try:
+        frag = get_last_fragment()
+        if frag is None:
+            return None
+        return frag.getParentActivity()
+    except Exception as e:
+        return None
+
+def _notify_filters_changed(delay=NOTIFY_DELAY_MS):
+
+    def do_notify():
+        try:
+            from org.telegram.messenger import NotificationCenter, UserConfig
+            nc = NotificationCenter.getInstance(UserConfig.selectedAccount)
+            nc.postNotificationName(NotificationCenter.dialogFiltersUpdated)
+        except Exception as e:
+            pass
+    run_on_ui_thread(do_notify, delay=delay)
+
+def _filter_display_name(f):
+    try:
+        if f.isDefault():
+            try:
+                from org.telegram.messenger import LocaleController, R
+                return str(LocaleController.getString(R.string.FilterAllChats))
+            except Exception:
+                return 'Все чаты'
+    except Exception:
+        pass
+    try:
+        name = f.name
+        if name is not None and str(name):
+            return str(name)
+    except Exception:
+        pass
+    for attr in ('title', 'localName'):
+        try:
+            v = getattr(f, attr, None)
+            if v is not None:
+                try:
+                    t = getattr(v, 'text', None)
+                    if t is not None:
+                        return str(t)
+                except Exception:
+                    pass
+                if str(v):
+                    return str(v)
+        except Exception:
+            continue
+    try:
+        return f'Папка {f.id}'
+    except Exception:
+        return 'Папка'
+
+def _is_default_filter(f):
+    try:
+        return bool(f.isDefault())
+    except Exception:
+        return False
+
+class FolderTree:
+
+    def __init__(self, separator):
+        self.separator = separator
+        self.default_filter = None
+        self.top_level = []
+        self.groups = {}
+
+    @staticmethod
+    def build(filters, separator, name_overrides=None):
+        tree = FolderTree(separator)
+        for f in filters:
+            if _is_default_filter(f):
+                tree.default_filter = f
+                continue
+            name = _filter_display_name(f)
+            if name_overrides and separator not in name:
+                fid = _safe_filter_id(f)
+                if fid in name_overrides:
+                    name = name_overrides[fid]
+            if name is None:
+                name = _filter_display_name(f)
+            if separator in name:
+                parent_name, child_name = name.split(separator, 1)
+                parent_name = parent_name.strip()
+                child_name = child_name.strip()
+                grp = tree.groups.setdefault(parent_name, {'parent': None, 'children': []})
+                grp['children'].append((child_name, f))
+            else:
+                tree.top_level.append((name.strip(), f))
+        for name, f in tree.top_level:
+            if name in tree.groups:
+                tree.groups[name]['parent'] = f
+        return tree
+
+    def group_names(self):
+        return list(self.groups.keys())
+
+    def children_of(self, parent_name):
+        grp = self.groups.get(parent_name)
+        return grp['children'] if grp else []
+
+    def parent_filter_of(self, parent_name):
+        grp = self.groups.get(parent_name)
+        return grp['parent'] if grp else None
+
+    def describe(self):
+        return {'separator': self.separator, 'has_default': self.default_filter is not None, 'top_level': [n for n, _ in self.top_level], 'groups': {p: {'has_parent_folder': g['parent'] is not None, 'children': [c for c, _ in g['children']]} for p, g in self.groups.items()}}
+GROUP_TAB_ID_BASE = 20300
+SUPPRESS_AFTER_NAV_MS = 1200
+
+def _set_filter_name(f, name):
+    try:
+        f.name = name
+        return True
+    except Exception as e:
+        try:
+            TL = jclass('org.telegram.tgnet.TLRPC$TL_textWithEntities')
+            t = TL()
+            t.text = name
+            f.name = t
+            return True
+        except Exception as e2:
+            return False
+
+def _make_filter_stub(fid, name):
+    try:
+        try:
+            DialogFilter = jclass('org.telegram.messenger.MessagesController$DialogFilter')
+            df = DialogFilter()
+            df.id = fid
+            _set_filter_name(df, name)
+            try:
+                df.flags = 0
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            return None
+    except Exception:
+        pass
+
+def _java_filter(*names):
+    if HookFilter is None or hook_filters is None:
+        return lambda fn: fn
+    try:
+        return hook_filters(*[getattr(HookFilter, n) for n in names])
+    except Exception:
+        return lambda fn: fn
+
+class GetDialogFiltersHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._last_signature = None
+        self._stable_key = None
+        self._cached_visible = None
+        self._cached_result = None
+
+    @_java_filter('RESULT_NOT_NULL')
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            key = self._stable_key
+            if key is not None and self._cached_visible is not None:
+                original = param.getResult()
+                if original is not None and key == (self.plugin.expanded_group, tuple(((_identity(original.get(i)), _safe_filter_id(original.get(i)), _filter_display_name(original.get(i))) for i in range(original.size()))), _FILTERS_GENERATION[0]):
+                    self.plugin.last_visible = self._cached_visible
+                    if self._cached_result is not None:
+                        param.setResult(self._cached_result)
+                    return
+        except Exception:
+            pass
+        self._handle(param)
+
+    def _handle(self, param):
+        try:
+            original = param.getResult()
+            if original is None or original.size() == 0:
+                return
+            separator = self.plugin.get_separator()
+            all_filters = [original.get(i) for i in range(original.size())]
+            cheap_key = _cheap_key_of(all_filters, self.plugin.expanded_group)
+            if cheap_key is not None and cheap_key == self._stable_key and (self._cached_visible is not None):
+                self.plugin.last_visible = self._cached_visible
+                if self._cached_result is not None:
+                    param.setResult(self._cached_result)
+                return
+            tree = FolderTree.build(all_filters, separator, self.plugin._orig_names)
+            self.plugin.last_tree = tree
+            expanded = self.plugin.expanded_group
+            if expanded is not None and expanded not in tree.groups:
+                self.plugin.expanded_group = None
+                self.plugin._nav_generation += 1
+                self.plugin._select_generation += 1
+                self.plugin._suppress_until = 0.0
+                self.plugin._suppress_tab = None
+                expanded = None
+            visible = []
+            if expanded is None:
+                self.plugin._restore_child_names(all_filters)
+                for f in all_filters:
+                    if _is_default_filter(f):
+                        visible.append(f)
+                        continue
+                    name = _filter_display_name(f)
+                    if separator in name:
+                        continue
+                    visible.append(f)
+                for gname in tree.group_names():
+                    if tree.parent_filter_of(gname) is None:
+                        stub = self.plugin._get_group_tab_filter(gname)
+                        if stub is not None:
+                            visible.append(stub)
+            else:
+                grp = tree.groups[expanded]
+                parent_tab = tree.parent_filter_of(expanded)
+                if parent_tab is None:
+                    parent_tab = self.plugin._get_group_tab_filter(expanded)
+                if parent_tab is not None:
+                    visible.append(parent_tab)
+                for child_name, child in grp['children']:
+                    self.plugin._apply_child_short_name(child, child_name)
+                    visible.append(child)
+            signature = _signature_of(all_filters, expanded)
+            if signature != self._last_signature:
+                self._last_signature = signature
+            self.plugin.last_visible = visible
+            self._cached_visible = visible
+            self._cached_result = None
+            if [_safe_filter_id(x) for x in visible] != [_safe_filter_id(x) for x in all_filters]:
+                result = JavaArrayList()
+                for f in visible:
+                    result.add(f)
+                self._cached_result = result
+                param.setResult(result)
+            self._stable_key = _cheap_key_of(all_filters, self.plugin.expanded_group)
+        except Exception as e:
+            pass
+
+def _safe_filter_id(f):
+    try:
+        return int(f.id)
+    except Exception:
+        return -1
+
+def _safe_size(obj):
+    try:
+        if obj is None:
+            return 0
+        return int(obj.size())
+    except Exception:
+        return -1
+
+def _field_size(f, field_name):
+    try:
+        v = getattr(f, field_name)
+        if v is not None:
+            return int(v.size())
+        return 0
+    except Exception:
+        pass
+    try:
+        v = get_private_field(f, field_name)
+        if v is not None:
+            return int(v.size())
+        return 0
+    except Exception:
+        pass
+    return -1
+
+def _filter_snapshot(f):
+    snap = {'id': _safe_filter_id(f), 'name': _filter_display_name(f)}
+    try:
+        snap['flags'] = int(f.flags)
+    except Exception:
+        snap['flags'] = -1
+    try:
+        snap['always'] = _field_size(f, 'alwaysShow')
+    except Exception:
+        snap['always'] = -1
+    try:
+        snap['never'] = _field_size(f, 'neverShow')
+    except Exception:
+        snap['never'] = -1
+    try:
+        pinned = getattr(f, 'pinnedDialogs', None)
+        snap['pinned'] = int(pinned.size()) if pinned is not None else 0
+    except Exception:
+        snap['pinned'] = -1
+    return snap
+
+def _cheap_key_of(filters, expanded):
+    try:
+        return (expanded, tuple(((_identity(f), _safe_filter_id(f), _filter_display_name(f)) for f in filters)), _FILTERS_GENERATION[0])
+    except Exception:
+        return None
+
+def _signature_of(filters, expanded):
+    parts = []
+    for f in filters:
+        s = _filter_snapshot(f)
+        parts.append((s['id'], s['name'], s['flags'], s['always'], s['never'], s['pinned']))
+    return (expanded, tuple(parts))
+
+class FilterMutationHook(MethodHook):
+
+    def __init__(self, plugin, method_name):
+        self.plugin = plugin
+        self.method_name = method_name
+
+    def before_hooked_method(self, param):
+        if self.plugin._unloaded or self.method_name != 'removeFilter':
+            return
+        try:
+            args = list(param.args) if param.args is not None else []
+            folder = args[0] if args else None
+            plan = self.plugin._capture_parent_delete(param.thisObject, folder)
+            if plan is not None:
+                self.plugin._cascade_plans[_identity(param)] = plan
+        except Exception as exc:
+            pass
+
+    def after_hooked_method(self, param):
+        plan = self.plugin._cascade_plans.pop(_identity(param), None) if self.method_name == 'removeFilter' else None
+        if self.plugin._unloaded:
+            return
+        if plan is not None:
+            failed = False
+            try:
+                failed = bool(param.hasThrowable())
+            except Exception:
+                pass
+            if not failed:
+                try:
+                    self.plugin._finish_parent_delete(param.thisObject, plan)
+                except Exception as exc:
+                    pass
+        try:
+            args = list(param.args) if param.args is not None else []
+            info = {'method': self.method_name, 'args': _describe_args(args)}
+            for a in args:
+                try:
+                    if a is not None and hasattr(a, 'id') and (not isinstance(a, (int, float, bool, str))):
+                        info['filter'] = _filter_snapshot(a)
+                        break
+                except Exception:
+                    continue
+            try:
+                _FILTERS_GENERATION[0] += 1
+                self.plugin._schedule_settings_reload()
+                hook = self.plugin.gdf_hook
+                if hook is not None:
+                    hook._last_signature = None
+                    hook._stable_key = None
+                    hook._cached_visible = None
+                    hook._cached_result = None
+            except Exception:
+                pass
+        except Exception as e:
+            pass
+
+class FiltersSheetHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            result = param.getResult()
+            if result is None:
+                return
+            try:
+                size = int(result.size())
+            except Exception:
+                return
+            if size == 0:
+                return
+            items = [result.get(i) for i in range(size)]
+            tree = FolderTree.build(items, self.plugin.get_separator(), self.plugin._orig_names)
+            parent_ids = set()
+            for gname in tree.group_names():
+                pf = tree.parent_filter_of(gname)
+                if pf is not None:
+                    parent_ids.add(_safe_filter_id(pf))
+            if not parent_ids:
+                return
+            kept = JavaArrayList()
+            removed = []
+            for f in items:
+                if _safe_filter_id(f) in parent_ids:
+                    removed.append(_filter_display_name(f))
+                    continue
+                kept.add(f)
+            if not removed:
+                return
+            param.setResult(kept)
+        except Exception as e:
+            pass
+
+class FiltersSheetLayoutHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            sheet = getattr(param, 'thisObject', None)
+            if sheet is None:
+                try:
+                    sheet = param.getThisObject()
+                except Exception:
+                    sheet = None
+            if sheet is None:
+                return
+            self.plugin.prune_filters_sheet(sheet)
+        except Exception as e:
+            pass
+
+class TabsDelegateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin._unloaded:
+            self.plugin._ensure_counter_hook(param.thisObject)
+
+class TabCounterHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            native = int(param.getResult())
+            if native <= 0:
+                return
+            tab_id = int(param.args[0])
+            context = self.plugin._counter_context(param.thisObject, tab_id)
+            if context is None:
+                return
+            mc, folder = context
+            count, reason, evidence = self.plugin._explicit_unread_state(mc, folder)
+            if count is not None and 0 <= count < native and (jint is not None):
+                param.setResult(jint(count))
+                panel = self.plugin._panel_from_counter_delegate(param.thisObject)
+                if panel is not None:
+                    self.plugin._schedule_counter_ui_sync(panel, tab_id)
+        except Exception as e:
+            pass
+
+class ParentTabTitleHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            self.plugin._decorate_return_parent(param.thisObject, int(param.args[0]))
+        except Exception as exc:
+            pass
+
+class CounterCellStateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin._observe_counter_cell(param.thisObject)
+
+class CounterPanelUpdateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin._unloaded:
+            self.plugin._sync_counter_ui(param.thisObject)
+
+class CounterTabWidthHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        plugin = self.plugin
+        if plugin._unloaded or plugin._counter_width_busy or jint is None:
+            return
+        try:
+            if not bool(param.args[0]):
+                return
+            tab = param.thisObject
+            tv = get_private_field(tab, 'this$0')
+            cap = plugin._counter_cap_for_tab(tv, int(tab.id))
+            before = int(get_private_field(tab, 'counter'))
+            if cap is not None and 0 <= cap < before:
+                if not plugin._write_counter_int(tab, 'counter', cap):
+                    return
+                plugin._counter_width_busy = True
+                try:
+                    param.setResult(jint(int(tab.getWidth(False))))
+                finally:
+                    plugin._counter_width_busy = False
+                plugin._schedule_counter_ui_sync(tv, int(tab.id), force=True)
+        except Exception as e:
+            pass
+
+class TabSelectHook(MethodHook):
+
+    def __init__(self, plugin, source_name):
+        self.plugin = plugin
+        self.source_name = source_name
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            args = list(param.args) if param.args is not None else []
+            try:
+                self.plugin.last_tabs_view = param.thisObject
+                self.plugin._ensure_counter_hook(param.thisObject)
+            except Exception:
+                pass
+            if str(self.source_name).endswith('selectTabWithStableId'):
+                return
+            progress = self._extract_progress(args)
+            try:
+                self.plugin._last_tab_progress = (progress, time.time())
+            except Exception:
+                pass
+            tab_index = self._resolve_index(param, self._extract_tab_index(args))
+            if tab_index is None:
+                return
+            self.plugin.on_tab_selected(tab_index, self.source_name, progress)
+        except Exception as e:
+            pass
+
+    def _resolve_index(self, param, tab_index):
+        if tab_index is None:
+            return None
+        if not str(self.source_name).endswith('selectTabWithStableId'):
+            return int(tab_index)
+        position = None
+        try:
+            position = self.plugin._position_by_stable_id(param.thisObject, int(tab_index))
+        except Exception as e:
+            pass
+        if position is None:
+            return None
+        try:
+            tabs = get_private_field(param.thisObject, 'tabs')
+            return int(tabs.get(int(position)).id)
+        except Exception:
+            return None
+
+    def _extract_progress(self, args):
+        for a in args:
+            if isinstance(a, float):
+                return float(a)
+        for a in args:
+            try:
+                if hasattr(a, 'floatValue'):
+                    return float(a.floatValue())
+            except Exception:
+                continue
+        return None
+
+    def _extract_tab_index(self, args):
+        for a in args:
+            if a is None:
+                continue
+            try:
+                tid = getattr(a, 'id', None)
+                if tid is not None and (not isinstance(a, (int, float, bool, str))):
+                    return int(tid)
+            except Exception:
+                pass
+        for a in args:
+            if isinstance(a, int) and (not isinstance(a, bool)):
+                return int(a)
+            try:
+                if hasattr(a, 'intValue'):
+                    return int(a.intValue())
+            except Exception:
+                continue
+        return None
+_GATE_FORCE_OPEN = [False]
+try:
+    _TAB_GATE = jclass('java.util.concurrent.atomic.AtomicIntegerArray')(2)
+    _TAB_GATE.set(0, -1)
+except Exception:
+    _TAB_GATE = None
+TAB_GATE_CONDITION = 'object.get(1) != 0 || param.args[0] != object.get(0)'
+
+def _tab_gate_decorator():
+    if _TAB_GATE is None or HookFilter is None or hook_filters is None:
+        return None
+    try:
+        return hook_filters(HookFilter.Condition(TAB_GATE_CONDITION, object=_TAB_GATE))
+    except Exception:
+        return None
+_TAB_GATE_DECORATOR = _tab_gate_decorator()
+
+def _gate_note_click(tab_index):
+    if _TAB_GATE is None:
+        return
+    try:
+        _TAB_GATE.set(0, int(tab_index))
+    except Exception:
+        pass
+
+def _gate_open(ms=None):
+    if _TAB_GATE is None:
+        return
+    try:
+        _TAB_GATE.set(1, 1)
+    except Exception:
+        pass
+
+def _gate_reset():
+    if _TAB_GATE is None:
+        return
+    try:
+        _TAB_GATE.set(0, -1)
+        _TAB_GATE.set(1, 1 if _GATE_FORCE_OPEN[0] else 0)
+    except Exception:
+        pass
+
+def _gate_set_enabled(enabled):
+    _GATE_FORCE_OPEN[0] = not enabled
+    if _TAB_GATE is None:
+        return
+    try:
+        _TAB_GATE.set(1, 0 if enabled else 1)
+    except Exception:
+        pass
+
+def _tree_sig(tree):
+    if tree is None:
+        return None
+    try:
+        top = []
+        for name, _f in tree.top_level:
+            kids = tree.children_of(name) or []
+            top.append((name, tuple((c for c, _cf in kids))))
+        orphans = tuple(sorted(((g, tuple((c for c, _cf in grp['children']))) for g, grp in tree.groups.items() if grp.get('parent') is None)))
+        return (tuple(top), orphans)
+    except Exception:
+        return None
+
+class TabSelectGatedHook(TabSelectHook):
+
+    def after_hooked_method(self, param):
+        TabSelectHook.after_hooked_method(self, param)
+if _TAB_GATE_DECORATOR is not None:
+    TabSelectGatedHook.after_hooked_method = _TAB_GATE_DECORATOR(TabSelectGatedHook.after_hooked_method)
+
+class BackPressHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            if self.plugin.expanded_group is None:
+                return
+            target = getattr(param, 'thisObject', None)
+            if target is None:
+                try:
+                    target = param.getThisObject()
+                except Exception:
+                    target = None
+            if not self.plugin._is_main_dialogs_screen(target):
+                return
+            try:
+                param.setResult(False)
+                self.plugin.collapse_and_go_home(target=target)
+            except Exception:
+                pass
+        except Exception as e:
+            pass
+
+class ResumeSyncHook(MethodHook):
+
+    def __init__(self, plugin, source_name):
+        self.plugin = plugin
+        self.source_name = source_name
+
+    def after_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            if self.plugin.expanded_group is None:
+                return
+            self.plugin.schedule_expand_sync(self.source_name)
+            self.plugin._request_counter_ui_recheck(self.plugin.last_tabs_view)
+        except Exception as e:
+            pass
+
+def _describe_args(args):
+    out = []
+    for a in args:
+        try:
+            if a is None:
+                out.append('None')
+            elif isinstance(a, (int, float, bool, str)):
+                out.append(repr(a))
+            else:
+                out.append(str(a.getClass().getSimpleName()))
+        except Exception:
+            out.append('?')
+    return '[' + ', '.join(out) + ']'
+FILTER_CREATE_CLASS = 'org.telegram.ui.FilterCreateActivity'
+APPROVED_PRESENT_TTL = 3.0
+
+def _set_java_field(obj, name, value):
+    cls = obj.getClass()
+    while cls is not None:
+        try:
+            fld = cls.getDeclaredField(name)
+            fld.setAccessible(True)
+            fld.set(obj, value)
+            return True
+        except Exception:
+            cls = cls.getSuperclass()
+    return False
+
+def _identity(obj):
+    try:
+        from java.lang import System
+        return int(System.identityHashCode(obj))
+    except Exception:
+        return id(obj)
+
+class PresentFilterCreateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._unloaded:
+            return
+        try:
+            args = param.args
+            if args is None or len(args) == 0:
+                return
+            target = args[0]
+            if target is None:
+                return
+            try:
+                if str(target.getClass().getName()) != FILTER_CREATE_CLASS:
+                    return
+            except Exception:
+                return
+            if not self.plugin._should_offer_subfolder(target):
+                return
+            host = param.thisObject
+            if host is None:
+                return
+            if not self.plugin._offer_create_choice(host, target):
+                return
+            param.setResult(True)
+        except Exception as e:
+            pass
+
+class SubfoldersPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self.expanded_group = None
+        self._panel_audit_generation = 0
+        self._select_generation = 0
+        self._last_force_update = 0.0
+        self.last_tree = None
+        self.last_visible = []
+        self._last_click = (None, 0.0)
+        self._hooked = []
+        self.gdf_hook = None
+        self.last_tabs_view = None
+        self._orig_names = {}
+        self._short_names = {}
+        self._short_name_objects = {}
+        self._cascade_plans = {}
+        self._cascade_busy = set()
+        self._nav_generation = 0
+        self._unloaded = False
+        self._group_tabs = {}
+        self._suppress_until = 0.0
+        self._suppress_tab = None
+        self._expanded_at = 0.0
+        self._update_tabs_method = None
+        self._last_tab_progress = (None, 0.0)
+        self._settings_tree_sig = None
+        self._settings_reload_pending = False
+        self._approved_present = {}
+        self._collapse_pending = False
+        self._stuck_generation = 0
+        self._counter_hook_classes = set()
+        self._counter_ui_hook_classes = set()
+        self._counter_ui_pending = set()
+        self._counter_ui_busy = False
+        self._counter_width_busy = False
+        self._counter_cell_state = {}
+
+    @property
+    def last_tabs_view(self):
+        holder = getattr(self, '_last_tabs_view_ref', None)
+        if holder is None:
+            return None
+        try:
+            kind, ref = holder
+            view = ref.get() if kind == 'java' else ref()
+            if view is not None and self._tabs_view_is_alive(view):
+                return view
+        except Exception:
+            pass
+        self._last_tabs_view_ref = None
+        return None
+
+    @last_tabs_view.setter
+    def last_tabs_view(self, view):
+        self._last_tabs_view_ref = None
+        if view is None:
+            return
+        try:
+            JavaWeakReference = jclass('java.lang.ref.WeakReference')
+            self._last_tabs_view_ref = ('java', JavaWeakReference(view))
+            return
+        except Exception:
+            pass
+        try:
+            self._last_tabs_view_ref = ('python', weakref.ref(view))
+        except TypeError:
+            pass
+
+    def _tabs_view_is_alive(self, view):
+        try:
+            context = view.getContext()
+        except Exception:
+            return True
+        seen = set()
+        for _ in range(5):
+            if context is None:
+                break
+            ident = _identity(context)
+            if ident in seen:
+                break
+            seen.add(ident)
+            for name in ('isDestroyed', 'isFinishing'):
+                try:
+                    if bool(getattr(context, name)()):
+                        return False
+                except Exception:
+                    pass
+            try:
+                context = context.getBaseContext()
+            except Exception:
+                break
+        return True
+
+    def on_plugin_load(self):
+        self._unloaded = False
+        try:
+            try:
+                self._hook_get_dialog_filters()
+            except Exception:
+                pass
+            try:
+                self._hook_tab_selection()
+                _gate_set_enabled(True)
+            except Exception:
+                pass
+            try:
+                self._hook_back_press()
+            except Exception:
+                pass
+            try:
+                self._hook_resume_sync()
+            except Exception:
+                pass
+            try:
+                self._hook_filter_mutations()
+                self._hook_filters_sheet()
+                self._hook_present_filter_create()
+            except Exception:
+                pass
+            try:
+                tree = self._build_tree_now()
+            except Exception:
+                pass
+            try:
+                _notify_filters_changed(delay=500)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        run_on_ui_thread(self._attach_counter_to_current_panel, delay=700)
+
+    def on_plugin_unload(self):
+        self._unloaded = True
+        self._nav_generation += 1
+        self._select_generation += 1
+        self._panel_audit_generation += 1
+        self._stuck_generation += 1
+        _gate_reset()
+        try:
+            try:
+                self.expanded_group = None
+                self._restore_child_names(self._get_all_filters_raw())
+                _notify_filters_changed()
+            except Exception:
+                pass
+        finally:
+            hook = self.gdf_hook
+            if hook is not None:
+                hook._cached_visible = None
+                hook._cached_result = None
+                hook._stable_key = None
+                hook._last_signature = None
+            self.gdf_hook = None
+            self.last_tabs_view = None
+            self.last_tree = None
+            self.last_visible = []
+            self._update_tabs_method = None
+            getattr(self, '_method_cache', {}).clear()
+            self._group_tabs.clear()
+            self._short_name_objects.clear()
+            self._cascade_plans.clear()
+            self._cascade_busy.clear()
+            self._approved_present.clear()
+            self._settings_reload_pending = False
+            self._collapse_pending = False
+            self._settings_tree_sig = None
+            self._hooked.clear()
+            self._counter_hook_classes.clear()
+            self._counter_ui_hook_classes.clear()
+            self._counter_ui_pending.clear()
+            self._counter_cell_state.clear()
+
+    def _hook_get_dialog_filters(self):
+        try:
+            mc_class = find_class('org.telegram.messenger.MessagesController')
+            if mc_class is None:
+                return
+            method = mc_class.getClass().getDeclaredMethod('getDialogFilters')
+            method.setAccessible(True)
+            self.gdf_hook = GetDialogFiltersHook(self)
+            self.hook_method(method, self.gdf_hook)
+            self._hooked.append('MessagesController.getDialogFilters')
+        except Exception as e:
+            pass
+
+    def _hook_tab_selection(self):
+        candidates = ['scrollToTab', 'selectTabWithId', 'selectTab', 'selectTabWithStableId', 'setDelegate', 'addTab']
+        try:
+            ftv_class = find_class('org.telegram.ui.Components.FilterTabsView')
+            if ftv_class is None:
+                return
+            java_class = ftv_class.getClass()
+            all_methods = java_class.getDeclaredMethods()
+            names_available = sorted({str(m.getName()) for m in all_methods})
+            for cand in candidates:
+                hooked_any = False
+                for m in all_methods:
+                    if str(m.getName()) != cand:
+                        continue
+                    try:
+                        m.setAccessible(True)
+                        hook_cls = TabSelectGatedHook if cand == 'selectTabWithId' and _TAB_GATE_DECORATOR is not None else TabSelectHook
+                        if cand == 'addTab':
+                            hook = ParentTabTitleHook(self)
+                        else:
+                            hook = TabsDelegateHook(self) if cand == 'setDelegate' else hook_cls(self, f'FilterTabsView.{cand}')
+                        self.hook_method(m, hook)
+                        hooked_any = True
+                    except Exception as e:
+                        pass
+                if hooked_any:
+                    self._hooked.append(f'FilterTabsView.{cand}')
+        except Exception as e:
+            pass
+
+    def _hook_back_press(self):
+        try:
+            da_class = find_class('org.telegram.ui.DialogsActivity')
+            if da_class is None:
+                return
+            all_methods = da_class.getClass().getDeclaredMethods()
+            hooked_any = False
+            for m in all_methods:
+                if str(m.getName()) != 'onBackPressed':
+                    continue
+                try:
+                    m.setAccessible(True)
+                    self.hook_method(m, BackPressHook(self))
+                    hooked_any = True
+                except Exception as e:
+                    pass
+            if hooked_any:
+                self._hooked.append('DialogsActivity.onBackPressed')
+        except Exception as e:
+            pass
+
+    def _hook_resume_sync(self):
+        candidates = ['onResume', 'onBecomeFullyVisible']
+        try:
+            da_class = find_class('org.telegram.ui.DialogsActivity')
+            if da_class is None:
+                return
+            all_methods = da_class.getClass().getDeclaredMethods()
+            for cand in candidates:
+                hooked_any = False
+                for m in all_methods:
+                    if str(m.getName()) != cand:
+                        continue
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(m, ResumeSyncHook(self, f'DialogsActivity.{cand}'))
+                        hooked_any = True
+                    except Exception as e:
+                        pass
+                if hooked_any:
+                    self._hooked.append(f'DialogsActivity.{cand}')
+        except Exception as e:
+            pass
+
+    def _parent_filter_ids(self, items):
+        ids = set()
+        try:
+            tree = FolderTree.build(items, self.get_separator(), self._orig_names)
+            for gname in tree.group_names():
+                pf = tree.parent_filter_of(gname)
+                if pf is not None:
+                    ids.add(_safe_filter_id(pf))
+        except Exception as e:
+            pass
+        return ids
+
+    def prune_filters_sheet(self, sheet):
+        try:
+            key = int(sheet.hashCode())
+        except Exception:
+            key = None
+        seen = getattr(self, '_pruned_sheets', None)
+        if seen is None:
+            seen = set()
+            self._pruned_sheets = seen
+        if key is not None and key in seen:
+            return
+        try:
+            items_list = get_private_field(sheet, 'dialogFilters')
+        except Exception as e:
+            return
+        if items_list is None:
+            return
+        try:
+            size = int(items_list.size())
+        except Exception:
+            return
+        if size == 0:
+            if key is not None:
+                seen.add(key)
+            return
+        items = []
+        for i in range(size):
+            try:
+                items.append(items_list.get(i))
+            except Exception:
+                pass
+        parent_ids = self._parent_filter_ids(self._get_all_filters_raw() or items)
+        if not parent_ids:
+            if key is not None:
+                seen.add(key)
+            return
+        removed = []
+        for i in range(size - 1, -1, -1):
+            try:
+                f = items_list.get(i)
+                if _safe_filter_id(f) in parent_ids:
+                    removed.append(_filter_display_name(f))
+                    items_list.remove(i)
+            except Exception as e:
+                pass
+        if key is not None:
+            seen.add(key)
+            if len(seen) > 20:
+                seen.clear()
+                seen.add(key)
+        if not removed:
+            return
+        try:
+            adapter = get_private_field(sheet, 'adapter')
+            if adapter is not None:
+                run_on_ui_thread(lambda: adapter.notifyDataSetChanged(), delay=0)
+        except Exception as e:
+            pass
+
+    def _hook_filters_sheet(self):
+        try:
+            sheet_class = find_class('org.telegram.ui.Components.FiltersListBottomSheet')
+            if sheet_class is None:
+                return
+            all_methods = sheet_class.getClass().getDeclaredMethods()
+            try:
+                names = sorted(set((str(m.getName()) for m in all_methods)))
+            except Exception:
+                pass
+            hooked_any = False
+            hooked_layout = False
+            for m in all_methods:
+                name = str(m.getName())
+                if name == 'getCanAddDialogFilters':
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(m, FiltersSheetHook(self))
+                        hooked_any = True
+                    except Exception as e:
+                        pass
+                elif name == 'updateLayout':
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(m, FiltersSheetLayoutHook(self))
+                        hooked_layout = True
+                    except Exception as e:
+                        pass
+            if hooked_any:
+                self._hooked.append('FiltersListBottomSheet.getCanAddDialogFilters')
+            if hooked_layout:
+                self._hooked.append('FiltersListBottomSheet.updateLayout')
+        except Exception as e:
+            pass
+
+    def _hook_filter_mutations(self):
+        candidates = ['addFilter', 'onFilterUpdate', 'removeFilter']
+        try:
+            mc_class = find_class('org.telegram.messenger.MessagesController')
+            if mc_class is None:
+                return
+            all_methods = mc_class.getClass().getDeclaredMethods()
+            for cand in candidates:
+                hooked_any = False
+                for m in all_methods:
+                    if str(m.getName()) != cand:
+                        continue
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(m, FilterMutationHook(self, cand))
+                        hooked_any = True
+                    except Exception as e:
+                        pass
+                if hooked_any:
+                    self._hooked.append(f'MessagesController.{cand}')
+        except Exception as e:
+            pass
+
+    def get_setting(self, key, *args, **kwargs):
+        if key in ('enabled', 'tap_navigation', 'hide_parents_in_sheet', 'mvel_tab_filter'):
+            return True
+        if key == 'separator':
+            return DEFAULT_SEPARATOR
+        return super().get_setting(key, *args, **kwargs)
+
+    def get_separator(self):
+        try:
+            sep = str(self.get_setting('separator', DEFAULT_SEPARATOR)).strip()
+            return sep if sep else DEFAULT_SEPARATOR
+        except Exception:
+            return DEFAULT_SEPARATOR
+
+    def _all_filters_or_none(self):
+        try:
+            mc = get_messages_controller()
+            if mc is None:
+                return None
+            filters = get_private_field(mc, 'dialogFilters')
+            if filters is None:
+                return None
+            return [filters.get(i) for i in range(filters.size())]
+        except Exception as e:
+            return None
+
+    def _get_all_filters_raw(self):
+        filters = self._all_filters_or_none()
+        return filters if filters is not None else []
+
+    def _build_tree_now(self):
+        filters = self._get_all_filters_raw()
+        if not filters:
+            return None
+        tree = FolderTree.build(filters, self.get_separator(), self._orig_names)
+        self.last_tree = tree
+        return tree
+
+    def _nav_start(self, label):
+        self._last_force_update = 0.0
+
+    def on_tab_selected(self, tab_index, source, progress=None):
+        now = time.time()
+        if now < self._suppress_until:
+            own_tab = self._suppress_tab
+            if own_tab is None or int(own_tab) == int(tab_index):
+                return
+            self._suppress_until = 0.0
+            self._suppress_tab = None
+        last_idx, last_ts = self._last_click
+        if last_idx == tab_index and (now - last_ts) * 1000.0 < CLICK_DEDUP_MS:
+            return
+        self._nav_generation += 1
+        self._select_generation += 1
+        self._stuck_generation += 1
+        self._last_click = (tab_index, now)
+        _gate_note_click(tab_index)
+        self._nav_start(f'вкладка #{tab_index} от {source}')
+        try:
+            visible = list(self.last_visible)
+            if not visible:
+                tree = self._build_tree_now()
+                if tree is None:
+                    step_note = 'нет данных о папках'
+                    return
+                visible = [f for f in self._get_all_filters_raw()]
+            if tab_index < 0 or tab_index >= len(visible):
+                return
+            f = visible[tab_index]
+            name = _filter_display_name(f)
+            tree = self.last_tree or self._build_tree_now()
+            if tree is None:
+                return
+            fid = _safe_filter_id(f)
+            in_flight = self._transition_in_flight(progress, source)
+            if _is_default_filter(f):
+                if self.expanded_group is not None:
+                    self._collapse_now_or_later(in_flight, progress)
+                return
+            if self.expanded_group is not None and int(tab_index) == 0:
+                if self._group_name_by_tab_id(fid) == self.expanded_group or name == self.expanded_group:
+                    self._collapse_now_or_later(in_flight, progress)
+                    return
+            group_name = self._group_name_by_tab_id(fid)
+            if group_name is None and tree.children_of(name):
+                group_name = name
+            if group_name is not None and self.expanded_group != group_name:
+                if in_flight:
+                    self._expand_when_settled(group_name)
+                else:
+                    self.expand(group_name)
+        except Exception:
+            pass
+
+    def expand(self, group_name):
+        if self._unloaded:
+            return
+        tree = self._build_tree_now()
+        if tree is None or not tree.children_of(group_name):
+            return
+        self._nav_generation += 1
+        _gate_reset()
+        try:
+            self.expanded_group = group_name
+            self._panel_audit_generation += 1
+            now = time.time()
+            self._expanded_at = now
+            self._suppress_until = now + SUPPRESS_AFTER_NAV_MS / 1000.0
+            _notify_filters_changed()
+            first_child = 1 if self._expanded_has_parent_tab(group_name) else 0
+            self._suppress_tab = first_child
+            self._select_tab_later(first_child, 'первая подпапка')
+        except Exception:
+            pass
+
+    def _expanded_has_parent_tab(self, group_name):
+        try:
+            tree = self.last_tree or self._build_tree_now()
+            if tree is None:
+                return False
+            if tree.parent_filter_of(group_name) is not None:
+                return True
+            return self._get_group_tab_filter(group_name) is not None
+        except Exception as e:
+            return False
+
+    def _expand_when_settled(self, group_name, attempt=1, generation=None):
+        _gate_open()
+        max_attempts = 24
+        settle_ms = 120
+        if generation is None:
+            generation = self._nav_generation
+
+        def check():
+            if self._unloaded or generation != self._nav_generation:
+                return
+            if self.expanded_group == group_name:
+                return
+            try:
+                progress, stamp = self._last_tab_progress
+            except Exception:
+                progress, stamp = (None, 0.0)
+            idle_ms = (time.time() - stamp) * 1000.0
+            animating = False
+            tv = self.last_tabs_view
+            try:
+                if tv is not None:
+                    animating = bool(tv.isAnimatingIndicator())
+            except Exception:
+                animating = False
+            at_rest = True
+            try:
+                if progress is not None:
+                    at_rest = float(progress) >= 0.999 or float(progress) <= 0.001
+            except Exception:
+                at_rest = True
+            if at_rest and idle_ms >= settle_ms and (not animating):
+                self.expand(group_name)
+                return
+            if attempt >= max_attempts:
+                self.expand(group_name)
+                return
+            self._expand_when_settled(group_name, attempt + 1, generation)
+        run_on_ui_thread(check, delay=60)
+
+    def _transition_in_flight(self, progress, source):
+        moving = False
+        try:
+            moving = progress is not None and 0.001 < float(progress) < 0.999
+        except Exception:
+            moving = False
+        if moving:
+            return True
+        animating = False
+        tv = self.last_tabs_view
+        try:
+            if tv is not None:
+                animating = bool(tv.isAnimatingIndicator())
+        except Exception:
+            animating = False
+        if animating:
+            return True
+        if str(source).endswith('scrollToTab'):
+            return True
+        return False
+
+    def _collapse_now_or_later(self, in_flight, progress):
+        if not in_flight:
+            self.collapse_and_go_home()
+            return
+        if self._collapse_pending:
+            return
+        self._collapse_when_settled()
+
+    def _collapse_when_settled(self, attempt=1, generation=None):
+        _gate_open()
+        max_attempts = 24
+        settle_ms = 120
+        group = self.expanded_group
+        if group is None:
+            self._collapse_pending = False
+            return
+        self._collapse_pending = True
+        if generation is None:
+            generation = self._nav_generation
+
+        def check():
+            if self._unloaded or generation != self._nav_generation:
+                return
+            if self.expanded_group != group:
+                self._collapse_pending = False
+                return
+            if self.expanded_group is None:
+                self._collapse_pending = False
+                return
+            try:
+                progress, stamp = self._last_tab_progress
+            except Exception:
+                progress, stamp = (None, 0.0)
+            idle_ms = (time.time() - stamp) * 1000.0
+            animating = False
+            tv = self.last_tabs_view
+            try:
+                if tv is not None:
+                    animating = bool(tv.isAnimatingIndicator())
+            except Exception:
+                animating = False
+            at_rest = True
+            try:
+                if progress is not None:
+                    at_rest = float(progress) >= 0.999 or float(progress) <= 0.001
+            except Exception:
+                at_rest = True
+            settled = at_rest and idle_ms >= settle_ms and (not animating)
+            if settled or attempt >= max_attempts:
+                self._collapse_pending = False
+                self.collapse_and_go_home()
+                return
+            self._collapse_when_settled(attempt + 1, generation)
+        run_on_ui_thread(check, delay=60)
+
+    def _refresh_visible_snapshot(self, tv=None):
+        before = []
+        try:
+            before = [_filter_display_name(f) for f in list(self.last_visible)]
+        except Exception:
+            before = []
+        try:
+            owner = self._resolve_dialogs_activity(tv) if tv is not None else None
+            mc = owner.getMessagesController() if owner is not None else get_messages_controller()
+            if mc is None:
+                return
+            mc.getDialogFilters()
+        except Exception as e:
+            return
+        try:
+            after = [_filter_display_name(f) for f in list(self.last_visible)]
+        except Exception:
+            return
+
+    def _panel_matches_filter_snapshot(self, tv, visible):
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            logical_ids = [int(tabs.get(i).id) for i in range(int(tabs.size()))]
+            normal = list(range(len(visible)))
+            without_default = [i for i, f in enumerate(visible) if not _is_default_filter(f)]
+            if logical_ids not in (normal, without_default):
+                return False
+            stable = [int(tv.getStableId(i)) for i in range(len(logical_ids))]
+            if any((value < 0 for value in stable)):
+                return None
+            by_id = [_safe_filter_id(visible[i]) for i in logical_ids]
+            by_local = []
+            for i in logical_ids:
+                folder = visible[i]
+                if _is_default_filter(folder):
+                    by_local.append(0)
+                else:
+                    try:
+                        by_local.append(int(folder.localId))
+                    except Exception:
+                        by_local.append(None)
+            return stable == by_id or (None not in by_local and stable == by_local)
+        except Exception:
+            return None
+
+    def _resolve_selection_panel(self, panel_ref=None):
+        if panel_ref is None:
+            return self._resolve_visible_tabs_view()
+        if self._unloaded:
+            return None
+        try:
+            kind, ref = panel_ref
+            tv = ref.get() if kind == 'java' else ref()
+            if tv is None or not self._tabs_view_is_alive(tv) or (not bool(tv.isShown())):
+                return None
+            self.last_tabs_view = tv
+            return tv
+        except Exception:
+            return None
+
+    def _return_parent_title(self, folder, index):
+        name = _filter_display_name(folder)
+        group = self.expanded_group
+        if group is not None and int(index) == 0 and (not _is_default_filter(folder)):
+            if name == group or self._group_name_by_tab_id(_safe_filter_id(folder)) == group:
+                return '← ' + name
+        return name
+
+    def _write_return_parent_title(self, tab, title):
+        try:
+            cls = tab.getClass()
+        except Exception:
+            try:
+                tab.setTitle(title)
+                return str(tab.title) == title
+            except Exception:
+                return False
+        while cls is not None:
+            try:
+                fields = cls.getDeclaredFields()
+            except Exception:
+                return False
+            for field in fields:
+                if str(field.getName()) != 'title':
+                    continue
+                try:
+                    field.setAccessible(True)
+                    type_name = str(field.getType().getName())
+                    old = field.get(tab)
+                    if old is None or title != '← ' + str(old):
+                        return False
+                    if type_name == 'java.lang.String':
+                        value = title
+                    elif type_name == 'java.lang.CharSequence':
+                        builder = jclass('android.text.SpannableStringBuilder')('← ')
+                        builder.append(old)
+                        value = builder
+                    else:
+                        return False
+                    field.set(tab, value)
+                    return str(field.get(tab)) == title
+                except Exception as exc:
+                    return False
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                return False
+        return False
+
+    def _decorate_return_parent(self, tv, tab_id):
+        if self._unloaded or self.expanded_group is None or int(tab_id) != 0:
+            return
+        try:
+            visible = list(self.last_visible)
+            if not visible:
+                return
+            folder = visible[0]
+            title = self._return_parent_title(folder, 0)
+            if title == _filter_display_name(folder):
+                return
+            tab, pos, _ = self._find_tab_object(tv, 0)
+            if tab is None:
+                return
+            stable = int(tv.getStableId(pos))
+            allowed = {_safe_filter_id(folder)}
+            try:
+                allowed.add(int(folder.localId))
+            except Exception:
+                pass
+            if stable < 0 or stable not in allowed:
+                return
+            old_title = str(tab.title)
+            if old_title == title:
+                return
+            if old_title != _filter_display_name(folder):
+                return
+            old_width = int(tab.getWidth(False))
+            if not self._write_return_parent_title(tab, title):
+                return
+            new_width = int(tab.getWidth(False))
+            if new_width != old_width:
+                total = int(get_private_field(tv, 'allTabsWidth'))
+                self._write_counter_int(tv, 'allTabsWidth', max(0, total + new_width - old_width))
+        except Exception as exc:
+            pass
+
+    def _expected_tab_titles(self, tv, visible):
+        expected = [self._return_parent_title(f, i) for i, f in enumerate(visible)]
+        if self._panel_matches_filter_snapshot(tv, visible) is False:
+            return expected
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            ids = [int(tabs.get(i).id) for i in range(int(tabs.size()))]
+            full_ids = list(range(len(visible)))
+            if ids != full_ids:
+                allowed = [i for i, f in enumerate(visible) if not _is_default_filter(f)]
+                if ids != allowed:
+                    return expected
+            return [str(tabs.get(pos).title) if _is_default_filter(visible[i]) else expected[i] for pos, i in enumerate(ids)]
+        except Exception:
+            return expected
+
+    def _rewrite_tab_titles(self, tv, expected):
+        if self._panel_matches_filter_snapshot(tv, list(self.last_visible)) is not True:
+            return False
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            if tabs is None:
+                return False
+            count = int(tabs.size())
+            visible = list(self.last_visible)
+            ids = [int(tabs.get(i).id) for i in range(count)]
+            allowed = list(range(len(visible)))
+            without_default = [i for i, f in enumerate(visible) if not _is_default_filter(f)]
+            if ids not in (allowed, without_default):
+                return False
+            if count != len(expected):
+                return False
+            changed = 0
+            for i in range(count):
+                tab = tabs.get(i)
+                title = expected[i]
+                applied = False
+                cls = tab.getClass()
+                while cls is not None and (not applied):
+                    for f in cls.getDeclaredFields():
+                        if str(f.getName()) != 'title':
+                            continue
+                        try:
+                            f.setAccessible(True)
+                            if str(f.get(tab)) != title:
+                                f.set(tab, title)
+                                changed += 1
+                            applied = True
+                        except Exception as e:
+                            pass
+                        break
+                    cls = cls.getSuperclass()
+            if changed == 0:
+                return False
+            for name in ('adapter', 'listView'):
+                try:
+                    obj = get_private_field(tv, name)
+                    if obj is None:
+                        continue
+                    if name == 'adapter':
+                        obj.notifyDataSetChanged()
+                    else:
+                        adapter = obj.getAdapter()
+                        if adapter is not None:
+                            adapter.notifyDataSetChanged()
+                except Exception:
+                    pass
+            try:
+                tv.requestLayout()
+                tv.invalidate()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            pass
+        return False
+
+    def _force_update_filter_tabs(self, tv):
+        now = time.time()
+        self._last_force_update = now
+        try:
+            target = self._resolve_dialogs_activity(tv)
+            if target is None:
+                return False
+            cached = self._update_tabs_method
+            if cached is not None:
+                method, cached_argc = cached
+                try:
+                    if cached_argc == 2:
+                        method.invoke(target, True, False)
+                    else:
+                        method.invoke(target, True)
+                    return True
+                except Exception as e:
+                    self._update_tabs_method = None
+            cls = target.getClass()
+            while cls is not None:
+                for m in cls.getDeclaredMethods():
+                    if str(m.getName()) != 'updateFilterTabs':
+                        continue
+                    argc = len(m.getParameterTypes())
+                    try:
+                        m.setAccessible(True)
+                        if argc == 2:
+                            m.invoke(target, True, False)
+                        elif argc == 1:
+                            m.invoke(target, True)
+                        else:
+                            continue
+                        self._update_tabs_method = (m, argc)
+                        return True
+                    except Exception as e:
+                        pass
+                cls = cls.getSuperclass()
+        except Exception as e:
+            pass
+        return False
+
+    def _audit_panel_titles_later(self, attempt=1, generation=None):
+        max_repair_attempts = 4
+        final_verification_attempt = max_repair_attempts + 1
+        read_only = attempt > max_repair_attempts
+        if generation is None:
+            generation = self._panel_audit_generation
+
+        def schedule_next(reason, allow_final_verification=False):
+            limit = final_verification_attempt if allow_final_verification else max_repair_attempts
+            if attempt >= limit:
+                return
+            self._audit_panel_titles_later(attempt + 1, generation)
+
+        def audit():
+            try:
+                if self._unloaded or generation != self._panel_audit_generation:
+                    return
+                if self.expanded_group is not None:
+                    return
+                tv = self._resolve_visible_tabs_view(allow_fast_path=False)
+                if tv is None:
+                    schedule_next(u'видимая панель ещё не найдена')
+                    return
+                visible_snapshot = list(self.last_visible)
+                expected = self._expected_tab_titles(tv, visible_snapshot)
+                actual = self._tab_titles(tv)
+                if not expected:
+                    schedule_next(u'ожидаемый состав ещё не сформирован')
+                    return
+                if not actual:
+                    schedule_next(u'вкладки панели ещё недоступны')
+                    return
+                if [x.strip() for x in expected] == [x.strip() for x in actual]:
+                    return
+                if read_only:
+                    return
+                if self.expanded_group is not None or generation != self._panel_audit_generation:
+                    return
+                if self._rewrite_tab_titles(tv, expected):
+                    schedule_next(u'названия записаны напрямую, проверяем результат', True)
+                    return
+                if self._force_update_filter_tabs(tv):
+                    schedule_next(u'вызван updateFilterTabs, проверяем результат', True)
+                    return
+                if self._rebuild_tabs_manually(tv, visible_snapshot):
+                    schedule_next(u'выполнен ручной ремонт, проверяем результат', True)
+                    return
+                schedule_next(u'ни один способ ремонта не сработал')
+            except Exception as e:
+                schedule_next(u'исключение: {}'.format(e))
+        try:
+            run_on_ui_thread(audit, delay=150 if attempt == 1 else 240)
+        except Exception as e:
+            pass
+
+    def collapse(self):
+        self._nav_generation += 1
+        self._select_generation += 1
+        _gate_reset()
+        try:
+            prev = self.expanded_group
+            self.expanded_group = None
+            self._expanded_at = 0.0
+            self._suppress_until = time.time() + SUPPRESS_AFTER_NAV_MS / 1000.0
+            self._suppress_tab = 0
+            self._restore_child_names(self._get_all_filters_raw())
+            _notify_filters_changed()
+            self._refresh_visible_snapshot()
+            self._panel_audit_generation += 1
+            self._audit_panel_titles_later(1, self._panel_audit_generation)
+        except Exception:
+            pass
+
+    def _freeze_tab_position_before_collapse(self):
+        tv = self.last_tabs_view
+        if tv is None:
+            return False
+        try:
+            ok = self._set_private_int(tv, 'currentPosition', 0)
+            self._set_private_int(tv, 'previousPosition', 0)
+            if ok:
+                return True
+        except Exception as e:
+            pass
+        return False
+
+    def _root_return_target(self, tv, preferred_filter_id=None):
+        if self.expanded_group is not None:
+            return None
+        visible = list(self.last_visible)
+        if not visible or self._panel_matches_filter_snapshot(tv, visible) is not True:
+            return None
+        child_ids = set()
+        tree = self.last_tree
+        if tree is not None:
+            for group in tree.groups.values():
+                child_ids.update((_safe_filter_id(f) for _, f in group['children']))
+        separator = self.get_separator()
+        for f in visible:
+            if not _is_default_filter(f) and (_safe_filter_id(f) in child_ids or separator in _filter_display_name(f)):
+                return None
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            candidates = []
+            for position in range(int(tabs.size())):
+                logical_id = int(tabs.get(position).id)
+                if not 0 <= logical_id < len(visible):
+                    return None
+                fid = _safe_filter_id(visible[logical_id])
+                if fid == -1:
+                    return None
+                candidates.append((logical_id, fid))
+        except Exception:
+            return None
+        for candidate in candidates:
+            if _is_default_filter(visible[candidate[0]]):
+                return candidate
+        if preferred_filter_id is not None:
+            for candidate in candidates:
+                if candidate[1] == preferred_filter_id:
+                    return candidate
+        return candidates[0] if candidates else None
+
+    def _root_parent_filter_id(self):
+        group = self.expanded_group
+        if group is None:
+            return None
+        tree = self.last_tree
+        parent = tree.parent_filter_of(group) if tree is not None else None
+        if parent is None:
+            parent = self._group_tabs.get(group)
+        if parent is None:
+            parent = next((f for f in list(self.last_visible) if not _is_default_filter(f) and _filter_display_name(f) == group), None)
+        fid = _safe_filter_id(parent) if parent is not None else -1
+        return fid if fid != -1 else None
+
+    def collapse_and_go_home(self, target=None):
+        if self._unloaded:
+            return
+        try:
+            tv = self.last_tabs_view
+            if target is not None:
+                try:
+                    tv = get_private_field(target, 'filterTabsView')
+                except Exception:
+                    tv = None
+                if tv is None or not self._tabs_view_is_alive(tv):
+                    return
+            if tv is not None:
+                self.last_tabs_view = tv
+            panel_ref = getattr(self, '_last_tabs_view_ref', None) if tv is not None else None
+            parent_filter_id = self._root_parent_filter_id()
+            self._nav_start('Назад → основные папки')
+            self.collapse()
+            if tv is not None and self._tabs_view_is_alive(tv):
+                rebuilt = self._force_update_filter_tabs(tv)
+            self._select_tab_later(0, 'основные папки', allow_settle_skip=True, delay=NOTIFY_DELAY_MS + 20, prefer_direct=True, preferred_panel_ref=panel_ref, root_return=True, root_filter_id=parent_filter_id)
+        except Exception:
+            pass
+
+    def schedule_expand_sync(self, source):
+        generation = self._nav_generation
+
+        def check():
+            if self._unloaded or generation != self._nav_generation:
+                return
+            try:
+                group = self.expanded_group
+                if group is None:
+                    return
+                mc = get_messages_controller()
+                if mc is None:
+                    return
+                current = None
+                got = False
+                try:
+                    sel = mc.selectedDialogFilter
+                    if sel is not None:
+                        current = sel[0]
+                    got = True
+                except Exception as e:
+                    try:
+                        sel = get_private_field(mc, 'selectedDialogFilter')
+                        if sel is not None:
+                            current = sel[0]
+                        got = True
+                    except Exception as e2:
+                        pass
+                if not got:
+                    return
+                if current is None:
+                    self.collapse()
+                    return
+                cid = None
+                cname = '?'
+                try:
+                    cid = int(current.id)
+                    cname = str(current.name)
+                except Exception:
+                    pass
+                if cid is not None and cid in self._orig_names:
+                    return
+                parent_shown = False
+                try:
+                    if cname == group:
+                        parent_shown = True
+                    elif cid is not None and self._group_name_by_tab_id(cid) == group:
+                        parent_shown = True
+                except Exception as e:
+                    pass
+                if parent_shown:
+                    return
+                self.collapse()
+            except Exception:
+                pass
+        run_on_ui_thread(check, delay=260)
+
+    def _apply_child_short_name(self, child, short_name):
+        fid = _safe_filter_id(child)
+        try:
+            current = str(child.name) if child.name is not None else None
+        except Exception:
+            current = None
+        if current == short_name:
+            return
+        if current is not None and (fid not in self._orig_names or self.get_separator() in current):
+            self._orig_names[fid] = current
+        if _set_filter_name(child, short_name):
+            self._short_names[fid] = short_name
+            self._short_name_objects[fid] = _identity(child)
+
+    def _restore_child_names(self, all_filters):
+        if not self._orig_names:
+            return
+        try:
+            by_id = {_safe_filter_id(f): f for f in all_filters}
+            for fid, orig in list(self._orig_names.items()):
+                f = by_id.get(fid)
+                if f is None:
+                    pass
+                else:
+                    current = _filter_display_name(f)
+                    if current == self._short_names.get(fid):
+                        if not _set_filter_name(f, orig):
+                            continue
+                self._orig_names.pop(fid, None)
+                self._short_names.pop(fid, None)
+                self._short_name_objects.pop(fid, None)
+        except Exception:
+            pass
+
+    def _get_group_tab_filter(self, group_name):
+        if group_name not in self._group_tabs:
+            fid = GROUP_TAB_ID_BASE + len(self._group_tabs)
+            self._group_tabs[group_name] = _make_filter_stub(fid, group_name)
+        return self._group_tabs[group_name]
+
+    def _group_name_by_tab_id(self, fid):
+        for gname, df in self._group_tabs.items():
+            if df is not None and _safe_filter_id(df) == fid:
+                return gname
+        return None
+
+    def _is_main_dialogs_screen(self, target):
+        if target is None:
+            return False
+        for field in ('parentDialogsActivity', 'parentFragment'):
+            try:
+                parent = get_private_field(target, field)
+            except Exception:
+                parent = None
+            if parent is not None:
+                return False
+        try:
+            tabs = get_private_field(target, 'filterTabsView')
+        except Exception as e:
+            return False
+        if tabs is None:
+            return False
+        try:
+            if not bool(tabs.isShown()):
+                return False
+        except Exception as e:
+            pass
+        return True
+
+    def _resolve_dialogs_activity(self, tv):
+
+        def owns_panel(owner):
+            try:
+                panel = get_private_field(owner, 'filterTabsView')
+                return panel is not None and (tv is None or _identity(panel) == _identity(tv))
+            except Exception:
+                return False
+        if tv is not None:
+            try:
+                delegate = get_private_field(tv, 'delegate')
+                try:
+                    owner = get_private_field(delegate, 'this$0')
+                    if owns_panel(owner):
+                        return owner
+                except Exception:
+                    pass
+                for field in delegate.getClass().getDeclaredFields():
+                    if not str(field.getName()).startswith('this$'):
+                        continue
+                    field.setAccessible(True)
+                    owner = field.get(delegate)
+                    if owns_panel(owner):
+                        return owner
+            except Exception as exc:
+                pass
+        try:
+            owner = get_last_fragment()
+            if owner is not None and owns_panel(owner):
+                return owner
+        except Exception:
+            pass
+        return None
+
+    def _find_method_in_hierarchy(self, obj, method_name, argc=None):
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return None
+        cache = getattr(self, '_method_cache', None)
+        if cache is None:
+            cache = {}
+            self._method_cache = cache
+        cache_key = None
+        try:
+            cache_key = (str(cls.getName()), method_name, argc)
+        except Exception:
+            cache_key = None
+        if cache_key is not None and cache_key in cache:
+            return cache[cache_key]
+        while cls is not None:
+            try:
+                for m in cls.getDeclaredMethods():
+                    if str(m.getName()) != method_name:
+                        continue
+                    if argc is not None:
+                        try:
+                            if len(m.getParameterTypes()) != argc:
+                                continue
+                        except Exception:
+                            continue
+                    m.setAccessible(True)
+                    if cache_key is not None:
+                        cache[cache_key] = m
+                    return m
+            except Exception as e:
+                pass
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                return None
+        return None
+
+    def _invoke_scroll_to_tab(self, method, tv, tab, position):
+        pos = int(position)
+        attempts = []
+        if jint is not None:
+            attempts.append(('jint', lambda: method.invoke(tv, tab, jint(pos))))
+        if jarray is not None:
+
+            def via_array():
+                JavaObject = jclass('java.lang.Object')
+                args = jarray(JavaObject)(2)
+                args[0] = tab
+                args[1] = Integer.valueOf(pos)
+                return method.invoke(tv, args)
+            attempts.append(('Object[] + Integer.valueOf', via_array))
+        attempts.append(('Integer.valueOf', lambda: method.invoke(tv, tab, Integer.valueOf(pos))))
+        attempts.append(('python int', lambda: method.invoke(tv, tab, pos)))
+        for name, call in attempts:
+            try:
+                call()
+                return True
+            except Exception as e:
+                pass
+        return False
+
+    def _position_by_stable_id(self, tv, stable_id):
+        if tv is None or stable_id is None:
+            return None
+        try:
+            mapping = get_private_field(tv, 'positionToStableId')
+        except Exception as e:
+            mapping = None
+        if mapping is not None:
+            try:
+                size = int(mapping.size())
+                for i in range(size):
+                    if int(mapping.valueAt(i)) == int(stable_id):
+                        return int(mapping.keyAt(i))
+            except Exception as e:
+                pass
+        try:
+            total = int(tv.getTabsCount())
+            for i in range(total):
+                try:
+                    if int(tv.getStableId(i)) == int(stable_id):
+                        return i
+                except Exception:
+                    continue
+        except Exception as e:
+            pass
+        return None
+
+    def _page_selected_types(self, tv=None):
+        types = []
+        try:
+            panel = tv if tv is not None else self.last_tabs_view
+            if panel is None:
+                return types
+            target = self._resolve_dialogs_activity(panel)
+            if target is None:
+                return types
+            pages = get_private_field(target, 'viewPages')
+            if pages is None:
+                return types
+            try:
+                length = len(pages)
+            except Exception:
+                length = 2
+            for i in range(length):
+                try:
+                    page = pages[i]
+                    value = get_private_field(page, 'selectedType')
+                    types.append(int(value) if value is not None else None)
+                except Exception:
+                    types.append(None)
+        except Exception as e:
+            pass
+        return types
+
+    def _clear_selected_dialog_filters(self):
+        try:
+            mc = get_messages_controller()
+            if mc is None:
+                return False
+            selected = None
+            try:
+                selected = mc.selectedDialogFilter
+            except Exception:
+                selected = None
+            if selected is None:
+                try:
+                    selected = get_private_field(mc, 'selectedDialogFilter')
+                except Exception:
+                    selected = None
+            if selected is None:
+                return False
+            try:
+                length = len(selected)
+            except Exception:
+                length = 2
+            cleared = []
+            for i in range(length):
+                try:
+                    item = selected[i]
+                except Exception:
+                    continue
+                if item is None:
+                    continue
+                fid = _safe_filter_id(item)
+                if int(fid) == 0:
+                    continue
+                try:
+                    selected[i] = None
+                    cleared.append(int(fid))
+                except Exception as e:
+                    pass
+            if cleared:
+                return True
+        except Exception as e:
+            pass
+        return False
+
+    def _force_page_selected_types(self, index, tv=None):
+        try:
+            panel = tv if tv is not None else self.last_tabs_view
+            target = self._resolve_dialogs_activity(panel) if panel is not None else None
+            if target is None:
+                return False
+            pages = get_private_field(target, 'viewPages')
+            if pages is None:
+                return False
+            try:
+                length = len(pages)
+            except Exception:
+                length = 2
+            fixed = []
+            for i in range(length):
+                try:
+                    page = pages[i]
+                except Exception:
+                    page = None
+                if page is None:
+                    continue
+                try:
+                    value = get_private_field(page, 'selectedType')
+                    current = int(value) if value is not None else None
+                except Exception:
+                    current = None
+                if current is not None and int(current) == int(index):
+                    continue
+                if self._set_private_int(page, 'selectedType', int(index)):
+                    fixed.append((i, current))
+            if fixed:
+                return True
+        except Exception as e:
+            pass
+        return False
+
+    def _reset_selected_type_guard(self, tv, tab_id):
+        try:
+            target = self._resolve_dialogs_activity(tv)
+            if target is None:
+                return False
+            pages = get_private_field(target, 'viewPages')
+            if pages is None:
+                return False
+            changed = 0
+            try:
+                length = len(pages)
+            except Exception:
+                length = 2
+            for i in range(length):
+                try:
+                    page = pages[i]
+                except Exception:
+                    page = None
+                if page is None:
+                    continue
+                try:
+                    value = get_private_field(page, 'selectedType')
+                    current = int(value) if value is not None else None
+                except Exception:
+                    current = None
+                if current is None or current != int(tab_id):
+                    continue
+                if self._set_private_int(page, 'selectedType', -1):
+                    changed += 1
+            if changed:
+                return True
+        except Exception as e:
+            pass
+        return False
+
+    def _set_private_int(self, obj, name, value):
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return False
+        while cls is not None:
+            f = None
+            try:
+                f = cls.getDeclaredField(name)
+            except Exception:
+                f = None
+            if f is not None:
+                try:
+                    f.setAccessible(True)
+                    if jint is not None:
+                        f.setInt(obj, jint(int(value)))
+                    else:
+                        f.setInt(obj, int(value))
+                    return True
+                except Exception as e:
+                    return False
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                return False
+        return False
+
+    def _filter_slot_ids(self):
+        ids = []
+        try:
+            mc = get_messages_controller()
+            if mc is None:
+                return ids
+            selected = get_private_field(mc, 'selectedDialogFilter')
+            if selected is None:
+                return ids
+            try:
+                length = len(selected)
+            except Exception:
+                length = 2
+            for i in range(length):
+                try:
+                    item = selected[i]
+                except Exception:
+                    continue
+                ids.append(_safe_filter_id(item) if item is not None else 0)
+        except Exception as e:
+            pass
+        return ids
+
+    def _page_filter_ids(self, tv=None):
+        panel = tv if tv is not None else self.last_tabs_view
+        try:
+            target = self._resolve_dialogs_activity(panel)
+            pages = get_private_field(target, 'viewPages')
+            slots = self._filter_slot_ids()
+            result = []
+            for page in pages:
+                try:
+                    kind = int(get_private_field(page, 'dialogsType'))
+                    if kind in (7, 8):
+                        slot = kind - 7
+                        result.append(slots[slot] if slot < len(slots) else None)
+                    elif kind == 0:
+                        result.append(0)
+                    else:
+                        result.append(None)
+                except Exception:
+                    result.append(None)
+            return result
+        except Exception:
+            return []
+
+    def _selection_matches(self, tv, index, expected_id):
+        try:
+            types = self._page_selected_types(tv)
+            ids = self._page_filter_ids(tv)
+            return bool(types and ids and (types[0] is not None) and (ids[0] is not None) and (int(types[0]) == int(index)) and (int(ids[0]) == int(expected_id)))
+        except Exception:
+            return False
+
+    def _verify_selection_later(self, index, expected_id, allow_retry=True, preferred_panel_ref=None):
+        generation = self._select_generation
+        mode = self.expanded_group
+
+        def verify(attempt=1):
+            if self._unloaded or generation != self._select_generation or mode != self.expanded_group:
+                return
+            try:
+                tv = self._resolve_selection_panel(preferred_panel_ref)
+                if tv is None:
+                    return
+                visible = list(self.last_visible)
+                if not 0 <= index < len(visible) or _safe_filter_id(visible[index]) != expected_id:
+                    return
+                if self._selection_matches(tv, index, expected_id):
+                    return
+                if attempt < 3:
+                    run_on_ui_thread(lambda: verify(attempt + 1), delay=220)
+                    return
+                types = self._page_selected_types(tv)
+                ids = self._page_filter_ids(tv)
+                if not ids or ids[0] is None:
+                    return
+                if allow_retry:
+                    self._recover_selection(index, expected_id, preferred_panel_ref=preferred_panel_ref)
+            except Exception as e:
+                pass
+        run_on_ui_thread(verify, delay=110)
+
+    def _find_tab_object(self, tv, index):
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            if tabs is None:
+                return (None, -1, 0)
+            count = int(tabs.size())
+            for position in range(count):
+                tab = tabs.get(position)
+                if int(tab.id) == int(index):
+                    return (tab, position, count)
+            return (None, -1, count)
+        except Exception as e:
+            return (None, -1, 0)
+
+    def _recover_selection(self, index, expected_id, preferred_panel_ref=None):
+        try:
+            tv = self._resolve_selection_panel(preferred_panel_ref)
+            if tv is None:
+                return
+            tab, position, count = self._find_tab_object(tv, index)
+            if tab is None:
+                return
+            if self._set_private_int(tv, 'currentPosition', -1):
+                self._set_private_int(tv, 'previousPosition', -1)
+            self._reset_selected_type_guard(tv, index)
+            m = self._find_method_in_hierarchy(tv, 'scrollToTab', argc=2)
+            if m is None:
+                m = self._find_method_in_hierarchy(tv, 'scrollToTab')
+            if m is None:
+                return
+            if self._invoke_scroll_to_tab(m, tv, tab, position):
+                self._verify_selection_later(index, expected_id, allow_retry=False)
+        except Exception:
+            pass
+
+    def _collect_tabs_views(self, obj, depth, found):
+        if obj is None or depth < 0:
+            return found
+        try:
+            cname = str(obj.getClass().getName())
+        except Exception:
+            return found
+        if 'FilterTabsView' in cname:
+            if all((obj != x for x in found)):
+                found.append(obj)
+            return found
+        if depth == 0:
+            return found
+        try:
+            cls = obj.getClass()
+            while cls is not None:
+                for f in cls.getDeclaredFields():
+                    try:
+                        tname = str(f.getType().getName())
+                    except Exception:
+                        tname = ''
+                    interesting = 'FilterTabsView' in tname or 'DialogsActivity' in tname or 'List' in tname or ('Fragment' in tname)
+                    if not interesting:
+                        continue
+                    try:
+                        f.setAccessible(True)
+                        v = f.get(obj)
+                    except Exception:
+                        continue
+                    if v is None:
+                        continue
+                    try:
+                        vname = str(v.getClass().getName())
+                    except Exception:
+                        continue
+                    if 'List' in vname:
+                        try:
+                            for i in range(int(v.size())):
+                                self._collect_tabs_views(v.get(i), depth - 1, found)
+                        except Exception:
+                            pass
+                    else:
+                        self._collect_tabs_views(v, depth - 1, found)
+                cls = cls.getSuperclass()
+        except Exception as e:
+            pass
+        return found
+
+    def _resolve_visible_tabs_view(self, allow_fast_path=True):
+        if self._unloaded:
+            return None
+        cached = self.last_tabs_view
+        if allow_fast_path and cached is not None:
+            try:
+                if bool(cached.isShown()) and self._tab_titles(cached):
+                    self._ensure_counter_hook(cached)
+                    return cached
+            except Exception as e:
+                pass
+        found = []
+        try:
+            frag = get_last_fragment()
+            self._collect_tabs_views(frag, 3, found)
+        except Exception as e:
+            pass
+        if cached is not None and all((cached != x for x in found)):
+            found.append(cached)
+        if not found:
+            return None
+        best = None
+        cached_ok = False
+        skipped_hidden = 0
+        skipped_empty = 0
+        for tv in found:
+            if not self._tabs_view_is_alive(tv):
+                skipped_hidden += 1
+                continue
+            is_cached = cached is not None and tv == cached
+            try:
+                shown = bool(tv.isShown())
+            except Exception:
+                shown = None
+            if not shown:
+                skipped_hidden += 1
+                continue
+            titles = self._tab_titles(tv)
+            if not titles:
+                skipped_empty += 1
+                continue
+            if is_cached:
+                cached_ok = True
+                best = cached
+                break
+            if best is None:
+                best = tv
+        if cached_ok:
+            best = cached
+        if best is None:
+            return None
+        self.last_tabs_view = best
+        self._ensure_counter_hook(best)
+        return best
+
+    def _attach_counter_to_current_panel(self):
+        if not self._unloaded:
+            self._resolve_visible_tabs_view(allow_fast_path=False)
+
+    def _ensure_counter_hook(self, tv):
+        if self._unloaded or tv is None:
+            return False
+        try:
+            self._ensure_counter_ui_hooks(tv)
+            delegate = get_private_field(tv, 'delegate')
+            if delegate is None:
+                return False
+            method = self._find_method_in_hierarchy(delegate, 'getTabCounter', argc=1)
+            if method is None:
+                return False
+            key = str(method.getDeclaringClass().getName())
+            if key in self._counter_hook_classes:
+                return True
+            self.hook_method(method, TabCounterHook(self))
+            self._counter_hook_classes.add(key)
+            self._hooked.append(key + '.getTabCounter')
+            try:
+                tv.checkTabsCounter()
+                tv.invalidate()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            return False
+
+    def _panel_from_counter_delegate(self, delegate):
+        try:
+            owner = get_private_field(delegate, 'this$0')
+            tv = get_private_field(owner, 'filterTabsView')
+            actual = get_private_field(tv, 'delegate')
+            if _identity(actual) == _identity(delegate):
+                return tv
+        except Exception:
+            pass
+        return None
+
+    def _ensure_counter_ui_hooks(self, tv):
+        if self._unloaded:
+            return
+        self._ensure_counter_cell_hook()
+        targets = [(tv, 'checkTabsCounter', 0, CounterPanelUpdateHook), (tv, 'notifyTabCounterChanged', 1, CounterPanelUpdateHook)]
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            if tabs is not None and int(tabs.size()) > 0:
+                targets.append((tabs.get(0), 'getWidth', 1, CounterTabWidthHook))
+        except Exception:
+            pass
+        for obj, name, argc, hook_type in targets:
+            try:
+                method = self._find_method_in_hierarchy(obj, name, argc=argc)
+                if method is None:
+                    continue
+                key = str(method.getDeclaringClass().getName()) + '.' + name
+                if key in self._counter_ui_hook_classes:
+                    continue
+                self.hook_method(method, hook_type(self))
+                self._counter_ui_hook_classes.add(key)
+            except Exception as e:
+                pass
+
+    def _ensure_counter_cell_hook(self):
+        key = 'org.telegram.ui.Cells.DialogCell.update:counter_refresh'
+        if self._unloaded or key in self._counter_ui_hook_classes or 'counter_refresh:update_unavailable' in self._counter_ui_hook_classes:
+            return
+        try:
+            cls = find_class('org.telegram.ui.Cells.DialogCell')
+            if cls is None:
+                return
+            candidates = []
+            for method in cls.getClass().getDeclaredMethods():
+                if str(method.getName()) != 'update':
+                    continue
+                types = list(method.getParameterTypes())
+                if len(types) not in (1, 2):
+                    continue
+                try:
+                    names = [str(t.getName()) for t in types]
+                except Exception:
+                    names = None
+                if names is not None and names not in (['int'], ['int', 'boolean']):
+                    continue
+                candidates.append((len(types), method))
+            if not candidates:
+                marker = 'counter_refresh:update_unavailable'
+                if marker not in self._counter_ui_hook_classes:
+                    self._counter_ui_hook_classes.add(marker)
+                return
+            argc, method = max(candidates, key=lambda item: item[0])
+            method.setAccessible(True)
+            self.hook_method(method, CounterCellStateHook(self))
+            self._counter_ui_hook_classes.add(key)
+        except Exception as exc:
+            pass
+
+    def _request_counter_ui_recheck(self, tv):
+        if self._unloaded or self._counter_ui_busy or tv is None:
+            return
+        try:
+            if not bool(tv.isShown()) or not self._tabs_view_is_alive(tv):
+                return
+            tabs = get_private_field(tv, 'tabs')
+            for i in range(int(tabs.size())):
+                tab = tabs.get(i)
+                if int(get_private_field(tab, 'counter')) > 0:
+                    self._schedule_counter_ui_sync(tv, int(tab.id), force=True)
+                    return
+            for view, tid in self._counter_bound_views(tv):
+                if self._counter_view_stale(view):
+                    self._schedule_counter_ui_sync(tv, tid, force=True)
+                    return
+        except Exception:
+            pass
+
+    def _observe_counter_cell(self, cell):
+        if self._unloaded or self._counter_ui_busy:
+            return
+        try:
+            tv = self.last_tabs_view
+            if tv is None or not bool(tv.isShown()) or (not bool(cell.isShown())) or (not self._tabs_view_is_alive(tv)):
+                return
+            if not bool(get_private_field(cell, 'isDialogCell')) or bool(get_private_field(cell, 'isTopic')):
+                return
+            peer = int(cell.getDialogId())
+            account = int(get_private_field(cell, 'currentAccount'))
+            unread = get_private_field(cell, 'unreadCount')
+            marked = get_private_field(cell, 'markUnread')
+            if unread is None or marked is None:
+                return
+            key = (_identity(tv), account, peer)
+            state = (int(unread), bool(marked), int(get_private_field(cell, 'dialogsType')), self._nav_generation)
+            if self._counter_cell_state.get(key) == state:
+                return
+            owner = self._resolve_dialogs_activity(tv)
+            if owner is None:
+                return
+            try:
+                mc = owner.getMessagesController()
+            except Exception:
+                method = self._find_method_in_hierarchy(owner, 'getMessagesController', argc=0)
+                if method is None:
+                    return
+                mc = method.invoke(owner)
+            if mc is None or int(get_private_field(mc, 'currentAccount')) != account:
+                return
+            if len(self._counter_cell_state) >= 128 and key not in self._counter_cell_state:
+                self._counter_cell_state.clear()
+            self._counter_cell_state[key] = state
+            self._request_counter_ui_recheck(tv)
+        except Exception:
+            pass
+
+    def _counter_cap_for_tab(self, tv, tab_id):
+        if self._unloaded or tv is None:
+            return None
+        try:
+            delegate = get_private_field(tv, 'delegate')
+            context = self._counter_context(delegate, tab_id)
+            if context is None:
+                return None
+            count = self._explicit_unread_state(*context)[0]
+            return int(count) if count is not None and count >= 0 else None
+        except Exception:
+            return None
+
+    def _counter_zero_for_tab(self, tv, tab_id):
+        return self._counter_cap_for_tab(tv, tab_id) == 0
+
+    def _write_counter_int(self, obj, name, value):
+        try:
+            get_private_field(obj, name)
+            setattr(obj, name, int(value))
+            return int(get_private_field(obj, name)) == int(value)
+        except Exception:
+            if not self._set_private_int(obj, name, value):
+                return False
+            try:
+                return int(get_private_field(obj, name)) == int(value)
+            except Exception:
+                return False
+
+    def _counter_bound_views(self, tv):
+        found = []
+        try:
+            lv = get_private_field(tv, 'listView')
+            for i in range(int(lv.getChildCount())):
+                view = lv.getChildAt(i)
+                try:
+                    tab = get_private_field(view, 'currentTab')
+                    if tab is not None:
+                        found.append((view, int(tab.id)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return found
+
+    def _counter_view_stale(self, view, target=0):
+        for name in ('lastTabCount', 'animateFromTabCount'):
+            try:
+                if int(get_private_field(view, name)) > int(target):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _schedule_counter_ui_sync(self, tv, tab_id, force=False):
+        if self._unloaded or self._counter_ui_busy:
+            return
+        try:
+            tab, _, _ = self._find_tab_object(tv, tab_id)
+            if tab is None:
+                return
+            stale = int(get_private_field(tab, 'counter')) > 0
+            if not stale and (not force):
+                stale = any((tid == tab_id and self._counter_view_stale(view) for view, tid in self._counter_bound_views(tv)))
+            if not stale and (not force):
+                return
+            key = _identity(tv)
+            if key in self._counter_ui_pending:
+                return
+            try:
+                holder = ('java', jclass('java.lang.ref.WeakReference')(tv))
+            except Exception:
+                holder = ('python', weakref.ref(tv))
+            owner_ref = weakref.ref(self)
+            generation = self._nav_generation
+            self._counter_ui_pending.add(key)
+
+            def apply():
+                plugin = owner_ref()
+                if plugin is None:
+                    return
+                plugin._counter_ui_pending.discard(key)
+                if plugin._unloaded or plugin._nav_generation != generation:
+                    return
+                try:
+                    panel = holder[1].get() if holder[0] == 'java' else holder[1]()
+                    if panel is not None:
+                        plugin._sync_counter_ui(panel)
+                except Exception as e:
+                    pass
+            try:
+                run_on_ui_thread(apply, delay=16)
+            except Exception:
+                self._counter_ui_pending.discard(key)
+        except Exception:
+            pass
+
+    def _sync_counter_ui(self, tv):
+        if self._unloaded or self._counter_ui_busy:
+            return False
+        self._counter_ui_busy = True
+        changes = []
+        try:
+            if tv is None or not bool(tv.isShown()) or (not self._tabs_view_is_alive(tv)):
+                return False
+            tabs = get_private_field(tv, 'tabs')
+            targets = {}
+            delta = 0
+            for i in range(int(tabs.size())):
+                tab = tabs.get(i)
+                tid = int(tab.id)
+                cap = self._counter_cap_for_tab(tv, tid)
+                if cap is None:
+                    continue
+                before = int(get_private_field(tab, 'counter'))
+                if before < 0 or (before == 0 and cap > 0):
+                    continue
+                target = min(before, cap)
+                if before > target:
+                    old_width = None
+                    try:
+                        old_width = int(tab.getWidth(False))
+                    except Exception:
+                        pass
+                    if not self._write_counter_int(tab, 'counter', target):
+                        continue
+                    if old_width is not None:
+                        try:
+                            delta += int(tab.getWidth(False)) - old_width
+                        except Exception:
+                            pass
+                    changes.append({'tab_id': tid, 'verified_cap': cap, 'model_before': before, 'model_after': int(get_private_field(tab, 'counter'))})
+                targets[tid] = target
+            view_changes = []
+            for view, tid in self._counter_bound_views(tv):
+                if tid not in targets or not self._counter_view_stale(view, targets[tid]):
+                    continue
+                try:
+                    animator = get_private_field(view, 'changeAnimator')
+                    if animator is not None:
+                        animator.cancel()
+                except Exception:
+                    pass
+                try:
+                    view.clearTransitionParams()
+                except Exception:
+                    pass
+                self._write_counter_int(view, 'lastTabCount', targets[tid])
+                self._write_counter_int(view, 'animateFromTabCount', targets[tid])
+                try:
+                    view.invalidate()
+                except Exception:
+                    pass
+                view_changes.append({'tab_id': tid, 'target': targets[tid], 'stale_after': self._counter_view_stale(view, targets[tid])})
+            if not changes and (not view_changes):
+                return False
+            if delta:
+                try:
+                    total = int(get_private_field(tv, 'allTabsWidth'))
+                    self._write_counter_int(tv, 'allTabsWidth', max(0, total + delta))
+                except Exception:
+                    pass
+            self._stretch_tabs(tv)
+            try:
+                lv = get_private_field(tv, 'listView')
+                adapter = lv.getAdapter()
+                if adapter is not None:
+                    adapter.notifyDataSetChanged()
+                lv.invalidateViews()
+                lv.invalidate()
+            except Exception:
+                pass
+            try:
+                tv.requestLayout()
+                tv.invalidate()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            return False
+        finally:
+            self._counter_ui_busy = False
+
+    def _counter_context(self, delegate, tab_id):
+        try:
+            owner = get_private_field(delegate, 'this$0')
+            tv = get_private_field(owner, 'filterTabsView')
+            if tv is None or not bool(tv.isShown()) or (not self._tabs_view_is_alive(tv)):
+                return None
+            actual_delegate = get_private_field(tv, 'delegate')
+            if _identity(actual_delegate) != _identity(delegate):
+                return None
+            if int(tv.getDefaultTabId()) == int(tab_id):
+                return None
+            tab, _, _ = self._find_tab_object(tv, tab_id)
+            if tab is None:
+                return None
+            try:
+                mc = owner.getMessagesController()
+            except Exception:
+                method = self._find_method_in_hierarchy(owner, 'getMessagesController', argc=0)
+                if method is None:
+                    return None
+                mc = method.invoke(owner)
+            if mc is None:
+                return None
+            visible = mc.getDialogFilters()
+            if visible is None or not 0 <= tab_id < int(visible.size()):
+                return None
+            snapshot = [visible.get(i) for i in range(int(visible.size()))]
+            if self._panel_matches_filter_snapshot(tv, snapshot) is False:
+                return None
+            folder = visible.get(tab_id)
+            if _is_default_filter(folder):
+                return None
+            raw = get_private_field(mc, 'dialogFilters')
+            if raw is None or not any((_identity(raw.get(i)) == _identity(folder) for i in range(int(raw.size())))):
+                return None
+            return (mc, folder)
+        except Exception:
+            return None
+
+    def _explicit_unread_state(self, mc, folder):
+        evidence = []
+        try:
+            if int(folder.flags) != 0 or _is_default_filter(folder):
+                return (None, 'native_rules', evidence)
+            included = get_private_field(folder, 'alwaysShow')
+            excluded = get_private_field(folder, 'neverShow')
+            if included is None or excluded is None:
+                return (None, 'membership_unknown', evidence)
+            denied = {int(excluded.get(i)) for i in range(int(excluded.size()))}
+            peers = {int(included.get(i)) for i in range(int(included.size()))} - denied
+            pinned = get_private_field(folder, 'pinnedDialogs')
+            if pinned is not None:
+                for i in range(int(pinned.size())):
+                    if int(pinned.keyAt(i)) not in peers and int(pinned.keyAt(i)) not in denied:
+                        return (None, 'pinned_membership_unknown', evidence)
+            if len(peers) > 100:
+                return (None, 'large_folder', evidence)
+            if any((peer >= 0 for peer in peers)):
+                return (None, 'user_or_encrypted_members', evidence)
+            dialogs = get_private_field(mc, 'dialogs_dict')
+            if dialogs is None:
+                return (None, 'dialogs_unknown', evidence)
+            count = 0
+            complete = True
+            for peer in sorted(peers):
+                dialog = dialogs.get(peer)
+                if dialog is None:
+                    complete = False
+                    evidence.append({'peer': peer, 'loaded': False})
+                    continue
+                marked_value = get_private_field(dialog, 'unread_mark')
+                if marked_value is None:
+                    return (None, 'unread_mark_unknown', evidence)
+                marked = bool(marked_value)
+                raw = int(get_private_field(dialog, 'unread_count'))
+                mentions = int(get_private_field(dialog, 'unread_mentions_count'))
+                chat = mc.getChat(-peer)
+                if chat is None:
+                    complete = False
+                    evidence.append({'peer': peer, 'loaded': True, 'chat_loaded': False})
+                    continue
+                forum_value = get_private_field(chat, 'forum')
+                if forum_value is None:
+                    return (None, 'forum_state_unknown', evidence)
+                forum = bool(forum_value)
+                effective = int(mc.getDialogUnreadCount(dialog))
+                forum_topics = None
+                forum_mentions = None
+                forum_reactions = None
+                forum_poll_votes = None
+                if forum:
+                    topics = mc.getTopicsController().getForumUnreadCount(-peer)
+                    forum_topics = int(topics[0])
+                    forum_mentions = int(topics[1])
+                    forum_reactions = int(topics[2]) if len(topics) > 2 else None
+                    forum_poll_votes = int(topics[4]) if len(topics) > 4 else None
+                    if forum_topics < 0:
+                        complete = False
+                    effective = max(effective, forum_topics)
+                if raw < 0 or effective < 0 or mentions < 0:
+                    complete = False
+                message_unread = effective if forum else max(raw, effective)
+                unread = message_unread > 0 or marked
+                count += int(unread)
+                evidence.append({'peer': peer, 'loaded': True, 'raw': raw, 'effective': effective, 'marked': marked, 'mentions': mentions, 'forum': forum, 'forum_unread_topics': forum_topics, 'forum_mentions': forum_mentions, 'forum_reactions': forum_reactions, 'forum_poll_votes': forum_poll_votes, 'counter_source': 'forum_topics' if forum else 'dialog', 'counted_unread': bool(unread)})
+            if not complete:
+                return (None, 'incomplete_data', evidence)
+            return (count, 'verified_explicit_folder', evidence)
+        except Exception:
+            return (None, 'unsupported_or_unknown_state', evidence)
+
+    def _tab_titles(self, tv):
+        titles = []
+        try:
+            tabs = get_private_field(tv, 'tabs')
+            if tabs is None:
+                return titles
+            for i in range(int(tabs.size())):
+                t = tabs.get(i)
+                name = None
+                try:
+                    name = t.title
+                except Exception:
+                    name = None
+                if name is None:
+                    try:
+                        name = get_private_field(t, 'title')
+                    except Exception:
+                        name = None
+                titles.append(str(name) if name is not None else '?')
+        except Exception as e:
+            pass
+        return titles
+
+    def _stop_tab_animation(self, tv):
+        if tv is None:
+            return
+        try:
+            tv.stopAnimatingIndicator()
+        except Exception as e:
+            pass
+        for field_name in ('manualScrollingToPosition', 'manualScrollingToId'):
+            try:
+                self._set_private_int(tv, field_name, -1)
+            except Exception as e:
+                pass
+
+    def _settle_after_switch(self, index, position, attempt=1):
+        generation = self._select_generation
+
+        def apply():
+            if self._unloaded or generation != self._select_generation:
+                return
+            tv = self.last_tabs_view
+            if tv is None:
+                return
+            try:
+                if bool(tv.isAnimatingIndicator()):
+                    tv.stopAnimatingIndicator()
+            except Exception as e:
+                pass
+            for field_name in ('manualScrollingToPosition', 'manualScrollingToId'):
+                try:
+                    value = get_private_field(tv, field_name)
+                    if value is not None and int(value) != -1:
+                        self._set_private_int(tv, field_name, -1)
+                except Exception as e:
+                    pass
+            if position is not None and int(position) >= 0:
+                for field_name in ('currentPosition', 'previousPosition'):
+                    try:
+                        value = get_private_field(tv, field_name)
+                        if value is None or int(value) != int(position):
+                            self._set_private_int(tv, field_name, int(position))
+                    except Exception as e:
+                        pass
+            self._reset_page_geometry(tv, index, attempt)
+            self._stretch_tabs(tv)
+            if attempt < 2:
+                self._settle_after_switch(index, position, attempt + 1)
+        run_on_ui_thread(apply, delay=120 if attempt == 1 else 180)
+
+    def _refresh_dialogs_page(self, tv, index):
+        try:
+            target = self._resolve_dialogs_activity(tv)
+            if target is None:
+                return False
+            pages = get_private_field(target, 'viewPages')
+            if pages is None:
+                return False
+            try:
+                length = len(pages)
+            except Exception:
+                length = 2
+            refreshed = []
+            for i in range(length):
+                try:
+                    page = pages[i]
+                except Exception:
+                    page = None
+                if page is None:
+                    continue
+                adapter = None
+                for field_name in ('dialogsAdapter', 'adapter'):
+                    try:
+                        adapter = get_private_field(page, field_name)
+                    except Exception:
+                        adapter = None
+                    if adapter is not None:
+                        break
+                if adapter is None:
+                    continue
+                try:
+                    adapter.notifyDataSetChanged()
+                    refreshed.append(i)
+                except Exception as e:
+                    pass
+            if refreshed:
+                return True
+        except Exception as e:
+            pass
+        return False
+
+    def _set_private_flag(self, obj, name, value):
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return False
+        while cls is not None:
+            f = None
+            try:
+                f = cls.getDeclaredField(name)
+            except Exception:
+                f = None
+            if f is not None:
+                try:
+                    f.setAccessible(True)
+                    f.setBoolean(obj, bool(value))
+                    return True
+                except Exception as e:
+                    return False
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                return False
+        return False
+
+    def _clear_private_object(self, obj, name):
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return False
+        while cls is not None:
+            f = None
+            try:
+                f = cls.getDeclaredField(name)
+            except Exception:
+                f = None
+            if f is not None:
+                try:
+                    f.setAccessible(True)
+                    current = f.get(obj)
+                    if current is None:
+                        return False
+                    f.set(obj, None)
+                    return True
+                except Exception as e:
+                    return False
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                return False
+        return False
+
+    def _reset_page_geometry(self, tv, index, attempt=0):
+        target = None
+        try:
+            target = self._resolve_dialogs_activity(tv)
+        except Exception as e:
+            pass
+        if target is None:
+            return False
+        pages = None
+        try:
+            pages = get_private_field(target, 'viewPages')
+        except Exception as e:
+            pass
+        if pages is None:
+            return False
+        try:
+            length = len(pages)
+        except Exception:
+            length = 2
+        snapshot = []
+        fixed = []
+        for i in range(length):
+            page = None
+            try:
+                page = pages[i]
+            except Exception:
+                page = None
+            if page is None:
+                continue
+            tx, ty, alpha, top, padding = (None, None, None, None, None)
+            try:
+                tx = float(page.getTranslationX())
+            except Exception:
+                tx = None
+            try:
+                ty = float(page.getTranslationY())
+            except Exception:
+                ty = None
+            try:
+                alpha = float(page.getAlpha())
+            except Exception:
+                alpha = None
+            try:
+                top = int(page.getTop())
+            except Exception:
+                top = None
+            try:
+                padding = int(page.getPaddingTop())
+            except Exception:
+                padding = None
+            snapshot.append(u'page[{}]: translationX={}, translationY={}, alpha={}, top={}, paddingTop={}'.format(i, tx, ty, alpha, top, padding))
+            changed = []
+            if ty is not None and abs(ty) > 0.5:
+                try:
+                    page.setTranslationY(0.0)
+                    changed.append(u'translationY {:.1f} → 0'.format(ty))
+                except Exception as e:
+                    pass
+            if tx is not None and abs(tx) > 0.5:
+                try:
+                    page.setTranslationX(0.0)
+                    changed.append(u'translationX {:.1f} → 0'.format(tx))
+                except Exception as e:
+                    pass
+            if alpha is not None and alpha < 0.99:
+                try:
+                    page.setAlpha(1.0)
+                    changed.append(u'alpha {:.2f} → 1'.format(alpha))
+                except Exception as e:
+                    pass
+            if changed:
+                fixed.append(u'page[{}]: {}'.format(i, ', '.join(changed)))
+        panel = []
+        try:
+            panel_ty = float(tv.getTranslationY())
+            if abs(panel_ty) > 0.5:
+                tv.setTranslationY(0.0)
+                panel.append(u'панель translationY {:.1f} → 0'.format(panel_ty))
+        except Exception as e:
+            pass
+        for flag_name in ('tabsAnimationInProgress', 'animatingForward'):
+            value = None
+            try:
+                value = get_private_field(target, flag_name)
+            except Exception:
+                value = None
+            if value is None:
+                continue
+            try:
+                if bool(value) and self._set_private_flag(target, flag_name, False):
+                    panel.append(u'{} сброшен'.format(flag_name))
+            except Exception as e:
+                pass
+        try:
+            if self._clear_private_object(target, 'tabsAnimation'):
+                panel.append(u'tabsAnimation очищен')
+        except Exception as e:
+            pass
+        if fixed or panel:
+            try:
+                view = target.getFragmentView()
+                if view is not None:
+                    view.requestLayout()
+                    view.invalidate()
+            except Exception as e:
+                pass
+            return True
+        return False
+
+    def _watch_panel_stuck(self, index):
+        self._stuck_generation += 1
+        generation = self._stuck_generation
+        marked_at = time.time()
+
+        def check():
+            if self._unloaded or generation != self._stuck_generation:
+                return
+            try:
+                progress, stamp = self._last_tab_progress
+            except Exception:
+                progress, stamp = (None, 0.0)
+            if stamp > marked_at:
+                return
+            tv = self.last_tabs_view
+            state = {}
+            for field_name in ('currentPosition', 'previousPosition', 'manualScrollingToPosition', 'manualScrollingToId', 'selectedTabId'):
+                value = None
+                try:
+                    if tv is not None:
+                        raw = get_private_field(tv, field_name)
+                        value = int(raw) if raw is not None else None
+                except Exception:
+                    value = None
+                state[field_name] = value
+            animating = None
+            try:
+                if tv is not None:
+                    animating = bool(tv.isAnimatingIndicator())
+            except Exception:
+                animating = None
+            suspicious = bool(animating)
+            for field_name in ('manualScrollingToPosition', 'manualScrollingToId'):
+                value = state.get(field_name)
+                try:
+                    if value is not None and int(value) != -1:
+                        suspicious = True
+                except Exception:
+                    pass
+            if not suspicious:
+                return
+            if tv is not None:
+                self._stop_tab_animation(tv)
+                self._stretch_tabs(tv)
+        run_on_ui_thread(check, delay=1500)
+
+    def _stretch_tabs(self, tv):
+        if tv is None:
+            return
+        method = None
+        try:
+            method = self._find_method_in_hierarchy(tv, 'updateTabsWidths', argc=0)
+            if method is None:
+                method = self._find_method_in_hierarchy(tv, 'updateTabsWidths')
+        except Exception as e:
+            pass
+        if method is not None:
+            try:
+                argc = len(method.getParameterTypes())
+                if argc == 0:
+                    method.invoke(tv)
+                elif argc == 1:
+                    method.invoke(tv, 0)
+            except Exception as e:
+                pass
+        try:
+            tv.requestLayout()
+            tv.invalidate()
+        except Exception as e:
+            pass
+
+    def _refresh_tabs_view(self, tv):
+        try:
+            lv = get_private_field(tv, 'listView')
+            if lv is not None:
+                adapter = lv.getAdapter()
+                if adapter is not None:
+                    adapter.notifyDataSetChanged()
+        except Exception as e:
+            pass
+        try:
+            tv.requestLayout()
+            tv.invalidate()
+        except Exception as e:
+            pass
+        self._stretch_tabs(tv)
+
+    def _rebuild_tabs_manually(self, tv, visible):
+        return self._force_update_filter_tabs(tv)
+
+    def _select_tab_later(self, index, label, allow_retry=True, allow_settle_skip=False, delay=None, prefer_direct=False, preferred_panel_ref=None, require_default=False, root_return=False, root_filter_id=None):
+        self._select_generation += 1
+        select_gen = self._select_generation
+        waits = [0]
+
+        def retry_wait(reason):
+            if preferred_panel_ref is None or waits[0] >= 16:
+                return False
+            waits[0] += 1
+            run_on_ui_thread(do_select, delay=160)
+            return True
+
+        def do_select():
+            nonlocal index
+            if self._unloaded or select_gen != self._select_generation:
+                return
+            try:
+                try:
+                    tv = self._resolve_selection_panel(preferred_panel_ref)
+                except Exception:
+                    pass
+                if tv is None:
+                    retry_wait('панель исходного экрана временно недоступна')
+                    return
+                if preferred_panel_ref is not None and (not self._tab_titles(tv)):
+                    self._force_update_filter_tabs(tv)
+                    if not self._tab_titles(tv):
+                        retry_wait('исходная панель временно без вкладок')
+                        return
+                expected_titles = []
+                actual_titles = []
+                panel_ok = False
+                try:
+                    expected_titles = self._expected_tab_titles(tv, list(self.last_visible))
+                    actual_titles = self._tab_titles(tv)
+                    panel_ok = bool(expected_titles) and bool(actual_titles) and ([s.strip() for s in expected_titles] == [s.strip() for s in actual_titles]) and (self._panel_matches_filter_snapshot(tv, list(self.last_visible)) is not False)
+                except Exception as e:
+                    pass
+                if panel_ok:
+                    pass
+                else:
+                    try:
+                        if self._force_update_filter_tabs(tv):
+                            self._stretch_tabs(tv)
+                    except Exception:
+                        pass
+                self._refresh_visible_snapshot(tv)
+                try:
+                    refreshed = self._expected_tab_titles(tv, list(self.last_visible))
+                    if refreshed and refreshed != expected_titles:
+                        expected_titles = refreshed
+                        panel_ok = False
+                except Exception as e:
+                    pass
+                try:
+                    try:
+                        visible_snapshot = list(self.last_visible)
+                        expected = self._expected_tab_titles(tv, visible_snapshot)
+                        actual = actual_titles if panel_ok else self._tab_titles(tv)
+                        if not expected or not actual:
+                            pass
+                        elif [s.strip() for s in expected] == [s.strip() for s in actual]:
+                            pass
+                        else:
+                            rewritten = self._rewrite_tab_titles(tv, expected)
+                            confirmed = False
+                            if rewritten:
+                                updated = self._tab_titles(tv)
+                                confirmed = bool(updated) and [x.strip() for x in updated] == [x.strip() for x in expected]
+                            if confirmed:
+                                panel_ok = True
+                                expected_titles = list(expected)
+                    except Exception as e:
+                        pass
+                except Exception:
+                    pass
+                if root_return:
+                    root_target = self._root_return_target(tv, root_filter_id)
+                    if root_target is None:
+                        retry_wait('основные папки ещё не восстановлены на исходной панели')
+                        return
+                    index, root_target_id = root_target
+                if require_default:
+                    visible = list(self.last_visible)
+                    if not (0 <= index < len(visible) and _is_default_filter(visible[index])):
+                        retry_wait('снимок ещё не содержит настоящий фильтр Все чаты')
+                        return
+                tab = None
+                position = -1
+                try:
+                    tab, position, count = self._find_tab_object(tv, index)
+                    if tab is None:
+                        if preferred_panel_ref is not None:
+                            retry_wait('целевая вкладка ещё не создана')
+                        return
+                except Exception:
+                    pass
+                if self._panel_matches_filter_snapshot(tv, list(self.last_visible)) is False:
+                    if preferred_panel_ref is not None:
+                        retry_wait('стабильные ID панели ещё не совпали')
+                    return
+                expected_id = 0
+                try:
+                    visible = list(self.last_visible)
+                    if 0 <= index < len(visible):
+                        expected_id = _safe_filter_id(visible[index])
+                except Exception as e:
+                    pass
+                base_tv = tv
+                base_tab = tab
+                base_position = position
+
+                def do_switch():
+                    if self._unloaded or select_gen != self._select_generation:
+                        return
+                    tv = base_tv
+                    tab = base_tab
+                    position = base_position
+                    try:
+                        fresh_tv = self._resolve_selection_panel(preferred_panel_ref)
+                        if preferred_panel_ref is not None and fresh_tv is None:
+                            retry_wait('панель исчезла перед переключением')
+                            return
+                        if fresh_tv is not None:
+                            tv = fresh_tv
+                        fresh_tab, fresh_position, fresh_count = self._find_tab_object(tv, index)
+                        if fresh_tab is None:
+                            if preferred_panel_ref is not None:
+                                retry_wait('вкладка исчезла перед переключением')
+                            return
+                        else:
+                            tab = fresh_tab
+                            position = fresh_position
+                    except Exception as e:
+                        if preferred_panel_ref is not None:
+                            retry_wait('перечитывание исходной панели не удалось')
+                            return
+                    if preferred_panel_ref is not None:
+                        visible = list(self.last_visible)
+                        if self._panel_matches_filter_snapshot(tv, visible) is not True or not 0 <= index < len(visible) or _safe_filter_id(visible[index]) != expected_id or (require_default and (not _is_default_filter(visible[index]))):
+                            retry_wait('повторная проверка идентичности цели не пройдена')
+                            return
+                    if root_return:
+                        if self._root_return_target(tv, root_filter_id) != (index, expected_id):
+                            retry_wait('основная папка изменилась перед переключением')
+                            return
+                        self._suppress_until = time.time() + SUPPRESS_AFTER_NAV_MS / 1000.0
+                        self._suppress_tab = index
+                    current_position = None
+                    try:
+                        value = get_private_field(tv, 'currentPosition')
+                        if value is not None:
+                            current_position = int(value)
+                    except Exception as e:
+                        pass
+                    self._stop_tab_animation(tv)
+                    settle_skip_allowed = allow_settle_skip and (root_return or (int(index) == 0 and int(expected_id) == 0))
+                    if current_position is not None and current_position == position:
+                        if settle_skip_allowed and self._selection_matches(tv, index, expected_id):
+                            return
+                        if prefer_direct:
+                            pass
+                        else:
+                            ok1 = self._set_private_int(tv, 'currentPosition', -1)
+                            self._set_private_int(tv, 'previousPosition', -1)
+                            if ok1:
+                                current_position = -1
+                    self._reset_selected_type_guard(tv, index)
+                    if prefer_direct:
+                        try:
+                            delegate = None
+                            try:
+                                delegate = get_private_field(tv, 'delegate')
+                            except Exception as e:
+                                pass
+                            if delegate is None:
+                                pass
+                            else:
+                                done = False
+                                try:
+                                    delegate.onPageSelected(tab, False)
+                                    delegate.onPageScrolled(1.0)
+                                    done = True
+                                except Exception as e:
+                                    pass
+                                if done:
+                                    self._set_private_int(tv, 'currentPosition', position)
+                                    self._set_private_int(tv, 'previousPosition', position)
+                                    try:
+                                        tv.selectTabWithId(index, 1.0)
+                                    except Exception as e:
+                                        pass
+                                    self._refresh_dialogs_page(tv, index)
+                                    self._reset_page_geometry(tv, index, 0)
+                                    self._settle_after_switch(index, position)
+                                    self._watch_panel_stuck(index)
+                                    self._verify_selection_later(index, expected_id, allow_retry=allow_retry, preferred_panel_ref=preferred_panel_ref)
+                                    return
+                        except Exception:
+                            pass
+                    try:
+                        try:
+                            m = self._find_method_in_hierarchy(tv, 'scrollToTab', argc=2)
+                            if m is None:
+                                m = self._find_method_in_hierarchy(tv, 'scrollToTab')
+                            if m is not None:
+                                if self._invoke_scroll_to_tab(m, tv, tab, position):
+                                    self._watch_panel_stuck(index)
+                                    self._verify_selection_later(index, expected_id, allow_retry=allow_retry, preferred_panel_ref=preferred_panel_ref)
+                                    return
+                                raise RuntimeError('scrollToTab invoke failed')
+                        except Exception as e:
+                            pass
+                    except Exception:
+                        pass
+                    try:
+                        try:
+                            tv.selectTabWithId(index, 1.0)
+                        except Exception as e:
+                            pass
+                        try:
+                            delegate = get_private_field(tv, 'delegate')
+                            if delegate is None:
+                                return
+                            forward = True
+                            if current_position is not None:
+                                forward = position > current_position
+                            delegate.onPageSelected(tab, forward)
+                            try:
+                                delegate.onPageScrolled(1.0)
+                            except Exception as e:
+                                pass
+                            self._verify_selection_later(index, expected_id, allow_retry=allow_retry, preferred_panel_ref=preferred_panel_ref)
+                        except Exception as e:
+                            if index == 0 and (not root_return):
+                                try:
+                                    tv.selectFirstTab()
+                                except Exception as e2:
+                                    pass
+                    except Exception:
+                        pass
+                run_on_ui_thread(do_switch, delay=16)
+            except Exception:
+                pass
+        start_delay = NOTIFY_DELAY_MS + 24 if delay is None else int(delay)
+        run_on_ui_thread(do_select, delay=start_delay)
+
+    def _cascade_raw_filters(self, mc):
+        raw = get_private_field(mc, 'dialogFilters')
+        return [raw.get(i) for i in range(int(raw.size()))]
+
+    def _cascade_filter_name(self, folder):
+        name = _filter_display_name(folder).strip()
+        fid = _safe_filter_id(folder)
+        if self._short_name_objects.get(fid) == _identity(folder) and name == self._short_names.get(fid):
+            return self._orig_names.get(fid, name).strip()
+        return name
+
+    def _cascade_child_of(self, name, group):
+        separator = self.get_separator()
+        if separator not in name:
+            return False
+        parent, suffix = name.split(separator, 1)
+        return parent.strip() == group and bool(suffix.strip())
+
+    def _capture_parent_delete(self, mc, folder):
+        if self._unloaded or mc is None or folder is None or _is_default_filter(folder):
+            return None
+        try:
+            account = int(get_private_field(mc, 'currentAccount'))
+            owner_key = (_identity(mc), account)
+            if account < 0 or owner_key in self._cascade_busy:
+                return None
+            raw = self._cascade_raw_filters(mc)
+            fid = _safe_filter_id(folder)
+            matches = [f for f in raw if _safe_filter_id(f) == fid]
+            group = self._cascade_filter_name(folder)
+            if fid <= 0 or not group or self.get_separator() in group:
+                return None
+            virtual = False
+            if len(matches) == 1 and _identity(matches[0]) == _identity(folder):
+                pass
+            elif not matches and fid >= GROUP_TAB_ID_BASE:
+                stub = self._group_tabs.get(group)
+                current_mc = get_messages_controller()
+                if stub is None or _identity(stub) != _identity(folder) or current_mc is None or (_identity(current_mc) != _identity(mc)) or any((self._cascade_filter_name(f) == group for f in raw)):
+                    return None
+                virtual = True
+            else:
+                return None
+            children = []
+            seen = set()
+            for child in raw:
+                cid = _safe_filter_id(child)
+                name = self._cascade_filter_name(child)
+                if _is_default_filter(child) or cid == fid or (not self._cascade_child_of(name, group)):
+                    continue
+                if cid <= 0 or cid in seen:
+                    return None
+                seen.add(cid)
+                children.append((cid, _identity(child), name))
+            if not children:
+                return None
+            plan = {'owner': owner_key, 'parent_id': fid, 'group': group, 'virtual_parent': virtual, 'children': children}
+            return plan
+        except Exception as exc:
+            return None
+
+    def _delete_cascade_child(self, mc, account, child):
+        req = jclass('org.telegram.tgnet.TLRPC$TL_messages_updateDialogFilter')()
+        req.id = _safe_filter_id(child)
+        try:
+            manager = mc.getConnectionsManager()
+        except Exception:
+            manager = jclass('org.telegram.tgnet.ConnectionsManager').getInstance(account)
+        manager.sendRequest(req, None)
+        storage_ok = True
+        try:
+            try:
+                storage = mc.getMessagesStorage()
+            except Exception:
+                storage = jclass('org.telegram.messenger.MessagesStorage').getInstance(account)
+            storage.deleteDialogFilter(child)
+        except Exception as exc:
+            storage_ok = False
+        mc.removeFilter(child)
+        removed = not any((_safe_filter_id(f) == req.id for f in self._cascade_raw_filters(mc)))
+        return (removed, storage_ok)
+
+    def _finish_parent_delete(self, mc, plan):
+        if self._unloaded or mc is None or plan is None:
+            return
+        try:
+            account = int(get_private_field(mc, 'currentAccount'))
+            owner_key = (_identity(mc), account)
+            if owner_key != plan['owner'] or owner_key in self._cascade_busy:
+                return
+            if any((_safe_filter_id(f) == plan['parent_id'] for f in self._cascade_raw_filters(mc))):
+                return
+        except Exception:
+            return
+        self._cascade_busy.add(owner_key)
+        deleted, failed = ([], [])
+        try:
+            try:
+                current_mc = get_messages_controller()
+                active = current_mc is not None and _identity(current_mc) == _identity(mc)
+            except Exception:
+                active = False
+            if active:
+                self._nav_generation += 1
+                self._select_generation += 1
+                self._panel_audit_generation += 1
+                self._stuck_generation += 1
+                self._collapse_pending = False
+                if self.expanded_group == plan['group']:
+                    self.expanded_group = None
+                    self._expanded_at = 0.0
+                    self._suppress_until = 0.0
+                    self._suppress_tab = None
+                    _gate_reset()
+                self._group_tabs.pop(plan['group'], None)
+            for cid, object_key, full_name in plan['children']:
+                try:
+                    if self._unloaded or int(get_private_field(mc, 'currentAccount')) != account:
+                        failed.append(cid)
+                        continue
+                    current_raw = self._cascade_raw_filters(mc)
+                    if any((_safe_filter_id(f) == plan['parent_id'] or (not _is_default_filter(f) and self._cascade_filter_name(f) == plan['group']) for f in current_raw)):
+                        failed.append(cid)
+                        continue
+                    matches = [f for f in current_raw if _safe_filter_id(f) == cid]
+                    if not matches:
+                        continue
+                    if len(matches) != 1:
+                        failed.append(cid)
+                        continue
+                    child = matches[0]
+                    if _identity(child) != object_key or self._cascade_filter_name(child) != full_name or (not self._cascade_child_of(full_name, plan['group'])):
+                        failed.append(cid)
+                        continue
+                    removed, storage_ok = self._delete_cascade_child(mc, account, child)
+                    if removed:
+                        deleted.append(cid)
+                        if self._short_name_objects.get(cid) == object_key:
+                            self._orig_names.pop(cid, None)
+                            self._short_names.pop(cid, None)
+                            self._short_name_objects.pop(cid, None)
+                    if not removed or not storage_ok:
+                        failed.append(cid)
+                except Exception as exc:
+                    failed.append(cid)
+            if active and (not any((self._cascade_child_of(self._cascade_filter_name(f), plan['group']) for f in self._cascade_raw_filters(mc)))):
+                self._group_tabs.pop(plan['group'], None)
+            _FILTERS_GENERATION[0] += 1
+            hook = self.gdf_hook
+            if hook is not None:
+                hook._stable_key = None
+                hook._cached_visible = None
+                hook._cached_result = None
+                hook._last_signature = None
+            if failed and active:
+                BulletinHelper.show_error('Не все подпапки удалены полностью. Проверьте папки и подключение к сети')
+        finally:
+            self._cascade_busy.discard(owner_key)
+
+    def _parent_content_state(self, parent_name):
+        target = (parent_name or '').strip()
+        if not target:
+            return {'found': False, 'scan_known': True, 'not_empty': False}
+        filters = self._all_filters_or_none()
+        if filters is None:
+            return {'found': False, 'scan_known': False, 'not_empty': False}
+        try:
+            for f in filters:
+                if _filter_display_name(f).strip() != target:
+                    continue
+                try:
+                    flags = int(f.flags)
+                    flags_known = True
+                except Exception:
+                    flags = None
+                    flags_known = False
+                always_raw = int(_field_size(f, 'alwaysShow'))
+                pinned_raw = int(_field_size(f, 'pinnedDialogs'))
+                content_known = always_raw >= 0 and pinned_raw >= 0
+                always = max(0, always_raw)
+                pinned = max(0, pinned_raw)
+                has_rules = not flags_known or flags != 0
+                has_explicit = not content_known or always > 0 or pinned > 0
+                return {'found': True, 'scan_known': True, 'filter_id': _safe_filter_id(f), 'flags': flags, 'flags_known': flags_known, 'always': always, 'pinned': pinned, 'content_known': content_known, 'unknown': not flags_known or not content_known, 'has_rules': has_rules, 'has_explicit_dialogs': has_explicit, 'not_empty': has_rules or has_explicit}
+        except Exception as e:
+            return {'found': False, 'scan_known': False, 'not_empty': False, 'error': str(e)}
+        return {'found': False, 'scan_known': True, 'not_empty': False}
+
+    def _deny_if_parent_has_dialogs(self, parent_name, must_exist=False):
+        if not parent_name:
+            return False
+        if not PARENT_CONTENT_CHECK_ENABLED:
+            return False
+        state = self._parent_content_state(parent_name)
+        if state is None:
+            state = {'found': False, 'scan_known': False, 'not_empty': False}
+        if not state.get('scan_known', False):
+            try:
+                BulletinHelper.show_error(u'Не удалось прочитать список папок. Создание подпапки отменено, чтобы не скрыть существующие чаты')
+            except Exception:
+                pass
+            return True
+        if not state.get('found', False):
+            if not must_exist:
+                return False
+            try:
+                BulletinHelper.show_error(u'Папка «{}» больше не найдена. Откройте список заново и повторите'.format(parent_name))
+            except Exception:
+                pass
+            return True
+        if not state['not_empty']:
+            return False
+        unknown = bool(state.get('unknown'))
+        details = []
+        if state['always'] > 0:
+            details.append(u'добавлено явно: {}'.format(state['always']))
+        if state['pinned'] > 0:
+            details.append(u'закреплено: {}'.format(state['pinned']))
+        if state['has_rules'] and state.get('flags_known'):
+            details.append(u'включены категории чатов')
+        if unknown:
+            details.append(u'состав папки прочитать не удалось')
+        description = ', '.join(details) or u'есть правила отбора'
+        try:
+            if unknown:
+                BulletinHelper.show_error(u'Не удалось проверить содержимое папки «{}». Создание подпапки отменено, чтобы не скрыть существующие чаты'.format(parent_name))
+            else:
+                BulletinHelper.show_error(u'Папка «{}» уже содержит чаты или правила отбора ({}). Очистите её перед созданием подпапок'.format(parent_name, description))
+        except Exception:
+            pass
+        return True
+
+    def _hook_present_filter_create(self):
+        try:
+            cls = find_class('org.telegram.ui.ActionBar.BaseFragment')
+            if cls is None:
+                return
+            hooked = 0
+            for m in cls.getClass().getDeclaredMethods():
+                try:
+                    if str(m.getName()) != 'presentFragment':
+                        continue
+                    params = m.getParameterTypes()
+                    if len(params) == 0 or str(params[0].getName()) != 'org.telegram.ui.ActionBar.BaseFragment':
+                        continue
+                    m.setAccessible(True)
+                    self.hook_method(m, PresentFilterCreateHook(self))
+                    hooked += 1
+                except Exception as e:
+                    pass
+            if hooked:
+                self._hooked.append('BaseFragment.presentFragment')
+        except Exception as e:
+            pass
+
+    def _should_offer_subfolder(self, target):
+        key = _identity(target)
+        now = time.time()
+        ts = self._approved_present.get(key)
+        if ts is not None:
+            if now - ts < APPROVED_PRESENT_TTL:
+                return False
+            self._approved_present.pop(key, None)
+        try:
+            if not bool(get_private_field(target, 'creatingNew')):
+                return False
+        except Exception:
+            return False
+        try:
+            chats = get_private_field(target, 'newAlwaysShow')
+            if chats is None or int(chats.size()) == 0:
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _present_approved(self, host, target):
+        now = time.time()
+        for k in [k for k, t in self._approved_present.items() if now - t > APPROVED_PRESENT_TTL]:
+            self._approved_present.pop(k, None)
+        self._approved_present[_identity(target)] = now
+        try:
+            host.presentFragment(target)
+        except Exception as e:
+            BulletinHelper.show_error(u'Не удалось открыть редактор папки')
+
+    def _offer_create_choice(self, host, target):
+        activity = _get_activity()
+        if activity is None:
+            return False
+        plugin = self
+        items = [u'📁 Обычная папка', u'📂 Подпапка…']
+
+        def on_full_name(full_name, parent_name):
+            plugin._present_subfolder_editor(host, target, full_name, parent_name)
+
+        def on_select(bld, which):
+            bld.dismiss()
+            if which == 0:
+                plugin._present_approved(host, target)
+            else:
+                plugin._show_create_subfolder_dialog(on_full_name=on_full_name)
+        try:
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(u'Создать')
+            builder.set_items(items, on_select)
+            builder.set_negative_button(u'Отмена', lambda bld, w: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            return False
+        return True
+
+    def _present_subfolder_editor(self, host, target, full_name, parent_name):
+        snapshot = self._all_filters_or_none()
+        if snapshot is None:
+            BulletinHelper.show_error(u'Не удалось прочитать список папок — повторите позже')
+            return
+        existing = [_filter_display_name(f) for f in snapshot]
+        if full_name in existing:
+            BulletinHelper.show_error(u'Папка «{}» уже есть'.format(full_name))
+            return
+        parent_exists = parent_name in existing
+        if self._deny_if_parent_has_dialogs(parent_name, must_exist=parent_exists):
+            return
+        if not parent_exists:
+            if not self._create_one_filter(parent_name):
+                BulletinHelper.show_error(u'Не удалось создать группу «{}»'.format(parent_name))
+                return
+            _notify_filters_changed(delay=300)
+        ok = False
+        try:
+            from android.text import SpannableStringBuilder
+            ok = _set_java_field(target, 'newFilterName', SpannableStringBuilder(full_name))
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                ok = _set_java_field(target, 'newFilterName', full_name)
+            except Exception:
+                ok = False
+        if ok:
+            pass
+        else:
+            self._prefill_failed(full_name)
+        self._present_approved(host, target)
+
+    def _prefill_failed(self, full_name):
+        try:
+            from org.telegram.messenger import AndroidUtilities
+            AndroidUtilities.addToClipboard(full_name)
+            BulletinHelper.show_info(u'Введите имя папки: {} (скопировано)'.format(full_name))
+        except Exception:
+            BulletinHelper.show_info(u'Введите имя папки: {}'.format(full_name))
+
+    def _schedule_settings_reload(self):
+        if self._settings_reload_pending:
+            return
+        self._settings_reload_pending = True
+        plugin = self
+
+        def do_reload():
+            plugin._settings_reload_pending = False
+            if plugin._unloaded:
+                return
+            try:
+                sig = _tree_sig(plugin._build_tree_now())
+                if sig is None or sig == plugin._settings_tree_sig:
+                    return
+                plugin.set_setting('_tree_rev', int(time.time() * 1000), reload_settings=True)
+            except Exception as e:
+                pass
+        run_on_ui_thread(do_reload, delay=400)
+
+    def _show_create_subfolder_dialog(self, view=None, on_full_name=None):
+        try:
+            activity = _get_activity()
+            if activity is None:
+                BulletinHelper.show_error('Откройте список чатов и попробуйте снова')
+                return
+            tree = self._build_tree_now()
+            if tree is None:
+                BulletinHelper.show_error('Папки ещё не загружены')
+                return
+            parents = sorted(set([n for n, _ in tree.top_level] + tree.group_names()))
+            items = [f'📂 {p}' for p in parents] + ['➕ Новая группа…']
+            plugin = self
+
+            def on_select(bld, which):
+                bld.dismiss()
+                if which < len(parents):
+                    plugin._show_subfolder_name_dialog(parents[which], parent_exists=True, on_full_name=on_full_name)
+                else:
+                    plugin._show_new_group_dialog(on_full_name)
+            builder = AlertDialogBuilder(activity)
+            builder.set_title('Родительская папка')
+            builder.set_items(items, on_select)
+            builder.set_negative_button('Отмена', lambda bld, w: bld.dismiss())
+            builder.show()
+        except Exception:
+            pass
+
+    def _show_new_group_dialog(self, on_full_name=None):
+        self._show_text_input_dialog('Новая группа', 'Название группы (например: Работа)', lambda text: self._show_subfolder_name_dialog(text, on_full_name=on_full_name) if text else None)
+
+    def _show_subfolder_name_dialog(self, parent_name, parent_exists=False, on_full_name=None):
+        try:
+            if self._deny_if_parent_has_dialogs(parent_name, must_exist=parent_exists):
+                return
+            plugin = self
+
+            def on_name(text):
+                if not text:
+                    return
+                full_name = f'{parent_name}{plugin.get_separator()}{text}'
+                if on_full_name is not None:
+                    on_full_name(full_name, parent_name)
+                else:
+                    plugin._create_folder(full_name, ensure_parent=parent_name)
+            self._show_text_input_dialog(f'Подпапка в «{parent_name}»', 'Название подпапки (например: Проект А)', on_name)
+        except Exception:
+            pass
+
+    def _show_text_input_dialog(self, title, hint, callback):
+        activity = _get_activity()
+        if activity is None:
+            return
+        try:
+            from android.widget import EditText, FrameLayout
+            from android.view import ViewGroup
+            from android.util import TypedValue
+            from android.graphics.drawable import GradientDrawable
+            from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
+            edit_text = EditText(activity)
+            edit_text.setHint(hint)
+            edit_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            edit_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            edit_text.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            edit_text.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(12), AndroidUtilities.dp(24), AndroidUtilities.dp(12))
+            edit_text.setSingleLine(True)
+            bg = GradientDrawable()
+            bg.setShape(GradientDrawable.RECTANGLE)
+            bg.setCornerRadius(float(AndroidUtilities.dp(12)))
+            bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+            bg.setStroke(AndroidUtilities.dp(1), Theme.getColor(Theme.key_divider))
+            edit_text.setBackground(bg)
+            container = FrameLayout(activity)
+            container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(8), AndroidUtilities.dp(24), AndroidUtilities.dp(4))
+            container.addView(edit_text, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(title)
+            builder.set_view(container)
+            builder.set_positive_button('OK', lambda bld, w: (callback(str(edit_text.getText()).strip()), bld.dismiss()))
+            builder.set_negative_button('Отмена', lambda bld, w: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            pass
+
+    def _create_folder(self, full_name, ensure_parent=None):
+        try:
+            try:
+                snapshot = self._all_filters_or_none()
+                if snapshot is None:
+                    BulletinHelper.show_error(u'Не удалось прочитать список папок — повторите позже')
+                    return
+                existing = [_filter_display_name(f) for f in snapshot]
+                if full_name in existing:
+                    BulletinHelper.show_error(f'Папка «{full_name}» уже есть')
+                    return
+                if ensure_parent and self._deny_if_parent_has_dialogs(ensure_parent, must_exist=ensure_parent in existing):
+                    return
+                if ensure_parent and ensure_parent not in existing:
+                    self._create_one_filter(ensure_parent)
+                ok = self._create_one_filter(full_name)
+                if ok:
+                    _notify_filters_changed(delay=300)
+                    BulletinHelper.show_success(f'Папка «{full_name}» создана. Наполните её чатами в настройках папок')
+                else:
+                    raise RuntimeError('local create failed')
+            except Exception as e:
+                BulletinHelper.show_error(f'Создайте папку вручную с именем: {full_name}')
+                self._open_folder_settings()
+        except Exception:
+            pass
+
+    def _create_one_filter(self, name):
+        try:
+            mc = get_messages_controller()
+            if mc is None:
+                return False
+            try:
+                DialogFilter = jclass('org.telegram.messenger.MessagesController$DialogFilter')
+                df = DialogFilter()
+            except Exception:
+                pass
+            try:
+                used = {_safe_filter_id(f) for f in self._get_all_filters_raw()}
+                new_id = 2
+                while new_id in used:
+                    new_id += 1
+                df.id = new_id
+            except Exception:
+                pass
+            try:
+                try:
+                    df.name = name
+                except Exception as e:
+                    TL = jclass('org.telegram.tgnet.TLRPC$TL_textWithEntities')
+                    t = TL()
+                    t.text = name
+                    df.name = t
+            except Exception:
+                pass
+            try:
+                try:
+                    df.flags = 0
+                except Exception as e:
+                    pass
+            except Exception:
+                pass
+            try:
+                try:
+                    mc.addFilter(df, False)
+                except Exception as e:
+                    return False
+            except Exception:
+                pass
+            try:
+                try:
+                    from org.telegram.messenger import MessagesStorage, UserConfig
+                    storage = MessagesStorage.getInstance(UserConfig.selectedAccount)
+                    storage.saveDialogFilter(df, False, True)
+                except Exception as e:
+                    pass
+            except Exception:
+                pass
+            return True
+        except Exception:
+            pass
+
+    def _open_folder_settings(self, view=None):
+        try:
+            try:
+                if self.expanded_group is not None:
+                    self.collapse()
+                fragment = get_last_fragment()
+                if fragment is None:
+                    return
+                cls = find_class('org.telegram.ui.FiltersSetupActivity')
+                if cls is None:
+                    return
+                activity = cls.getClass().getDeclaredConstructor().newInstance()
+                fragment.presentFragment(activity)
+            except Exception as e:
+                pass
+        except Exception:
+            pass
+
+    def _on_group_row_click(self, group_name):
+
+        def handler(view=None):
+            if self.expanded_group == group_name:
+                self.collapse()
+            else:
+                self.expand(group_name)
+        return handler
+
+    def _on_settings_changed(self, _=None):
+        self.expanded_group = None
+        _notify_filters_changed()
+
+    def create_settings(self) -> List[Any]:
+        try:
+            items = []
+            items.append(Header(text='Структура'))
+            tree = self._build_tree_now()
+            self._settings_tree_sig = _tree_sig(tree)
+            if tree is None or (not tree.top_level and (not tree.groups)):
+                items.append(Text(text='Папки не найдены. Создайте папки в Telegram', icon='msg_folders'))
+            else:
+                shown_groups = set()
+                for name, _f in tree.top_level:
+                    children = tree.children_of(name)
+                    if children:
+                        shown_groups.add(name)
+                        state = 'развёрнута' if self.expanded_group == name else 'свёрнута'
+                        items.append(Text(text=f'📂 {name} — {len(children)} подпап. ({state})', icon='msg_folders', on_click=self._on_group_row_click(name)))
+                        for child_name, _cf in children:
+                            items.append(Text(text=f'      📁 {child_name}'))
+                    else:
+                        items.append(Text(text=f'📂 {name}', icon='msg_folders'))
+                for gname, grp in tree.groups.items():
+                    if gname in shown_groups or grp['parent'] is not None:
+                        continue
+                    items.append(Text(text=f'⚠️ {gname} — нет родительской папки «{gname}»', icon='msg_folders'))
+                    for child_name, _cf in grp['children']:
+                        items.append(Text(text=f'      📁 {child_name}'))
+            items.append(Text(text='➕ Создать подпапку', icon='msg_add', on_click=lambda view=None: self._show_create_subfolder_dialog(view)))
+            items.append(Text(text='Настроить папки Telegram', icon='msg_folders', on_click=lambda view=None: self._open_folder_settings(view)))
+            items.append(Divider())
+            return items
+        except Exception:
+            pass
