@@ -1,0 +1,368 @@
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+from android.graphics import Path, RectF
+from android.text import TextPaint, TextUtils
+from android.view import MotionEvent, View
+from java import dynamic_proxy, jclass
+from java.lang import Runnable, System
+from java.lang.ref import WeakReference
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.Components import AlertsCreator, Text
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+
+__id__ = "mini_app_domain"
+__name__ = "Mini App Domain"
+__description__ = "Показывает домен Mini App в заголовке."
+__author__ = "@itsbodyq"
+__icon__ = "exteraplicons/7"
+__version__ = "1.0"
+__app_version__ = ">=12.5.1"
+__category__ = ["tools", "appearance"]
+__min_version__ = "12.10.6"
+
+
+class _Hook(MethodHook):
+    def __init__(self, after):
+        self.after = after
+
+    def after_hooked_method(self, param):
+        self.after(param)
+
+
+class _TouchListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onTouch(self, view, event):
+        return self.plugin._touch_domain(view, event)
+
+
+class _ClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, plugin, owner):
+        super().__init__()
+        self.plugin = plugin
+        self.owner = WeakReference(owner)
+
+    def onClick(self, view):
+        owner = self.owner.get()
+        if owner is not None:
+            self.plugin._open_url(owner, view.getContext())
+
+
+class _UiTask(dynamic_proxy(Runnable)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def run(self):
+        self.callback()
+
+
+def _domain(url):
+    try:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        host = parsed.hostname
+        if not host or len(host) > 253 or any(char.isspace() for char in host):
+            return None
+        _ = parsed.port
+        return host.rstrip(".").lower()
+    except (TypeError, ValueError):
+        return None
+
+
+def _public_url(url):
+    if _domain(url) is None:
+        return None
+    parsed = urlsplit(str(url))
+
+    def public_params(value):
+        return "&".join(
+            item
+            for item in value.split("&")
+            if not unquote(item.partition("=")[0]).lower().startswith("tgwebapp")
+        )
+
+    fragment = parsed.fragment
+    if "?" in fragment:
+        route, marker, params = fragment.partition("?")
+        params = public_params(params)
+        fragment = route + marker + params if params else route
+    else:
+        fragment = public_params(fragment)
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, public_params(parsed.query), fragment)
+    )
+
+
+class MiniAppDomainPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._owners = []
+        self._domains = []
+        self._text_paint = None
+        self._text_layout = None
+        self._displayed_text = None
+        self._pressed = None
+        self._loaded = False
+
+    def on_plugin_load(self):
+        self._loaded = True
+        sheet = find_class("org.telegram.ui.bots.BotWebViewSheet")
+        attached = find_class("org.telegram.ui.bots.ChatAttachAlertBotWebViewLayout")
+        container = find_class("org.telegram.ui.web.BotWebViewContainer")
+        buttons = find_class("org.telegram.messenger.BotFullscreenButtons")
+        if sheet is not None:
+            self.hook_all_methods(sheet, "show", _Hook(self._sheet_shown))
+            self.hook_all_methods(sheet, "dismiss", _Hook(self._sheet_hidden))
+        if attached is not None:
+            self.hook_all_methods(attached, "onShow", _Hook(self._attached_shown))
+            self.hook_all_methods(attached, "onHide", _Hook(self._attached_hidden))
+        if container is not None:
+            self.hook_all_methods(container, "onURLChanged", _Hook(self._url_changed))
+        if buttons is not None:
+            self.hook_all_methods(buttons, "onDraw", _Hook(self._draw_domain))
+        AndroidUtilities.runOnUIThread(_UiTask(self._existing_sheets))
+
+    def on_plugin_unload(self):
+        self._loaded = False
+        for ref, kind in tuple(self._owners):
+            owner = ref.get()
+            if owner is not None:
+                if kind == "sheet":
+                    buttons = get_private_field(owner, "fullscreenButtons")
+                    if buttons is not None:
+                        buttons.setOnTouchListener(None)
+                self._forget(owner)
+        self._owners.clear()
+        self._domains.clear()
+        self._text_paint = None
+        self._text_layout = None
+        self._displayed_text = None
+        self._pressed = None
+
+    def _existing_sheets(self):
+        if not self._loaded:
+            return
+        iterator = jclass("org.telegram.ui.bots.BotWebViewSheet").activeSheets.iterator()
+        while iterator.hasNext():
+            self._track_sheet(iterator.next())
+
+    @staticmethod
+    def _same(first, second):
+        return (
+            first is not None
+            and second is not None
+            and int(System.identityHashCode(first)) == int(System.identityHashCode(second))
+        )
+
+    @staticmethod
+    def _action_bar(owner, kind):
+        if kind == "sheet":
+            return get_private_field(owner, "actionBar")
+        alert = get_private_field(owner, "parentAlert")
+        return get_private_field(alert, "actionBar") if alert is not None else None
+
+    @staticmethod
+    def _container(owner):
+        return get_private_field(owner, "webViewContainer")
+
+    def _current_url(self, owner):
+        container = self._container(owner)
+        web_view = container.getWebView() if container is not None else None
+        return web_view.getUrl() if web_view is not None else None
+
+    def _open_url(self, owner, context):
+        url = _public_url(self._current_url(owner))
+        if url is not None:
+            AlertsCreator.showOpenUrlAlert(context, url, False, True, True, False, 0, None, None)
+
+    def _remember(self, owner, kind):
+        self._owners = [
+            (ref, saved_kind) for ref, saved_kind in self._owners if ref.get() is not None
+        ]
+        if not any(self._same(ref.get(), owner) for ref, _kind in self._owners):
+            self._owners.append((WeakReference(owner), kind))
+        self._update(owner, kind, _domain(self._current_url(owner)))
+
+    def _forget(self, owner):
+        remaining = []
+        for ref, kind in self._owners:
+            saved = ref.get()
+            if saved is not None and self._same(saved, owner):
+                action_bar = self._action_bar(saved, kind)
+                if action_bar is not None:
+                    subtitle = action_bar.getSubtitleTextView()
+                    if subtitle is not None:
+                        subtitle.setOnClickListener(None)
+                    action_bar.setSubtitle(None)
+            elif saved is not None:
+                remaining.append((ref, kind))
+        self._owners = remaining
+
+    def _sheet_shown(self, param):
+        self._track_sheet(param.thisObject)
+
+    def _track_sheet(self, sheet):
+        self._remember(sheet, "sheet")
+        buttons = get_private_field(sheet, "fullscreenButtons")
+        if buttons is not None:
+            buttons.setOnTouchListener(_TouchListener(self))
+
+    def _sheet_hidden(self, param):
+        buttons = get_private_field(param.thisObject, "fullscreenButtons")
+        if buttons is not None:
+            buttons.setOnTouchListener(None)
+        self._forget(param.thisObject)
+
+    def _attached_shown(self, param):
+        self._remember(param.thisObject, "attached")
+
+    def _attached_hidden(self, param):
+        self._forget(param.thisObject)
+
+    def _update(self, owner, kind, domain):
+        container = self._container(owner)
+        if container is None:
+            return
+        self._domains = [
+            (ref, value)
+            for ref, value in self._domains
+            if ref.get() is not None and not self._same(ref.get(), container)
+        ]
+        if domain is not None:
+            self._domains.append((WeakReference(container), domain))
+        action_bar = self._action_bar(owner, kind)
+        if action_bar is not None:
+            action_bar.setSubtitle(domain)
+            subtitle = action_bar.getSubtitleTextView()
+            if subtitle is not None:
+                subtitle.setOnClickListener(_ClickListener(self, owner) if domain else None)
+        if kind == "sheet":
+            buttons = get_private_field(owner, "fullscreenButtons")
+            if buttons is not None:
+                buttons.invalidate()
+
+    def _url_changed(self, param):
+        if not param.args:
+            return
+        container = param.thisObject
+        domain = _domain(param.args[0])
+        for ref, kind in self._owners:
+            owner = ref.get()
+            if owner is not None and self._same(self._container(owner), container):
+                self._update(owner, kind, domain)
+
+    def _sheet_domain(self, buttons):
+        for ref, kind in self._owners:
+            owner = ref.get()
+            if (
+                kind == "sheet"
+                and owner is not None
+                and self._same(get_private_field(owner, "fullscreenButtons"), buttons)
+            ):
+                container = self._container(owner)
+                for domain_ref, domain in self._domains:
+                    if self._same(domain_ref.get(), container):
+                        return owner, domain
+                return owner, None
+        return None, None
+
+    def _pill_geometry(self, left, right, domain, paint):
+        margin = AndroidUtilities.dp(8)
+        available = right.left - left.right - 2 * margin
+        if available <= AndroidUtilities.dp(36):
+            return None
+        if paint is None:
+            self._text_paint = TextPaint(1)
+            self._text_paint.setTextSize(AndroidUtilities.dp(13))
+            self._text_paint.setTypeface(AndroidUtilities.bold())
+            paint = self._text_paint
+        text = str(
+            TextUtils.ellipsize(
+                domain, paint, available - AndroidUtilities.dp(24), TextUtils.TruncateAt.MIDDLE
+            )
+        )
+        width = min(available, paint.measureText(text) + AndroidUtilities.dp(24))
+        return text, width, (left.right + right.left) / 2
+
+    def _draw_domain(self, param):
+        if not param.args:
+            return
+        buttons = param.thisObject
+        _, domain = self._sheet_domain(buttons)
+        if domain is None:
+            return
+        left = get_private_field(buttons, "leftMenu")
+        right = get_private_field(buttons, "rightMenu")
+        background = get_private_field(buttons, "backgroundPaint")
+        if left is None or right is None or background is None:
+            return
+        geometry = self._pill_geometry(left, right, domain, self._text_paint)
+        if geometry is None:
+            return
+        text, width, center = geometry
+        paint = self._text_paint
+        if text != self._displayed_text:
+            if self._text_layout is None:
+                self._text_layout = Text(text, paint)
+            else:
+                self._text_layout.setText(text)
+            self._displayed_text = text
+        rect = RectF(center - width / 2, left.top, center + width / 2, left.bottom)
+        canvas = param.args[0]
+        radius = AndroidUtilities.dp(15)
+        blur_node = get_private_field(buttons, "blurNode")
+        if blur_node is not None and background.getColor() == 0x38000000:
+            path = Path()
+            path.addRoundRect(rect, radius, radius, Path.Direction.CW)
+            canvas.save()
+            canvas.clipPath(path)
+            canvas.translate(AndroidUtilities.dp(8), 0)
+            canvas.drawRenderNode(blur_node)
+            canvas.restore()
+        canvas.drawRoundRect(rect, radius, radius, background)
+        self._text_layout.draw(
+            canvas, rect.centerX() - paint.measureText(text) / 2, rect.centerY(), -1, 1.0
+        )
+
+    def _hit_domain(self, buttons, x, y):
+        paint = self._text_paint
+        if paint is None:
+            return None
+        owner, domain = self._sheet_domain(buttons)
+        if domain is None:
+            return None
+        left = get_private_field(buttons, "leftMenu")
+        right = get_private_field(buttons, "rightMenu")
+        if left is None or right is None:
+            return None
+        geometry = self._pill_geometry(left, right, domain, paint)
+        if geometry is None:
+            return None
+        _, width, center = geometry
+        rect = RectF(center - width / 2, left.top, center + width / 2, left.bottom)
+        return owner if rect.contains(x, y) else None
+
+    def _touch_domain(self, buttons, event):
+        action = event.getActionMasked()
+        if action == MotionEvent.ACTION_DOWN:
+            owner = self._hit_domain(buttons, event.getX(), event.getY())
+            if owner is not None:
+                self._pressed = (WeakReference(buttons), WeakReference(owner))
+                return True
+            return False
+        if self._pressed is None or not self._same(self._pressed[0].get(), buttons):
+            return False
+        if action == MotionEvent.ACTION_UP:
+            owner = self._hit_domain(buttons, event.getX(), event.getY())
+            if self._same(owner, self._pressed[1].get()):
+                self._open_url(owner, buttons.getContext())
+            self._pressed = None
+        elif action == MotionEvent.ACTION_CANCEL:
+            self._pressed = None
+        return True
