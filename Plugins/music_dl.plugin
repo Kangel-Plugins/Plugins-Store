@@ -14,24 +14,30 @@
 ##################################
 
 __id__ = "music_dl"
-__name__ = "Music Downloader"
+__name__ = "Music Downloader modded"
 __description__ = """Ищи, скачивай и получай рекомендованные треки.
 Сервисы: SoundCloud | Spotify | Tidal 
 Автор: @s1mclick"""
-__author__ = "@s1mclick"
-__version__ = "4.1.0"
+__author__ = "@s1mclick, @tefumu, codex(a bit)"
+__version__ = "5.0.0-beta"
 __icon__ = "IbukiMiodaOneLove/0"
-__app_version__ = ">=12.5.1"
+__app_version__ = ">=12.10.6"
+__category__ = ["media", "integrations"]
 
 import base64
 import hashlib
 import hmac
 import io
+import json
+import zlib
 import os
 import re
 import struct
+import shutil
+import subprocess
 import threading
 import time
+import tempfile
 import urllib.parse
 from collections import Counter
 from difflib import SequenceMatcher
@@ -68,7 +74,7 @@ SERVICE_SC = "sc"
 SERVICE_SP = "sp"
 SERVICE_TD = "td"
 SERVICE_NAMES   = {SERVICE_SC: "SoundCloud", SERVICE_SP: "Spotify", SERVICE_TD: "Tidal"}
-SERVICE_ICONS   = {SERVICE_SC: "☁️",         SERVICE_SP: "🟢",      SERVICE_TD: "🌊"}
+SERVICE_ICONS   = {SERVICE_SC: "", SERVICE_SP: "", SERVICE_TD: ""}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SoundCloud
@@ -133,12 +139,15 @@ TEXTS = {
         "lang_select":           "Язык интерфейса",
         "svc_hdr":               "Сервис",
         "svc_select":            "Источник музыки",
+        "ffmpeg_path":           "Путь к FFmpeg или avconv",
+        "ffmpeg_sub":            "Необязательно: исполняемый FFmpeg или avconv с libmp3lame, доступный приложению",
         "sc_cid":                "SC Client ID",
         "sc_cid_sub":            "Свой токен (если встроенные не работают)",
         "sp_dc_key":             "Spotify sp_dc",
         "sp_dc_sub":             "Куки из браузера для поиска и скачивания",
         "td_token":              "Tidal Token",
         "td_token_sub":          "Свой токен (если публичный не работает)",
+        "mp3_bitrate":           "Битрейт MP3 для SoundCloud",
         "ui_hdr":                "Интерфейс",
         "per_page":              "Результатов на странице",
         "limit":                 "Всего результатов",
@@ -214,12 +223,15 @@ TEXTS = {
         "lang_select":           "Interface language",
         "svc_hdr":               "Service",
         "svc_select":            "Music source",
+        "ffmpeg_path":           "FFmpeg or avconv path",
+        "ffmpeg_sub":            "Optional: executable FFmpeg or avconv with libmp3lame accessible to the app",
         "sc_cid":                "SC Client ID",
         "sc_cid_sub":            "Custom token (if built-in ones don't work)",
         "sp_dc_key":             "Spotify sp_dc",
         "sp_dc_sub":             "Browser cookie for search and download",
         "td_token":              "Tidal Token",
         "td_token_sub":          "Custom token (if public one doesn't work)",
+        "mp3_bitrate":           "SoundCloud MP3 bitrate",
         "ui_hdr":                "Interface",
         "per_page":              "Results per page",
         "limit":                 "Total results",
@@ -290,6 +302,15 @@ TEXTS = {
         "searching":             "⏳ Searching [{svc}]: {q}...",
     },
 }
+
+# Remove decorative emoji from plugin-owned templates, preserving track names.
+def _plain_ui(value):
+    value = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]", "", value)
+    return value.strip()
+
+for _lang_map in TEXTS.values():
+    for _key, _value in list(_lang_map.items()):
+        _lang_map[_key] = _plain_ui(_value)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Глобальное состояние
@@ -490,29 +511,266 @@ def sc_search(query: str, limit: int = 20, custom: str = "") -> Tuple[List[Dict]
     except Exception as e:
         return [], str(e)
 
-def sc_stream(track_id, custom: str = "") -> Tuple[Optional[str], Optional[str]]:
+def _sc_get_retry(url: str, **kwargs):
+    """Повторяем только временные ошибки SoundCloud, не показывая токены."""
+    kwargs["timeout"] = (10, 25)
+    for attempt in range(3):
+        try:
+            response = _safe_get(url, **kwargs)
+            if response.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                return response
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt == 2:
+                raise
+        time.sleep(attempt + 1)
+
+def sc_stream(track_id, custom: str = ""):
+    """Выбираем исключительно MP3, не выдаём Opus/AAC за MP3."""
     cid = _sc_get_cid(custom)
-    if not cid: return None, "no_cid"
+    if not cid:
+        return None, "нет SC client_id"
     try:
-        resp = _safe_get(f"{SC_API}/tracks/{track_id}",
-                         params={"client_id":cid}, headers=SC_HEADERS, timeout=12)
+        resp = _sc_get_retry(f"{SC_API}/tracks/{track_id}", params={"client_id": cid}, headers=SC_HEADERS)
         if resp.status_code == 401:
-            _sc_invalidate(); return None, "client_id заблокирован"
-        tcs = resp.json().get("media",{}).get("transcodings",[])
-        opus = mp3 = None
-        for tc in tcs:
-            fmt   = tc.get("format",{}); mime = fmt.get("mime_type",""); proto = fmt.get("protocol","")
-            if "opus"  in mime and proto == "progressive" and not opus: opus = tc.get("url")
-            if "mpeg"  in mime and proto == "progressive" and not mp3:  mp3  = tc.get("url")
-        chosen = opus or mp3
-        if not chosen:
-            for tc in tcs:
-                if tc.get("format",{}).get("protocol") == "progressive": chosen = tc.get("url"); break
-        if not chosen: return None, f"нет потока ({len(tcs)} форматов)"
-        url = _safe_get(chosen, params={"client_id":cid}, headers=SC_HEADERS, timeout=12).json().get("url")
-        return (url, None) if url else (None, "нет url")
-    except Exception as e:
-        return None, str(e)
+            _sc_invalidate()
+            return None, "client_id устарел; повтори поиск"
+        resp.raise_for_status()
+        data = resp.json()
+        choices = []
+        track_auth = data.get("track_authorization")
+        for tc in (data.get("media") or {}).get("transcodings", []):
+            fmt = tc.get("format") or {}
+            proto = (fmt.get("protocol") or "").lower()
+            mime = (fmt.get("mime_type") or "").lower()
+            preset = (tc.get("preset") or "").lower()
+            url = tc.get("url") or ""
+            if tc.get("snipped") or "/preview/" in url:
+                continue
+            is_mp3 = preset.startswith("mp3") or "audio/mpeg" in mime or "audio/mp3" in mime
+            is_aac = preset.startswith("aac") or "audio/aac" in mime or "mp4a" in mime
+            if not (is_mp3 or is_aac):
+                continue
+            if proto not in ("progressive", "hls") or not url:
+                continue
+            choices.append((0 if is_mp3 and proto == "progressive" else 1 if is_mp3 else 2, proto, url, "mp3" if is_mp3 else "aac"))
+        choices.sort()
+        errors = []
+        for _, proto, endpoint, codec in choices:
+            try:
+                query = {"client_id": cid}
+                if track_auth: query["track_authorization"] = track_auth
+                response = _sc_get_retry(endpoint, params=query, headers=SC_HEADERS)
+                response.raise_for_status()
+                url = response.json().get("url")
+                if url:
+                    return {"url": url, "protocol": proto, "codec": codec}, None
+            except Exception as exc:
+                if isinstance(exc, requests.exceptions.Timeout): errors.append("SoundCloud долго не отвечает (тайм-аут)")
+                elif isinstance(exc, requests.exceptions.ConnectionError): errors.append("нет соединения с SoundCloud")
+                elif getattr(getattr(exc, "response", None), "status_code", None): errors.append("HTTP " + str(exc.response.status_code))
+                else: errors.append(type(exc).__name__)
+        if errors:
+            return None, "SoundCloud не отдал поток: " + errors[-1]
+        return None, "полный MP3/AAC-поток недоступен для этого трека (возможно, ограничение SoundCloud)"
+    except requests.exceptions.Timeout:
+        return None, "SoundCloud долго не отвечает после нескольких попыток. Попробуй позже или через другую сеть/VPN."
+    except requests.exceptions.ConnectionError:
+        return None, "нет соединения с SoundCloud. Проверь сеть или VPN."
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        return None, ("SoundCloud HTTP " + str(status)) if status else type(exc).__name__
+
+
+def _mp3_payload(data: bytes) -> bytes:
+    # HLS-сегменты иногда содержат собственный ID3-тег с временной меткой.
+    while data.startswith(b"ID3") and len(data) >= 10:
+        size = ((data[6] & 127) << 21) | ((data[7] & 127) << 14) | ((data[8] & 127) << 7) | (data[9] & 127)
+        end = 10 + size + (10 if data[5] & 16 else 0)
+        if end > len(data):
+            raise ValueError("повреждён ID3 сегмента")
+        data = data[end:]
+    if len(data) < 4 or data[0] != 0xff or data[1] & 0xe0 != 0xe0:
+        raise ValueError("поток не является обычным MP3; конвертер недоступен")
+    return data
+
+
+# lamejs 1.2.1, LGPL-3.0: https://github.com/zhuker/lamejs
+# Source and licence: https://github.com/zhuker/lamejs/tree/master
+_LAMEJS_ZLIB_B64 = 'eNrsvXtz2zjSN/q/PoUzVesSLUrmTRJlCnb5NhvvZJJJnLn66FVREiX50cWyJNuxY5/Pfn7dAEmQopzM7r513lN1NjsWATQaQKO70QAawPBu3l9f38x3puEs+p9V2fg6jGP+KPeNr8tofbec78yjh52L+dp1jpfL8BEJLwnYTzmwH6c3YSFgPyTI62HZFqJfm0bz0XpsqIxAcmV1jOA+XO5MBH0HfQCtptf9qGwbwfBmWaa0ubjqmHfCCu7ak+CuUjHmtcXdalxm3EYQVyMt9OKVQv/4Dwu92FbooL+9UEVJu6EI9B/VgAsqqsGH3vYa6AWX/t2SuYCikpdM8PX4elW7WQ6u5+FU9NPUf76WON3MGqeVExbrv6QZZv2ygh9F63dg4N+i5QoJm9l+cGstv+b98BLo4Jfjm+X6b+YB+OM38r07/vmc8i61rL+sHrdnsGotN1fMr8uCxv8wXq8XB/v7Dw8PtdnCHUT3INRoP5f1w+rkej2PVquiJjm96/Xqh5eXUkLEP3WZ75eHZs/sm6E5MyeIBxcE1hsxq1YDo38VdoR9XrWtyvCqV7E6exOwTRXRVZu+7Q7Fy29Hxjv07cp4/vZkvEvfdRnP3w0Z79F3U8bzty/j6/TdkvH8bauCGxxQJcuAKrrJAVW2DKjCfQ6o0mVAFd/igCpfBlQFbG6traogQ47VMSuVEP/1UpacfIuA/wHpNkubl4eJYAz3hi8ksb+JP2uffr7s/n7x/uzD793PFz+fd9//+vP5p+PPHz6ZpfOC5LPz9x9+vnjPACfi6qpmuX69WW+1PLfumFW35nuNhtewm7btW42mWa1Zjt2w3EbT9j3br5vNmm/XLbtRdy2rXnd9grBsx3Vbdddu+HXbrNp2zfXspuXW67brWB7wtmpOy240m61667xaN223hsxIsVuu06x7dcICnHUHRXl2w24Bi1NzfNTMb9Vtr+60PJOrYgPG95DLM1s1z3daLurp2q1mi+tqNT0L0IBCXav1mt906k0f7aE2toDCqrc8p4U8ddupm04NpTfqAPCbaLVLAK7V8BzfcoAUjan5jRbKazbqLWqPadccy6m7Dv42z6uolO220ApUsdFEtQiB44OIbsNHQqNjgsR1UK5Rb3hA7BKNvabvoRo+SGA1ba53y7bx7Vs+os1GzUWTmvhfvdGwPUlj3/ObVstttpjGfq3uNetoZtNrUt0lSN22qRw0qWWWQJ5mo+U2CK3tKCSu12pZLctDPCHxba/lN3zbbVp2vU4UdojWLlqIHkVF/LqHFA8FN1otxuHUWw0XTGOjziCxV3NbHirWQjmtep1IbDccz294rYbTahKJ7VYD9UL9W1ZT1dTxLL/ZstAAnyLQEstzEYuuljRscHc0fNSnSTRGPUGRVt0HiSTL+c1mwwWJ3IZDREYl600H1fDtlgOcTs1t+i2fGtx0LS4FjXBRDooFdaliqBLAQTREOMzrqHkTRdh1FwxOSEDMZhO87IBnnLpkQZf600f9feBwQBgwRxNVb4J/qsTYKBVFIUcdRLZrkB0PxbgQooZFrUMZNvoGbWw5xFHElPjnoW11ai7o44D9QGnQi3CCW+quV/fBSS2fmBS0QJ846Bi0B/QBJXy7AY7y0TtmiaTJRTvBTY7ty36rW5DFJjUG1GQSg9iOhVr4HHZcVKsFtGis5BWwRcNpoq/dFlEY/dNqoAtdFlpumI1kcBzYh7qpWnMcdBqIjn6DSqCWNakJLQdNaTGBUcOm67jokmaTinHqYFiIKMTQopa7Dom0ZTcdqCGkg5eaoF/Lhh6RrAOuQw1BX8/1ZJGu70MummhwgxnUbXi2Z5OYOqC2S3l9Ei7fkWwAungQV8tttbjHHMd20VYoGtSU+pjKtEFBB1QmhvYgp44LZddkJelDMVk+es8/rzaIcoSxTvoSipF7z2KNAvlueFKjOB5q1wKXKGkHoEtdCQ3HpEWVHddC/4F+DpEWiei9JsQOSrPFhAJ7O2gYfZg1qgo0ENrpoyAilI3mgTKk6SDJpZoNFQUQoPWJ/QEAZgMjNpp1x6Jm+ySNLc8j9pR6HJzgQUobFiQa7QY/gB1bIJXjOkxaC4oFHdpSGWwILLGlDTa0W4q0LSKW48negsoj2YZ6tmwiBdrgOQ5lcOtEKh9qBvVFx9jc/YhAR4OFUDcWJo94BYIBFvEacpSgjkBvQcsR7VEdh3mSuo7SIWP4r06CTaT1PDAMuKwBIhBAAwxmYYBxSBypN9AWiC6h91j4wOQYLnxoROjwBrMH1DWUHIYNYocqFAvw4Q+EixuJTgBFLJsGRNn/EAiIVb0JAhH7gLAOeKoFyaP8kDrSJqgmmFnSES22SauC4XyTGBKKrA49hQFOYoAmJTmjGJZdsA94qm5B0tC1pFEg3w0UjRqUaqQ+mw0aDD0MQ1xHn8QESgJao8kdAeUHPmhCqTBPklRj2EPHklonQXQcFkoIAQ+LUHqsvzEKMc/S0ESaH6RrEFtD2NFPlgtqQiSZUDS2kqS1oA5J8dGIAdULbgBhWG2BG0CrJniCBbEBGQIroddbrPbRDGomjVZNHhag3PE/9BSkgwiHIQXWiUfksohjQTMP/IIfwEL2LRo1SO5tJoProl3gPZc4lvsWZEWH2xgEHaZ0A2qEhm6ASCUJdDZiwbfMfjR0Q+1iOAAWYmAAgPIYYiVDoxcxwIJ9IP8sEUiCAvbq0O6EH1oCIxYGObcuGRwSA2VZ99BKx2a6oo+g1DF8kn0FEMgPWN4Bs0DHEMPVSfvTKA4qNIkMLvUuKIthGxJJ6h9qgrQHKonaMmnBGegmiJLnNYm0pAWa6DEYNaQlMR5BLOsEwe2C2JHko/MbxA6kHB1qGoYIMqNgLJAShf6sy3ZAnKC5YIqQZvRZX0GXYIi3yG6S4yJICE0AXQjrSJoJsJPQHai4Ky0LAEP2EFUngEYLuqBBw3yL7QpkZLKhx1uKtmQQQqiYiYm4VL6N/9UtSVzQiUw7MFyTrQSM62BgH7oCVK1zNUFrHwNMvcHDnkfjO6hGotWiHvdIMCDpLqFVxkuThuMGKVRZDfAo1A2pnSaJjuc0iEsgxJ7NOsmjMRaqHpFkDENeHVLEsJFbMAkgFzANfZfGDfRxnTqjTqIGRQnr1idqo5G2C6pgSJJjHCB8Gu8htFQEuhPdi0ERoyYkiziABkCYOWiZKwcI8BnKaEET2apaJGwwt6VCAFs0yVingU3aKH6jQWxr+xzE+GvBuvJttg7QOhqciNqu1+mYDzSXICkiqqBXm2Sm2bUWGuGSqkQ1pM3QohEA2puMF7SFwmQzQEeggRTO4KA+w0gInQA14zeZfMABkwsKDyyIvKocyyIJhBpnOWuRxeZ7ZD+7dTOHgpGi9j7ZMRjRqVuBou7TyEKa1m35KgbFNOrUdtjPCIMhyYBGFDFkFofECtmk2QmYylE4JL+Qnd2MY2hygC5HrZqEFcqQbF3MM7iuGRwSKxlZDhkMYHfGAaVqk0mCHlJkhUy5PDzDlHUxBJBqrpOEg0TUg1kkjJYGvDpJMoZENlQxNBCfEnUtV8WQngHvYyyC6VNrkWzAwgAeKGszh0NiJRPNIxOnLocFjHFkFSAndKEkNcY+slagvC0av2CYQMohp1C8vm3mcDBWqLoGplN1UvQKK7QwskPEFV3JsIXiJksA0k/FMouAHA2y6rIoGCl6EUXWadik6aNdg6pGLWG0uqT7OIY418V4RYM7GkzzM9jkUGE2Gag5HJ2OXJ65mF+v/xlez4/n4fRxda0tzwzNnvE1PPgaL7r1hRX02z8f/9H98Ons/FPQr1SMYW16PV8so97d8KrfEQiu1tEiDd3crZPAUocsIZwBXaagVrB6uF73x2XrGTXoh6toB/arewCg6PZ6Poi+AKS3jMJJIBNhkVl6qq2nuk42q6MnOl420c0kklWqp3p6qt3IZq1nEnOFNjKJkIe6ntrUU3Mt9VXaIBqGd9P1QU9cvL/43P3n8cX77vH743d/Xl5cds8/ffrwSQLuhC/D2iqcLabR78Bw8yCs53Jv77fKedU29s8D6qK7GQhIHaA+1jdryoHveVi7nk7Lw9qxaRlBYVkffnq5HpZ7b4rT4uXcrZUsxSwjUk6KeSMTxZyUBdqIIf7KgmQj0JyhbM8JtWd73dAoKQ4sBk/RJRMwKwzmPa+f3ZkRr2FbQtzFrc0j46XzKehJvwNxFzN0pNjZPghFL5iJ+wy7HWR7uhA3E/HlLhXDo/LnWkhr5/2bxWOZKqnJpJmAmXeGqQNSSzSRzAAaB9+JM/n6XtylNIdczA+s9iAwvhKZRmJwmOXcasKZR9sSDgYBumKaksP4Gom4spUp0/9WaLXnmLNEGymQha6egtFhgq463d0tj4QWNl6iKTorEveVqXkreuaZmOFrIcKgX741IzPVgfFnJamuOTJPrlLh7hjIszDPzFQZxp+v5ZmUXy0jUbvqK4PqYRPVK0Unall9vYYqEvnigtt0CAhKZyKPI1ikej/Z2lmK0T98Wpxe0uK01FYVMS/fXkWVSscwpdqimMXVGcVwTuTa35bL6hgV+WUnX07y5SZfXvJVT74ayVcTZUcV4ecqIJHTl518OcmXm3x5yVc9+WokX4T8DMiDQVWMgmkFfxIqZQJCZCUB3BkJ29r7s3b5+fyXy+4iWnYHJ3s/h+sxKD+yrXJZEUNW29hPUO3V6hX7vOo20S5hHYroyDqwniMzOkQZx2p3jvGnQQwhaP/xVdSpVEw1ksTjSEYFpDxYKmJMa5vq0BlukwlfyabJg1ZcHPlaeUUZl4UZtYHSILWThHN6y/h3NLeuYe8y+larQ/Vuo/qZTMvvybRVn1fvvnuUYNDNcaJyV9WU/ZZGbBSRybWlEemu7paB+5/R+vP1ehqRLasN23Js6REPB9KITbmZhnOyf6A/QvyG7X4QwqaFbPeuwk4gx/iZ0RNc5PsPn7vn7z/8+s+33cvjn395d34Z0EjwFSieWd760fW0PNsr21UY8Gp8C0UfQ1xYre7uvilDyMqzKiNHMplXDa/mO9VwPyu+L5RTWttpZZW5fQIDuUJtwK8pf1QT/qvm+avWuW4w5pRA3Ek9fS/3oZ/dzJU7kUNzgtFyag4wlNxiDFyYS3Nt/kttnd/3ll2MrrJvb+/C+brbv0GJ/XxMd4WRl+OiL4s/xVB+r9bd6XImJkloJSL5PQtXk+v5qBsO/kdMN6K6K9pEFwOZgF7tTm8eIowuaUT/bnkfids0YhXNV9fr6/vr9aM4k9HX83W07I/FQpUfDqP/uUGkWKqIYc+xZzcDsVY1WA2vv4h/6Ru2rxBJkej7qJKWrUgzX8nSJhlKRRqlpjFgL1ytYlqs+uE0iumgE/E2T6vSWZ5YiyxVEiJInGt955ibLYV2KHq1304+CfFP5obl+Ojk4MGcyNjubXe4DPsYuogpgyH9YAgOItWgipjsQT3KQDWONWT6Kk1dybQVpWitUgBaTDWTngOXbLOZScZXC2AJQUIylTEJV7W0GJApqQFyuKqlxYAaO2rgWmx1A46yqs5RWVSomsRzg4lv4kbSd1XFQdeJUiRlNrAOh7AahjRGttryswVdJzsNTKh3HxQGbLbwqKczc6QFDqw269awtyrrQNUdmCLPz+WtGY1NxEq2o0zUtgJUzxUUU4iGi4tYBaHFPfqIltezaL4Op3+KJC2pFVMVU83ucBqOSNR+WT2iV9Zhf7IeYyIcM2y2et/Ildb2e9F/b31IfbKY/K36QLhK31mjpICkRkpiIDB3K6K2JkHZSmQAq5Ys7pXcxSUkvbohqa+UppikqMzt+JLyjz+/lQpTF/d929ILhGlfTSFlOdvy6Yil3tW0Q7YVMUTKMUV5EoSICcPMOLehQrL4NzKkjPAduFBuO1E8ECedR0/Hn0IMFSJJL+BIBZMTh42chiwnGSBjwe3OV4vV4/puHj0LLVlBq5F7C7BKbbedtDvkcKtUZY6bWIsm9cxAIr8QIZcjVWffzKjOiebE+ps+bs7EeW0ehctotT65Xi/DdfTj3XR6QdP0cl9pYjWmhr2l0sezKJx3exK8O+ktVrAptqVwA2bX8/IWANOl1m/LXZLZwy9bs/uUuUdhsQUkQAntLWlMscH1KuxNoy6IEC3vb66X4g11SHt4Neu83uNOCibtEwbKq6+b6xV01jhcQLQpC80V0o7l7NJ8MmSfTAQwlL09PQUj5QTIJxVMA6jFuYpMwEQvm6MjY/g3B8hc3u1jZA7wPxgmNzAZQSkjF4oi3yscOvh3j6ayO/93DqhaCX9jTI1z/e1hdef7h9WkjKRe0uqW8fSZLZyj0gLywFvGZwb4ziG6VDhG5zEkYqjFHb0yctdae3+jEt8euQvwGQevlG/X7P9uBYoQFtgODPLvmQ8bWTctiATk7xkR2WyMtrQxhDPQvzuK65mTpaE+uxqfq+lltP75ZnCX2cXpGV/PRe+FV4JOxBWdeuiXLbOFf5ZZrzkmOdpWPXxUGzXX9Gq+aSPFMh3Toc3epmHKPHaSx5V53FqDfHgbyFM3bfyX5LJrbj3O5iTZGjKbU2NPZvbwBLiWyWvFmVzOZCMTauNavNVLOcmls2G6qK/MZSEXRhKVy1O5UJBLLhS89U6IbZPKq/qcifI0k5LqcZ6aZ9qeZQIOX9UmfmkzHGWcc2GUq5U0qpHkQlkesjSa+A9F2B5KLTWoNLtlenFep+bGWZv5rL5ZazI4clIjHbORZkuo7+ey2dRzNfIUcaiuNmjkuGYzzmnF+Vob+Rr8X9XFr41MddPfyGRbuVwgg8zh5HOwb0mWqYiXqKOb1E1cubiTG0X8FIPXuVbfy05xLq/mSe5wEl6y/UJeinO4ModTl4wR85JdL+SlOBdxbY0a8gonlbJZqOLEE0107HfwUpyNup3cdSnbJiPl2UjlInFi7qtv8FCeg1QOm4ph0DzvOHneiXOwzLaIhNYG7zgbvKNyOXEeyT3IquXpmEPJPRNVPYqOmc4irxD8VcXxQQbTluVMynZjewaqrMyQwjveK/DWJrzrbIe3M/hLMoNnvZKBC2hRw5MCPP/vwddfaTDLsp8Bb7zW3k1wf3vt0WOSORLgVlwVByyRByetXZf8l3aW7SQ5nM0sDst8PZvFielDwpLo5zgLRiopThpDxJxHUqkGAQmOBtdZcC0NvOUk4F4rGZ4og1RcKCJRiWAfx0vAAUYDZymG96kDWlL/JPD1WK4JXzzOEnWgPKh7dWBM7RLgLCxBOrGqVWvMi8X0sbugad5aG+blZFg5XfSV08XvtU/uzxd/HPTF77Xf3Mw8eLZejnVXjN9rP5+fXfz6s4T1MrDFkN0fjy8/F4Fvor78fPz+7PjTmYR2XkUew2ronW+gP//j86fzn88lsPUqdgWqIbe+gfzi/eXx+/PYNaUvStRbvZrqgL4ZL0SYOpqb4dDsv6RQwUbH/NaKUVLntQhBPy7yN19P87NpTT2tmU1r6GmNbFpdT6tn0zw9zcumuXqam01z9DQnm2braXY2zdLTLE4jDyu/Lfq7u6DvoejHO8oxeYOEmFZQcAL1tqdvuN2VQ7VjRKcshfUc6vtMoTkwF2bPjEx0x0DU6i2vsT+Qm5eHh8LmKQE5VURX/UqlIwaHi6sePo5K1oFt5iMRp+/mEHJGbU6NrxIdmd5jEf7DKSjiq/TF6bGrx94gkP4gmSBa/LwI1PaQnjBCwpK//pVNOEPCMFhUxEkNMyjPvVpDdyDuX8EyjRt1gv7VlJpC6IdpwpmWsAz+lcGSJAzTz3/Rkg0tWqbNMNMmmFo1UFDHXOrhZcdMK5F+LjMLfYqkilZmXwzMsaCd2MHNV0mvkPvEnKqPYNFecn2WRjBukz/TWEyNl4fx9TQq99s9AwCywphIKclcKMlMWHOhPBehJUqDYIDiFuKhNl5f2Z3aeBrNUTp61dmjIq1OJeTNOLNfEY45qIjF1bgTaAVGzIkVMYiZ14494KTHJkqhQoZXi6qN+qO0sSxt0Kl9odKWwhFicPRQW9Mqn+MeqK96gyoiW2519saZioD2y6tppiKhWOw26nW3HiyIERv4CZkUoHKlklZ0EVd0oDxOZUXr8qchf5ryx5c/LfmD+bjy+VS/qo22q34VKruebfRSyF6dZhsuOT2OIsqbZypYUV1h3sYRTtI3al1YkWWqyBIQWUgyRphMB+OKOKNfsOQtfl8yZBoEpcWh4hKTnCRAKcVVJlIrTgGtwsSTEdpscXgd1i7+IPeE347fxfpM5hFIenf86Z/n3ZOLz5cY54NFVdh15dXgeIHrHPbJgYLb1e+QU8Ms/HIoFgZ7OTDgWPSrfuB4VEsFOc5AjrnWYgzSUpc39hhmIQlbiVEzlccsTsxHAxKlUfwB2SYBsj2WoykqaYJsS8Oc7oF7DEofyfQR+w2m6SCyQd8PtWm4HEXr3jRlxYGk8Vix4liy4phZEarSXGAASMg7jsm70BT+uabGp+bYHBlfU3+6AXKOuvfh9C5aYYoBxdvu1y5PqCumFRvKriKVyRcRyjW+Ydjv9sL5oDa9GnaCEnoPFFwa0hCQSji6GladTmVQ69/czdc2VY3WwBe1RbhcO123K51W2mKtsq0FWXd35bURfBE0jH1hTwbEr7lhQUHW52cgDFer69G8PDDMPIRYI2oZjUAAq8v1EFOuVhJtq2hEVpMkVhTdVTSN+usrqyPGhQl2B1JRlOB0xBfj5UWuIM3vptPY9WJxv9bCRatPGIZPhAYdyoWocSiurmDTdsxX/tIpADvzl86GOOqvm/zFVCD31zPr2l86+FDP/KUTco3kL09CgdwsIQX/yObG/93C/ysjfH4TL/CD2F2W6LTNxJexExY4yu1Gc/LaSPaQ6s2GOaDtoO78Zv4ULW+AJhoOK87hod1u20ZANH0DPQ1lQ/trshSb3AvYgdhuR7u7lhBljLFQnM/045A7apX2ZWIGFVHiYDoVlkkC7lLGN2W7Xc5m5R9X/ngdY9exvabnuw2vaTBWL/ZOcfbK/H8JWJHZjIqqQEUiJWdODE6uw7I0lgGXAi9DMU3qp7MYaX3WtUPo2kIAO22YpHagyzjaKl3XoljNcvr0pj/prh8XEd29cvn2w6fP3c9//nJ+BDXm7uUlf3UFZipND3W8rPH0CCi0bPggX8z7D59+TkoZ5IQ1rPXuu6v+kOnFqLJSq6XblL6pnaaVMQY5snQKkigPdTHIKFXP0AA187JMqmhMXtsGGH/Iqoj8GvN1bZr52iUqtGpXm1W7sBI+VRsamXtzKmjHeZpy/hRWHIaaJDymsMUjy/YqW7LKFtS8XuVg2h6/ms+W+WhwyOSDHRXW7lZRtxet1t3x3XA4C+e7uyVQIKdth6YO0h1c318PIpJvQpeH5h3RRHK3soUcpnrkfLlBvF6nrTNXYGCCEWRUQO8l5m/lA7pNAUV0kknOLaJYBU2FbpDsn9Qufvnwu2OVo9poetMLp91ReD3nZkS1L8vFzUOXDIlpLFIZkwW9ui0/K3gQyIIRYWEmYMFes8jtFGbawrzH7yks+At1VOSjkDTr7e5m8AjR04MMe4m2bBVq1z9wbGUXwXpui0u2f5gIdwIWFtr18fk52toxd+TQpRVZRcPiHoJhVSmzTxMmobTxeHRCX+A3pBxYRrudwnb5o2IbVX8PsXc9WSChvIpqD+wvjVzsbftxd7dXI7dTRNDhGmVNzcsj8O2peWHemvcG0ZENLTI/J+WlnrSkUYGdcqmdfwkqYLAe0+xjWEkDh9HmeMOmVkF8dVixzfgY0cIsgDBpBEOV/oK2tg7/AqK/qIZjcYlWkw/HiMcnqq7s8pnq8rN4bENvkzdDytm7u+NDkY1gAEma3d07TpWho/JWMpn58mi6+Re021bqIUcpl2VEWXhAOcTH11cIv7275BrSywvxISBmFa1n6NyDFhrqIeNF4syiDGQdslXgGr4R5ZB4jEgTe2fsOoZBckDD/qWoNVw6Kc6XtdBFF1vkvpJnYNJxFgxndvEBC7DVTCyb1HaI2QHp0sUquhvcjMPpEFEGRv+PzJE7VIeRmJocM2pPg0plZCyuRh0xwJ9DcXlEgYNkPWeLZQV9RtpMKbwCjZzRfFLgIx4Vlj1Ts8Cm4o+y41Kz5G9prD5G8pfoqavtNxn98vxsv0FbZzeDqDtaGl+j1EzPZyzQ91Snx+y0hFzHHedQzIIZCDvF/DM7KWRVRkB241DCfJVrO5vjxoxmtqjE2aF41OYst+j/iRoebw3wuBxGz8yJEdyKiZyExLU7RUn+4WlwGhd0UVjQKawPKuoiLWoiboO4GGC+4GLOwKQITOJiOG+HvX/kp5iYQ/kxM8fy494cyY8LzDbOudtp4QfDPs/vXshvThsdUYs3ZPM9omvaMGgfpSX7CNOJds+J3FKVVBxSWO1Hw8h2G9S9GlYfmQxngsj9eJgp5ZHM31vN8n2Ulu+jsnwfleVLxZqzxPK9ZSlXlu9tJ9Bxorio2AieHZ6RshBnZrTFCI50I3gWbB3NjjbpdwCBzxk4M3BhoQ03O3zkijxi3GnP8BmqDs6jMFDTYmttRsu6GyWG0ggzHw//FlZly83Mx1ex5m2ywzwkGWaKASIDXPYiL17s0QRQ/pM7yY7p8T+f/9kNk+4Ku5fTRIqNf/W/+K9jYmJryf0a01UYJT6X/3k0P50RjM1x8a/+l2a1wS1GO1TZ7oIMIoyDDgdnmiZMdfb6ZqlpQrIAF7QELSdu09p6fRV1rhYdcwRmWKoDNCNBttKoPYx1/CiW/keYy1LLj3gOJyXkUVQfA4t4w6JjeVKxXj1WYG080loTSSPZ5KndBGW/FFXHeJHzs2FukFGIlFEldWVhpax2BinZLs8iE2WoKWB5vGsbwPsGkw+FrwBbKY8uE6blKEy2c5VFS+yXpCGqzru7w61jxu4urdmmY4asjW2jOjSX+uXyz+6UJuSZstuJZUn1qjpv8s2kBlBbR2wASyzFuLdQLhOuCq08arNql2xsTD/vcMTIpsg6XF2Dj6hnLaqG3sTdXRtz8N1dZjeL2O0V2jCQ/SoQHW1OwTBzTBGrM7AwHtoPslJKfalTm8GSWFnWXwe4WnZAolI2CuMn9cNYJwwZ+xm6We1sTKYnNvBtL3sDlPFkUNN0RSP1spP2xZTXyG1bdUjV3qhneVqpmIt2PnaRq72hJFoKW5ZnirBCwGl1IS+FhViX0mxZcics2j20AAZ++55/y7S2vKQ1+Rn9PCbqXOlssqizUWJkatYpOdUu6VbVJZ2QFNbLFiGvOkLkWL+UU01WbFlnuPgoPf1FBigPuOWhcVAQ3Z2uYPuZQ4wlbHI9sWr3Tbdh1j36v/xoOupvy1J/bcuX/9G9LFE2l226dbPumk3brDtm0zJ932y0TJ+WJsnVy0MuXgO64pVKB0MN/u+Sq5Rrmx7+YkByKK/nEp4G/o/SvU5Q0ILMWi3f3cDzKJq+rzXbgNg83Dr5jr3wn3hfsza7/hINuhJY6kiYEpG6RgCIZpgUyJmDrvcHpL0GWc1Iez6pQhxA5gZK5ga69uN91URz2WYeFeciXFVR0rC9yGItgIbEOXI6wcCjNoEzs665XF55VXDEYQQ0jIGGCijMsu2mPT+QgjFQZfQ4+xCCQb/Z3IcziTuHk2LNsEAaBolPaC5Hthov6oKOqyvyYuIVb1pbV9+08q48X2Ssyzwlo5sKwFUAhfxEEqFPyNS2bQ9G6BT2G825PMP8oqmNIBSZlRXnQBonUx53pgHUmTG+mqrhJvoGEz6qDfcJxrU5OWJ0aU2B81yFnavHTlCSC3AzRt8LerHJgynRVa+z7yaFT9u3VLhJcy+Ko/mwezjkifCXK3dvVhl2DsfIQ3oQPyKOhGGZTIAfeRK2pS5mthoEL2th5sv/gvlhrqxZh6Zxb+SaV09DQ+mHAyqBwW/5IAjNlm5p/kNVIP64pg7qspW9lVR5zBFboVT86IpKgdknVJzVCXrxt01Dtfp26KSq+oZdq3bbw2S3vUixl+t7j5Veu+0ZlfK43XaMyjBzmVBhJs+yKnFG5Bhn75kpylGqI4tLOXIXDn2uRcsl+PF6vh6WfyCXazqo9bizWkfL6GZnfrPeuaa7D+iwYzTYeYzW/9f8B4NNQ9BYEi03guk01BMqIqHpXmHfICGW69sXtRmupg/xpMJVk5XknxLMeJXken6dVfPxnH8gnAAz40Paha8IJ02IwLS9ggXqSiXq0O01ijHGIc0p0PMFS9mwa6DmjF61iglDj04UJeCkJ9U+xwCzZ9HLoLOL0WWyVJwtyO0sckwbey/apvEXOpbPdyIEpa17lhPwppio5aZP0er+x2U4i06ikX7LwsScx0vLk9yRFPNc3NHUaIWxxDyBihpF6yGh4MWsiRHMpQtA+aTq793VCOx6PrwhhjD272IjhLv6QTiWR0AqsuqTHNNJsIk8LWbI6Z2/R2et7HN3T8Xvlye1mztMD/mODo6x7bpj7PuVWt1Qy3OCoqCdaqv18rq/7l5cfuCxTGJznXPvdTRGcMf0+Tn8IobVkzR0SJe0pGkPajE1iXl+nmweVzPSDBatJzGR0qZXkk0jCXd5/RSZSRYjmPAZ7IkYGsF5DUjvz5bh9Zz8JOmOL150vqstiNBkBqrPWnyUbqXK23fMOIlwrFCISMtLRlidO1D6SWb7pW/OzTvzPD4F18+zxwM4JmnBUAWAhWwnTIvKDxUxZ7sUxM+v7NLMtjzcE7UWEV9WPLCtvYfD1t7wqHwuHqr42IdVeKecJ87NDSzPwnZ84wDQ1mbirqAbJ/ub/fP8vK1Kz89lWVpV1Oy9OfiiLx7ajb2kZajP0cNBNiLoV8U5pLePBvWFpR1oSUl7rM5JaZSFbCbEq6LTsss7lXlGueZl+Hw+EKUsNu4j847e5pASG6T40Q97/UQe5/T2hs5ZN6t1PoqZjckkUjT/8KnT5hXB66Fa9efVftr37YkGlPA6yz6hHoTrsNsjHYRa7/v5YisQ2kkwr/KPTiEKb6CoislGU9DYTMa57lwZ5pwr5faius2sF8SXw50ZX8+EH9xWKnK6MI7CQbS8CmsP3cV62ak9LK/XUXd9PaMjpGKkVLEIA/12nH6crR9nk/fiDMxbsGVGW6IkkY3CxA9NzsUpRKKkPir27iCs0Tbo2/Pjs/NP3ZNff6zaL4OrW9iYL33tsK95ZgS9qugHZ/SHAJ5FdHgIC+OMStIdUCfp5kMPM5uczPcDvy3oBPUdOe02TN8wB+gcQ49u1Aujm81i6FYazWMCkmTxZHoVvKtS1uDSy3PGya1XhDuoVPoG4TSpiHGtPw6Xx+ty30BZL8r3BFDV6sAggF4tnPevp9Nw+cjtJO/6fNz/AjE2dEmR02yUmh9EwIR3xpIJ8IdOowdxG5NOiky/Wu7tKleVcbCZlW7x6R0ellz03uDwMGq3VY4qjMSKGL8UliZ6OR9U42vYboO9NSMp8A+jIIJRRymYdvJfkv/y4H+FBju3NUj4B/9LuE6z6SZabpBzZIt3raQbY8Haf8XFjL9HXjzk/6rvI40yQWVKlWMc1Yy3yr7H8lqtKueAqZzpqwsB450ydpkkNUYeSEO6AM46HNS+LK9GiN/dnUqvQg3a1qE98gx00ix2YRZHz+LksjiFWVwtSyWXw41z9FEBEk0vIDU1rah9BNqrLEXsG0p7lAHb3SoUu1SM0z45iX0ozHGspJQDKi2OqIXmQewYMZKLAxEoG7EZrZGWPBnZw9Jcxh8z9oAYxw2LOpgfpiFFzFO6BOJwTK2L0LYZtbhaNQK73h5Id0uCmD2L0yqi2jbKWgCrXTdMpNFYshQTOqg0A08uTAAuaaN5gbIIZkm+m1QOQc4k26rSuMOS8k7F6d6yMgmGVUEzcbSBqXbaYfr2FXVPMWE1OGZmDmldVEwrw5iuI/2JMo3Xi12wgijvgRVlPa4CqSG4i/JbTxgmIjNdCIFwE1hpwzGIoHQZGmj+5kO9jhnRij36Mn5SlcS/v8Cdh9RLzotKwfeL4ceHkVxUBSfzZ58+t7d2TK1Vzdxs5djsb1JjwyEMQFGGAr34Ma/1zTqc0gJrnHJfHiQLOmhYdpBT7erJQVZRpSc1atUOqrbgUwJjUTD4Gur62F6sicdZa6E6CiJVnam8eUIke1t2ZVztB+N2nycvHKpsFGEEpSlZQ8O9XsY4eBmgIzITNBBsSn76qjztUy5T8ec//CO7or73/YPkK811i462Dqe7u9piwnRe/gFzrXA+inYQeYPaT+9WY7RvB2PUMFru1Gq1HVpLiPtsyl63IbvQQnHQPMZ8kj+R/Jl+ywOX94D7xtcZ7Kwnagzm2/Tam1oHZCTSc4YdtZIXzBKKbK4Qb9g3cXX9vbL13HQwD4X1dy/tjopt7JGfComSvLKEr089ekjCUockGTpXOdDOQahmu/thbjpaoR3fwQAUjP1DTj+ddplzJCNp9r4m1r+VB2D8XadeN9kBna5ypThXxkXps3s9useaVn11g5KXcThDL8kwuPI6ove4jsowEH0K1+MwgcTV4w7nGed6GYWz76CtGSnBGiRTFOsQSvEeDaLd855BE7AJL7VCuGMLngyFvN2PuEFtCJp+ihbT8JHujWQVM8tcJUmeoCPKxOjCwfUNXzDJBtdwegPCYMLZpwWAZ8tQCH+Jwom8QJqsndr8pj+9XlC20zFxu0hvi3QsS7+rdVBLs+679JoQmmOZVnsTydH5x7JSmiZNOrWgZRzF8Je8U1vSastY9/WC9mzLMvbpBvVsrqq9EWHEHQcu6w7uZrPHLnVqZoWbL43flInkEnmyufisV1/zyR7DkrTaY8TSxAlUw8zJxMzJlNOQWCFqrrKYi4xpFD6jP3Iu0j88HKu5yFS7QnND+7Fdn1i5/axuhYH3EnPnzXIWrv8WewbxQBkzp6z3hhYBhoCZNDtxNZLRM8f1C/MxkJtK4wT1OBkddDvdSu4830zn63gxTGbkl+5Fp6vsD/Pa5IjI7Fkt2mAzDlSgToGAAomGMm0ZYZtJCqtzNOhmHTHBaIYTg42z6sz04ui0ZJXixClKqcUYgP8LL0KnZUtXtPh9zrKR5uUFC8CnlaN59fJ6NF6nmW8QpoxaCbPFOFxhmHFoCTXfHvJIHJO7SoOnkTbt3ilqGF8pabaxTtFiV2ueRM7n0XTVBbGPJChGw3tqNTGG6UpS52Lr8f60FTy2s0jY14QSF7ysvggW9Bwqo5Bb5o/s6FJSr6cSlKOgXkWpdoFm5GOw4P0PQnqbX2O6zawxJdxxq5mK+w61XsZqPpZ0zZeM3NiMIKa4zflBaEcJJLfR4XVZUgLHFy9wXH7TlaBtT4jbvNlIW0IbPlt0lEviyRuZ9UI0dgEaeysam9GopmccolGAW5xib01xKMU4KCuO3NrM0v9L7SxA4xSgcbaicTRyZSYbppeNVnMKIkfMq3ITNRbr25wLUxq/ucSANG3fslimfVl+TlazsmSYj+yjUihjuniZ3yleZqF4mUXixZGlIvlChv9fvv678vV/lniV/vfKl7lFnMxXxKlwHM1NUHjILjBbjIAsHw4H6lfMileuC+yizEp7kjzLGX7TBDNgeNa+MV09p/of7GSL3Fnf3OysZuF0unM930msxVpfzl1h2u4NsjMmdSuBebJp6D2Jk8TAy1sWsQu8ozzg0+H7ZMvwfSpKT6RgZqxgLoTuR3t1uqkXOuZHoTvXFsIoM+KW7gBon2qeQgvlK5dmgmbjBfoTMxNnXkD9VMSF8iNSWMiP6PtRfGQUH8np43T7Majbyk+U0zi4rQz5gzZJzuXXWUXc6p4ps62kPBUpFdXRKyv4KCQN0Eunr3jhcAu9w4/Bx7hTHsRpoWvDx86+a/5FibSm+FHSmQ6GXbQfggvyYgQGIkRyf6pGEXcPNKFDSIZJIKUtMHQoMoXaBuTEQJcV4e799QKaSTIyubJNosD2FuntMb+3LQut+L+ow2TXvWS67rJy+0I3FmxOo25Wa7WknY3kG9szA3hFlKfVMW0gpssHtDQTrxpsyP+FEtZ4gep63r/BPGSF2Uj/sSbXr0gB7LQPd2IkUAF08i1XdLaYctbHBih2kt0huTZ2AGWi9EIe1cHOPwZIJWwETrv0Bzv6/ziZaLEzIGLslJlEryRjIprLLVXmTjgf7MSa7EBLpsqw5ssWHCfzImBhOpLLy4gaBPTUEAPgBLiIljxZLmjJD2apgKDaYs8GO+Sn2WZeI5t00X02T3UTxhz/wzen9HpJhik+Y3K/g/+HO8OQ2sn9VdvZuVjvYAq5s4qgvxENpKtrSMVOP7xbRauDHzYQtax//GNn593xz+c7pGyvp9Fg5+F6PQa3jUaPO2oY2LkZ7oz6/Z27Fa2UhoP7cN4H4M2ChrEnuhtzvtrEvdMi3H/e3IFBHsGvM6rxDVD2SXNFg4IcNuVA0TSqcaXA5Dc0D9+ZXveW4fLxh8wKW0GfyMnxeautfFrlIytF6zGhMUh2HXNr3WIUjIQVb59YL8pXiWbxXSmGueUnsx/vU4143VkeXRzF+1OWOinY390dHcYXK8Fs0HfdB7x10jNHNLwg7UzEuca8RPhHGaZOn0y8sDb/GT3Rhx1jTmt3CzQ+iiPKfYXE1KBEn/cq+H6QkC+wXkXRRCrM2vzkcR2tfkfzoVH4xpCwNoj6tIRBSnUcwUp4NGjprB+Wr+jiujpddTAWo2QlbYj6mgvazBoGdEBxiLFrfL3oSjR2F6SaXi8W0YA8Eq4XcluP24I/dsfgTVXanYgfcUBdh+zSEObWNmWfLtgMGPLI3ZeHEQ5DbXXxSA8IBXFQLQJlimjAMZBko3YpzE6sNku3v1m6HZduf0/pDMSHdcKNheJZ7qVAgMh1YklLi6mJn6GZq7YQf9YKHoaKGbHxku4Uxq+mXPMiZFfald2HzDrkgA+NYWDyj4l9y7/XSFa7kLCff3EhXD+efyLLWxq2yveEj9vnN/kzRrIl+X4kwPmaW8dTL/uQTxifqx+I8KpH++FOvR4MxKDd9p9DdnvMx8iNhmTnP02Quw1ZF5Ie+xkgsWTRHWOHjseZJWaKsBtJhMMRfhJ2Ec5inOsYrRy4vQH+Wwyu6opEsEi73Xse7P7f5aqNL8PIei70tq4L99RRQOIN36QtEETJc3w89zSb2QhMvwvXZK0DOw+YThAyCXQ76AZk0cIsQcmLMGgq6Jm5/aZssoPk/EJtFsLmh0MzEdqCLSW5MsklbPmF22x6iYqLV3CzSba+kruZFK/obpYXr+wask8kexKBdh3PVuv3+rTryHb8g+LOcJ2DhheE+iNFN3yTQCTiPbqAPofLCJqbdxNAcOIju7H3U009ziAfZoi0BfV8QaofM7Vibhw825ZxoD7pthtBFN+1XdkBnBA967vZJ5JL401w0YMM/K+nq3KPPHQA3+Et1p+gtnqv7aLSTvrXn0QYDOmZCDGQ+6f34qlXe//rz58/nJ6///zp4vzSDCkKyujHT9BKlxd/nZszcV/xkn+tio1/Pv91+a9TKXn445h8esjjR8M9eteYXpXAV8uxzVbDMhsehZpOy6xbDb9l2k3HN+0WYOq2ZSHs+BYl0f2klstHhXzfrDsOIlyn4ZlA3EC4DvyuD2T0lDVgHb+BiIZHUtogZC2LYq1W03R8Qml7dXx6rYZJL84j7CBDve4AoOG6DbMBFAg3bIRbtmPWUYUmIlpoQqOJ+jUbhKZpUc2awGH65y6g6s0mkuyGiTYBbcOl2tjUHs+jEvCnSd+IqFuebTYsRkN19Hy6tNVFbtPzLUklxFo+wm4dn26D7l11XRTh0dWwDdsDBtsBNB26ajqIodz0cDta4HgW8DuUH2QErWzXdzw0z260uJGI94ACME26ktqlWtgu1Q2NRZfYKJG6qAnagZQo3K5Tq4k2pNqoK0mmEGGh79CXKLBko12Irzsu6uO5hNmroyUNl2nnEklRqkUHvRyiA72Tjb/NJh8GoxItenWc3pPnQ2VEoFaL6my1qFZ2q0GHzCQF0IWm9PkGJUHghkWsYNsudZ8PipktUJB4DVh8YrFWy/eA0CWeaxGPtZqond+0EOtb1AWgErgTleOOsU16Ot30qbX1pocM9Cy9DeYBCzALoatsoohTB/HwTcxNHUQxqJpJD6LT8TUq3QP7IZ4Ig28qyGlYzKbE+R69wW46TWJczyMm99DFYNQmtdlDRwPeR0vxF4gQ06D60HPwgKE2O02ihQdZIMxEO88lVvdc9C9iEGW6FjGw1yRmp1uxWqZrU595Tb/p4pv6GODULjSRuLHBJ/BQPgsd4n2iAL3JjU9i+ZLnk3xA+FA3VIra2PK5LGJwr0G8SM/Fgz5N4nuvQTznWmA9QNroEtSSOB/s4Jr0EDvFoBaUitqS1AIPRAmYLeJ4F2yJEpvEAWByi2IafGSQONgh9kEMSQgpBuRyHKKbQ5zn+lQ6ST59u6SWQFrQhxjcdFvEqQ5lxt8WtIFnOawuWHlZJAmeRc12qOMBQ9RzW8TZbstHjzguUc9tkaQ5IDO0DPRLA6WAzaGzfJIBHxKKvz6UhVun3iG9h1x1kgS3Tr0GtUUHKlvU+26DlVyjSXWzqPdRBslkq0XHJyFF0IZ10nN2k1jeRVUAD/YBTJO4i3Ql5ApSAZw+cZ3rkYS4Lstzk1QrKWA6eUncSw/O0zdpN4BQWQ3wQCfxHvitt2QndN0jZZu/sPLN6eVmS0EoXvGa6eW8ZoJBbY5C39/NuNxVpYIYfsc3pI8I862KvERDhtqD2kM4X7O/ag1z9zatBjxJh45eOLriSNiMhMPkAHkrcFbBjiCIoVO0lMmIp782TX85KgjJN1KiCvfJdpWfVE8qd084AePYF07sjzCK1mjB53AkNmlGkwCQB4lnNAehk5W9GlNPObRGfIWl3Tk8dHfJPzLk+0FhUu+6dO0FQi5CDYQWSZq3a9f5ntcslfnmBKAnA4UfaaI9iBi7d/SgG4gyh9O5GnYOChKiDt8wORQDdic7ct+I2RGq0jhADewDFcQXkLuye6ill+slZilleh7TKxsmeW0ZRi26vQunq/IPfyDtB4MOzH4b9mI+vPnBiNcG2HlsQP6yvdr4YkAOKiImY59dpmQqOTUP5fETJDM/qXS67dYzFIAjAchFJpeuLisa7noGz63VPVC19U0/Weafte95mZ9j6UIcIvGsQzW4f+mRtRm75ajifFlckpApMfYl5EM80imNbuXaW+ynHcnn3uxAsorVabc9cuFNehasUJYB8IWBeRtdHSt5hadRvNASPT+75247MiJ1y5h1uJBRC2NBUb1aNO+fRZhIi1IkQ79I/4705tie4vgLTH3zLN+L3dZ6xWrCprvSNmz3XrHt3tu03UnRKNt9oAjV0733Bvt5XMojLcosF1boOprc8s5nWgdl9cMrZvx0/aDdf34eHIbo5h4t/ESqvW/s9NqoDUQZTSYsM3p1IakIQL7YvRkdFYOTShL2ZjwpOYtlSoiNxF4oLy/YjBb8SgS67wpDaqegGkQeJIF5c8sboWGel2lWbkbiG/Q1pftXxO5ew5zLGuG46kt/RTv2assu3+nzHUCT16h+2CFq94E5MkKaRZ5gfjmoRB2TQkaqr+nYCXpTDnX6/GnrQgHpuDDDCmCP2uk0XK26F2dvhFrfuTh7frYOMWpsdkhmobOvTrS0B68TK870DbDEuaxPZ5C+QX/LCM65rUF6CVnak/cG3yycmR0b6R2tdjCF/qtUpkZEp91pKov/9qbkqJhe8TfboIC6COtQzJgW6uq3FJu6BlI92S19Iqf793sSPFgc8kfV5jtC1DcdvbCeMR0EFI3Si87+jCQoQI3afDGt4BWdpKaLl5eFyG36Fu1+lxd8SW3/asE3vb/2MQHJF5gbGaR0PRUcvKoYFOgmjXLrzN/qc1mW9TxTCPWV8ohWOk26FzG+93NBO2/qyfKiNg/zTsnlgVlSPBLfxCTP+y/4soMlhKsPwpr0EjKGiKlYqjuoN2SHVoNpkZM3KugldRplAnkuOY2NvQnHAqxUta09uQx/Ww3pncLp9frR/ELXbUrp/S1aPuYOjsmLFa5sekaFb7uy6I4qij0Gm5SJKcLa9OZhAZkFc98Sy1ZqdVqyOShKMMwnKNEH/Pdho03ZlybNH+m0DG2k8k2HmQcjd9WxgY+FiY6hNq5PMbKYs7CooFG46PJWnfnXtuT+3XIZzdfmOwAcf35LG97JJQZERXWRgXpa9ICK/E2EW97wLGl3Eqjx9+C3eOUsdwlBguU6i+TlUVgVWXa6iNh+VAx49HiVS6LrSYP1ptt33bba69S/GzFaSCDVMKv4e7gdpspADwKzR0xV0ZttoSUfPTxroYOHZ0xHn6taVFyrzIbEk0gexbOQP+8cLl3HFzcPZcyEXUOeQif3iRndHG+16S7SS7rvwvyrPQtZp51SkK4lfFcply+ObL6tlW6WKH9UgToFTlWgQYFLFWjSi6Xy0IplpN1O67Oq33/+8P7DwUeae6Q9e/n5/NM5xdoqtsTRZ78ev+uevj1+//78HRIdPcu/Ply8/9xNMobkid2PurPVkXfg5hjjo2i+nApaTzhkps0ulnv+uSs24h2Ob+ej3QNbntTl9xelcxvmcMtMRJfrMnh+/gbY4Hq1iOYrgqzywq0m97u7Mmp8PRrHcYyQ746ZRsN1Ow7w8nY27XAjbeNEqXw2RkkSQcxvIK30gZ+b+fQRxoMQ72CXF9HN+BF99UF8qJQ/8uUh5R8lV5wSP/CF/cluJo8NUWVhjtXYEN843Doc84XDdIZvURl3RInGxS/xGVoJ3go4WY6Zj7SJp0ccc0RcwJMqYK7CDxx2krClwhqCixzGtviNdTCl/ZYvbUkTHFlbW62cL6Vk3PEJFpmkFtXvqCxXz/4hxSfH67heoXqoR1Uvbs4s15w4Pd0mXwT0zMaUR7+oEvKZwhh6mh6dfX3sVpbo4m5zGkU2qNwa33hFdqtNielbn+YIk8SupB0beQBUi8kDo29K6nxVxgSkB0f7NYjzgB6ofqTDZgOhT9oH5g8Xlx+qvl9vVW1M02urdbhcr36/RjE/XJy5PxiQ8XJ5cNXAlNRpQkc59jOCzThoexT042DzeXDVkoFKfDleXEkuPD/ZCHoiZ8Xz5IOa3DuMMaTtpX3qw15qgPflrir7E/SSPtN3VH9Fj07MOdhZHjKkM7GiL3tNvl0iJjIk7yaaq8tsCOxBu8olpMe00jee+mnSYz8+wFi0lYPSja9afVbJcUfGw1/kJtK9vDzTQvKyNA7L+7BhpIj4lKQeZGgZLmlHJ5/SSqWqTGgRpOi0sEKWmXYLtTu+ETW/m3XjLfc0RkKpiD7Pp64H8Qm/xMli+igBMnNxuWhJ2/2r6xXNzNUbHmwsxihoGBTTsCaHLRkn99SvB+46HHXDu/UN5jjXfZEtMvbrkNFZy0TFpTMkEZ9M4vEwqUvezJZg8VanCsV7sIqYaodUJO40WifEzp7ky7fk93YlVZjIMc02nliX/ZVcn6NTKvsoeCkXHaOEzRotr+kiqXD6Z5JdvXQWQ6RWrdjI9FeMiZZ10qOgRc8rbybIqHhQ5vteZZQaurUYfeTOwKQRpEQx2A3IZE1jSFp0+1VLyVm2Wkreck6TtLJuu8Nl2I/bzwO+TMSH1mJlACTEhQUZhtD2dKfX9T3xsxY9vbkbhAuw1Rc9lt1cY2TyKek4JF9/jkMMqCqUMZZKadfcraLP4NObJTgxrpN86V2Jt/bms0LFXR/DTqGTu+EUeEGdQXc0XMQygwRMhbUQrypJlslOBbORPGuUUWrZTyTFyiMX3TCuSnbgZI5LldxxouSgycHEvbuh+Kns7P3J/m8fPp2Ra46WHiOd0o1CEliCXh7//Mu788vuL+efur9fvD/78HulAAflSlBAVf59DMgUI1h+o8bLTI2Xf7fGpTRbguPfqfLwehnLLUkeb/UIhTvu+2nyhbGJRgGlp3g8+J0foBBJDeLaHIs/MOX6k7T5L5fdBbHFiSLD4EQVfvIqjOZz0S/fKUZglcfXaCn+WUesXucQtZtF5kI1846MAvnMVMGlaj+VVxhrfqQnaOgS/5/oHSXD7NHl/XS5/UnmBKq8WRxGgmUEmXrUlve5S91QdEiPkYXZC/HlhsRJcv9TcgP/k8gi5JetamjQIuJW9Ey6BgPm7kniyCPo7qGff/ln9+ez7s+X3XefaCadQTJbYViYQ/rW5aQhwGEWFbWMBncYDAkEttnd1ayDEp/U1btPqPZT3qf/Ka57JO6VX/9TJ3+b5puC2zR5WQqk/eXyTx45unLcqE7lMQK65KQgWY431SlRQA43Xak0k9m7bZk1e2+a7xt2/EOFwVjEHeUTOllfAMKv01CqOTQ2SCmJBBuq3/0y4+59kA0G+HmeolphE0o3h+aT2QOwsVFwwrgwWK5XY9gxEaowA+VfXraz2Pl8QKcTQkMzOU8TNcmrsYl1FCthScV317PrtR6hvsPLdOj6RcRDirorLdaGEI/kuSbVkpUWt1Jxi9Ww59ic8AtEy7G1eNtJ4umMq7SSel2J+vTk+P3ZZRq72oyNbqfdB44+efcTOULtO5qKeArLd5l5AD3PYVc2K63H5qotk4oqnqbYah3wXKlGU71HtwpoC3c5uiMzapXcgiV5KVwu36WJ5MEYR19q0XYajcqk8U4aj6qU0gS3Y+oryUlRmCud47/krH+SoKol0U3jyZdRiOUSGE6KsFxmsKxex+LQw9QajYsQOnYGowR8HS0/Yq11UBFa29lAm0QZut/p9cZ1dD3ja0+ckwFGc4a7aQi9GKYX32T0TrlXVdc/VMLEnDMyXrjxRE2E7Bs4l5ekPMif829euMIutHN0fPAgesE5+QrKvV1+diezrxvf2HzV60iHwpPMG10VxxyHFPOR3Jsx6MWfjrJ5s7f2iqurq4ZZp38d86rFb4q3+JVD+YVPTm/yu4n84rjDTyI24k+CsG26VVzdAE3OL+lt0OqboNLroG16r5yfKWdMBOYooIZJ/1wJROXJwjggC6PnNeoJeopXWHz+7HTUrUvJqxrZf7b2xoa8CpeKTiZR9FpG7NU5PAnnA/Y8FVdkG0ABASlXxibXNL5EvWF6fG17o2H6ltlCKr39QS565L5mWabjkjuZR04/5MREzlrkYUnOb/xopWeWfA2lvIi9YTY90JQcBh1yOCLnJfnQZfpvIywfh//eWpLDIr1SArAWOWKBIE1yawJZEOZaepZWy6SSDUbnm8hJnpGWQkTf//VK/l1SvlpJ79+iZIy0QdfmZ2rqEHZgpMv5+f1PT5GzoWpKHmDoT9QnX0PyWDNLLrm7MR60mPq7IUn536kh6EJum/R8AHmeEXLy/q1TAURLizwhQUvy0fOKa0hebT6j8SQZ2RP2v0hC2dkO+apKzFw7sCP5GLaoEz3yyyRv3uIaEgnRUN9s+qqX/f/zWbH07/Li/ycEBggdL8aWsp8vdVmD+0bqG+kKaZLLqEde4g36j4SFOptqmbIlP6kk0dILFw63lhw8CR8JHTlgN76TNTvKE/+n8jisDCu2YYb8bZgzOsRLe830Ezti/o/niqf8XDR7RfpWhytzIF/T5GlmST05m0PDf+ii/YJoYQeDzUu56BBDfkMChkltmsxFR8UAykS7LU5dmZPt2dCti83mLUXe08vkKUX6enawjqeS/xKLjRsM1/T6a0E0XWrJz18AAsZYTZk3v54H/2qPg3+lz3H/a2/JN4wHXwRdMPuF7lHjLMpWpJBJj1ETtrhqcgLANaPozYpJOhXXLk6jc+KjrdVLa2aW4qrF4KpqI1m1QK+ZmrVIom3Wa4UswbgoOibY7TdqRLo+qc9tpj63qj70u7eljGpRjTZoazvbGiA5qbgVcVrclMnfacok05SJaspkS1Nst6glttOhg4w9uTIsXdmKuJk5zD6vOlawhau4o0ubIHr33m7Houg3SSBeFiyHcvJvZ+7Do/bTrXPBjJzsLPVoDD1mc8JvxtDzL+l0ZmB6+64RpM/YnFRtBnsisEHFriagtfpemTJXZuzPapi1Zt0IGK5W1zCMQ0YQZspxzGrN9ptAMag6tmXoRQrSupznPpen5sQZqkO6oCjzIEWZvU172e0Ncs5uuAFfUk2OqVXR8IxglJm/Dfa9fdpGLcjsF2S+/d7MtleQe6JuEvx2dscqyN4Tk72i/Cn1UlYkCi4EPcZxNDqwXfq9PXDI4/FoctAzo9p89cvqEWwyH4HJ6S5isShAtFKI6gqRJRHZdh4Rr9ElmGKPe17G3PADNYfmLB4TNy5wGfEiIK/C3qKv1LrryODTCtoLCXyIbkQLoyMxkmut8u6/USUMxofqkDy9UcQr4P/8dPz+13fn+o2x+TRJyFu+x+S2HWXXPCuVW4PvUkwHjxwW5Ytjjvaj3AVW9GSnKFnPlH+vdzXs4He/aVlViuDUQ3evv+/xa6YA5YBhWocUiiMtiadCeQ63lB3DJpeCgEeKIblow6AnRvlBUXpG6zBUTwZtaT6jDvfoZ38WvApK2CVmM6zKEr5BW1RkkFRkWwd9s8y9bX3L92Dui1mQ3M6tNk3Sxe8Cd+WeqLnuHpRdtWfsQ6/Fr8NA5mr1tvymB1AQ8wyN2Nsrk/tyJeSHY3rbeqlaCuWFVz2xDYK9oPXibKfeFqG84Iq+6bPaO+Ly+ApvLlj0YK1SCj4OVBSHkYUTBD7oiLBI6olq9lV20d+jn/2eBKWQjVByZel6nH9BQy1OAV1Y+/H48nP33Yd/2lb3D4w6pJfCPREq336LHj4YBDxetUO+A8Ku5HOFyLXfsmqu5Tdh+zuGUfCiR27Rv9zb61fKg4qWrdryar7jYWrYcI3kxtVkBT/fz8NYFdEL8xvqaEZvZ8H0tcx7qBmMszD66JZ4GBeZc8uz9XJMbn7mI8Ay2xTSJY5BSyks+ZJlshv01Fh6dIUsnsfulO50SraKjrNFFiBBHZJuKt+rhX7znt5a7uCHTQTjIE7YkwmBXJUcqBdaVcSdON6fq0VEp+Y4Fh149FpO3XJt97xqN9QLhXOMdUH85PPgRj32TC+s7dGf4LQiLoIT/GnfHV0c3JFLcvCN9JeH8fU0KlvtavXJCE4Pj3d3J8g1097ooyutxPHeKD+MoZkn7Tuknog7g48RfUHgWJzQHQ6J7x5S6dyMJIvVPmFsp3u92no848i9x/0TU2W+2xMFxRjmMZdzTOXIgo6GVxH5rh0fxB9F9Xs5FaV6s/768+Cs6Y4FJriE+bha3d29DWvnH8vjq2O63CkwTsUxT/7Id2j+FC1vuv2baDgUp8ks7yM50A973RV4PmYoYqeP/AaccCVPXaqXof5dzlrRxVRFnEUJQYarqGKX/OjdZXAprwWzAsVAd+IB3LaN0wY3OkuZxDJmyjImvWr3jfQgx1IPkqU+piy1YiZ4SLosNWg+ZnnqWHBnnxw86CwVJm4iKXsRCa4uUw4rxSymErZwmV7y32MzPedLqLuG0F00V1HV7RzyD7/KUI4/K0IlVuMYAyh5B9Ew4yiV0UkzOklGmvvFcWlW4yX3vhWrYOmP3888L50MuLEiplODK1bH8iELkpbhYajuRTTkU0FvxIDvwZY7yyE9NzHs0HOKdOhuujcNiiKTV0MJnfYOhHpe6yfYnZgYJpOlCY+ESVnT1J9coTaqk6sRfjsmPSMiyzCLwEqbcOnlea8WMJMZ9/rfKqIIkI6ZimE8eEYbPZG7lEI3zS1pi/NV/nf4jy42+iIwgJv0CuWx9uSEOU/OnQxTb0c6ghLGWmcaD2J0Z6N2y2q1fHw1BxdXyvzWa/xqZw9yzD7zYe6OzIptVH166iNzx2gILUN+KMjFJqQ8DjqjW4bIRYaOFWEIUP4WM3kmhAafxwpd6cMKCqGBlKen/f7VCB9BAoqBfAQAeXvfk7i/OqkkW2edRIHGeEifPVa0cCncVNT0MpsoiK8+Vmw+/PBw9ABEdNrikSdBk/IjJtiiSJDQdY/mA3l4PwoogSBpfTlt/omZNls8EabN1mbssXIyiXgy2WyjObeGWCcMEL7oaVr/Znub7xV8Cqz2E6vTdJ7ybFt7T5UanSU0UxaqiJO9E77G/q5Clf6S5vhCjhJD3Zn2NhhqzrPjYKj7zt4hmDraftHewIx3Xrv8Tp8uDkOIw+iVmerUnJBsbD5Df1SrH9hm6V5LgPBkHI6+ZIOyi1e9IPUzCVkYx0aQdnYZYfML+prPYCsrzVLmGz9WLQ3G156Q5+oWvKg8F45jaGfH5rrERhtrsBhln4qiad3zQTxVT6T2pBft2k/BHa1XVVAwFNVdZ0/9BpN98aBMR/vcrgeReisxml+NOuRkA8463Zsk8V+Gq6GewiP+F/zZfwhQFEwctumm9Pp6MjQfTfaT+AMrwbUeL3VUCV9N9gbKCpzSuVpeOMenkWSk06OgdJqZn+hLHrrf3S3ZdltM5avjxTmqt3s9xjnVn6feCl8Vt3v3BE/rj8PtV6XyPduChoZhavhNtaUc7tHN3lyR7nsqiqbF1rQ3pWVP9tsFXUFqfJ0orX8qToJTdPNpYTdDdivJI4RE4f0HpVCCjX7vrlSr3b1p5WKz9zfTx1dz4oF5hgeoRVcXnbjrVfDAklOxApvNoKZorLFZzgaDKKSKR1bcn6VcF+bRVB0QJTtyXXQ0LlhtckEOheSFOcrCoPnyogPfrhQoOkBTuRnGpc0iWipLAHO3pQ8zt6XneX4zYw6OFK6CeNRUc5KeaGAFBKX/mEZm0GzCpbFpT8XqXodLIrP4MJxkq4YIzYnuLD1QAaJLO1M9O6INZrEvNrnd/lF2W0bsLM7nM37KxdDoKDgyLWeZnA/5slROp8rHjg1dYE2jYnlEZDpWKA/vnAZXxwtS1ZBBkD5SvdEidVohbW5qE8twlkOEqvri5oFc8ROPcu2mciJM3ACd1fmp9th7Rl15rYpgE1HEScl3vAKSpLBKS0NpWuZxbK1JmXplSaIdi1GqWzkx61e161HqUve4yfIwQ6ZnSiqBPaI3+0xWiY8FWQkdNh5P19zB6IxSSrTNub6lFtcoWa3RrVbXo3n28WliNLIufpzehGvXkSezJoils2OK69SxrTRVxhNEwoQbMHEKQaUcMUm/EZ/jnkkuAhAav0305/H6MVdO1AdidMadZJRcv4DXJ5txVF4qIxMtgJQNmZpsRAX9LKtv0ERPBUP0cyKwSUM9WR7m03ltkg0n6XYu3U7SY16exF86aSTPT3IRCakzTZsURCYdmuvO9CBgLJWT1Brtp5I7Se2Sfirdk3Spsx/L/yS+0L4fa4dJPJPsa+pjot2e31ciuUFjjjY4nSWzAIDijYQOLKITLaDakBfVSVEsxPa6H/GRzb4U4c1O59eG+wUSPdmM08ao837WUzU+sagO5+uHFiflvv4ArhX02jFt+b25+Mhpcmd8r1PJMetVTDCkddSRzDe2mjm9saQvq9pFuZdqi2fCsaP74n6dxp6bJ0yHR8yEwuCV05Q9k85PfE3OcAL1Q+x0KXGei0kwDkUYnGgoyufAGy/1p6cfMphTgpDqxDB7OAwqFbX8H4IY6zWaemV15HqKOUuibBUV5GEE7YOHlZmxh7nz5cdPnx3q9WwmCVPVYF70i4lZW+YoEFfJeu5tMkTQy4y/8YUyIBs5RJlW+trg0MQUlEaJNqhVqdzHM9lk5YgwXd3DmBxWRBRM8CnTVrfLdTna074Ng5MPtbL5rixN7xOiF76vnPZ4hnJ6QFdp9Dceeed7vSZCvaglj2v3YvmmU9sk9dHd4GYcTodXYQc9nrBd3N6eGqNMK252zKI6ddMDGSmJh+zgnR+a6L43bSyioBqA6FMfeRybYjbHmxJF55+w2YizC+IcGZd/a6cg0i6KLMzuysi87dLLjSAUE48ZmWbJsSIlQ2Zw4Fz6SMBZY+WfTGpVJOv+ZI4T9FLVzxNVx6ZDTcvwKPFeONAxKP2f5pJYZVwyyvS0UcG2ExEgHpxobhETvg9OrsxNOvrKjVrBmPBa9mZ0x+zF6hD5+Cq9XmYqXto87hTGBr5GhgyhWD56RcsxWg7X1HLQBFIdIavwpXQJdWKQirtXLhfTdZXQdWVU0xKMIoISmgR6E1hROs5YtX29W7V+kWffNgmagnQy9yGRSoFIh1KsDbWMlJav9eaKezPu6flGISvqtagomlapprySMeVFkRjHQMyDQTtinxfWjTNaIQ0x9x5Upp0g1BsmK1Z6pWYxn0F/JZ90N0YacDpbalctbEvCgcBoaSFCauthumXDDCvCfellZx29QjvmPH/yg54NsPiGSnp5JlZE9G1r3472rbTNpkVDW52pyk6WQy1yhhrS0glT9csyL1AF+6E9vnlJxL50dG1jmxac3/SCWbWqlr+GxQ6ZsyJOiNMkO5ynHg6w0dQG50RDMFG7nLR6ZTvt0jC/uevwrtp0TxSlGGa1GgXRIVgsQm3R3HQD5yrqGO2pQb9CXc6GxqpbgNJdojzLZghiO8UEcfeGRb6MlfKw0PGxENjYm27CK4/M2WYelUKe35jPbs9ZxOgJVrq68JUuYZh8lww39kFt3q8cpF2SSfpmnww2+0ReugUT7q52cvH+8vz40+nb7vsP78/Zvr0jw19P+fUXFW9n488+/P5epcSnIekpbzqE3+W30FYLDLTLu9kqY7hI61gqVX0HgcRH3oi6YWx5xvPzK5LFWwIF2WzHN4yv59peU5lKn5lyp0LtQaTaV1rUc1qXTDYQ5fAm7bSreYcv9s8an3M6GRviR0QvhCMSNJBsW+JmBBgUlJvJlDZoEnUadQJ68kXeX2hDEBDz/FyG8lmhy+l9quqI3pKRjhQos8pveeF/6qXWsl2lPMbehHDJUwBT6dQiHSNLdnBfGdDLM2+A5D1jua8ALV1biY/KAJ8Gjx6BvCUxTt9LPvjO0tv2wvgK2tyTuoiBquw0xsx1WxULFCUGyhPmvj3iHn4j6z6lan8d3OzkaEmly62HlOiII+ep1P1hZLy8KLSVSpSY3UawYRGP6dqr+I4RDCL8OiczIfd94uNZbGKbcz64fhIzw3Bj+4zZf9mDnKvD96Psptit2hTDLIY+zvrmQrTk/8wlqb41/aFr/8bmFxHVTuXdepe04wndQFd0mMeI/zAd/EZGfezZ9CTyopsz8I/VLVwn1ayVGyhng7eiNFa+CJImkRnGVFGPDn55fn4rxNiQd629PRwflZ+EyCsA9NQjXy/3iK8v+8Kh0yVZ7WG+FV+Mg3zmX3/5ZlbCj8xV7lmtdRXxlhwL9ShmmMwyt8m4+XrO1yHp+leGZTd/auguXTOaxR8Y2RpUUK/tBMx3pPDa4riawXDkHThBpmNFtsANXn4bxMdrMvdBxjdN0Z2oOVU3N0fmrXnP7yiT8ZRHGZSmarm13KPXNeVWmG7Kkg07iO3YN8uARPbrON7pfeSXU77wZZNRwQz5yLEOXHmpgmbL85Vjdnt0NVWWd0exGKKnr+lNPQ/G3efnTASGQonn5VhMg7ciDJ42BJZl54M4Nn8UI/NUvDUvikE+0pb4h/yWuF1zWg3fbdXpGQ56X6RxYNcavt1sOb5r1a2m57ScZDi5BAvOaF1gFrY/xOtWM1oZuGz/eDULO3wxI3+B9qG4yHZrN5wtAlfIaxyRvD5y6JkedePiLFS3LToH2p2J9sGlsNuXR4l/6aVZqxsHtVZ97zJ3ZeIlRoI2XerIibwQ9pfq/+JKs9Z4B6IoX7iwE/xVEe/kUMWtaF/Ke8yJGy6K10su9DWRGU0BhMjHsQdqQTyEUhQRSfV6kHYXQVcq3JZ3ovoOquJd8A5NOL36q/Kusyc+mvLr8ENmJUgLCQnAmnBLqcqEAsBHMSkfG8Zxcl03xyHbUzzNPRrH1zVCDFllIMPBRmR3uhqWn8xjQ0nIU07QySlITUOeNOLQQ5mg13GOXY2vH9Uo8KP4gB79sf0x7tAfqT8vROmj6swfO8Gp+JjSD2F04sfUH6B8WoEhK4+PI9UIPpDHq+rr011bXrF8yj6M1QsQXO6uv736ULkAwTcFx5RJhx8zPaCFhAQwgky1xOnhof3yUVvt+Zhf7bGDj+iIxEXu+BWFYoHC2c2Lr70DUO0pgIoIfoTCPdWUAJPyLYp8KyVDTqHfyoVou9EGz7ztGF/fJpOend5L/Hpr4m4A2bpUYvZWpGgqFzFWtRHwlpxbL9uEktUE45Yv5b5NBZOhIKkKDMglnDQfG4eXu7v+IVQF81OzTQXmNu6pviWtwpsQEKRLjTfitY8P2trH9tYklaQjEWGiPN7ym7D8UxXe4WFe05qYA/5lEID4S74/Owvl9IXjrOAvcKO8O6Ls2Fal/Fe7/WHTyc4IkHcW7pUvKmqZFuoAmGJ98OPVJeuDv0z59Yo+kAAJQrd6UbWNF70alsOpaROzxabx/0HxLy9vibc/irfPz6RzXj5icvCfqJrSMTsDv/ko5eWYeJeY51jpVIj3NEdXNtqcukf5TqrTrHEp7xKNczO7lqcFNnnObJrCRjHIRX6qW0Bt8RgY06zVJW0ELerwMTUeLHoFPXXZUO8uf38FFv9JBV4ytteUba8x2V5jaXvlawHrZPuM9mioXYx4MNy4PBGW1y3oP4auI1NnFJsFT7DP1ADPBkHrwGrrXixkwR8nriNtUUr9SMw0XmjuJXwB9TE3AZjoxzAOnoR1eJw6vezu2taeFq4o+JxvTEXm1y95tg6S+nD9MpV9ftaTRMYdZ3f3WHOmaeueNa9nk7NPPbOpZzYIceJ909Y9cbRq+1RtDBD2edVtMpvTAPsBA6za//lA1gYNYR1YmVmX1Jrb8Cu1huvsndI/w/yxIk6DJ82zM3HT4l0o80cjNu6IVglYW/c60urmMNg3m+ACrLQFjmjwzXI85gKRYYOao0Pz4xSZdOvwUQ9qAZ2dqjVnay8U4Gz/pzgrWe6x2hn81ZpV/84i7EwRlRyHfnd59vcWV99e3vcVXillXNK03q2nglkkYf8VKWr8p2WUt7BpmjeJMrXkXO2EVj1Dr1/zu5TTZtVfrLzSgQp9okJ1LQr9/0RTHWVFPxmLjem5eSvGZi+eoU/p9g7L3Do7jy1eXiEY3k2n2sYxG4CVyuzwCy+VljLDZDJ+uhtrCzTT2d1FC1yrPfsuQLvezgyP1Yd4piTX62hhJTuk5g0MIyhGf7Q+WsI+OShraxZm/sHueM+NSfUgMiXRWptlHBCSl2H+qNhw46jYNtQHxasd9BDYltXvciSXEpPznzr5X/IXr6R3KW7xqOgnt2EORagcNSadAFZNL6KbJhNqrulcReyOEti8v3sHojKYunlgdzfOF19FIGcgyDc0AnlaXe1eUMxLcrNyV16VC5MznN9Now3/F1plNyNZ5yHqvHFtzP/D3Js2t40z7cLf/SveqXpOShRBmasW07DLiZ1t4iSTZDKLSuUiJdnyWFZsSd6SyX9/rwsAV9GZuZ/nnFPnvjMWCTQajUaj0VjYbXZOz7Kd02s5FbfgrL2wtumKxRXL6tl6fgY3ya9NqG30CpC83bt2Qn//J28nCxFTcmhZ0HbL73IlDKIrhrTaHHqTR4SMUnCWCdnUkYEPsZo6i4J0a6e1kLf2ZgY/kzOBgopRPamiPysJmmWZMeP5u2ssJCrNXMaw+oGtIqXFdZLqzRJ021YWjepEuUFWJmn1YlFzR/FDjHIMRXlad1QdL4g2x9oaWxtlvMwB7SZk7lrWiy93M+SFf2z14XAd3aXIfdkmlki5dXpX92A7hsiLzINtSWq/zCcnV8spenu6cSilRRaLgYnmxtnmhv81pOUWtt5ZjaSzDcL14ckGXaci98JrbZ/lrnQrHUOggjWMh7TcLUCX2WbcGqtP7WOX9M+Hy5G4EksOirMfutktOdY9y1XJ0hJHFTe6Ct+FRrq2yk58zup+C9aanhuZo6NWWo7oBQezxc0/eNSdcX+ov93ybGX5Tu+vWgHdFWgM24ELVtEKi2eooO52d6ZXrjPpd6LuP+HwQtGAw/jmncVnP/bNO7PiujfeM3FDf0yqEnlU8rB7KhKdKm7EpX5SX74aWPTCNY+0pqao53d5VjbXr9qXU1O/P9oJ9KZzu7cYbsghqtpqGbxt2QQgTO62vIVG089785zOjMR51oraZ2dAo66O3SwhOArj2UPDcW/Vh/RpxYd0+QB2gbxKy9RZbBFz77QsYpej4YLXHlLzNNHfe8Znu9PiptUZI6gMJ7bNjUi74/qD9ln7bDu/T1U81d0/N3ybdCanxWWZs9JlmX+oZVU8if+tYHGi254Fs1Of9xh2bHUGbZOdn3Sy96GBfqgDf3Dc6eU8Vt9xlcP2fZvWdKJrYqlA2U30YfJ1kz5UMVcmemtAuXi61kO6jm5al1xRQi8aEYsMsajr10vaG5fDDZyjkvuKadXReVnZLng4OwGvOIZLyraua0uqdlryYZ7r9lt1s3XDEcxtFqFwWpP22xGr+5GSmta1GyMs1rTWVFwpZVRVWBe6Aqj7RD9Z6mSf04ktFzpJa6Ym9qgWNbXmlt7C9q75eabG0ZbXwjxuy7Ncn8zLn3WvkyV7rGqlFBJ68wMJLbwR/qMAxUU8Iu0W/4bi1yyi0w2TZlI3Z075VXc1AKwW6Ml2K2dWu+ZYCWhOmwN8tE+LiBVt7yiIH1938HKQ13EHwLbNr9erkWm3Jo7cIAyAj9EUa9unMwigeXrtluc5p5vBYKztqBPFncEej4cIjRXGrn42u968tn1aEpPTzHC5zg4ajRxVKldjLaGDKZh16N3WWVvHWuq57m6q0zWaW5XdMmlOT7mw7oQW1g5zjheVHG+guvrBidDt7mTbRxtu0Wf0kr4XtPGwfyvV7467d6sy6RdIo2UYZvP4A4dWGQ2PQFjxNX0cKRgeKF7/0HlUI9ewtrcMhsf9R20ZiG2oWDXVPaa4rMe6r2oiEh3UBv5MaiIkfuie7FSmDbh/KBH/cx6LNOexjtzFwf5oQ/8NMW1JFCJnalr6zOV57TOXVIzLVtCphLZeyLHtB33HCx2/3xWMlU33XFBc2UCZS3DXdjx3ZFRVOlzYju+Ho/bcjNJ0CCQ6wUAPVHRwBel13VF7a04FTjj1msP1C7hBl+kGSr8YoF4BFPglIP1igLo5UAXGqQBFOVClNqdSXZgDGVozqCrpQQ5mmp6BVTnhGzBmRLpSR5eKypV6BRi96xZg5k2DuSUov1+G0m8aqoSrG5aAuiW6CrLcEkSpfUEOUMHhlJGEOUyVmoy4LQ0WFWCVpmUtxcRBMPTgXJ45E6i1wLX99nQkz2z15uk3AvVY4NSWXj8eO476ePss651RO5fUSdH5WS+ge1oqMeyPHC2J6opiSVqNJGQdkpfouyObDyhpSvRLHUGpMJ2Tl/A8X1eCoqZIryQIlBDTU0WRMNS1eOqicC7UTi7rpt+KEr2uaQmKmhJRXiJrSVAq4bt9U0cvb3yYl8hbEpaLhK6uhGVNkSAvwpbEqZw4Z/FYTuyz+Ix+8pC2NeFDNEIGO3AENaOeYImkqlORJ1PV2QCXY8CxBORG+eyLM597SIjVXzkxdXdtcpJZA8J6zPc07EDBDppgu4T1Vb6G7arnbg7b83PYHmED5gcatqdge02wIWFD5ocaVj3jbwbruf0cOCJwRIBIA6tn/G0C9gmsqOxqYE29T+D8IzkFGRBS0djTkIp2/C1BFhCONGhZgzTJxGHqmMi8Wqm6To9IsniiMg0eqXrTDFeTuVUmU/e/6euscEGb6vhMAPJsl21Rfd7XbVGy4LsFi/puziKPwKrTBxpYCQP+NgB7SrI8hc4z/hxVPV4hW76XC4ynhUtLlxYvT9XkDRrBlXx5qu2eljBPMdErJMyPcrHxlIh5iheeFjJPsdXrbYI7qv12Lltus6Dl1DiKBXYuXl6zrJWoD3OmayE2/G+AjHKOawk2zJdbm6BuwRHD7ow7m8PIK7FDw2asaYDVQ7lvuNuoJHoF68BRO1MNXq9ZT+TIzWCh+1HfiIuVq4xcdrSslmADIytWrjJywanBOkrebKV5LC18NW2kITYKDVShni40qKslDaEHhRFSDmejw+gwlBnNwzkwlDqFiPdNkaBxkGcDh3qSI960dWAKcTw1Dn2D3M3gBo/oAMNnL4NzR0bJTbTmyOE8wzQD542M2pxoBZTrlG5O7cRwWenBiVGYk0zrG25S86nMbpZZ6mpX63srl2qj+zcAPa3rrVykjd7fBNTyrCUtE+hC69Whlebwtaxl8lyoPSXzJfC+GYRWrlBLo1AP+lqJgRmKVq5VS2NRD37o+UoRPa9hPFlaw9TGmKOVT60eaC5bjVlLqzGnOo4dreGKOVarUz/jtJopJmUmKdthkpUvTbhas/pRnmrGQMYwbUlMMnLLCjpXySrRQA3K6CcV1CbhB1V5Ro4VOx+rPLeBimJGJNV0klM4qZBnmt9/lFwz1Eo83GiAAQmbG7TVyPbNNpoxqITssVZvdtYGH0pmYKC6ItA6QfMoH1iBggvcIq9bmhs8Ne6ojgrGFUPHU8OXSihnYmF6BLlllDG0sDT83ILKmatZa8uSpZWzuRgYxrRycoYXpmOvpKcmsmopdku6blLWEJXZxin6pJj583nLKfqnZKYMStp7IutWCfixlc8Ik/IYtasTzKQ86G2ZG9vI+64/IB/y7KsPsyboR6HrBq7ricCnt2kv9AbRoBt0w27EiESd0A3CcBB2g77fY9ydftDxkNLvoZgfMsIN/hd0BmEv6HX9wOuFDI4W9Tp+zwu60QBA0aAnAjfq9ELXD72e34v6HiMZdUDBwO8P3J7fBwVI6vSjIPD6fQ+1eSAiEtGgE/oD1w3DoB8OIi8UPXfQifqDwaCLIkEQAsbve50ByPD9ged6PeFEfX/Q6XbDftBFZWFXOH2v1+n6g8Bzg17Y73qBcHpdFOpG3UEfTRsMer5wwk40CP3uYBAMsCwDH0Rn4HaDsOd1B6438PAgOh5qDkKQDADPJ6aOF4XdbncQulEIVNGAgbA6ZE+/1yePgSlCg70OCvUiEAai/EiQqIgNARP6/X4EXka9oEMMrtftDXQSGoeeciNel3dVfJXA91CuFwB60B+EIeMEASjwXR9kg/tBr0du9jwX3IpQow86GZYr6HQjF73pRVEAboCqbj/soC60x0PDfIYb8sGGbhfU98BMNA8d0e2AI/3IQ2e5/VA4A7ffGUAegi46agB2g8ODTj9wu/0+ktGmYIBu6ISQjQGQs5dBvECXgwP9Hsr7/S4aLoDYxdqgG0LQfD/q9sjOLugGQyBUQOn6gQi6ENge2R6CkKjPQF4uCAdzol6374HPXYgGZJgf3UB0SAa6Bm0CXV1X9bHrDiCbQNiB5Pi9PoS4T9EMoo4P4UI2OOp7EBdwM4QUgpV+Hx0EGQs6QQ+9CXkGI8GVrgh75DgEGn0OcfR64GWE+oOe1xt0AUJhiTyQFHrobMhAOCDrIEmDjovxAzZA7KNIMNoiBHgwgGx6HkfDgGnoKx887xF/NwD6LQdccEM2zwVy10cno72QYchdF29uEAUCg8OFUAdRGLn9gR8OFEPRUxgL6FW/62EciaDX6UUs6fYwhoIBk1Cji/oDtrPbw/AVQIpuDjFiQCt6Hwz1g6jf6WFMQCZ7YBEkNPR8jHYMIQ8s9fsBpDHsgjB+4wH5iHq+R45iWLDPu9ARLogGSz0kdUFoEAz6lEoRup2IbIEcBizeFV2vS/GEGEEgXPS9IMmQNHRjj8IegaW9MAo7kC/AgXIGAwP7BlA4aqR6fZYnm71+xw8hkiAC6q3Xg6x1OxCeEOzCkIyCyA0F9AbGJTk+8AY+xAc87kYYApCwHsZwb6BEFCoB1UOQ0SqXke8GkMYIPALjoJaACGU7qB1qAHX1Bwz2BQ5H0HkehwlwMqQkUFCdhRhW6K4eQ8KhyRGHlQ/tgpZxwEdRZ9CPXI44aEMOCA8DJ6I6hRxAdtHxPtVZ6HvUn9BmEGuINnhA5YX2djl2GGOsg9rQ4RA+KGhfhGg3JDkcDDD8QCyGMrUhOgLaBKrS7WnWDcAGnzymfuwyDdgxbMPewIcq5uTgQKigg3o9lyMOdYDrVHCYGQYBRAFNCnpQqVSSGB5QPx4EL1TspE70+UmQj3ZD60AUIP3oA8xJoB19hWGBQQJuB1S1EEoRYHYIKNEkkmoP/BxEKEgW+1QJjI7XhXhiWoCeCRQHoRm7PmYaiovS4ex18NPFROX7Lv7DgMPQAozP/0EvQdkO+qAAMwbUEqe5roeJgWEEMdH0yY+QTWAIxBBooSw8yDNGfIQUh5JFKPCbzXTJPL/vs9/7EdCBiZhqHAxMJEEzs5NDjKEAQ74PHqNzwDLQDuVDjkJYOeliRnDBIIhMh5Nw6KKTMUR84u8EEE+wGHx3MVDRNhGyidCOA+oQ9D7a00M3oxofoxTizVCmGDVQnlDMrCrigEdbMQcHfQojEEKDdiEdICrAUEPnB5ztuj0YCuzyLhmDKjm9RxAhzLbQKBj4mFnQ4AAlggAaDnLogwCoYkwyEQV44AN5CHGEpnAxpDAFQRxVvLywG0INcSiDnVAEnH+6EW/OQxow1XGu8aCfoTD7gMGY8iHFEBsqPpe2Cmc3FuPA6sMmAfcwW0IWwx6MHEgXugItHWBEdsAKiE4E5QWVCoVDXqJ28iiAIkSXKl4GRAMmYEKkSEI4+FkbOgV8i6BYGeCxQzXc60LJY+T0e+RmwKkMPIUGg7QwpCsagBaD/ZzjQxUEcqBUDpgONaQG2xbErMfJBGOG03LAQIdgObppAF0DXY8JCDVimsLUMEBZyC7Q90TIjoCaRBPBmC6sjhCDsIMpAjVisgFfIC5oFGYgamaP5k7XozSiQd0BxQDED8AhpNH6Qz9hnPYBFdKy8lzYGdAlLNmnDYQpiDMeCmKgQGNCStHwehrZCv0JfY3xhUahrxVbIT9QOoTknMwYiBDbiDSDNxBdDHuQgWkJwg7EYAjmcsYRxXTXga0GZveg46kL+mR1FPQHStv3fcVYiBq0CpRdxFaCrZh70RaYC1BOkE6wFUwJ1UwPbYOmYRLq9GiToYOgojmfYPqEqgP5fcgyKnQH0P8M1wK5AZ89KFLFGeiuDjJpAdP44LhHV9FYhjJGWYx/4QArWQHNBS5CcgKq2w6UV0jpxliCiHXFVidAG1xOpiCTmh88xeDFUBlQKUdUiOBpn2YduqFHYw3SC/ZxRgkj/iNyGNaQeuiuAO101aTuQK0DCqUglTR2yU+omA4teCpNGFaoDkYADFjaxdT4tP057gPXp9EE/KgHSpqFQGOIPEprKGibQ5KpbjGQGR12k0r0I21/cA94YTDTLOsRF8YnegpDGMJLjkYcZYDg/AjB4sCHTHcw60Sc0kAIx7mvrH1MtbAHaGpAO3SoZjBZqB4EL0AELB0IEaQEXKYNDeHjEoETAKSIuKkufCgVTAdoc8jhhL6KMCiBGhZrCOsAbEH1HEg+lw5Y7sCq4OwFlaGWGlhT9RU/B5jRIH6cdFTYXBhX6D6fmhQ9m81LmLsxkXS5TOlh3GPK6fa1NdBHp0FAIVJcjmG+GVDZYK6gpQ2TiTMa5lAYQegHiHrARQTU4YB2PGwyzPMU0ICS1Y+oITloO5QmZYv2OVdBu2PKiWgy0MajyezAOqBC6pNNMCIpMR5XDWgTxjQtOnAPsy740eWyDP1Nu9ajnciFjs/knqf42TfKosdoKAHNJmDnug2kQbjAF9g6UJlYiwRcE/Q4RKB1YbnBGsM47MLCJj8hO5BjCkQf/MBYxtwVQVVAcYAHZAMYGkHWoRgGlDTII0Y3J2JMyzDOsKj0Vfxd6EfqKBhW6AdUH6oBiH6DLECsoae5nELfdcgj2E4gC0OFRgO4DGHCDMBFCY0blMRStcOpAbVCF3TJLDCvw7kLKpWmA4c4BKjTxaqIMyHmPCgXKgeoJ5RRswiNOYx6LmBgULLVmAjQ8E6f0xUnQJdDg8tPGAE+JRVzC7WmT+se0xMXARQPj/HKIX2w22jPobOULsdw7UARqzU6jCMwh9OKC4Zh6HB54jNmNoRHWZqQFQxQyh/mFgwmrnI92tKcP7Bi5OQNAaENhCmIgwnD2KXZjhZDXYZKtrCYh52ijF8XTAxonaHPuANBKcE8wzC5PRjOGKoQhz51n1KI/QArTqzAsf6AXg04QYHhtIrJVmCk+sPUjaUczIm+movcQNWJoYImqw0EsFVw6wNDDrodc0NAtbmpoRy1dujSgQPnyYGSJbXew8ICy0JodNHnOnKg9gHcrqf1E9RIB2Yzhm8QQrdyBQrmciUCFetxGHRpZMFU6WO9AgUFqpSdjgkNstDl1MEFCQY+jHL0PGUh5HCn8cBO5VJyQCqhyXrUdOjDAVUpiA90a7A2RwshoBhOGLDofSDFSgBKClMM2jKg2qQChbmu5ltMWap/MJKgt9giLEWw8EOTIE8YetQjUBNQnZzDoJc92kQYC1DVMPZAA5iLnqUq4yKEg39AqwPj0+XqnhYFrXfMo5gqMGfSXAl4SRvTEBZ2oNLjPAB1B1rVBgnsHIgrRw9mJ5BOrQVhDjk5YZYAe7Dug43juzSBBzQIIWvQrlzCcn0J3RkGkBJaiF2qdOFjJdCDVKLroW99nwLIEQb+BtyH4GKNQ5P2OyZoF5MrhnuXy6YOJ0IYqZg1upzJaV7BpoHggYMDtUaCovM7XS5GQ9q4AaVvQK3BLTYMHo+6HujBd0wqIQ0pboexSozOgLM7uAH9i3SMfK70IX3QCKp3NU8HrB6aHCORYeshgT1urYC4/Hx52wcjwiOni1zMdhjSvbA5E9oPI/axoiAXyslryESToDb60ZHThJgSibmjORMaGkbTkdNUJ/fj+NCEE8Ms5Fq2r9aE3JHhHywxOEIGajMMmgnTPEYgzEaOjwGNHbdDoyoDiaiYYDdAGVMIwXBw0xc0AqGn+hjsmJdCLvBhGHI3jdKloUZiIYdDEoSB43FhBTtbxfIKBNUa11kwEzxuWYUqFbYmN8sG4IbLzYy+SoW8UQygvDnHgQx6eWMq6ucWGHcEMB+o1K1m4BriQSMNOrVOr6YB0wymTW5vcSsAgqjQoldpkKo1OXs3S4X1j6FHa4v7Xj2VGoDzkEWSAJ3iG1iuqvs04LitC7GLTCrkDKscTOjcWBn0TYs5JXOjkutMJRNI7XPkocM8mkmY7kPTChp33FTAWpX7zCrVaW6G09wOp7khTnNLnHpTullyU1uc5sY49dZEmu5HmlPrK1/LFjf9Kj0b6nSnLgUGS7PIOM0C9hh0Hbfuhg1KGunWMjYS/5fHyr8aKgZvvR3efzBWgv/xWAn+47GyVZcvv3GwRP8wWGh8hpxfuJqPslGBhQWNUMzUIL5IxgIupGGG5SvZnQ0WrATVkon71/iTJbswU3x2Cmjp96NssIQ0/7Bk7XFDqxtlMof5jTunsOOwtIy8TOZ6PJKCCdsF7X4/Ey7aIbD5OMv3UblKdkv/BwhMTpbFZArOB7o30QQQT+uQx04urLgMISwILpa7qjY9yiCtalMGLOBGR4/7Gxu7GNwHZvNpxHA/lzs8aDhN3IiLOqznuCYP1DkGV6/QSK5ZXnRhYvWwRMSqh7O4z11jSO+gx81o4deqCrk3DosLlpnrczeQMhB2Ih7noC6snH2ur3h4xOMBrDx7XI92ad/wEAHiD+sv4KY3DGQgAZcDzucuWgXrjLsdLrfXI2VDwKYEhzzIog/eYxHYwXyJ5qCWHu27vt6hhQ3Vp2jC2Axctezg5hr+F3B3GCsz0VFHOhFXbX0e2PVEh/s8XCqTUB6OwUxmUohFauCRLd2Qe9XcuYD52qPx5Ls0xdSxBddF3IbB6BvwzNChaYEFE8xuIAJkl6TBkuaI72McoZmh2v50eZAJ7JBsP9Tb/5jkMY8PaNZyWOAN9HH5hXUlFjww32A0IKXPM8yBsig4KLhfjcUoFidqU5nLbTA14CYMT1c8CjJSsPj0eB7CAz4gZQpWcOgmjmPuJ6kUbnZw257b5iphwDOnyOUOpetDDMuS3SzYW82C3SjXonnUNw/65jHfPOSbR3x9wGf6umm8Nw735tHuNOvg/+FEHzRP9NF/NNH7/xsmejMxOs0zo9M8hW39H5noDXKneYJ8ZKZndDxG1ig+nBmJo42UpxspLzZSTiXknwcMAsZ8XwwElkbcFRZYbmE4IIdb3MLvCwxCCKFQJxZY8AqucaH+eqIretCCAhqFmxc8hhC8sKJjaEzG65PVTRr2i4/INj5H5acX+sO1dPPDtdKHp25MR7PZNyLTcuZcTLSL4OxLvan6kO5MB9lm6NFDel1PzUdZyBt6znRkfBy48WCv+Lr3pkX/xIfDq5El+Lx1SU8CeGdEW3FlS5+Bj6EG59KLA1950pa+BQDHY6C9tnS8PASiybfFNW/tW98OZTlcc3xVp8q4DF43Uau+Xm5w848qnjxpHfKbKB04w/P30g6Knpyez9fTJYPKZY4bzkCIi//Qja52WKIcHW7AZ58/e33DGfU1+Skjo7ZlDZi1Hta+1P2mEThB7O6VPph/XRfA4VJd0R9e20F7aQ9G8mo4sPOaXjtXw76TveZgvGR5NfRCpwC08R7Zm5CugoyqKEslC0jUvR76Bcqt1/Z6GDSg9AgYlDGWy+VwvCO2LlHfJr6ibd+X8gzdf60k5bVyUPg6fp3xaSaXkLfuqF1nlztymMN7XWsF427C+BpmoEXpXs5s/UHhg5w561ijBoIG3Lau1aAeNKG2daWxjiSfoX4rHT6upd/BvMc9Aw+TLmYmrom9douFgk10nmkNr2jOflQWEA2FbY3WijVNEmYeZhPYZdSXPTXBee170GVa3AzgHNiz+IGfb/JwHAZpT12M6aqVsBdvHchBJ+JpEUy/Pq8kuMzw2yymCZAPzkGsWScf7IP4/pES92D/20cr0iyX9/bb2DRZ3jtv4ysVoZED9bX8uQUdEpuhNciH1j1G1SGHkt8btTFQgUYLmW3Sgy7TC1lkpFidgz6+KhVwTDJGWLs89MRrBQSCHtp3FH68qDQOxfs8yX6IM7G+l69j7eX6Xt3WvB8aeXzHhIgJvLjHlOdMCVWKP4rf4g2SeM/LiAfM4XNvBPm4p/jd8w7hA54DPmMYKF71RvKtPXMenNYB0PCG8mvZUilW+0hdGc8z1rL10nnnPFcZfV0eorG2X2dduHZex1s6oGzrXl0+vVd34U2BA3lgcBIh8L3kK0h7Zr/jEwh7zl/kvZbOWz52R/aBM+NTDzzib0Z4UbGvKzbogpHzzHmn0Wh0foGul6OLDLruKBOfDB01Xwkf2GvIg3Z4rmsAvrcaCYeARuM86Ao0jqCEL9T42J99cgQ6gF2puAPa2ImqVwPdhSRS9bnqwy5feBVzpnvf1r3/oHve1j1vRjG6zX5AfzE10B2mkkxPOkXOa9WVdqUrvRJLPcNT1Y9KBr1SLyokjulL1JLxYitnhp0x43XGRDtnop0x0aiArM4wY/tmVzlZV73O+tjO+9jJ+pg4egW6fhVdWZCcTJBeZxLo5BLoZBKYab6cJVq+ldfkw42ozj/JuZn5ewwCsowdZ2kdSk5py1H76dB38Wvz1fGgG9ovhn7fpn+aDMQkOAWIKSTyFHkoNLC8+v79QiaxMgCNw/vcvFNkTLUBoj/HrYb3qRpHtJuUy6VKsmuSA5/BCvJPgX9Pstip69mlcj3wu4kMN13ILf1eQPMrYu1aZ9x5/vzTu+fPPx59Ehe1z7XFQgWpg1mehRzV70f652k5Huc/Bawr4UjjI0aokxfflaKcaadLz01Qu3lyOc18gF1eBdq7RtVZw61y1vA1c9bwLm0NYakzDrUOzqObn+hXr/TqVXO9cq7+LrrANa/imldxzau45pu4JnKouMQ/tNkbXD6NE1YG9Q07ftjhhSwK3ZBrd72CxxS1rL7HE9aa4ge13RrntGcVpimGndA3h/UtlVuNfujX4rUpmz5a9hYTM3dztIuVWf72WAnpGatPOxKC+NtRr9tueXYh/8qp03qX6XnifuuWfoCwLiM15aUS7P+ZyrKsHQ3E1g9fjx4HJV8AYAnbfm3lVujr0grrdcXdUbrp7qiy4npN30Rlxw5l3ULXeMVasEXBnGFQnnWuksnkfEFvNu5e66yzmn9Zn4D3DnoK/BqffLx6Tu8aRY694V1DFFg8y/hyPFNuYNEOrc9mFQlDe8Rr+XvLt7Ds3OK6s3DxlC85dbTLmo8nxrycDVMyLyUe9I7quVunpBziVG64Mtzwbrh/13kTgMbx7MtJQolDMkbsTKzBGjpAu+L6lWEVxTX/vLZ26iUWqx8XMKxITXQKJ4y1zycp50nn9btXbz+dfPx09OHoHRePDNrIcjSx1G8AzbnL5EpuMNrmi3FG9iiPvumFR8UZGUqno/i+LCGvdcpGxFz3exGtSm8MVDvoh3VvVloVyrfvPhwrmRRbDaCbtCiess+vzG/PhbBSlTBi+81qqn0z7ut37fFHejsgEOi/3EwW09XqZHWtdSRUWTVV6UYO0mpL9lupvVneG3EbYQMBjJodwqfMvbY0NsMvhlop3BkDwrJEyliiadsQnHycLlbn6/Pb8/XDe9FxA8+PdtN9xj4qN6nevvLrbvnlzfnl+VoN2RL8BoAlNpIwenda1zLAIq3fTu1ux+dpdwVuT17vVxC3Ja8ptK/tzsCPKqC713Ua0PSdjUr35NZ1tWnX/yeahrprKvBMUEMLauGKt8DcrnjzAf+Mj68vyzGm+JXVBKfsj9z17CND3OyUyZm8/k/HE2TKjAAxs7NBEF/vSq89U070KqMITUqrKXlVDJRFMa44/6EAlxKePEnrEGkdovUoFyzre9nv4oUK9AXNKJeWZiT15sPqfPXkyRanAjVP0B+T9d/UNKowAwUrf0zUkmflN1GCmC6mywLssJyrGse2GQXzQw2Wl8rBTZdUnZhuolABMbPC91mXGjeqdbZlcNPlKieqmoL1aq1Gk492nj3kIEWVpYzHkjva86tleqs0YX45Pa1NoUm61EI914sEHc/wzMTnu5qeni/TG+5dyM00e8vTXuZu5fI/7fRlMQY2EHMzZMkdkHrGYJRvCA8MpcDTaqDWbkDqzLFqHXfwzmCY3HBdSt6Cb+dkt6uEbi/j/5ZAm4a15RLjqHCHTI91tVdYHlfiUEyteNHRzgeVp7j1cppctk6tmI5mKRYnaMHpdAltp9YhwlOeaX9bAtvndPmJu9dHUJQTvCh3byxbG6nVgfpj2+xb4TTqRvmJygfL+HKSrBP6ab4cya2mZLvk7C3zQXgTe13X3bv8Aa6J+nVuRt9VIHFj5StIMGlKjZS5lFuBhdMvx+yNl+crasaKQ7sRv4S148fhsY7XIBvmghqx/7qaYrADmfhxfRXYslO5QqwY/FxHNnTjyaZr2ol1WdVop6PhpKzR/naFstg3QBoCGl/K0CpRrPI+AccjLb2sNvCfwCOCbz0KT378GCMhiCTzqJiUth1ejLNtB0qYWeN/WemHu2SxlmZ7YLowTzeUZO3hFYZosYPw6cs6mavh8jHHtHj6sJ6uOLDWWfkFBtXbm0sFuIJNnVPyMqdkvcaaubQyKj2bA7zldHV7uEzOFyeg1ZBYSltmDVme3yp+0F2kPvljPsfJSUoXjllLVuPT1bkc/t5CP/LPKHfEOQaIvzeOxyV3tBcq7ULFQTYED8d0tW5clxdtepW3aZ6s1phtaWYpr8Jq7yAU9M+Q5x+s18n4YiVJgU7N1K3c+rnlDTJQE3gXC/rcQ63JygPAlvJWJi9R2NczuuOVtZRyP/ye5jQ31aAIL5zRcsNTb0Qx29SkPJgXWz4X1rfynHzRmWOmvVF/S+irzn4LP7aLEufv1InUXXyHtJvOargYDe9G8iJ7Ksn1JKn62TNNulovjWhT2Z+sYQarZb6WZzCaPfhqse4fkNxW6FrfVRZPKc2scQJBU6t8vWlSc9KvXKoWGY/stKi8Z+jz1cmrw6z6y1MSoPeU6Kzw+cdXfx6BvdpDey1wg0ZRd9qfDdFSpC4z6ipBE1brDEG2H5EXLLsQbSqKljck66TZ+dnsCm3yq6+eYcWXu1KmeTN5uZmnycg3UYxP1cyfdD2p5ra1lFh4oTcVnJ4U+o0vqorVyfqL6Z1ch+iuVb2p08oTRy0l466Zc7KONFOGkqWXZlc0s7+5C5cNJbN3pHFk+0qmX8zW0ZZBuU7Qa1fTcUnfLo5vVufjZx+eZdVmEUPVHpJOKgUbLaVW/QRnwn97Ai0IKBUzxAhHFkkQyaVwzJr6UsyBnzwTq2IBCaYnfamHT1ZhOoee4cF8lt6GfD99/4xh0Mz4Ob/U/Ho+/5Ksu2G1fNlBba6ysz11M2J83gGh1njz6vjVp0ytFjcCwPggwzebJhOk6EqMX9CXRweHRx9Onv763ADR2e9xYiSNL8W0lizG0AfJ8kFvxmiFcpLrlpl6zKeWUnw81cSviemG88VtMj/RWvbZ04O3hx+tSs6Kar+WtUhPPDN3ZDmjIst/PGv1g2Krx8qtgpN5phsg1KuS+E2m4+QhaySPLIzGtPJDi2oCQ+lwVYXWhvlElm8YZZ042sxCN99OS8Pmcj45aZqZmL5qmPfSS4D/vgGefmlOvjxZlZJXBXRT8oLBQbLpVL/M844PoKnkKzVbaq4WzVN5KNecu7i5nJ+j9RSA3zcEIMvU1FfylqXMTaECf8bpD3JWmzkFvhM8GmVdkKcT3cxWKXVtZWtBaYSKFgS+zbSVSsvUUbb7oBIL3aWWoXqWHheO62GewmpP0rlWIi9M1vuPf+g6Dj69LGvOL2fJ1clY60ZZSlrThM0oOEUXvZ8mFx+1lsnTPkyv5snDi3xqxUCg+sfcv55hkp8zYrTGcHAzOf9yxUgtBfSHBGnFa6kCU2h5RvNUbpXJHc/Prz6qIKalBCJ5hpnoLC/6yIpJSZnXFVEmX83LhAysm4HNzjMjgbq3xD9OrtoUWph5NKOguhyXNWivnuBqpGW7+mLXqA+z61IY2dNFZmH/nqoiJXDonw14pD1eQM8AG2V0clbspjAnX9fcNo/FhTjVBwraZfWuiWWzkBf2qYlqEzIIkbpMaEzkZG9PQ01ldl6Z7O565rhxbk/jrUTOs5QzeWGCI5zZNxmqp3I8PLPdkcMfcy3vyqTZpbSlSptruEl2fU+n2SZNv8krZx1rBPLK1o+TkXzqLGONTz61lzHrvdb1XrOOK/Num/dl4RGPKRNeXaikzFnfdVHfdVHfdVHfdVYfHZ/T4W1iQh2d7S70QuNI3g3T7KrXTL142caIl++wmKMez/Hbs/bM3DPj81EMttqX8TX+Tp3LjK0H8qGtW+vct02T1vLepNkPWVrO/nWcc13fNfs5Y9CBuWBk+HMQZ7gnGe5JgXuS4d6akIemz3hlzXTV2txO0rwzyJ+bV4V81l47R+13KHLUXtszPD3Wr4rPPwOH4fPPqvxR+7kzay9RftZ+bh+1l1k/vSz66WVZLg4KuTho7qd7eRQfqQtY7ClgN700M2neyJ6ZzO+pLX1TNtk9tYxfMs5ET9/8zBWQJRbl15PVtm+JOznsDPyAX5EGfuR5fr/bU94Euv0gVM4xXLpU4G18OnXwu92e7w26A/WBquv1+IWqP4i6blddvqfrL/VRru/y5r/Lr4TVV490JOari/68s+95vYgOTFzP43eRXS9Q3xyHA35P2It425n3lv2+6PLzQn7XKryuK+i9gm4FusILQ9F3Bb+/oC+AXldsebwvH7qCn7J3Bb8vd12Bd3ov8ug9KGC+oL+vfp9OGwQ/Ve8jhVehgSXkp8VCfU5MlyGCn4t7wOHzejTwAATQ/HQkopHMO9L0phGqS9SoCESg2YIJ/OoepPn0YgJ8qIifYQMJGuGhdk/dw1bGdoBEfm1LH0+o0hdgt/K/AaiwK/r8Tt4VEcrxI30P5UJfXdAO+qKHN9cXTOghBZ3gAwkLR6EY8IJ3X/AL9z6/9wQiYFGOPQSh6WWGznyQ4vJ+NxuKgmBgl5/mCzqa6NMbHejhJ8J4RUU98qIrmMAvo0EIpIeXwj1UhEb4QKJ8MbD/gCgKzVbT6amJA1XazxB3Ql1j0Tu7F2pTQm8H5ZH4StIqLmU3ioLoCSSi3brAokc8ZfStAqTveJkimsqj4dPdXX/0xI8iM0cshtNRW0WzuLWn9mXm838x9PyeU8lSPt/N5DF3JrwCPjFzCJAor/El4K5y5rkYdoM6loGvsRzKa2C5JpbEwXx2h6lxmFAjzO3r7M3Hm5O/efQQf5i9BXhzDmPVBmRVKtGVg9sbbRiM4hL9hvaoSntkaPc3aA9GcYluQ0ilR2oNqOZVm1PNqzaumqebalSZuysd56kV37QIKxJRht3y86hLlC7u5xXCtSiEa1HIkRKRmmxt+7l9AaFZFBLzVDJkT8YUIy9TJtoRryxnGerNyNhTZxo/tWUW+oawKhhCDsu3WCPpdfulDL4ZkZsAyYRIjLAoSXlqT9Sjz7lDP3pk/5l6DMjts1iRXBIQJR4ZyUGF5IAhCXJyM1J7FVJ7BamDCqlKsnIy78qdqMUio7acXKK8nFxqRTlZt6gsBwslB2KrJAWYw7L4ntwwhBgUEnCj1coN1MrNbl4ivoF6uRjejGQn9J1O1FbXJ8ZfVi1fP75/1W7d2J3I2i6mTrvj9gvA8HHAuKFGSrWqdaFqjdotz/kXlWJxbJU2Yt+nVcs5YRDFzOKH7SxmqHW2W5Zq255ZKijLbNSeqEsL0+v5yR1esxOMtC0PiyougHQsJhg0PNrilyPjvcTiz27SXlpaNsfbib6OkB2C2OP8Q5NkT44BWMo5k8n2+HtiyzEP/rp7MrUDhflsT17lgDHo/7sSxfvk99YZ5qY8eFXS3rofprByHgUcS/cnOd0/Ve3kKnw4GbVPS1c1dvKseT0rr2V33R7vJ3vj/dZE0rMl6GXwJ/mAui0xlvWq0TjMntteZImk3Wrx8pgzsdpje2JZO16wm+4nO0mbpfHD3ILZC81s65u7lzC6Dr/vcffGeBybT33cPZlkLBqbhHHBM93v6KF9dMkOKCGI4+/KCb8ZkhPF5rTMZvTHpIF/aYnRLQBZ7QMwiFeI091KZya7Y0XpuOiWoj13lEiIzixbz03FmZhDLi9MMKqpPFPfeBUnErZ9JmzbhLC9ZCjRL+i2Kb9fSLItoXhLL0kudx/2L3ce4rPdy9jidDY8G4kLxhzB75ltxwkXtrNRhwigp+QcKVy6lpJUaGUI3oP1DdXqSNS8o6wiurHuk7vp+dmMn5fFD1jzXDAUTJs1xRdtVVO9FruhGluy3IMphwcWVGHdao2fWnWaXbFBc+lA6SjjsAklK6aME0gem4PbqVpBF9EWUYXg8e03vRZQ/J0zmtRlzt+5WdBf7F7uX+xcgsKL2Dojexm3kuzF77TEXpaXZ0Wj55rXjHa1Jy/J2FPD2HnB2HnG2NNRjNWlM6dZ0mYd8byt6qjgt1HBVqUG8vlMXpoieGAZzdNqg0+tCqElhs5r3HyajT8jyh4GDkYrxthkf7zj7o7388B/HOUc1Tul4r/VFXBAJ7S9XAubboa1MSudu50qE/e0iNQ2lYpAdPeM3a1G+S5GxLRtDE4oUG7iZPlne1N15+9szzvy3PZ0P7X9AOusqB+5A3/Aj0677bcA3klt/rQrg711tj3lpJJp/6I5p/Xm0AO0G/WiWoPmpkEmmLEmfs4ZRVEOWTvNKJ9qylXmdO9UkT3VZJ82kv2SZG+l9stNuqfbp810p6oXU4yLYlRURkMh6PlIMINGXJQ2s5LSFi35bNsXZdU0ptxhWFzG891LFbXx0vqe6qEw0SNgpt7aSXnzGEmlGfw2ozX7CPC12TdzPAHBYJBsinqqYydlkmBmXdX5u2OVp2IA6kcL9pnvtmFGnDlTa7s1bbdqTbGr7yjjeBaK/U1lvDdTl+hmlm7FVF/MVc+ZUvHKTOSnr+h9RanjKVozggWo3dd08SqgojWnFJNnE/FCEx+0tx6hnnX8q/YItkcU7RG6PdaOaUuF4vgfSP0HljYQ9S9IKOQgyWWWF7zzLvbbsxhisDvbL0ccPYUdERffQV8IEzRPBST8pvfj6Iqe8VKvlNd6Pl2jJa56wtqHl4jxdI8nDcf9MQWn7nl2on578eTJwjxe77d0vN/2A6bu/G7xvdCP54vWUkUEb1+hyfMCYFkA3Iu5xS8VLiSeeDsTjQJTlphVUO4U1OWgefFrsbW0RP66EEugvy/QXzCA9rJ4n/N9Ie/tJQQP5F+3z/jTupZ42l6Ie0ZBXbZ5YfpClii7KIhWTQGl8cXeA0piqrbi+d6VGt5XMCg1tzCbG27JeWkwX7ITrW8w23Zlsu/32g4tvbExjJweLLBk393Jg2V3/MCou6CdWAWer62kYgImvPPsepmB5QV6fZCsk0Wr0+uirB1kixaVmLST7Yi3qUtIpyAuly+aYZQb8SCusvCgxQEVd1EWcr7d8qLdq33Pi/ydoB+S9TwVe5nvHS7j+bbZR8fyRjwz+kHH0M6QlUKnmy+Iv7bm7Rsrvh4uwb72jQlyfhN3gnCPeWvL2Tp48mS9Ky+wYOFXJzHjesu1o2GfyaXtYTG1jq37IdZQvIHJiOd7ALe+3ahStr00Jsf3Sj16GXalll5LeYnFlzjgD5XVMgvnfDr/AtBOZD+0W0ssByF17t5SSatr8VuSTbADDbYmDQBckwiOdizuWvcgwL5nGO9tH8MESXwRZypz0T5wrodMRXZLP1F/ZWmomYD7Ctrd8Xb5QL3Ed/STZicb0n7gWy7GB8KLuHbkXzEldFmFMNpBZc2ZrTgPLIseNbKvPW7Uvctn6qolI16kI5F1IFQiH7BEnShVd8o7w1zJHmCONFCtG82XEqh6V1/UTJ0DccNtJCPXz75v5dI6L0trPuGVT3SL43Rl7dLYtKqHXanaNcy+KpziPY/x+QC1c4FlmbbqMVwf9oP2ww6UXfuBqDoRkrBk6kRqZaAPgh5Ae3wl++3WVfvK8aHs9NR4BewPtuyEvZBLhKjT97ygP7B7xOYw+oQemqvr5brlQVqgU5wujMqHfRTdaT3IRo3QurIfLMbVfdju0HuLNwgs4L9qnyrDg9tk0xGWEjM8FR/PVJp6BWrsXCJ8b1uZ8J5vAoPrQzWsR65Ub/M7Ae/I8d3dS6jeCxDpXFvGoYB2WrDQEJ6/q3VNumotnHsrtq4hyPY95TsrvL+Q1zss9yDvm7HTPQaPM1y9nAP8v8YNvDsL9cX5whzIuSX6sEJfQAEsUPLBXrRb984DhsFRwODjqrxY2ih8LRkRYru11BBWyfLTkvOAaeOylQsKNKVivaixvl7sW6kbnjz5CRabKWCpToEuu1BfR07NCjiFAQXjow7qOAbUI+icWzbqxTHlbe/7BDp7ntF9uiHzBhB0ZGUVATA9qDNNTdngm5Su93H6SSRnoTgpFEpSUihZqX+lUhKjUooazvRE6XSCvS09ywWh5xa1YS7veCJhp+XbCgyD0C6WX8Lp9C0Glmjng8fpdEsATtAJhW9ZdrcM4UVlkH6np0A4u7ZbnS4ewvbYKlcT6lOza3Vo/XosDqW3zfgvPgMabLfKm47iSizFWryWQ0/QF20QiE4XS8Duj394xEZ/uXRbNsLSakjHxlj66B/BsBH9oNc2v2LQGUSui388cRvwOK1HL7E8++p49MrrU1mIHsMQuIwxEg7oMqrru4O2+VU+r8K2+ivCTtinUzW3q5yd022R3za/9IPMEBdt8yuUr3rQZn41YjqDHfiecqvHiAJ0BU8XbT26RDW/fPfcgCXVL73tRV3G6KBTRfqpZOwWuncnqAcqg7b5pWApN22Rr7yzuoPQ77fNL9+70aCtf/jW6w36KowSX4K+jlKBcjR2h16n10MeqlL1BFG/x7LqVzlTDiNFMn+VJ+Bw0GubXxLpRiGrVr+qfKCy8aNYM6D/vYFycu77ge+1za9qfZdBHCKyhptZQ4yiYADm+cr/fofe0dhB6pe+w+hFhEGi2Ft0MhW1zS995/tRyHf1y07q9QekW/0q1+WB4p/6JWWonJ2ofllZSI9ZLgNSsXGeapT6JeUDt8/C6ld57u2pHle/QjmGp3C4yql3wW4aBv+Ov1v/Fxj8FrSAH4zVwFPJjjouDrswhSKAKk/DotuDkulBDkU/BBTjbfDodSReyiEUi4jMf10oEpbEyGO0CVSGMUO3V14fKT7oUjFLGI3KVxFVWBGKskzXhYrpBcjtR3gaUCmhFzsg8Z0cKi+NrvbA1lP+9HpuwINiZAT0n95XGRjKnvLaDn3XC/xePwPv97rKl3LQoUM4Dev1VWwJ5YyMkUjoaQZvna5PP/Hm4LX+WXFxQMLtxGyBoJYHYpFd+EjqH+kvzc3CXAmOaB3rtKB8KjeiPbhVXWC8qi04npXfoUx/0Z9rf9Q/X8WheC5eirfiT/FGfDaVRIzqLC6T0m09Fv1QfY8zT1gf6ACLbfkk76vfrCSPfib9SZpv/I/R/urnafuuBB5zlRXruvv8Jut2ntzuRDuVcvwwPNn8VryWtN/pmiX+V0zrX3dr5H7N7Ng/YMd+xaSRyBm/SneCyHV8j2fMqvBzFEby3vP4eVbiV30Imcg/hrPEfk6nMQr0pfxVfar2Mn5J12aTxJbvhi9H7ZaBezmyzZPvOS/B9V8VAI8VcxDePSkBOdyK2voMAofPRxIYf/1+xh3sryPuAeoPGVr33Jr9yg9iTRY3D/M87tMy09/9xCX4I6Vtn4uAR8sz2/peMPNTwb9fEjpYgsg8JDLzCjkS11nqeSI9sUrKdzfF8+rrulzwq84rVsi/pUpSORhelkZD3jmB6ZpfErLo3nwIWP+eRXHQ7pIwging7R8Dh5hjdCxJBc01jS/lV+sRqfgjkZ+5OfRcnzb/zldPvZpk+Udi/57EJhVvzu+JMoxeEfTrE+iz6dhY4c+VIG0Z9Nma7D6R07EN7fwCTI2n4937BH8B8SIpLP5XyXA6HtH9wwtjC5ZSsVj4UZs1Y3hE/CKJ0XjPfr7NoI54A7IXyZ7OdvzR/otkO3/ZyZ/2PLf9ItnP37dbKsHacePrHDOPwJL8W0UjRam8VtE7deu92POzfk13VZ+hQRro+YitKL6rVTIrSynqRjbS4oY0+UuqeH4MexmduZ+xo/z10c5mYt4pOVlQXGvQAvY8eaKI2jumGW7S5PP/FfDrgaw1oSmFyWqvBcY+x8De4+9o37xtq7cd9Xd7yyRaBiNPXDwpn+tXV3ksoV9D9aI8EJW71XynhdaW4Cm+gXwE7u+/M2T2WoVIXasA1mvue1oYwepbQ5WjKjPVtlQK93N0mp/neibXL+UGea5vcgNFl7/3df8je+Y82QFTz8nFj6T5o0YeX+nuzS7os2PZg+9lIl5iiZWIF6n8LRVvErkUF6nEQBIfErkWbxP1PE7lVBzgWdwmciKuUzkTnxP5vu62hsN77yCxrvNLL63PCbAOL7hhk6A0ylriurhxxfwPyfBtUsrPXQpAVRyU/HX+VboYoxar8q8kdpy/Ei3+L1OparK3oCr+AsJXWYKn3mP9ojNl62Vqv0qtPPwAZsi4DE0ApwbwPaPkaSJ91v+U9T9NlDr7q3IlrEofSFONZOVPk5w6neYVaXWgJipFvVQjpS+VyOYthlJQKW35MtcQf1XuGTUw9HRcIChDktJ12phnk8+oogau9uNOx+3Tsb1O2+tUT4NNXHyRqmaB9govMKnlOW2ZP4oq07e3as1ACypoKvdesnY8DsHWZPVuFN1okxpRXxIz+4Ayz4v/SnaLKRdvUF9fYNKAQ2TU56QYkQfA+CXhCHpfUusGk9uECKUrjgzG6YhYlEjU8rTmNpniR5kl0nJnDwaxQqoAv2Nggsr1LElO+BVPcnW1/HLPqx0H1DyAK/uJKRWvf/LDdPFIurxpvUyQCS2dtu5h04gD2ECwe8BovKtH2Nx6fnjDr+iCvTfxm/z0OpG3X84n/58rDtLs6alSch8T+Ur8mchn4gaaTnyFJIvXycayQm+LJfKAl/+nye7r4t6HbU9LaukDbzgt+WeSytel0zdMq2jeiuVX6e4kRblVKmz7INUkPkvl03T4lexJR/GH1JbP0niZ7j7jxR4gfIZx8jEhEvkhVSMGtEyTDXKmSdboQ0WA+fKIBTlG/ivRiSerFSqy7VEbSA9TrQRs+zCND9PdejlvFFv/BUktlczKqRYIVZB13qbSb5Mafn82vEFrUD7+U9Od79r9F5Q7hgjgKl/9AB42m6x5A2wBp9fNkPoZUlFHepuKLZ1mKdQVaLlBUz1B/ldi7r4kuzI/J1Kda9juZlW68R1k7pV4hhXgGy1yfyLxz9KlmT+zTviUyGzF0FkN/xwN34ziTzw766v5cZfT9xuYC56yft7wsFmVu0t5TezN/hvH2/FpKz5tVfHc0dVKIri9aAFjwQckwj78rh0ZKuxWBZn4AbIAyMQmsnwOJpYnTwKNF+YUzBxpUprtIFbtq6ptb8f971StVgIpzeig/Qbmrm2ewvxpKxrF3bZ5iUa7f3DEKB5HIk8PK+nKbK/2ivyUfP/e3AhtYql+PpRv0dOHWPtmtzUOK87BU/BBjRz6r8Vwe53Kg+EUo+X18DLhw0jMNczJfD58y/H3mqpgikFXKskB11z0ojVPRa28mPKfcyjuuZcwT9FCL+qHfcax9EPG14qfAau8rw23rxujbX+e7jxt5V2AqoqDmva9+haVy5rDkcCIVO++fucRO4DVaihPlOUScflFzrUKAyfLY+3QOmCmKxS5bnyEYXbAYabEuVXaENFbIX//vfXIJgnsfHfXKPFnsw/8RM3sGKWymixOG7Q9B8/uaVLZ4Ch6+Rm17rOkdJ/rWa50P6byVF/lcnmV6xkU1VGe5JmkuAZiy6O0fZ/GNTBbfmSy4lS9zpWuM7+vleoLW8DBU9EKFSviGp6mNUqK5AZQQ5FoAM+o0ovOH7n54ndMibgg5Rdlbl2QcpT+yagCxYaLBGtd3uu4L3iAtL//rr5rmK1qQctsI1HXqq+FmdhW+zCBARFnJf9zurSfZRW3LlR6XuRXmhtNSLOS+uLbuI44eASxX0FcTZNnaVwtLc/G+hivxr+V5l/G4ZtE9fxNEt8w+b7oSuAY3mxwNU8vcbYR1q3AtnI+rCrMzUGaGVxkbzK5yCM/RFMFFQxg9NYmpx+twd+oYTMdXBebmMB5K35HtXC5Oj2/1zfc8o2fd4kRt59TCfGejeXPqfgzrdxkSHhnW3lbQDuK69tW/DOUsx/Pxvyb+zhhD96VB8hdrk5SMiW/DX6vvm0f3iWjUftPbXD9ljTcUSqNDsCKNCldWCoNJ5On59ikeXwYGAVymTZKegYCNv2WtH9Od5PUvjRW7QxGdtKejbdbOjFOwIBZGl+qn+/VikrHuqmoZlnxVrXGAvay1IUa9vufwF5eohXfVJDndX6vNL+z7jjUA+owiQ+ZXO6Ble6BVdYD4sfcV3DDw0d7oJJviaR5AJVxNPZAFaTUBXSxq/j/c5rxX2j+C83/ypAwSGTTMMoqSPIiwQ+KVGhCpd/VBuF5ujnPJtqBkf4wffWTXFYSTsZfbq7m0wmmeRieH7OdOW5jQSFVtrSyzvuZnfdzsntecxP8M7vyl+HPILbserVav6zXPzlfXU0Xq+lE7aCxsGf9UxnlJLMooHfr1PM+iKoaYASor3YyIj9+evdexzDZKdJyQPEYrrxtQNUIQ8wHWXiUR9Hktf8ATRFlxRILldgE2VyFalHcePxxlOibU97ulnEY/iaVDzGSHV8flKXldhJ0QVGokPT334th3bi1VMGSM2j1ZXUq9SGN45sLS6jtUpAIAXgeAwnAmIOg+E06PEpsLAmQV7Wcf2s9pyKquNqxdk6bUuOk5FewdV/sreiN96wOK7tG7n43H4H/v3I2e5sui8PZSeXu5r2+vZmNx6Wc1A9oD8TanLMWR1LPGk+kxNYvDYe5Xx85zP244dJGHG4mvTNJAZ7faE/tIvfW/ugTj9/Vke9bRj5qMnn3w51lReWIPyvnwS82GfFZvqiWuEx+gP2z+IBx8WH3c/xBrTi1m7jZ8EPhuu6TnNYOXMWxOVY7jo/zY7XMh79x7PnJPs4PXJUVLf9QZ2W/xr/y0HWW2PL58NdRu1WC/3Vkl958z/kVTfxDAarD1zIoD2BrwOoQ9k+QPjweSVTwx/f58GyE99Ip6gvafx848Wd5pUPUF2qe+aAOYS+5y3jxSHl1CnvxKILiFFYz9zLR3DXH0fkxrH64Lh+rnicSLeAZ44q64rk6/vqw/6Lp+GszUSx44KhPNT4o0wM9JX6lJ/fY3f0Va+Fj4Ti/mjvKrMols3iY+yePO49HsUmSa+iKJDapeHO+6o2sY2XG6I5/SJj34rGTSnYEj3InCkwBb/8YOFTnvjzKVdBxVuEgk7RMmn5P5CrhCesfbPAq2f09wV9A/FE6YT1PhqtEnc39UTphNamQgB/SognmQegfCc9EPftYHbHiDdj+SPZ0No9Y/0i285ed/IlHrH8k+/m7OmL9Qx2xTnLMFZaid3TPvEpYedAmkG2ewvwpGvGs3Yu77Txh9xWl9bfUbE7lRcrpaPE707LfUq6yJ7Wj3Xvoifzg5lgf7Wq23ye7qg85rSigYwyRF6WjXTUQ5Iv6MS6USEOavC+anVfBDT9FnTqoVVXsPSfxeao8Lo5qj9VRbUn76BPnY37O8iJRj6M4PAJIZtb+knLb78mTX9LdLcx27RfA/SLZ5eMvtGg9KY+fPFGVuaNdQ8soq1+dzAqTiMfvOeCLhq29D9Vy5kS3GVKd6BpYW/165tc3vwHD2+mTXZOvzFVTJqspP981ZQsYL4fxKzBBCcbPYbKz3g/7L9lVC3XWu2BHvGRrXhrD+EH3d36y9GGkr46mG/NRPPmXxjhoeZnZ4i+1LV6pMhv6xzTkjpPd65otfszhP/nXlvcWsB9r03vyL01vXaBEyntQ8n73bfw+E8OXiXz/xIsP5C9qNnwBdvC8+z3Pu8942v2Kp90HPOt+mfCw+0XaeLz9pnK8fZCgFI+4gEt9I1A+vH6T5EvM242z61ueUd6ao9ZlKhUaHkPeqjMx8+6p97icKVvL1P6cVI+uy9AEcGoA3z+oA+EcD1TJB30g/CHXK7cNB8IVKv9KCgRlSFL8Mm3Ms0n9h6QOrg5P/0rafyX2y7T9MtW3m1+lPMYzpHh0hlE+9LylEL1KbVJMrAel09M3QPkqZQeh16rHp7eUyQZMB7Xj04t0RDSKgQdNJ6QmU/wos0RbbuIbxAqpAvxurhC859njKx5BbwxMCM+k8YD1qbogk1YOWM/U0bWspmqynqoj7sZ0edP6miLTysK1vBy+TMxR1Jf88HTKGyEHJPNpijXt+xGPTw/5+ycbcJNWbqGtqq+vazci47Q1xdBKgQslAc2jXKTgeWuVAlxvOn1IzRm6Okz/kuxOiy9lv+T7ZL+nPG+dmmPL4Rd92DkeV5Mw6Tzj0ewhcT7j8ehwko7iQ4iRdrbyX4kuwMOVD+mo/TQlQPv1UEPyc9sPqTkqnaTxJN2V43FsfXuW2pvIbtN/QIbafscSUx+Hgn7nS2LpGoj9OwhsebbffpZa2y2/fWguFXxKOF5eD5+lxNCWn9Q9gWn9LPXPZON0Jz9Z9NvTRJ/G/AmugDPxx4Q/0t29S/fLx7R3qbVTfu8EbMYXbrIpXxrmdM7rGox+hlFMm6px96Q6hUOR/0roRkJO+TrVr1t3imOPtCNf8RcETlPxBwicphn9NdK/14iSdXpq76AiRq/dqBbiqc0CmdfWPA0M19Xt3ZJ4UzUPtD0KZ2Wtn+drVNVtAINFM7TAZBgce3v/CTZ9nvYl2S2dp0GeNDLIfNbDpZBGDISbYkTPUwzee46J+3T3dZoPr3seJfGdLJxDcd2nI6nfvexd1N5RAdQV7QH7pbJoJo/dYk5aH8WhWOZuSsXWMt/pFpNiA31Z2kBHutqSRzFDpJ7jy/O7ntpFpsOePDlqLYVSVkpTvS+sglO903uaxKdJtmbJMNn2ex5R1ZCZqxpUgx/BNBOR7bSY2Y/IxaN091lxIeOIXHyW3Uf4CDYdgU3PsusHJkHUE0xPfVvLr7E54Xsv3mHVrk7UnvG4ZM0zF5gnZ+PNOQNkvUs4R5xCRstX7M7GKDo847Ffqm0UbZ6cpuUjpY3Lazec+m+S/ORD4eD0/s6csMzGJs3L0+I6kGz9nNqzcdVY2aoXI5RTg/p+kahsWC0VpDBW8py2zB/1Z7U1t2wNDfmz1pAqPJt1l/wAwmYjTaUbRZVV82fa/jO175L2XaKtmjSfTH/Ln5L8TtJlip6dmbn10Myt5+z5n1XPHyWb20hvUvUZ2Cn9aOdfoo64eVm5Ia6hULaA0Z/TJvI3joM02T0qX2pKDYveccJ8ry40jeVR5UJTarZwEwp9ku5OxiiX8DbQb6bwYiwvU271Dn8D7DtMjYtx/D7dXYxp1wPrYmx9n6XEJN+l3F3l0/s0/pSlbU/0KSjpK2k2UGeAuU2rH/QXESmIFItUvknFr6n8lIr/SuXzVCTjsheLK67T3qNr0+FVMrLVT+7L4r0hPgV5Kj9OQbEBoXcQk668WgCJ9sGQpg4KbrfeJ+3WcVpmE2uop2TeLZR9RV9R75P4S7qX0G8R3pOxFf+Xqlt+SbXGNq/aFrriZspVsnucKWuO0isqsaxR9P1Qa51g0/Zz8rkEzxpWbtbIEo+3V5j2Bj9sLyv/FzzYMi4xDANElQEiZ4C1kzd+s3nxv27Vv+qqRtL/UyrZRRhU6ea4SnOL9YGCmt+yS7XBejmuJ5rY1PMxhHj4kBq/vmNjYp4beN7JwwhrzxQMjEMNTHv1t8TYqw9p/AB79ZL26nxsZ/jW48xeTf8JGWpbtM7HIh2Lh9RJlbEK9ET9HQQqY3U+VsbqemyihIy1sTofs3hb3ozjrcNEjdfzcXyUzYrnmPOYdpRNgiYhriewFOjUYx9PbRbJvOfnaahFV7KXsqdMhemYFtrRpk2l8zWqqoVmsGgNVWDS77TQ/hNsj+ixWabHDHL3u/vfMqBWIrefVv/aflpV7SdaPZnJIzP76a5qP4nTRDelbHSVTCVTLrcmPnN2+JzubhXn7Z/z4Jy3Y4ZpMAGdauaY2mSAfaq26t/zTPkzhOAUffxXWrpA+QZ5TFV3KM1Lfo3yL+Vt7zTZP03U3ceLsXzaqmH8azwSf6VY2nQtYC7WEEi7GBt3Cvo2ZVaV9Z+g9fqW2ERbvlJ5mqgblAZ7dq3SpC4bdiPfKwp8Q4G6WfnfoIBcfGdaFN+O+SP/0rfNal2x2QVSw2/IQTO1cku1zS8Omd5ubnOIKwrKVbr7trZfeJVLy5dx5eRXWeVX6Wj/bf2IGYkbB+uqcPlUXScUR+qPYSkfqTfCVI/UHyWmdKT+GJrSkXp8pRKbIOPG4l/GG73xTR2jvze+QsbyXrvYGGcn6ctx/ST9quEk/WrzJH053jxJX42lOmh7n5+ko8atS4HqXIECV9QeAFLHee9H8dV4eD22IRzIqx+lr8bUa/Wj9IbUeFI+Sl8W+2yqDpnVUT5Kr4RB0tGZig+NMw//G58Vn4qZ/MkVZ9IL6CiS3q3EvXT6HT8SD9IJO5HxWp4Z3DeVt4PK2x3wV4NHx6u78/V41kroEmK6PL+cLtbJ/E/r22R6mtzM1zvjBAx1d0iE9iEUqxQPKf/iy92fvJ1qOZ+YvHJKsHMm+2garxhEaB4vF6BtpTb6+P2eNkT6QHpcl0iI0VY9zatcvsmD+IV7p9rnXb49rgJGlmbJW8tsMtCt70h6R74rzLZEPWWVAaXGtDAAuebR902Ku3ZfVQDx6QKAnTmvXxhc1HjlpDyUZbB3q0j6VtxeKWa2MjZeHS8RZxCWU8G1TXWpfbCZygao7FbhfOQE1DTP/d6wr8u485upPKSJ800eOW2VrN056KQbTP5c4mchbvCobr/it+YkU9wVNzCQW4l71JmLwuH5Nr111SO/6fCNxWYT3fV9lReCrNuTDLL4VV62W3x1zmhThvixL9p8YGKWhLFFlpVvX37d9lwsYmoODqW7m1ad4e1727WUHXJGx0Cat1JtiIucRsWOAzHLGnDb0IRvlyBFxZf6fPDm16PSFadaVRQVwa69kHft2+2WdxS0SyEQLvI4NoxrejNPFMCFSCzHdzNPcaa9Ha99gRJtWatCXO5dqGCVFxaald8iBSsuYwxw37WxHiIvwa+4q/xFXtL/kBU7XrSnX/FkxZeO7ANDvhNa4/cl+d2uVf49X5rKrYqMrbSMrbSMrUoytipkbNUgYyq/KmWripv1oB+KUsCmpk5a6U76iqmwLGgPG4J2vylocbOgxf+mx1f/1OMg+H/c56vH+nyV93nP7pke92PP311of5KXbenZAVCqGuZfzrCUu0SDPX+vDOF3ghKEQ4gfCoqqduuHkrLSkqJjjeVDTvW06bBi0F1VGRB1fdS4rHmQQ9J6M+k697reSskXHcuscMGEllV9vG63MP2177a9gU8nXDLoRDQ39fx8sljBfljfLKZPfF5aOaXPsNINcXNvXGdlL7F5kKdKQrS32kJ3zJSS10dVMy7799LClyn3Mcp5spSXdXOpSablUa8LVptQhdt3bczsfgZtgsajkZUEHSVeXUxyvJ+kusbO6Rtm0YbJUrtVfSov5Mz4dc70/pavJvYLW96KtOTXHWLhbZdJrcs9ZV4p8ZktqwXjGYrOTI1lH/LK8f5pbFXB23L2XbP7tsLwlfI5X5mHCpGcjRTZmOTjprLzx8vO62WbJwkqgNatXdOY2z5UjVeeBNL8cIQsm7Qw4m/tupaPc+/Sub10alVLej/QhZu0rBpooXrKca4eoWZVomarmZyVJqdmjRc9X/b5k1rfjFWcFnJo7OBE0l3bwKrawjpVjYmyqauTXatq7upUz7K75fTQpKsqxzfL22lWLLPEM2zfG4Ir/9YYg5ZLlhM9wExkmXpyHtCtsK4aAh6W5sVK2MNyYIQski9XR3M1mt2qK/+0gGA8VlnyUf2Z65/cyzi9wtKz/763U/eet+1XXMMeVTorMZ0UhjAldjJP2J3b6XIFYLnlCdewun8UbOZ7pn/8xkzhm0713agBucHsh02FMRcYQek2ZxvcHn2zPYrb83+Iu/8Y6kx8GjId73vV3btyvU0q9ybKGznU9kTe5WH8VNxDxnv3ymGrMaGHe1IHrnZ3G6DHmMjzOaox30msYhabOLyG12qseDyyGnw0/tpMug7KvuUq+ibxRG8XNpI44XZjU7IsIkxkrlnBtYpXePPF0UQOedC1aPUFesoS+sXriqAHy9a8+qEIBsVr4IsoKl4ZIqsoGvZFr5RJD3NHYfZGx25eActYW0EJmF4EI694Z+gvL+qWEugtsFemk/GzShh4idvrl0qouGKwUYoEUjTolVvDeGPEMYpTOe0spslyulo/1Vx9fjOfv2JEZVpCSVlRTMDqTC1UHNdnmyL5bGAnHRXbmhGWnXHn+fNP754//3j0KY/WUnyllIqtyPMrBQLfKvuaPxVn4kJciWtBX9rG4/xpff/lHuPkQZaDxN+U32ixhP4gDHuD0Bv8JGd5sG0jNk5gDuvzKCOuCZE46TBIuYlQ2ZppOkQW2WSdga/jhS3X8T3/3HBpfYYfz8TquE46b49+aZ3q5QkK04VRJcmzLO1SGpp+9wqT4toiluEaJkoG40vQXd76xAhiHWUga7O6EyyI1g116vR/UbECbMC7VCuwBsQ6oxFzlVoNGW+ZKwY0FU6yBj554tXb+xil6ijdPNumDkuYB4CfybR1yruu6JaZDqvOSwAP7J/s3ehKOsV1gd0cP1Rk6JblWQ2ePD55jNvIQZUYL+E60OedfMjCbokjeSUO5Vq8lAcNF0RVFMG9l7Uw43//7XXo53K3npGfmbwDle+QXdkHf5dtg79QNF2K1/JQvBWf5d3w3Uh8ki+zoOfiVxCTjzfxm7wlwO/yqUgSeUTHfC8ETK13YpxsUC2Uc6oVM2rm/tdWPUmwcOndilfJng70DckFji39oo8Cl4n0jhxz05sTzDipNd+pejDfyLcs2CJ62H7AKmAjP/Z2P6DiD1yOqdsHiQy8WF2L/l/+kyeOs0jiRWLLZRKDGDx5RieMtS/GLEptjpWLRlozRZxzSsjPrWVixZVUL0tlB9JDxNtd6bdXPBt9a42TIh768G25PIOgq6vnqhw4nyeqTbrzxGA5z8/D+JXI10QC1lkl6qR1Va0VTXybAT9XCIu6z+loKpFvxT3+OF8T8Yv52uL9q/aH+D7ZZml37z7Rnw+4PC7NXgxLjxN5n9DlOJI2w5LdJ1mQMMveqkUiK+XFx7Z8ngxf8VL3kTMoJOI4sfZ/SbYN3E5WZHW+aC2S9i98RZszkhfq/ftm4+uNBtO35fH3H/Wy9L4fy0qXzs3lFv1h0K/6u6C38kN7U+w4ZMre9986eT/OeUzMLxQTG122SLYZbiGx9IriK7uhDOqgX20Ka5ubFl9raP321wTdbeNf5gv/LfiYN52y9opl3mZ1ieeQdkxir5L94+EyscHxnd+Gv/PXale49FVxKf48/GR/GAHp95m66XNys5pOSp9lJ6JoSEmE5/RVUSrhbDWy6bRVgtnDMLSKvlvqrjvmACGJJUj7rbPkXU3ehvuMUk4pryT6nxUDFAL8KSMYZcPLVAQ4YaMZRW0Qku+vOwuqWfkhPsTT+YLfgRgExZ3JQwNURDQoKVqs2E1RAyYOUOXBrnlDvQfWHWexXFPbByPJWWf4FE+c/1/W5/87TnI1eE/DW/GdXKv6MEutTR1kci1q+ZMnP802g5Y/eTLvHPDo7OtUxyNfoaCORS44kYpZPp1wHi29rkVt1pbyj86Lg1dvTw7eHrz54+OrjydHHz68+5BZXt1468qRd/GFjT85GtpR3p5+1fWfrL+cTBckkx+uN2bABD16++zw6M3BH/a48/7dx0/q2YqbwVmHYoipc0+eWd/u5NK556zAyxp31HJrzOt3MJRRqDNHZ5rSJ5dXwYnq3dZas0QxgvbhHQrpjn97c2nbwHD3A3Mxr9+BCZSLyyM0V2GUvwK6K9it8jy+Mx4LtLWU16AikzwM75RhpH/tEr5RHprqvhzmx2wJaNE2j5BitxxFJoPJlIJbCQ3D1VdmV/8k0/2vNPyT/5VaO9ojqw5kH//W+TyQoefyoS9DXz30ZBioh64MQ/UQyTBSD6EMu+ohkGFPPfgy7KsHT4YD9eBKLHXw8CE4fvU7JpQAzx8/Hbw9PPhwqKIp4P3o908fjo6P+Orj9dXbjwdv1VsZ+IRxvJgYFiXytAhpx0eHr3495ls3f8sBekh6c4ASxwe/H78Pnv76/PkRLJGwF0ZdfYVLTLDSuRaH4krZb+9T7Zk/NsHuxyp1rF9X0/Xxl8kNJKOyIybGjHipPrReiBvr21wm8USmMIDH8TWk+FBO4yWWJLBa49fyJkddwteaqLXWMgtHqgS+egqeBTUmPV/HWCSO1VrqfCKLJVbcfE6uykySOPPLNMfC4d2nE64Nk84XrAbOASq9OKlajlJtFsVJZYEgfZNgxoh0WC79bXm+nn5Ol5+SMx6GJ53rm2R+vn7Q2ZUPxGjW80DvJtUfiJ1BG2ows8w9XU4ZAiTpzLBOqSQYgLvzyXqmi2QgpSQesueet/X7ybUM4yTfPMzhTi6nyeIk29m4SK9WEmv/LO+8luVmGcl9c8YsWU5YTB3l1lBIL0srSksv0JxarE/GXy6vNF3Fu9mXVKn6mMIhluoMrhC/m08+J/MbZbd6fbecAqN1Syc9u1kup4v1x/VUXSgJa0meTqpc5VDI659Jayo2v6g2fc0lpn7UX0dxi1i/m/3icmbx6VQ5dTVdrGDE3FKAyFzotk/Ty6svS4ipEp+qtzBN0H8wNal4kcxfnlwlkwmaq7rMqOtSIWfcOT58lheqTuG8q5FszuHqCsdjyZsYdNp7mJ56xtdpH5LJ+RcFQsIObvB2xVDGedLiy3h+fsXXZxiZZ9NS4sesBzDeryAs07Vi4h2HKPRFsE7OTpKb9ZdL8G6sR6vSN8kc4xFiOTk5O70qzgMSo5Me2bFquKczZGB4we08RjkQISMciG4o+q7g3hu327jDxl01Fdie0ey7AHazmOrp0Ovq57H0tKI+LSVOmZitynm85XX3ZuqwDtN9vskFzTyc8c7hTxKUESnf4rHET0x0jCwpZyb4V7aP6SR7iXO6P90Z11UxRAUz9upf3EviwDIbXSCOAiv1gZk6MsSvUsjPxlae9/7jHyoPvyrvpsjS1p/K1Y8K4GDMQ8Pc+IBQVNV0vOWxcAmAwXNy9X/87u27CgLaGCW/cczfp49Lc1Q5vV9jVBy/f3FyfHhy/PHkzYe4Bq3Qq299T8CjnzwrrgdBePIEvf6TfETxPnkC4w8TCRMULvX0GLTB/lMZeyWFN642kjSNy+mUHyVD+h8hs0zIddI5+gWlqI4h/Twb0GpX7cA1ZUjPY7SVRsS7DfDAoiqs7uIo3NUkeZlc+TBinmM2vIH6emhB6lqdQa9dm7cty4KZZxjo/u1123VU7WrP61sPDbTxeLEoBSHieD/aoEwkdMBUYuzff+cd+DR7AoQ5XBH18pZ2897AA3VmUU/fbz02eRdjvxlA9Enoj8pyPf1I2W5oWTs8Aft/hSAoUMbJfKz81j9WHvj/g9qhri3zYTLFt2S7FYeOLGoOHvNhsKM1OJXYRXzaolykep9yitVecfJRPv/VhZN0uVMt+Ihu+CdEy9mOnjmGHiNkYRY6CvR5Dv7ysadSu3yMVCpWNfjrq+QjHlNFrvkuyWio6ydPBnvZs/UN88rQvPByRP5imy9HLjNQLmXHIJhn9cnyhCN6Kmbi0txwx0xHCmuH3XXCoyrhW15XpUTqbxjlpKsyinbRTPh+q0y4qBIuqkSLBqKtHUPwdz07/JTNDuby6+P6Gn0LpTFtS3UzqLoUmP6tvr5oUA9+uwK5V1OESomWMdXyGYltWpXdv10xq4Oh4WolJHg2vitn+3jnibJKNO/qWJ3KQb+rg3IeeOtXdfStTsfNuzoop4Dpd3X27eWl1Wm2OvA27+rsW1eurnX1eTbpYIaf7mNa2Gl50YBRIremKlcRY6H/0el7UqcF6tgVppefJ5EoSzC8V55CsizR84M8iZRZIgqLYp7CFEZekULyLAhWgUkRCFnavdzXXJrtK5YpDs10mubPbF/zSjFntq84pRiDZ80lXUSzSPEELyzS1+kZb3YurY2JRU7rslR4TuZZrKjqrcdgNy5Z+ZsF63P9/1/dtTe1sSP7//0pyKnaFA6DM9KM5oEzScGJSbgHSJbHnj3FpVzGmMBiDDEQdpPDd7/9a0ljzYzM4+xu7d6Kw8xIrVZ3q9Vqvf2uwZObYm0Sa4ipksxB3Ho6Zr/NbNc68dyCNzorgb+7E3j6MO1mZ6eO0NtL8uTgg2N/uJ6pnh4+aoy0jjsb5L/jfdVsSyid6aYvgnHTje2Nvf78wdOF5gAL5iuXEz+lLxyemHJAvyDv/PTs6uXL/8GjbwBGfz+7WeQIuF70KCrR6IYs4rYFu4CwaKHCvG3YRvbdnen9orLs0On+Ho9ISk6Htzm8ULeZ8zdJ1Bv7C7NBomx0K3H07dPkA1x+h/vw0k4UZB3qKlLrJXCfHjVv+i49ij2cta5eN+Gfq3xz3IrairN/Qf2+dzpRZkSu0k2rHN/dRffBHRJ712JV0QGiQGPoRgezSMn3jFcHy95J3EzvJliqQbRXHkApXjeUzs2wGUueqkttWCVPc+fY1HeLR/ZTFrV2Xnsv7mCgAw1BVJv95SosLsqeQbMhKZPCoa5gquY7i/Jyb+mdw/wsFwcWrI+aIwg8U06tdvANAznsaY5KBHrc4XvRyvO8XLccibeFHgS5KE5fRyK4eFuUSXDT+GTWoE2CU1y1XSLELoOLNxXo7zPo74DuzqALyhaXii1OljupalNeK4vf7esMThYT+r4H4WVBv3zpfLyhJATxqpPjtJmKboxc3Qj2OqPptHM1JRmNJ4s//TqYTs4mX1YWLMwCZktH04Xjs2ssTjvuLDhRtre8cHN5uXB9MRiP/3fyk+m4uKS1f/Ao9HxxvikcGnEDyqx3983Is4y2AnUYL+VP8BMj0RnL37ToZlzDu5u8W/y2VIp4Yl/N2mlcpyPfVmj85pAo3zr43/1l0ZGwXL5ov658O6BLfPU21QNi2VGgt7PyB7KLZUcdgcvCOeEOplGHqkJfF9PB6WHx7dVF96lDC3oOrwn9SGPMtabul7U5zBmpaB+VCxs1CaGe0ma4Z4xgBHU8+09KRQ5zLeFjXOl+YT23lqgeX1yfkRF6PBFOB2/G9IMc6w0ZhLp/fUON3UX/DusRR0VT+EtoxAxfS8mrOQM1YsUc96c3VpRLp5eE3VpR3Z4G1fjauT5Zoy8eXD4YHXJoBcnn3fU1nKRrNH+xiUbKw2VPqDhsv7bJSbm9EEunry4aO5qurk+OpAB1rLa+OIv3kE+LbfJ8PYfnay/P1z6ehZzP8/WBiA6XW55gWTItpIdphpjLtJDzmaY4i/ewwD2yBHR2PIJ69cejSSHQZTcq8q46Gk1q8k6KlShZaYYL6gxCm8nkX077V9PLmxEPt+vtNk4GOAfZ13QOyjUAD0x7vHx50zFhGuCbxCX2o7JeXRPO0eUWHOaPZ9c3xcZg8UAkgTp0gXgCcw87aV2YhGGcjklY61y9fDnlHon+Qr7OhIEzm8vXm2F6I3876o6cDadXI3N28+iwSMPwVat07WvuZneZS8FMvHGtt5NwcftBz92dR4Wz3q0773p+ojI3x/jduToYlS+dwdXV+B99PRO1OAio370sQuNmf8Wa3vBtOV/MKOzcMc/cv++tr+5v7vX/vL+6ubH3W7ur5kATIvXGH6UgYWxidHd3lCeB6O8mhJl+rcHpUCg76j1mRqa4lMTdIf4btnbHGN1odJaOOqQF3FmY9MeXl3rRAQlie3S3YSM2KXzxfds7btmQZqspzv8SVpM5hZE8t8DnyezT+HiOzGwfrUr5CxE8K+PATD/Rszay4x8yt726oFFI88bQQzP+XoyCRwstmFdoLW+pBQ2puVy8gwjXhiSxFZ5NXNupS/Leek/OmG37xxOXNcRdrz/AJrwOnNnDTf2rLmbyri/HWJsT8YibVmdg/4+ggT9aS9TmM5j9K0RmTNSXjqzNiXgKE44QW/t/BE/JxSxR264PFPNWwdR3ApUZHB40ZHI4b8XM40hmKQ67j85RPQtd8PCc8kOzeM/ifW4+94MOb1M2E/5ulV4qdFz/G9bu9AfzKn0drt1teTyhsn03Zq52cEm+MiqPXEG/pzO5PLsmz+d0cKVXxNRC+qQ6ntDrm0sdTC1//2hEJJ7enpxcDCYceEJuAjyR0VRbocqBJ9nKzASnOih1iRL/CaKSKgVhUdSQ82hFlSzRfh5dPHdTXQLHWKuL4hjrkxhoVThQ/w85CKv7ff+7GRCPMRD96xgQfgYEM9D6t3Eg/xgHoREqdZ+uKpC1MO67PZfbfxuz4j/DrPznmG39QW7DCrfBE7kNnsFt4OU28HMbPLVoAx+zgYfZe33cBAGvmo38b93FqO+iFffTnrUx2J2tOv1cuziysSz19TIOmbF9YHd9M/t6lQXPtQsxsMzybnTcfuyePQOHpRPlWorqWZMtJ8bevftI5ua+kLILZlYa286QXYgs6gDa7aiBmQ6I6cHzCmU9fcVrlUNwWDmY5XfUrbd1N6WxkphxPAJTfD7qbO+u7u2t/vzL3sedXvspiPvXT0Hdv64j7+9q9DwGpsuXl9gaKc0ZXTFRvOLcxunl5yayeXnEomdZtHRYM+udcUxzbQW0o4wPDsjw8MD1+PKmT7wXRxgqG/Z3r9btGvZqT9cPmspehCk2O/wr2nZC80/1PsbvIR/zU3ZEeQKbvNWr6ll/CKqdPuJu+TkZ316fulsuRsFJ8EXPgp03TwUcF8dD3PGGA84O28EpHwx47t/X4ywKD64KbKvnWw7f+sGru9QnLLTK7Lh3EePFkm9i+HV91aY+BrJwN+Vf/Mn54ivjWl8J4dclF6rtWc3+lccOvxaU99f2axdJ+OYrFqIWp2az9bS4Wj4vNypdFLPR0+70VX3yvzttTm12IeY3WJgyLfCKA3jNV7t7WnxZnqCdREtxCi09LRrFazb5D4IxtnONsZ1rykWMM92WiNIJ/nxdLi5eOORhcuHeX0z6qsrw7aktr1MPIccdVit0zfRkB8r+tHbwwLmmIxDtBsYZZU3cPHbiH3hu/6gPPIuHMrYnHrScnJGpXa8+8VQXjaK6Rek4GLq15rRZa87/2MkNw1mdwI5atkGn0BqzoTf8/Xf3c2IK682wXYHC0TlUVZ0g0QyyiYth91yfKuBgoCBRDZodL4nu7fjNsDvG0UrY2Tk+LI7oTyDcHXzsdgALoo/pT2mUvpEMkS5AbClJ53yYX4Z2K55vj9gwOG//cKA3H4MOJhX4LcDft8rv7Wfltl5uJdTi28GAEX+Xe7r4C8uhNkeT2cenkxPeOzJDNRxSkdgthUOkn/5MGrd6sxi237yR8e+VMEFhIqmGSQrLqkGRvoNhMih+YCf4SlUQwR0fmCupZZt+ucWg87W5MWB2MwaV7u2boQnu3mKz+cHt4SwBjowoNwvfFucEPZmB3d3fB3vFj8F0OvgHqmCDgKCnjxXtFedLve75m163PTm4W1o6LIYH5/Sg9AMinm/FWBGdWMRSRCqRURqFuRIBNiP2Nz99EKGDuhSjPbtPhBR47wD3/+pS0jr3p3h1fn/f9XuOPE4+HVDZdP1eoAUQDYDypjcLIhsg+l43Gx+VJxH8KA9dXIk6cSgzGalelN13S8eC03wAWXY6yYQIGzI9NSHShgyOpiYomiUrwWIbZsa33Hmr0jdm2DGLo+ZJ2xjBMe/3Vzf7P39c3d7ubdoYyTFYyWxDIg4xi7ZsINHxG3L7vNu/wuK6NexBpSCIBB8SH7yuEAl725/2P3zs765ufd7s7RbLMk5C0fXu2sYATz3i0y8FoOetVSxCf6RJ9tv+Zq//aec9tsNaEvWnG2ciQGJ/faf3Z174TIE7W7v9Xze233/6tb+3sdXrb+9v9XZW9yhX4Yl9T5xubWxzvAwdnMR2/3NvxwAXtcxePZDP6wdzWRJd3rhTM4pu/eGzTtqzUy7O2+9m4cvn7Tc4BSN55cCuPBh/3r7v6gN5vJm+0BuJEHLf/U7di/2tvU8/97b3djao6KElFEjcr++sbvVwmlMhsyzstvTJNj9uxMe1lQMR4B81QzdSf5KPG0QcGNE7IiJERBwhKhHKpkgCxWli+pfSe0rvSYk4AVhKAIqDJadXDAxcFlta5o9NCNjtRy+ITvHCGSAHrNlMgwxvcMcDkfECTiRMCXuOFZ0RZxRzIo080zzEICtDSsXUSGSTcx5MXswvyD1lrBGy5jwVZUmZIBGl1rRr9nLNntJZC8VkxJxBQu/4yvifQiRTGGo8giJzBhZIGrNwEkYqQkcakqRArITMccoyYR6IE8nkpMCVAz196w2SAogFky5J4nHQihMgojRpIDk+InnQewoAyCASeIvpbwI80gg9NmKArBMuauQFNBnLQQtYCCthEBwjR8IP8hSj4fCI6QeiUHMvmCDiLDL5SS5KIk7loMyWFdhnAhVDi4TVTGYgFUhtgWVMLquGXd2ba/EKFi/+WZUQrPAspoRlQaIjMTDONNAlBYElCABRqZYz4YSUQzCRcr4h64ouD6ZAMVEseZCWaS1TXC4p86oJjlh84FOrstI4QbAOZPYT1mcmOdJaoSwRlBUxRvTSX5ITwWb8l3BQ0bAmtyJTVXLOOEGMlqXeTIu/AgIGsbHRemhcgjKI8yAlDVagmKgnrukv0QZ5ceWhVFRwEcEI7MhNCT7CvlzKPE0QQlEoJMFFGyMjaBEOrQ1ykijKmwqJEsdIqRTKAbt7mQgijkqc8lO8zZcwpvRC6h+DLIqi/IiyNAahMZcRqXRMdTBDIPUdg5ywh4BLSGkjSIpwKS7oKOHqytWDKM0JmESuQA0lyRIQpLmHlJknYpr+Si2JGOQiJ0qV4iXhwiBOiOko5GqWMCfMVcSlQlkTQEYGivkhMWh41IMcWjDT9RTZZZLxh2CMGFZcxyH1hHVVGvwosQzSgWgFlXrCoAl4gyBTXRdSrpgSehrp0mXDQjpDMo/5BSqMswq1xiqjZwmLiEQHQSuQB82Wpc5CSQmF1MLJIVtiRGkToC0PW5GEmwlWHSTV9kchkcxNLRMcm2kDGwjovdI2VtcxxXaLZCdwQmJIphWURPwqQFWYQr6CZJNE2naDghRlQ2RBUbm6pMwu6UTCxaOY6NKUEO5Y17DcyAYiCLmYuTwUWw2iGmZIQS2I7YRVONfKn/OLZNVWSEvAELBkNQpRTVELFNcaifeM1ZRETMoRM82kf1AmhRDFlZu0k1Q74RJLOUdS1oQRtiIYDLY+SWjKi1QaJCvQBS1l7lHTBATAZixnkeaoKhnOwERekF6uAROQiyrNNofQU34x20siDrWdYZBPynSnbH+4nEigVLKp1qCUicqQE7JJECJCNl6oAqyRKEZlSUIxpVwVJfPOWLWg0EqxView9FliJEqiSnVBcT1FCStESTZggptw/mWwlBFHQ6cTFqkCaSAiNpZNtyApBAGrqY1GzAxLUwtMheG2P+NmFKqoGdWKCsXgQocljK2Cc7WBS5WyYUCtDFmTuInQLbB2gVAVEttmJU4DQCSlTExLCLaKIoUJR8NHeMA1TC6pV4S6kgamIUD9VJCbJg82UUEaqDoyFFx9ZJhqf8K0BRnrKsGErG2C6hDyglXhBh22Dqm5LTU2g1WZj00lw5ND9wQwoP2A0LhJgkSJsIQtFUxRAkoSxZZbgJgUniCaJYCQAqJWwKqBLVKLiMuftC5io44TUkMYCZgWIh2YuPjBBjSEeCfdi6hGxDGbBSFY+xQcLex4RQGZcyRQuxXKjLJFyUCEGWiEynL55Rk0krQjQxL4dzCz8CDQusJopNjCSPkRpWQysgyqD0UhPBm3AkJBznDVQC5cJ6r/sFUhRIhkMCGot1BneF0C5oTbppZAk8dNK47GgKaT9ENIB/UJDSpcJzIu8L2U9jHQyFBdQN1DrYAHCEZhx+AiwGKh5qAmSVBMhGaoTPCjJFwKaCjXJLgMcB5h+FCB8J+MAJVhKqHXsLAJx8coV1IPczAHWi/2XdGEQQXwJHZxnEeGkgGraCxhZ+BiSXiaKUiFn8/ahkJEfYe/EWN7KWWIsotALzkIZIuyFK2fgnlQ6HXAlCa5URCwB0IpHG4EvNEQkKgphDBjm0UxWQoi4kA732FQuq/W547KCN0HitCVirmacvUhseCwYOhtIrVWEDqUVIL6oeAt0VPCLsMekppmmfFhUY1AHOEJ2SJDZC1UNUGqF8EPYysEJwgtac5mMDVuPIxDpo9FQfPKLn2KI4WJffg88LphF8kExtyPyrjWUjVMof0xK4hgSwiJ4zTikGtHhCYGJZHDBGs7hRZZosYLeHhsGDI+lkUXF6pWxjoYQV+gFxnyDdmTJRvGTQ5UM9FtODu4MeuMPhmZqEV7jEpIVUNmguWJDGLT/MNicrHA6VDaGhFzMAZRDJcVzR2pXQ7vGt4yu/BxZKwNl2uuVSyE65ywmkRoxqhQIqDN4eGT9YfHnGl3E1WArSpst9IWNOet/xRN1JBIIvYXKXkGJaB2AX4wxxFmxWZQ5CgZlAKaKWCGl46WA10NdHXIk5fwIhBABR2l3JIlKGEYrSzSthJGlD18yAqNCskwh8tO+gkBEFyURmzE0LagQGJQilLM2NRG3CODSsG1gVolXEJKICnsX8ZmF8fvQBcgGjj49IS5QyXHCTwZyjVnU6gQlya6xiIHuFSk8pAKnCLCT0opMwgX3SFYQvJdhGKjGUEUkGKCvOEfp9wthtXKwBk6CMgs1S0E+/aSbTzb3QTVHhyHXNUjspWhceIrHX3B7nFihjBsVY7MsAgJSzfO0rj1kbSVFMZB2uOJRIJEkan/uocas5+O+sZHFkGtY26GZenrcuM+RkYYvVCwIearlfJgQsqDCRmQU4TkIQs93GLDlUmg++WKvZGU/zLt+gXDMWM7EqL777a3m3KfnlNgNKbElmsMOoH5SDlchKYjbzKxzlXtW86+NMMSAzLMRQU/D86E5qeHTcocnMwsyhpSNxpeP0ZmSk5Tm4dllIdgkpl8DOOusPIy60rmPDjjCKek2AwxOLwbRrIKqXUBSRtaEVPLisryVkJGtsmJGmK1kaEvRcSDNEbqJZmOWKy0c+10pg1OjA7pTzmvYLwlPqM4b1LtCWIVEagCcUWooVuKs4JJXHqd8qwkc0s1bJZtOBuXyutl7iiYo+UczqMyY+2Tp26GwlcIsR3ny+oZ8K81A47NL21UplLGFbRKD381QSs6UIHOTWn6VGtGgtL74xta1UQaOcCJVwWrmOMqfElJE6yE1MB6gCKcK+A68tSOOjbpUQ0yEjP64cdcwicO8syOhTRKr055an9ZBXOrjroGqn/V0qtQnDiklEmaFKQWMnfw5w7+uIo2dSjJzHAzfEH4KTwswwZWmRHuvFFHqiJRZRV5GDIy4+YPQdoCTOvVWvgximguoA8292bt1aC4tDmPI44NuP61/KA+/A+hbur+ExiswD+FjMhR/4fJaFbxms1q2oOasZFPQOvCR3N+Tch4Pnw8p9YqHnbpq9LG5w9prsHUcAUc2NbMRlhgv5GPfNaw0lyK+TqgZvNX8+qOh1nZgI+qtNasT1Rl7mHhu/BeSlTVVKUW/lHg0mBFcwRSAy7/xlVB12hOqrY4ma+0SeOnAx25tfxMJtV2p6xj8fyGqTTbqQOms3HzdhuE3OYVP2jImj/2b5Jn6X74gO7XVT98juqLZ6m+fKbqi2eqvnyS6rc8CZ6o+/KZui+fqfvRM3VfPlP3H/DhvKofPVP1o2eqfvSI01H/8ZqImLsgTdfe21LO+pStB/wRWQ4Ypk/ySHJvz8WLOG84LuHcpjqv+y3hQ45ADTB8xGnInfoUPsHBqMGIx3yM8AmQbrmG1frahKwpQeg4Lc+Bb3ngvCoWBk+FLOGjJwNHumh9/9wi5JEqaWy74lGgLNDTvnp8x3axeUTLVATFK0CSctQoMSNQGIO67951Tm/0tXz7i2EQBuXqX31l3f6ipMC7DpYe8aMMj3S41OGyHh7p8KgM9yKPNbDSwKoenujwpAxPdHiqw9N6eKbDs3p4rsPzMpzqu+YqNGyFTpSOsQyLRoxhWcx4FiYfYbgWHrYRDKe0kcYwL5yoQGhwE5M4hRHNiUHHyh/DJtcflWAu0h+FGfJ5yVgZ5byU6LhhYPxhajDhop9lFM/O+qMsoZ6olOcu/HElE5W4lo6kWiPm5cczCvE8tA6HntjQVACjJpFsxNi6QVpySBVwPJh+Gd0cjYuDRGF+JZJpkmEhR5ZigjTLM6wOUCri2SeFMflUhjnm4fHAOpaEZ+DwiO0jUyLHBGblkYsUc1YGi0yk4PnzCBN8SsY8s1TJz83Im19Uy49zSGpfJj/L0dyMVJkRcEqbA5Bh2rDy5WEssfwZZCYH82g9mpP0ZEEPRqoqWdAji0Is7dAPTifcQnokI0adPT8jfkQWtZGrv6x8GZkc/Pk1M4LXE2cKaz80gx51SB5k6UHOfPnqDPNKhukDMnwkJ4205edNiFhPmOqnxe5T8kfzUhqreFiMlrsKl9JXoaLH85IP52VUxWZlPk0pOZW2UbOeUFhVfhy+aiKt8dm0SY8UnD+fbK48azy3HJ2sGYnk8WpWU5S4kVvjKdI8SYSVsUXyVKX3iVMjbIjVPmWseB7afNuMtRU0yKvM17OqVbtmQdYoqOVo4U3OVQPosYOqrNiVBydPfY/M/2DUCVpPPoNFRtx48lJgiZUNLdPW8Gemm9TYNkCmwXOboxkqlWhUZVoGywxYDSEHxrqFERoyrQUypVnZ6HnaPmRdOVGmODjA5NdTbs+JY175tCwOg4Pw2Tft2HRz8loWzd8hqHXOgbQE8zHtAc6h1lcmMObZgfkBznfXgXxWe4DD24NMhzHK4cn1GR8rWBzwmlO9CFUcds8GnT/j5rZCqrT8kIUQCb42V3c+9PprG3u7heipbouCNv5qNh8VmQz1vUHXg+LHffd60NldxzmMRfSqPJGxOzv2mg9tdPYC807WrnP5UxFnXedO7YJEueTeDTXsvO9ZVBKgu2ubG1sbe0UEND+vrW6/3y2SmCM+7/7WHxdSlB+4daxbHo5JuMuPa1wRZo+WLJKuPXCRX8293wVJFYg/2u8y5jUOjCy/CBkVvgNIAU6kAd7+tLPV3/vtc68IQcXe6s6e/mRyP36yn0zj3qfP+gtEmtuBNnfox4lnARuc2r0+iNPPAjYYw8nZdHg5OikOljsijHKs9qG3LKeyxFsYRzJO5SsOVSrHmpMOVacwVr1lsnotgkjSNFYE0VEUSo9UJRnpHGFJwzx7pQ67x4PO1jrLKYpVsjTnri9Akfw/9lbf93b6a/vrLDsTCp3jfUt2l1gc5qoR+WFndXt/s1eQuQi7+s5l0oawuz7o7GysrxfD4eJPePmpjaBfV//S4yC86KCTi5s+B9HLgg7i+58QhBcdNB0Njj/Sf3fH79DujUfvY30QTKigqaOxfzahTgl1Rl7o/cyWkgIbX12IOHgRtgNLVSVxhsQvX1ryKnFkbiiyrTO/rUYljPIO+7/MsVS35shJkejjqES2cj7bklomFsni3ZJE6u65u4PVxX631GKSa8f/3ZxOL+9+Gv39ZjQ5Hh0vQIzD09vJ+cLk8mbhDJiwPXR0/FP3/m6puO3eFkbE5cbhNWwtfVFMujgdupIjy3CtRoUmgiR7SzI19wkT5rWl7P683F+71j13t9feLWV2mzG2cvotFbZ3/+26s3UV9fRO/8Z24ehFY4MsCvVycn05HunDVKFbO9srCzMsi1bcwYJz5PICn1LGQrq+Gg3PTs5IRO1gWIjg3NyEMsE9iXrL5y0r2a9UtHj+MgzW+OW3QF+I/nUQ6A2fd8PgiF/OBsE3fukNA3Od5VFwoW9PHwbf+WUb18vg5e/DYKzxHAV6s+nmMPjCL1vDbuvWvUNzLfgQnARHwbdgEFwE34Mv2BVaif9C4YN297sb+iG4aHdP3JBbYqwKMSKsYz45YxY6ptBbvsbz6vofOIjHTdHujt3vIz7sxckh4FzvqjeAfsGhBE4IeDixx0Lczi6iW8SZGpU7OYc4ZKNydec5hejjqyf0Zu8T0NtdKcAeuhYBrHoMNIWYc9RxGfdo+u3ybIpLAr/OvUBQdG8bt+QtftWEv+eWNLjCPWQdqV69X0qxwFRv5t2Y3GSr2Ha9eNUub0UlUteaBxi0fwiyNTiSpMBhdwOj4m/fU9D7wn4+IR8qCSvL6vETXwOck1BimgZhcFUeAFDFMsXRRLxfnGzpoG0vba0dU2IvbL1tnmVCmT0L/701AL8Ovhlbvz6412GkDa3/A7oRBI0='
+
+def _fetch_hls_audio(url, progress=None):
+    """Загружаем HLS только в пределах ограничений; DRM не обходим."""
+    for _ in range(4):
+        r = _sc_get_retry(url, headers=SC_HEADERS)
+        r.raise_for_status()
+        lines = [x.strip() for x in r.text.splitlines() if x.strip()]
+        if not lines or lines[0] != "#EXTM3U": raise ValueError("неверный HLS-плейлист")
+        variants = [lines[i+1] for i, x in enumerate(lines[:-1]) if x.startswith("#EXT-X-STREAM-INF:") and not lines[i+1].startswith("#")]
+        if variants:
+            url = urllib.parse.urljoin(url, variants[0]); continue
+        if any(x.startswith("#EXT-X-KEY:") and "METHOD=NONE" not in x for x in lines):
+            raise ValueError("SoundCloud вернул зашифрованный поток — этот тип пока не поддерживается")
+        if any(x.startswith("#EXT-X-BYTERANGE") for x in lines):
+            raise ValueError("HLS с диапазонами байтов пока не поддерживается")
+        if "#EXT-X-ENDLIST" not in lines: raise ValueError("неполный HLS-плейлист")
+        items = []
+        for x in lines:
+            if x.startswith("#EXT-X-MAP:"):
+                m = re.search(r'URI="([^"]+)"', x)
+                if not m: raise ValueError("неверная инициализация HLS")
+                items.append(m.group(1))
+            elif not x.startswith("#"): items.append(x)
+        if not items or len(items) > 3000: raise ValueError("некорректное количество сегментов")
+        out = bytearray()
+        for index, item in enumerate(items):
+            segment = _sc_get_retry(urllib.parse.urljoin(url,item), headers=SC_HEADERS)
+            segment.raise_for_status(); out.extend(segment.content)
+            if len(out) > 25 * 1024 * 1024: raise ValueError("трек слишком большой для встроенного конвертера (25 МБ)")
+            if progress: progress((index+1)*100//len(items))
+        return bytes(out)
+    raise ValueError("слишком много вложенных плейлистов")
+
+
+def _webview_encode_mp3(audio: bytes, path: str, bitrate: int = 192):
+    """Экспериментальный WebView: AAC -> PCM -> MP3, без сети в WebView."""
+    from java import jclass, dynamic_proxy
+    from android_utils import run_on_ui_thread
+    ValueCallback = jclass("android.webkit.ValueCallback")
+    WebView = jclass("android.webkit.WebView")
+    ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+    encoder = zlib.decompress(base64.b64decode(_LAMEJS_ZLIB_B64)).decode("utf-8")
+    js = """<html><head><meta name="viewport" content="width=device-width"></head><body><script>
+""" + encoder + """
+window.parts=[];window.out='';window.status='waiting';
+window.startEncode=async function(){try{
+let b=atob(window.parts.join('')); window.parts=[];let raw=new Uint8Array(b.length);for(let i=0;i<b.length;i++)raw[i]=b.charCodeAt(i); b=null;
+let ctx=new (window.AudioContext||window.webkitAudioContext)();let decoded=await ctx.decodeAudioData(raw.buffer);raw=null;
+let n=Math.min(2,decoded.numberOfChannels);let rate=decoded.sampleRate;
+let enc=new lamejs.Mp3Encoder(n,rate,""" + str(bitrate if bitrate in (128, 192, 256, 320) else 192) + """), left=decoded.getChannelData(0),right=n===2?decoded.getChannelData(1):null,out=[];
+for(let i=0;i<left.length;i+=1152){let len=Math.min(1152,left.length-i),l=new Int16Array(len),r=n===2?new Int16Array(len):null;
+for(let j=0;j<len;j++){let v=Math.max(-1,Math.min(1,left[i+j]));l[j]=v<0?v*32768:v*32767;if(r){v=Math.max(-1,Math.min(1,right[i+j]));r[j]=v<0?v*32768:v*32767;}}
+let chunk=r?enc.encodeBuffer(l,r):enc.encodeBuffer(l);if(chunk.length)out.push(new Uint8Array(chunk));}
+let end=enc.flush();if(end.length)out.push(new Uint8Array(end)); let size=out.reduce((a,c)=>a+c.length,0), bytes=new Uint8Array(size),off=0;
+for(let c of out){bytes.set(c,off);off+=c.length;}out=[];let segments=[];for(let i=0;i<bytes.length;i+=8192)segments.push(String.fromCharCode.apply(null,bytes.subarray(i,i+8192)));
+window.out=btoa(segments.join(''));window.status='done';await ctx.close();
+}catch(e){window.status='error:'+String(e);}};
+</script></body></html>"""
+    state = {"view":None, "callback":None}
+    def ui_call(fn, timeout=30):
+        event=threading.Event(); box={}
+        def action():
+            try: box["value"]=fn()
+            except Exception as exc: box["error"]=exc
+            finally: event.set()
+        run_on_ui_thread(action)
+        if not event.wait(timeout): raise ValueError("WebView не ответил")
+        if "error" in box: raise box["error"]
+        return box.get("value")
+    def setup():
+        view=WebView(ApplicationLoader.applicationContext); settings=view.getSettings()
+        settings.setJavaScriptEnabled(True); settings.setAllowFileAccess(False); settings.setAllowContentAccess(False); settings.setBlockNetworkLoads(True)
+        view.loadDataWithBaseURL("https://localhost/", js, "text/html", "UTF-8", None); state["view"]=view
+    def evaluate(code):
+        done=threading.Event(); result={}
+        class Callback(dynamic_proxy(ValueCallback)):
+            def onReceiveValue(self, value):
+                result["value"]=str(value); done.set()
+        cb=Callback(); state["callback"]=cb
+        ui_call(lambda:state["view"].evaluateJavascript(code,cb))
+        if not done.wait(30): raise ValueError("WebView не ответил на запрос")
+        return json.loads(result.get("value","null"))
+    try:
+        ui_call(setup)
+        for _ in range(100):
+            if evaluate("typeof window.startEncode") == "function": break
+            time.sleep(0.1)
+        else: raise ValueError("WebView не загрузил кодировщик")
+        data=base64.b64encode(audio).decode("ascii")
+        for offset in range(0,len(data),49152):
+            evaluate("window.parts.push("+json.dumps(data[offset:offset+49152])+");true")
+        evaluate("window.status='encoding';window.startEncode();true")
+        deadline=time.time()+240
+        while time.time()<deadline:
+            status=evaluate("window.status")
+            if status=="done": break
+            if status and status.startswith("error:"): raise ValueError("не удалось декодировать поток: "+status[6:150])
+            time.sleep(0.5)
+        else: raise ValueError("конвертация заняла слишком много времени")
+        length=evaluate("window.out.length"); parts=[]
+        for offset in range(0,int(length),49152):
+            parts.append(evaluate("window.out.slice(%d,%d)" % (offset,offset+49152)))
+        result=base64.b64decode("".join(parts),validate=True)
+        if not result.startswith((b"ID3",b"\xff")): raise ValueError("кодировщик не создал MP3")
+        with open(path,"wb") as output: output.write(result)
+    finally:
+        if state["view"] is not None:
+            try: ui_call(lambda:state["view"].destroy())
+            except Exception: pass
+
+def _read_stream_bytes(response, progress=None, limit=None):
+    response.raise_for_status()
+    total_text=response.headers.get('Content-Length', '')
+    try: total=int(total_text)
+    except (TypeError, ValueError): total=0
+    if response.headers.get('Content-Encoding', 'identity').lower() not in ('', 'identity'): total=0
+    if limit and total > limit: raise ValueError('трек слишком большой (25 МБ)')
+    out=bytearray(); last=-1
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk: continue
+        out.extend(chunk)
+        if limit and len(out)>limit: raise ValueError('трек слишком большой (25 МБ)')
+        if progress and total>0:
+            value=min(100, len(out)*100//total)
+            if value!=last: progress(value);last=value
+    return bytes(out)
+
+def _sc_download_mp3(stream: Dict, path: str, bitrate: int = 192, progress=None) -> None:
+    url = stream["url"]
+    if stream.get("codec") == "aac":
+        if stream["protocol"] == "hls":
+            audio = _fetch_hls_audio(url, progress=(lambda value: progress(('percent',value))) if progress else None)
+        else:
+            with _sc_get_retry(url, headers=SC_HEADERS, stream=True) as r:
+                audio = _read_stream_bytes(r, (lambda value: progress(('percent',value))) if progress else None, 25*1024*1024)
+        if progress: progress("Конвертируем в MP3…")
+        _webview_encode_mp3(audio, path, bitrate)
+        return
+    if stream["protocol"] == "progressive":
+        with _safe_get(url, headers=SC_HEADERS, timeout=60, stream=True) as r:
+            audio = _mp3_payload(_read_stream_bytes(r, (lambda value: progress(('percent',value))) if progress else None))
+        with open(path, "wb") as out:
+            out.write(audio)
+        return
+    # Поддерживаем незашифрованный VOD HLS с MP3-сегментами.
+    for depth in range(3):
+        r = _safe_get(url, headers=SC_HEADERS, timeout=20)
+        r.raise_for_status()
+        lines = [line.strip() for line in r.text.splitlines() if line.strip()]
+        if not lines or lines[0] != "#EXTM3U":
+            raise ValueError("SoundCloud вернул неверный HLS-плейлист")
+        if any(line.startswith("#EXT-X-STREAM-INF:") for line in lines):
+            variants = [lines[i+1] for i, line in enumerate(lines[:-1]) if line.startswith("#EXT-X-STREAM-INF:") and not lines[i+1].startswith("#")]
+            if not variants:
+                raise ValueError("в HLS нет аудиопотока")
+            url = urllib.parse.urljoin(url, variants[0])
+            continue
+        if any(line.startswith("#EXT-X-KEY:") and "METHOD=NONE" not in line for line in lines):
+            raise ValueError("зашифрованный поток не поддерживается")
+        if any(line.startswith(("#EXT-X-BYTERANGE", "#EXT-X-MAP")) for line in lines):
+            raise ValueError("этот формат HLS пока не поддерживается")
+        if "#EXT-X-ENDLIST" not in lines:
+            raise ValueError("SoundCloud вернул неполный поток")
+        segments = [line for line in lines if not line.startswith("#")]
+        if not segments or len(segments) > 5000:
+            raise ValueError("неверное число сегментов")
+        with open(path, "wb") as out:
+            for index, segment in enumerate(segments):
+                part = _safe_get(urllib.parse.urljoin(url, segment), headers=SC_HEADERS, timeout=30)
+                part.raise_for_status()
+                out.write(_mp3_payload(part.content))
+                if progress: progress(('percent',(index+1)*100//len(segments)))
+        return
+    raise ValueError("слишком много вложенных HLS-плейлистов")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ════════════════  SPOTIFY  ═══════════════════════════════════════════════════
@@ -608,6 +866,7 @@ def sp_search(query: str, limit: int = 20, sp_dc: str = "") -> Tuple[List[Dict],
                 "duration":    f"{dur//60000}:{(dur%60000)//1000:02d}" if dur else "",
                 "id":          t.get("id",""),
                 "sp_url":      t.get("external_urls",{}).get("spotify",""),
+                "preview_url": t.get("preview_url") or "",
                 "artwork_url": art,
                 "genre":       "",
                 "year":        (t.get("album",{}).get("release_date") or "")[:4],
@@ -622,15 +881,13 @@ def sp_search(query: str, limit: int = 20, sp_dc: str = "") -> Tuple[List[Dict],
     except Exception as e:
         return [], str(e)
 
-def sp_download(track_id: str, sp_dc: str = "") -> Tuple[Optional[str], Optional[str]]:
+def sp_download(track_id: str, sp_dc: str = "", progress=None) -> Tuple[Optional[str], Optional[str]]:
     """
     Скачивание через spotifydown.com API.
     Если есть sp_dc — отправляем для лучшего качества.
     """
     try:
         hdrs = dict(SP_DL_HEADERS)
-        if sp_dc:
-            hdrs["Cookie"] = f"sp_dc={sp_dc}"
         r = requests.get(f"{SP_DL_BASE}/download/{track_id}", headers=hdrs, timeout=25)
         d = r.json()
         if not d.get("success"):
@@ -638,7 +895,7 @@ def sp_download(track_id: str, sp_dc: str = "") -> Tuple[Optional[str], Optional
         url = d.get("link")
         if not url: return None, "нет ссылки на файл"
         path = "/sdcard/Download/music_dl_sp.mp3"
-        if _dl_file(url, path, headers=hdrs): return path, None
+        if _dl_file(url, path, headers=hdrs, progress=progress): return path, None
         return None, "ошибка загрузки"
     except Exception as e:
         return None, str(e)
@@ -716,13 +973,21 @@ def service_search(svc: str, query: str, limit: int = 20, **kw) -> Tuple[List[Di
 # Файлы / обложки
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _dl_file(url: str, path: str, headers: Optional[Dict] = None) -> bool:
+def _dl_file(url: str, path: str, headers: Optional[Dict] = None, progress=None) -> bool:
     try:
         with _safe_get(url, headers=headers or SC_HEADERS, stream=True, timeout=300) as r:
             r.raise_for_status()
+            try: total=int(r.headers.get('Content-Length',0))
+            except (ValueError, TypeError): total=0
+            if r.headers.get('Content-Encoding','identity').lower() not in ('','identity'): total=0
+            written=0;last=-1
             with open(path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=131072):
-                    if chunk: f.write(chunk)
+                    if chunk:
+                        f.write(chunk);written+=len(chunk)
+                        if progress and total>0:
+                            value=min(100,written*100//total)
+                            if value!=last: progress(value);last=value
         return True
     except Exception:
         return False
@@ -764,7 +1029,6 @@ def write_id3(path: str, title: str, artist: str, performer: str,
         frames += _tf("TPE2", artist)
         if genre:   frames += _tf("TCON", genre)
         if year:    frames += _tf("TDRC", year)
-        frames += _tf("TENC", f"music_dl/{svc}" if svc else "music_dl")
         if artwork: frames += _apic(artwork)
         header = b"ID3\x03\x00\x00" + _syncsafe(len(frames))
         with open(path,"rb") as f: mp3 = f.read()
@@ -839,12 +1103,31 @@ def build_favs_page(favs, page, per_page, lang="ru") -> str:
 # ════════════════  PLUGIN  ════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 
+_UI_EN = {'Music Downloader — как пользоваться': 'Music Downloader — how to use', 'Открой нужный чат и отправь команду .search — сообщение не появится в чате.\n\nВведи название, выбери сервис и нажми «Искать». Выбери трек, чтобы отправить его в текущий чат.\n\nБитрейт SoundCloud можно изменить в настройках плагина. Прежние команды .find и dlf также работают.': 'Open a chat and send .search; the command will not appear in the chat. You can also use the floating search button or the chat actions menu.\n\nEnter a title or artist, choose a service and search. Tap the play icon to preview a track, or tap its title to choose where to send it.\n\nYou can change the SoundCloud MP3 bitrate and floating button in plugin settings. The .find and dlf commands still work.', 'Принял': 'Got it', 'Ты точно понял, как пользоваться?': 'Are you sure you understand how to use it?', 'Учти, больше это окно ты не увидишь.': 'You will not see this guide again.', 'Да да, я понял': 'Yes, I understand', 'Погоди, я не понял': 'Wait, show me again', 'Что ищем?': 'What are we looking for?', 'Название или исполнитель': 'Title or artist', 'Сервис': 'Service', 'Произошла ошибка': 'Something went wrong', 'Повторить': 'Try again', 'Отправить трек?': 'Send this track?', 'Отправить сюда': 'Send here', 'Другой чат': 'Another chat', 'Отмена': 'Cancel', 'Результаты': 'Results', 'Изменить': 'Edit', 'Загружается аудио': 'Loading audio', 'Ищем вашу песню…': 'Searching for your song…', '\nСообщите @S1mclick': '\nReport this to @S1mclick', 'Назад': 'Previous', 'Далее': 'Next', 'Остановить предпрослушивание': 'Stop preview', 'Слушать трек': 'Preview track', 'Предпрослушивание: ': 'Preview: ', 'Введите название песни': 'Enter a song title', 'Аккаунт изменился. Открой поиск и выбери чат заново.': 'Account changed. Open search and choose a chat again.', 'Spotify не предоставил превью для этого трека': 'Spotify did not provide a preview for this track', 'Выбор чата: ': 'Chat selection: ', 'экран чатов не открылся': 'Could not open the chat picker', 'Звук занят другим приложением': 'Audio is in use by another app', 'Ничего не найдено': 'No results found', 'Новый поиск': 'New search', 'Tidal не предоставил поток для прослушивания': 'Tidal did not provide an audio stream', 'Поток недоступен': 'Stream unavailable', 'Трек слишком большой': 'Track is too large', 'Плеер Android не смог открыть аудио (код %s, %s)': 'Android could not play audio (code %s, %s)', 'Чат не выбран': 'No chat selected', 'Выбери один чат': 'Select one chat', 'Отправка в темы пока не поддерживается': 'Sending to topics is not supported yet', 'не удалось определить выбранный чат': 'Could not identify the selected chat', 'аккаунт изменился. Выбери чат заново': 'Account changed. Select a chat again', 'Чат ': 'Chat ', 'Отправить': 'Send', 'окно выбора уже закрыто': 'The chat picker has already closed', '\n\nКуда: ': '\n\nTo: ', 'аккаунт изменился, отправка отменена': 'Account changed; sending cancelled', 'Подключаемся к сервису…': 'Connecting to the service…', 'Подготовка трека': 'Preparing track', 'Не удалось показать загрузку. Повтори попытку.': 'Could not show download progress. Try again.', 'Аккаунт изменился. Повтори выбор чата.': 'Account changed. Select a chat again.', 'Не удалось скачать': 'Download failed', 'Закрыть': 'Close', 'Файл передан Telegram для отправки': 'File handed to Telegram for sending', 'Скачиваем трек…': 'Downloading track…', 'Конвертируем в MP3…': 'Converting to MP3…', 'Подготавливаем название и обложку…': 'Preparing title and artwork…', 'Передаём файл в Telegram…': 'Handing file to Telegram…', 'Аккаунт изменился; отправка отменена.': 'Account changed; sending cancelled.', 'Открыть поиск музыки': 'Open music search', '\nПрослушиваний: ': '\nPlays: ', '  Лайков: ': '  Likes: ', '\nЖанр: ': '\nGenre: ', 'Плавающая кнопка поиска': 'Floating search button', 'Показывать кнопку внутри открытого чата': 'Show the button inside the open chat'}
+
 class MusicPlugin(BasePlugin):
 
     # ── i18n ─────────────────────────────────────────────────────────────────
 
     def _lang(self) -> str:
-        return "en" if self.get_setting("language",0) == 1 else "ru"
+        # Старые значения 0 и 1 сохранены: настройки при обновлении не собьются.
+        value = self.get_setting("language", 2)
+        if value == 0: return "ru"
+        if value == 1: return "en"
+        try:
+            from org.telegram.messenger import LocaleController
+            locale = LocaleController.getInstance().getCurrentLocale()
+            code = str(locale.getLanguage()).lower()
+            return "ru" if code == "ru" else "en"
+        except Exception:
+            try:
+                from java.util import Locale
+                return "ru" if str(Locale.getDefault().getLanguage()).lower() == "ru" else "en"
+            except Exception: return "en"
+
+    def _ui(self, text):
+        if self._lang() == "ru": return text
+        return _UI_EN.get(text, text)
 
     def _t(self, key: str, **kw) -> str:
         text = TEXTS.get(self._lang(), TEXTS["ru"]).get(key, key)
@@ -856,11 +1139,10 @@ class MusicPlugin(BasePlugin):
     def _svc(self)        -> str: return [SERVICE_SC,SERVICE_SP,SERVICE_TD][self.get_setting("service",0)]
     def _per_page(self)   -> int: return [3,5,7,10][self.get_setting("results_per_page",1)]
     def _limit(self)      -> int: return [10,20,30,50][self.get_setting("search_limit",1)]
-    def _wm(self)         -> str: return self.get_setting("watermark_user","@s1mclick")
     def _sc_cid(self)     -> str: return _safe_text(self.get_setting("sc_client_id","")).strip()
     def _sp_dc(self)      -> str: return _safe_text(self.get_setting("sp_dc","")).strip()
     def _td_tok(self)     -> str: return _safe_text(self.get_setting("td_token","")).strip()
-    def _performer(self, artist: str) -> str: return f"{artist} | dled by {self._wm()}"
+    def _performer(self, artist: str) -> str: return f"{artist}"
 
     def _search_kw(self) -> Dict:
         return {"sc_cid": self._sc_cid(), "sp_dc": self._sp_dc(), "td_token": self._td_tok()}
@@ -926,11 +1208,669 @@ class MusicPlugin(BasePlugin):
         }
         send_text(pid, build_favs_page(favs, page, per_page, lang))
 
+    def _guide_show(self):
+        if self.get_setting("guide_accepted_v1", False): return
+        try:
+            from client_utils import get_last_fragment
+            from ui.alert import AlertDialogBuilder
+            from android_utils import run_on_ui_thread
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity: return
+            guide = AlertDialogBuilder(activity)
+            guide.set_title(self._ui("Music Downloader — как пользоваться"))
+            guide.set_message(self._ui("Открой нужный чат и отправь команду .search — сообщение не появится в чате.\n\nВведи название, выбери сервис и нажми «Искать». Выбери трек, чтобы отправить его в текущий чат.\n\nБитрейт SoundCloud можно изменить в настройках плагина. Прежние команды .find и dlf также работают."))
+            def accept(b, which):
+                b.dismiss()
+                def confirm():
+                    box = AlertDialogBuilder(activity)
+                    box.set_title(self._ui("Ты точно понял, как пользоваться?"))
+                    box.set_message(self._ui("Учти, больше это окно ты не увидишь."))
+                    def yes(dialog, n):
+                        self.set_setting("guide_accepted_v1", True, reload_settings=False)
+                        dialog.dismiss()
+                    def again(dialog, n):
+                        dialog.dismiss(); run_on_ui_thread(self._guide_show, 100)
+                    box.set_positive_button(self._ui("Да да, я понял"), yes)
+                    box.set_negative_button(self._ui("Погоди, я не понял"), again)
+                    box.show()
+                run_on_ui_thread(confirm, 100)
+            guide.set_positive_button(self._ui("Принял"), accept)
+            guide.show()
+        except Exception as exc:
+            try: self.logger.error("Music Downloader guide: %s", exc)
+            except: pass
+
+    def _open_search_ui(self, pid, source_fragment=None):
+        from android_utils import run_on_ui_thread, OnClickListener
+        from client_utils import get_last_fragment
+        from ui.alert import AlertDialogBuilder
+        from android.widget import LinearLayout, TextView, EditText, ScrollView, ImageView, FrameLayout, ProgressBar
+        from android.view import Gravity
+        from android.graphics.drawable import GradientDrawable, RippleDrawable, ShapeDrawable
+        from android.graphics.drawable.shapes import PathShape
+        from android.graphics import Path
+        from android.content.res import ColorStateList
+        from android.view.animation import DecelerateInterpolator
+        from java import dynamic_proxy, jclass
+        from org.telegram.messenger import AndroidUtilities, MediaDataController, UserConfig
+        from org.telegram.ui.Components import BackupImageView
+        from org.telegram.ui.ActionBar import BottomSheet, Theme
+        fragment = source_fragment or get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if not activity: return
+        dp=AndroidUtilities.dp
+        def color(key, fallback):
+            try: return Theme.getColor(getattr(Theme, key))
+            except Exception: return fallback
+        primary=color('key_dialogTextBlack',-1)
+        secondary=color('key_dialogTextGray',-7829368)
+        surface=color('key_dialogBackground',-14671580)
+        accent=color('key_windowBackgroundWhiteBlueText',-10053121)
+        field_bg=color('key_windowBackgroundGray',-13421773)
+        def background(fill, radius=16):
+            d=GradientDrawable(); d.setColor(fill); d.setCornerRadius(float(dp(radius))); return d
+        root=LinearLayout(activity); root.setOrientation(1); root.setPadding(dp(16),dp(4),dp(16),dp(12))
+        state={'service':self._svc(),'query':'','page':0,'results':[],'closed':False,'generation':0,'sheet':None,'player':None,'player_token':0,'player_callbacks':[], 'preview_id':None,'preview_button':None, 'service_menu_open':False}
+        scroll=ScrollView(activity); scroll.setFillViewport(False); scroll.addView(root)
+        builder=BottomSheet.Builder(activity); builder.setCustomView(scroll)
+        sheet=builder.create(); sheet.setFocusable(True); state['sheet']=sheet
+        def set_preview_icon(view, mode):
+            # API overloads differ between Android builds; a failed icon must not
+            # interrupt rendering any result or disable the play button.
+            spinner=view.getTag()
+            if spinner is not None: spinner.setVisibility(0 if mode == 'loading' else 8)
+            view.setVisibility(4 if mode == 'loading' else 0)
+            view.setContentDescription(self._ui('Загружается аудио') if mode == 'loading' else self._ui('Остановить предпрослушивание') if mode == 'stop' else self._ui('Слушать трек'))
+            if mode == 'loading': return
+            try:
+                shape=Path()
+                if mode == 'stop':
+                    shape.moveTo(5.0,5.0);shape.lineTo(19.0,5.0);shape.lineTo(19.0,19.0);shape.lineTo(5.0,19.0);shape.close()
+                else:
+                    shape.moveTo(7.0,3.0);shape.lineTo(20.0,12.0);shape.lineTo(7.0,21.0);shape.close()
+                drawable=ShapeDrawable(PathShape(shape,24.0,24.0));drawable.getPaint().setColor(accent)
+                view.setImageDrawable(drawable)
+            except Exception:
+                try:
+                    resources=jclass('android.R$drawable')
+                    view.setImageResource(resources.ic_media_pause if mode == 'stop' else resources.ic_media_play)
+                    view.setColorFilter(accent)
+                except Exception: pass
+        def show_preview_error(message):
+            try:
+                from ui.bulletin import BulletinHelper
+                BulletinHelper.show_error(self._ui('Предпрослушивание: ')+str(message)[:160])
+            except Exception:
+                try: self.logger.error('Preview: %s',str(message)[:200])
+                except Exception: pass
+        def stop_preview():
+            state['player_token'] += 1
+            player=state.get('player');state['player']=None;state['preview_id']=None
+            button=state.get('preview_button');state['preview_button']=None
+            if button is not None:
+                try: set_preview_icon(button,'play')
+                except Exception: pass
+            if player is not None:
+                try: player.reset();player.release()
+                except Exception:
+                    try: player.release()
+                    except Exception: pass
+            manager=state.pop('audio_manager',None);focus=state.pop('audio_focus',None)
+            if manager is not None and focus is not None:
+                try: manager.abandonAudioFocus(focus)
+                except Exception: pass
+            state['player_callbacks']=[]
+            path=state.pop('preview_path',None)
+            if path:
+                try: os.unlink(path)
+                except OSError: pass
+        def on_sheet_closed():
+            state['closed']=True;state['generation']+=1;stop_preview()
+        class OnClose(dynamic_proxy(jclass('android.content.DialogInterface$OnDismissListener'))):
+            def onDismiss(self, dialog): on_sheet_closed()
+        state['dismiss_listener']=OnClose();sheet.setOnDismissListener(state['dismiss_listener'])
+        def preview(item, button):
+            if state['preview_id'] == item.get('id'):
+                stop_preview(); return
+            stop_preview()
+            state['preview_id']=item.get('id');state['preview_button']=button;set_preview_icon(button,'loading')
+            token=state['player_token']
+            def resolve():
+                try:
+                    service=item.get('service',SERVICE_SC)
+                    if service==SERVICE_SP:
+                        path=item.get('preview_url')
+                        if not path:
+                            token_sp=_sp_anon_token()
+                            if not token_sp and self._sp_dc(): token_sp,_=_sp_user_token(self._sp_dc())
+                            if token_sp:
+                                response=requests.get(f"{SP_API}/tracks/{item['id']}",headers=_sp_headers(token_sp),timeout=12)
+                                response.raise_for_status();path=response.json().get('preview_url')
+                        if not path: raise ValueError(self._ui('Spotify не предоставил превью для этого трека'))
+                    elif service==SERVICE_TD:
+                        path,err=td_stream(item['id'],custom_token=self._td_tok())
+                        if not path: raise ValueError(err or self._ui('Tidal не предоставил поток для прослушивания'))
+                    else:
+                        stream,err=sc_stream(item['id'],custom=self._sc_cid())
+                        if not stream: raise ValueError(err or self._ui('Поток недоступен'))
+                        if stream['protocol'] == 'hls':
+                            audio=_fetch_hls_audio(stream['url'])
+                        else:
+                            response=_sc_get_retry(stream['url'],headers=SC_HEADERS)
+                            response.raise_for_status();audio=response.content
+                            if len(audio)>25*1024*1024: raise ValueError(self._ui('Трек слишком большой'))
+                        # Use exactly the same AAC decoder and MP3 encoder which is
+                        # already used by downloads, avoiding unsupported raw HLS containers.
+                        cache_dir=str(activity.getCacheDir().getAbsolutePath())
+                        fd,path=tempfile.mkstemp(prefix='music_preview_',suffix='.mp3',dir=cache_dir)
+                        os.close(fd)
+                        try:
+                            if stream.get('codec') == 'aac':
+                                _webview_encode_mp3(audio,path,128)
+                            elif stream.get('protocol') == 'hls':
+                                _sc_download_mp3(stream,path,128)
+                            else:
+                                with open(path,'wb') as output: output.write(_mp3_payload(audio))
+                        except Exception:
+                            try: os.unlink(path)
+                            except OSError: pass
+                            raise
+                    def play():
+                        if state['closed'] or token!=state['player_token']:
+                            if service==SERVICE_SC:
+                                try: os.unlink(path)
+                                except OSError: pass
+                            return
+                        state['preview_path']=path if service==SERVICE_SC else None
+                        try:
+                            MediaPlayer=jclass('android.media.MediaPlayer')
+                            AudioManager=jclass('android.media.AudioManager')
+                            Context=jclass('android.content.Context')
+                            class FocusChange(dynamic_proxy(jclass('android.media.AudioManager$OnAudioFocusChangeListener'))):
+                                def onAudioFocusChange(self, change):
+                                    if change < 0: run_on_ui_thread(stop_preview)
+                            focus=FocusChange();manager=activity.getSystemService(Context.AUDIO_SERVICE)
+                            if manager.requestAudioFocus(focus,AudioManager.STREAM_MUSIC,AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED:
+                                stop_preview();show_preview_error(self._ui('Звук занят другим приложением'));return
+                            state['audio_manager']=manager;state['audio_focus']=focus
+                            player=MediaPlayer();state['player']=player
+                            class Prepared(dynamic_proxy(jclass('android.media.MediaPlayer$OnPreparedListener'))):
+                                def onPrepared(self, mp):
+                                    if token!=state['player_token'] or state['closed']: return
+                                    try: mp.start();set_preview_icon(button,'stop')
+                                    except Exception: stop_preview()
+                            class Complete(dynamic_proxy(jclass('android.media.MediaPlayer$OnCompletionListener'))):
+                                def onCompletion(self, mp): stop_preview()
+                            class Failed(dynamic_proxy(jclass('android.media.MediaPlayer$OnErrorListener'))):
+                                def onError(proxy, mp, what, extra):
+                                    stop_preview();show_preview_error(self._ui('Плеер Android не смог открыть аудио (код %s, %s)') % (what, extra));return True
+                            prepared,complete,failed=Prepared(),Complete(),Failed()
+                            state['player_callbacks']=[prepared,complete,failed,focus]
+                            player.setOnPreparedListener(prepared);player.setOnCompletionListener(complete);player.setOnErrorListener(failed)
+                            player.setDataSource(path);player.prepareAsync()
+                        except Exception as exc:
+                            message=str(exc);stop_preview();show_preview_error(message)
+                    run_on_ui_thread(play)
+                except Exception as exc:
+                    message=str(exc)
+                    def fail():
+                        if token == state['player_token'] and not state['closed']:
+                            stop_preview();show_preview_error(message)
+                    run_on_ui_thread(fail)
+            run_on_queue(resolve)
+        def params(w=-1,h=-2,weight=0): return LinearLayout.LayoutParams(w,h,float(weight))
+        def clear(): root.removeAllViews()
+        def row():
+            v=LinearLayout(activity); v.setOrientation(0); v.setGravity(Gravity.CENTER_VERTICAL); root.addView(v); return v
+        def label(parent,value,size=15,tint=None):
+            v=TextView(activity); v.setText(str(value)); v.setTextSize(float(size)); v.setTextColor(primary if tint is None else tint); parent.addView(v); return v
+        def click(v, callback, fill=None):
+            ripple_color = color('key_listSelector', 0x334c8bf5)
+            try:
+                shape = background(field_bg if fill is None else fill, 16)
+                v.setBackground(RippleDrawable(ColorStateList.valueOf(ripple_color), shape, None))
+            except Exception:
+                v.setBackground(background(field_bg if fill is None else fill,16))
+            v.setClickable(True)
+            v.setOnClickListener(OnClickListener(lambda _:callback()))
+        def text_button(parent,value, callback, width=-2):
+            v=TextView(activity); v.setText(value); v.setTextSize(14.0); v.setTextColor(accent); v.setGravity(Gravity.CENTER); v.setPadding(dp(12),dp(8),dp(12),dp(8)); parent.addView(v,params(width,dp(44))); click(v,callback); return v
+        def sticker(index, height=76):
+            try:
+                image=BackupImageView(activity); lp=params(dp(height),dp(height));lp.gravity=Gravity.CENTER_HORIZONTAL;root.addView(image,lp)
+                MediaDataController.getInstance(UserConfig.selectedAccount).setPlaceholderImageByIndex(image,'SpottyAnimated',index,'130_130')
+            except Exception: pass
+        def status(title,index,detail=''):
+            clear(); sticker(index); v=label(root,title,18);v.setGravity(Gravity.CENTER);v.setPadding(0,dp(4),0,dp(4))
+            if detail:
+                v=label(root,detail,13,secondary);v.setGravity(Gravity.CENTER);v.setPadding(0,0,0,dp(6))
+        def form():
+            stop_preview();clear(); sticker(30,70)
+            v=label(root,self._ui('Что ищем?'),19);v.setPadding(0,0,0,dp(4))
+            line=row(); field=EditText(activity);field.setSingleLine(True);field.setTextSize(15.0);field.setTextColor(primary);field.setHintTextColor(secondary);field.setHint(self._ui('Название или исполнитель'));field.setText(state['query']);field.setPadding(dp(14),0,dp(10),0);field.setBackground(background(field_bg,16));line.addView(field,params(0,dp(48),1))
+            def submit():
+                query=str(field.getText()).strip()
+                if not query: field.setError(self._ui('Введите название песни')); return
+                AndroidUtilities.hideKeyboard(field)
+                state['query']=query;state['generation']+=1; generation=state['generation']; svc=state['service']
+                status(self._ui('Ищем вашу песню…'),31)
+                def task():
+                    try:
+                        results,err=service_search(svc,query,self._limit(),**self._search_kw())
+                        def render():
+                            if state['closed'] or generation!=state['generation']: return
+                            if err: error(err);return
+                            if not results:
+                                status(self._ui('Ничего не найдено'),14); footer=row();text_button(footer,self._ui('Новый поиск'),form);return
+                            state['results']=results;state['page']=0;results_page()
+                        run_on_ui_thread(render)
+                    except Exception as exc:
+                        message=str(exc)
+                        run_on_ui_thread(lambda: error(message) if not state['closed'] and generation==state['generation'] else None)
+                run_on_queue(task)
+            text_button(line,'⌕',submit,dp(48)).setTextSize(24.0)
+            service_line=row(); label(service_line,self._ui('Сервис'),13,secondary)
+            def open_services():
+                state['service_menu_open']=not state['service_menu_open']
+                menu.setVisibility(0 if state['service_menu_open'] else 8)
+                if state['service_menu_open']:
+                    menu.setAlpha(0.0);menu.animate().alpha(1.0).setDuration(180).start()
+            service=text_button(service_line,SERVICE_NAMES[state['service']],open_services)
+            menu=LinearLayout(activity);menu.setOrientation(1);menu.setPadding(dp(4),dp(4),dp(4),dp(4));menu.setBackground(background(surface,16));root.addView(menu,params(-1,-2));menu.setVisibility(8)
+            for code in (SERVICE_SC,SERVICE_SP,SERVICE_TD):
+                option=TextView(activity);option.setText(SERVICE_NAMES[code]);option.setTextColor(primary);option.setTextSize(15.0);option.setGravity(Gravity.CENTER_VERTICAL);option.setPadding(dp(16),0,dp(16),0);menu.addView(option,params(-1,dp(44)))
+                def select(value=code):
+                    state['service']=value;service.setText(SERVICE_NAMES[value]);state['service_menu_open']=False;menu.setVisibility(8)
+                click(option,select,surface)
+        def error(message):
+            status(self._ui('Произошла ошибка'),18,str(message)[:250]+self._ui('\nСообщите @S1mclick'));actions=row();text_button(actions,self._ui('Повторить'),form)
+        def choose(item):
+            stop_preview();box=AlertDialogBuilder(activity);box.set_title(self._ui('Отправить трек?'));box.set_message(item.get('title','')+' — '+item.get('artist',''))
+            selected_account=int(UserConfig.selectedAccount)
+            def send_to(target):
+                if int(UserConfig.selectedAccount)!=selected_account:
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_error(self._ui('Аккаунт изменился. Открой поиск и выбери чат заново.'))
+                    return
+                state['closed']=True;sheet.dismiss();tr=dict(item);tr['query']=state['query'];run_on_ui_thread(lambda:self._download_with_progress(target,tr,selected_account),250)
+            def send_here(b,n):
+                b.dismiss();send_to(pid)
+            def pick_chat(b,n):
+                b.dismiss()
+                def picker_error(message):
+                    try:
+                        from ui.bulletin import BulletinHelper
+                        BulletinHelper.show_error(self._ui('Выбор чата: ')+str(message)[:160])
+                    except Exception:
+                        try: self.logger.error('Chat picker: %s',message)
+                        except Exception: pass
+                def open_picker():
+                    try:
+                        Bundle=jclass('android.os.Bundle')
+                        DialogsActivity=jclass('org.telegram.ui.DialogsActivity')
+                        Delegate=jclass('org.telegram.ui.DialogsActivity$DialogsActivityDelegate')
+                        args=Bundle();args.putBoolean('onlySelect',True);args.putBoolean('allowSwitchAccount',False);args.putBoolean('canSelectTopics',False)
+                        picker=DialogsActivity(args)
+                        class ChatSelection(dynamic_proxy(Delegate)):
+                            def didSelectDialogs(proxy, picker_fragment, dialogs, *rest):
+                                try:
+                                    if dialogs is None or dialogs.size() < 1:
+                                        picker_error(self._ui('Чат не выбран'));return False
+                                    if dialogs.size() != 1:
+                                        picker_error(self._ui('Выбери один чат'));return False
+                                    selected=dialogs.get(0)
+                                    try: target=int(selected.dialogId)
+                                    except Exception:
+                                        try: target=int(selected.longValue())
+                                        except Exception: raise ValueError(self._ui('не удалось определить выбранный чат'))
+                                    try: topic=int(selected.topicId)
+                                    except Exception: topic=0
+                                    if topic:
+                                        picker_error(self._ui('Отправка в темы пока не поддерживается'));return False
+                                    if not target:
+                                        picker_error(self._ui('не удалось определить выбранный чат'));return False
+                                    if int(UserConfig.selectedAccount)!=selected_account:
+                                        picker_error(self._ui('аккаунт изменился. Выбери чат заново'));return False
+                                    try:
+                                        MessagesController=jclass('org.telegram.messenger.MessagesController')
+                                        controller=MessagesController.getInstance(selected_account)
+                                        if target > 0:
+                                            user=controller.getUser(target)
+                                            selected_name=((str(user.first_name or '')+' '+str(user.last_name or '')).strip() if user else '')
+                                        else:
+                                            chat=controller.getChat(-target)
+                                            selected_name=str(chat.title or '') if chat else ''
+                                        if not selected_name: selected_name=self._ui('Чат ')+str(target)
+                                    except Exception: selected_name=self._ui('Чат ')+str(target)
+                                    def show_confirmation():
+                                        try:
+                                            picker_activity=picker_fragment.getParentActivity()
+                                            if not picker_activity: raise ValueError(self._ui('окно выбора уже закрыто'))
+                                            confirm=AlertDialogBuilder(picker_activity);confirm.set_title(self._ui('Отправить трек?'))
+                                            confirm.set_message(item.get('title','')+' — '+item.get('artist','')+self._ui('\n\nКуда: ')+selected_name)
+                                            def confirmed(dialog,which):
+                                                dialog.dismiss()
+                                                if int(UserConfig.selectedAccount)!=selected_account:
+                                                    picker_error(self._ui('аккаунт изменился, отправка отменена'));return
+                                                try: picker_fragment.finishFragment()
+                                                except Exception: pass
+                                                self._music_picker_delegate=None;self._music_picker=None
+                                                send_to(target)
+                                            confirm.set_positive_button(self._ui('Отправить'),confirmed)
+                                            confirm.set_negative_button(self._ui('Отмена'),lambda dialog,which:dialog.dismiss())
+                                            confirm.show()
+                                        except Exception as exc: picker_error(exc)
+                                    run_on_ui_thread(show_confirmation, 100)
+                                    return False
+                                except Exception as exc:
+                                    picker_error(exc);return False
+                        delegate=ChatSelection()
+                        # Keep both Java and Python peers alive after the search sheet closes.
+                        self._music_picker_delegate=delegate;self._music_picker=picker
+                        picker.setDelegate(delegate)
+                        opened=fragment.presentFragment(picker)
+                        if opened is False: raise ValueError(self._ui('экран чатов не открылся'))
+                        sheet.dismiss()
+                    except Exception as exc: picker_error(exc)
+                # Opening a fragment from an AlertDialog click can race the dismiss animation.
+                run_on_ui_thread(open_picker, 250)
+            box.set_positive_button(self._ui('Отправить сюда'),send_here)
+            box.set_neutral_button(self._ui('Другой чат'),pick_chat)
+            box.set_negative_button(self._ui('Отмена'),lambda b,n:b.dismiss());box.show()
+        def results_page():
+            clear();line=row();v=label(line,self._ui('Результаты'),19);v.setLayoutParams(params(0,dp(44),1))
+            try:
+                image=BackupImageView(activity);line.addView(image,params(dp(44),dp(44)))
+                MediaDataController.getInstance(UserConfig.selectedAccount).setPlaceholderImageByIndex(image,'SpottyAnimated',27,'80_80')
+            except Exception: pass
+            text_button(line,self._ui('Изменить'),form)
+            total=len(state['results']);p=state['page'];start=p*5
+            for item in state['results'][start:start+5]:
+                outer=LinearLayout(activity);outer.setOrientation(0);outer.setGravity(Gravity.CENTER_VERTICAL);outer.setBackground(background(field_bg,12));lp=params(-1,dp(58));lp.bottomMargin=dp(4);root.addView(outer,lp)
+                cell=LinearLayout(activity);cell.setOrientation(1);cell.setPadding(dp(12),dp(5),dp(4),dp(5));outer.addView(cell,params(0,-1,1))
+                a=label(cell,item.get('title',''),15);a.setSingleLine(True)
+                sub=item.get('artist','')+('  ·  '+item['duration'] if item.get('duration') else '');b=label(cell,sub,12,secondary);b.setSingleLine(True)
+                click(cell,lambda tr=item:choose(tr),field_bg)
+                play_frame=FrameLayout(activity);outer.addView(play_frame,params(dp(52),dp(52)))
+                play_button=ImageView(activity);play_button.setPadding(dp(12),dp(12),dp(12),dp(12));play_frame.addView(play_button,FrameLayout.LayoutParams(-1,-1))
+                spinner=ProgressBar(activity)
+                progress_params=FrameLayout.LayoutParams(dp(24),dp(24),Gravity.CENTER);play_frame.addView(spinner,progress_params);spinner.setVisibility(8)
+                try: spinner.setIndeterminateTintList(ColorStateList.valueOf(accent))
+                except Exception: pass
+                play_button.setTag(spinner)
+                click(play_frame,lambda tr=item, control=play_button:preview(tr,control),field_bg)
+                set_preview_icon(play_button,'play')
+            nav=row();pages=max(1,(total+4)//5)
+            def move(delta):
+                stop_preview()
+                state['page']=max(0,min(pages-1,state['page']+delta))
+                results_page()
+                root.setTranslationX(float(dp(28) * (1 if delta > 0 else -1)))
+                root.setAlpha(0.35)
+                root.animate().translationX(0.0).alpha(1.0).setDuration(320).setInterpolator(DecelerateInterpolator()).start()
+            if p>0:
+                text_button(nav,self._ui('Назад'),lambda:move(-1),dp(88))
+            else:
+                placeholder=TextView(activity);placeholder.setVisibility(4);nav.addView(placeholder,params(dp(88),dp(44)))
+            counter=label(nav,str(p+1)+' / '+str(pages),13,secondary);counter.setGravity(Gravity.CENTER);counter.setLayoutParams(params(0,dp(40),1))
+            if p+1<pages:
+                text_button(nav,self._ui('Далее'),lambda:move(1),dp(88))
+            else:
+                placeholder=TextView(activity);placeholder.setVisibility(4);nav.addView(placeholder,params(dp(88),dp(44)))
+        form();sheet.show()
+
+
+    def _handle_chat_search(self, ctx):
+        from android_utils import run_on_ui_thread
+        from client_utils import get_last_fragment
+        def open_search():
+            try:
+                context = ctx if isinstance(ctx,dict) else {}
+                fragment = context.get('fragment') or get_last_fragment()
+                # ChatActivity supplies the exact dialog id (including group sign).
+                pid = None
+                if fragment is not None:
+                    try: pid = int(fragment.getDialogId())
+                    except Exception: pass
+                if not pid:
+                    raw = context.get('dialog_id') or context.get('dialogId') or context.get('peer')
+                    if raw is not None:
+                        try: pid = int(raw)
+                        except Exception: pass
+                if not pid and context.get('userId'):
+                    pid=int(context['userId'])
+                if not pid and context.get('chatId'):
+                    pid=-abs(int(context['chatId']))
+                if not pid:
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_error('Не удалось определить чат. Открой его и введи .search')
+                    return
+                self._open_search_ui(pid,fragment)
+            except Exception as exc:
+                try:
+                    self.logger.error('Не удалось открыть поиск из меню чата: %s',exc)
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_error('Не удалось открыть поиск: '+str(exc)[:120])
+                except Exception: pass
+        # Allow the chat action menu to close before opening the bottom sheet.
+        run_on_ui_thread(open_search, 250)
+
+    def _download_with_progress(self, pid, track, expected_account):
+        from client_utils import get_last_fragment
+        from android_utils import run_on_ui_thread
+        from ui.alert import AlertDialogBuilder
+        from org.telegram.messenger import UserConfig
+        fragment=get_last_fragment();activity=fragment.getParentActivity() if fragment else None
+        if not activity:
+            try:
+                from ui.bulletin import BulletinHelper
+                BulletinHelper.show_error(self._ui('Не удалось показать загрузку. Повтори попытку.'))
+            except Exception: pass
+            return
+        from android.widget import LinearLayout, TextView, ProgressBar
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        from android.content.res import ColorStateList
+        from java import jclass
+        dp=AndroidUtilities.dp
+        layout=LinearLayout(activity);layout.setOrientation(1);layout.setPadding(dp(24),dp(8),dp(24),dp(20))
+        status=TextView(activity);status.setText(self._ui('Подключаемся к сервису…'));status.setTextSize(14.0)
+        status.setTextColor(Theme.getColor(Theme.key_dialogTextBlack));layout.addView(status)
+        try:
+            MaterialBar=jclass('com.google.android.material.progressindicator.LinearProgressIndicator')
+            MaterialStyle=jclass('com.google.android.material.R$style')
+            ContextThemeWrapper=jclass('android.view.ContextThemeWrapper')
+            themed=ContextThemeWrapper(activity,MaterialStyle.Widget_Material3Expressive_LinearProgressIndicator_Wavy)
+            bar=MaterialBar(themed)
+            # Reject older versions which silently lack wavy support.
+            bar.setWaveAmplitude(dp(4));bar.setWavelengthDeterminate(dp(32));bar.setWavelengthIndeterminate(dp(32))
+            bar.setWaveSpeed(dp(24));bar.setTrackThickness(dp(4))
+        except Exception:
+            bar=ProgressBar(activity,None,jclass('android.R$attr').progressBarStyleHorizontal)
+        bar.setMax(100);bar.setIndeterminate(True)
+        try:
+            tint=ColorStateList.valueOf(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+            bar.setProgressTintList(tint);bar.setIndeterminateTintList(tint)
+        except Exception: pass
+        lp=LinearLayout.LayoutParams(-1,dp(24));lp.topMargin=dp(14);layout.addView(bar,lp)
+        percent=TextView(activity);percent.setTextSize(12.0);percent.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        percent.setGravity(5);layout.addView(percent)
+        progress=AlertDialogBuilder(activity);progress.set_title(self._ui('Подготовка трека'));progress.set_view(layout);progress.show()
+        self._music_download_dialog=progress
+        def report(stage, detail=''):
+            def update():
+                try:
+                    if stage=='error':
+                        progress.dismiss()
+                        box=AlertDialogBuilder(activity);box.set_title(self._ui('Не удалось скачать'))
+                        box.set_message(str(detail)[:250]+self._ui('\nСообщите @S1mclick'))
+                        box.set_positive_button(self._ui('Повторить'),lambda b,n:(b.dismiss(),self._download_with_progress(pid,track,expected_account)))
+                        box.set_negative_button(self._ui('Закрыть'),lambda b,n:b.dismiss());box.show()
+                    elif stage=='done':
+                        progress.dismiss()
+                        from ui.bulletin import BulletinHelper
+                        BulletinHelper.show_info(self._ui('Файл передан Telegram для отправки'))
+                    elif stage=='percent':
+                        value=max(0,min(100,int(detail)));bar.setIndeterminate(False);bar.setProgress(value,True)
+                        status.setText(self._ui('Скачиваем трек…'));percent.setText(str(value)+'%')
+                    else:
+                        status.setText(str(detail));bar.setIndeterminate(True);percent.setText('')
+                except Exception: pass
+            run_on_ui_thread(update)
+        def task():
+            try:
+                if int(UserConfig.selectedAccount)!=expected_account:
+                    report('error',self._ui('Аккаунт изменился. Повтори выбор чата.'));return
+                self._do_download(pid,track,progress=report,expected_account=expected_account)
+            except Exception as exc: report('error',str(exc))
+        run_on_queue(task)
+
+    def _attach_music_button(self, fragment, root):
+        if not self.get_setting('music_floating_button',True): return
+        try:
+            from android_utils import OnClickListener
+            from android.widget import FrameLayout, ImageView
+            from android.view import Gravity
+            from android.content.res import ColorStateList
+            from android.graphics.drawable import GradientDrawable, RippleDrawable
+            from java import jclass, dynamic_proxy
+            from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
+            if root is None or not isinstance(root,FrameLayout): return
+            if not int(fragment.getDialogId()): return
+            tag='music_dl_floating_button_v1'
+            if root.findViewWithTag(tag) is not None: return
+            dp=AndroidUtilities.dp;button=ImageView(root.getContext());button.setTag(tag)
+            button.setContentDescription(self._ui('Открыть поиск музыки'));button.setPadding(dp(14),dp(14),dp(14),dp(14))
+            try:
+                resources=jclass('org.telegram.messenger.R$drawable');button.setImageResource(resources.msg_search)
+            except Exception:
+                button.setImageResource(jclass('android.R$drawable').ic_menu_search)
+            tint=Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+            button.setColorFilter(tint)
+            fill=GradientDrawable();fill.setColor(Theme.getColor(Theme.key_dialogBackground));fill.setCornerRadius(float(dp(18)))
+            button.setBackground(RippleDrawable(ColorStateList.valueOf(0x334c8bf5),fill,None));button.setElevation(float(dp(6)))
+            lp=FrameLayout.LayoutParams(dp(52),dp(52),Gravity.LEFT|Gravity.TOP)
+            root.addView(button,lp)
+            # Сохраняем относительную позицию, чтобы она переживала смену размера экрана.
+            def stored(key, default):
+                try: return max(0, min(1000, int(self.get_setting(key, default)))) / 1000.0
+                except Exception: return default / 1000.0
+            position={'x':stored('music_button_x',1000),'y':stored('music_button_y',850), 'drag':False}
+            def place():
+                width=max(0,root.getWidth()-button.getWidth());height=max(0,root.getHeight()-button.getHeight())
+                if width and height and not position['drag']:
+                    button.setX(float(width*position['x']));button.setY(float(height*position['y']))
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(place, 100)
+            def opened(_):
+                try:
+                    pid=int(fragment.getDialogId())
+                    if pid: self._open_search_ui(pid,fragment)
+                except Exception as exc:
+                    try: self.logger.error('Floating music button: %s',exc)
+                    except Exception: pass
+            button.setOnClickListener(OnClickListener(opened))
+            from android.view import ViewConfiguration
+            touch_slop=ViewConfiguration.get(root.getContext()).getScaledTouchSlop()
+            touch={'x':0.0,'y':0.0,'left':0.0,'top':0.0,'moved':False}
+            class TouchListener(dynamic_proxy(jclass('android.view.View$OnTouchListener'))):
+                def onTouch(listener, view, event):
+                    action=event.getActionMasked()
+                    if action==0:  # ACTION_DOWN
+                        touch.update(x=event.getRawX(),y=event.getRawY(),left=view.getX(),top=view.getY(),moved=False)
+                        position['drag']=False;view.setPressed(True)
+                        try: root.requestDisallowInterceptTouchEvent(True)
+                        except Exception: pass
+                        return True
+                    if action==1 or action==3:  # ACTION_UP / ACTION_CANCEL
+                        view.setPressed(False)
+                        try: root.requestDisallowInterceptTouchEvent(False)
+                        except Exception: pass
+                        if touch['moved']:
+                            width=max(1,root.getWidth()-view.getWidth());height=max(1,root.getHeight()-view.getHeight())
+                            position['x']=max(0.0,min(1.0,view.getX()/width));position['y']=max(0.0,min(1.0,view.getY()/height))
+                            position['drag']=False
+                            if action==1:
+                                self.set_setting('music_button_x',int(position['x']*1000),reload_settings=False)
+                                self.set_setting('music_button_y',int(position['y']*1000),reload_settings=False)
+                        elif action==1: view.performClick()
+                        position['drag']=False
+                        return True
+                    if action==2:  # ACTION_MOVE
+                        dx=event.getRawX()-touch['x'];dy=event.getRawY()-touch['y']
+                        if not touch['moved'] and dx*dx+dy*dy > touch_slop*touch_slop:
+                            touch['moved']=True;position['drag']=True;view.setPressed(False)
+                        if touch['moved']:
+                            view.setX(float(max(0,min(root.getWidth()-view.getWidth(),touch['left']+dx))))
+                            view.setY(float(max(0,min(root.getHeight()-view.getHeight(),touch['top']+dy))))
+                        return True
+                    return True
+            touch_listener=TouchListener();button.setOnTouchListener(touch_listener)
+            from java.lang.ref import WeakReference
+            self._music_buttons=[ref for ref in self._music_buttons if ref.get() is not None]
+            self._music_buttons.append(WeakReference(button))
+        except Exception as exc:
+            try: self.logger.error('Cannot add floating music button: %s',exc)
+            except Exception: pass
+
+    def _floating_setting_changed(self, value):
+        from android_utils import run_on_ui_thread
+        def update():
+            if not value:
+                for ref in self._music_buttons:
+                    try:
+                        button=ref.get()
+                        if button is None: continue
+                        parent=button.getParent()
+                        if parent is not None: parent.removeView(button)
+                    except Exception: pass
+                self._music_buttons=[]
+            else:
+                try:
+                    from client_utils import get_last_fragment
+                    fragment=get_last_fragment()
+                    if fragment: self._attach_music_button(fragment,fragment.getFragmentView())
+                except Exception: pass
+        run_on_ui_thread(update)
+
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def on_plugin_load(self):
         self.add_on_send_message_hook()
+        self._music_buttons=[]
+        try:
+            from base_plugin import MethodHook
+            from hook_utils import find_class
+            plugin=self
+            class MusicChatViewHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        from android_utils import run_on_ui_thread
+                        fragment=param.thisObject;root=param.getResult()
+                        run_on_ui_thread(lambda:plugin._attach_music_button(fragment,root))
+                    except Exception: pass
+            self._music_view_hook=MusicChatViewHook()
+            self.hook_all_methods(find_class('org.telegram.ui.ChatActivity'),'createView',self._music_view_hook)
+            from client_utils import get_last_fragment
+            current=get_last_fragment()
+            if current:
+                from android_utils import run_on_ui_thread
+                run_on_ui_thread(lambda:self._attach_music_button(current,current.getFragmentView()),500)
+        except Exception as exc:
+            try: self.logger.error('Floating music hook: %s',exc)
+            except Exception: pass
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(self._guide_show, 1000)
         self._menu_ids = []
+        try:
+            self._menu_ids.append(self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU, text="Поиск музыки",
+                icon="msg_search", on_click=self._handle_chat_search, priority=20)))
+        except Exception as exc:
+            try: self.logger.error("Music chat menu: %s", exc)
+            except Exception: pass
         for text, subtext, icon, cb, prio, is_ctx in [
             ("Music Downloader", "Search, favorites & recs", "msg_search", self.handle_music_menu,    20, False),
             ("Favorites",        "Show saved likes",         "msg_saved",  self.handle_fav_menu,      19, False),
@@ -944,6 +1884,9 @@ class MusicPlugin(BasePlugin):
             )))
 
     def on_plugin_unload(self):
+        self._floating_setting_changed(False)
+        self._music_picker_delegate = None
+        self._music_picker = None
         for mid in getattr(self,"_menu_ids",[]):
             try: self.remove_menu_item(mid)
             except: pass
@@ -953,8 +1896,8 @@ class MusicPlugin(BasePlugin):
     def create_settings(self):
         return [
             Header(text=self._t("lang_hdr")),
-            Selector(key="language", text=self._t("lang_select"), default=0,
-                     items=["Русский 🇷🇺","English 🇬🇧"], icon="msg_info"),
+            Selector(key="language", text=self._t("lang_select"), default=2,
+                     items=["Русский", "English", "Автоматический / Automatic"], icon="msg_info"),
             Divider(),
             Header(text=self._t("svc_hdr")),
             Selector(key="service", text=self._t("svc_select"), default=0,
@@ -966,7 +1909,11 @@ class MusicPlugin(BasePlugin):
             Input(key="td_token", text=self._t("td_token"), default="",
                   subtext=self._t("td_token_sub"), icon="msg_search"),
             Divider(),
+            Selector(key="mp3_bitrate", text=self._t("mp3_bitrate"), default=1,
+                     items=["128 kb/s", "192 kb/s", "256 kb/s", "320 kb/s"], icon="msg_settings"),
             Header(text=self._t("ui_hdr")),
+            Switch(key="music_floating_button", text=self._ui("Плавающая кнопка поиска"), default=True,
+                   subtext=self._ui("Показывать кнопку внутри открытого чата"), icon="msg_search", on_change=self._floating_setting_changed),
             Selector(key="results_per_page", text=self._t("per_page"), default=1,
                      items=["3","5","7","10"], icon="msg_list"),
             Selector(key="search_limit", text=self._t("limit"), default=1,
@@ -981,10 +1928,6 @@ class MusicPlugin(BasePlugin):
                    subtext=self._t("auto_like_sub"), icon="msg_saved"),
             Input(key="favorites_cap", text=self._t("fav_cap"), default="200",
                   subtext=self._t("fav_cap_sub"), icon="msg_more"),
-            Divider(),
-            Header(text=self._t("wm_hdr")),
-            Input(key="watermark_user", text=self._t("wm_user"), default="@s1mclick",
-                  subtext=self._t("wm_sub"), icon="msg_mention"),
         ]
 
     # ── recommendations ──────────────────────────────────────────────────────
@@ -1034,13 +1977,15 @@ class MusicPlugin(BasePlugin):
 
     # ── download ─────────────────────────────────────────────────────────────
 
-    def _do_download(self, pid, track: Dict):
+    def _do_download(self, pid, track: Dict, progress=None, expected_account=None):
         svc  = track.get("service", SERVICE_SC)
         dur  = f" [{track['duration']}]" if track.get("duration") else ""
         icon = SERVICE_ICONS.get(svc,"🎵")
-        send_text(pid, self._t("downloading",
-            icon=icon, svc=SERVICE_NAMES.get(svc,svc),
-            title=track["title"], artist=track["artist"], dur=dur))
+        def message(text, is_error=False):
+            if progress and isinstance(text,tuple) and text[0]=='percent': progress('percent',text[1])
+            elif progress: progress('error' if is_error else 'status',self._ui(text))
+            else: send_text(pid,text)
+        message(self._ui('Скачиваем трек…') if progress else self._t("downloading", icon=icon, svc=SERVICE_NAMES.get(svc,svc), title=track["title"], artist=track["artist"], dur=dur))
 
         art_result = [None]
         def _get_art(): art_result[0] = _fetch_art(track.get("artwork_url",""))
@@ -1056,18 +2001,25 @@ class MusicPlugin(BasePlugin):
             except: pass
             stream, err = sc_stream(track["id"], custom=self._sc_cid())
             if not stream:
-                send_text(pid, self._t("stream_err", e=err)); return
-            ok = _dl_file(stream, path)
-            if not ok:
-                send_text(pid, self._t("dl_err")); return
+                message(self._t("stream_err", e=err),True); return
+            try:
+                bitrate_index = self.get_setting("mp3_bitrate", 1)
+                bitrate = [128, 192, 256, 320][bitrate_index] if isinstance(bitrate_index, int) and 0 <= bitrate_index < 4 else 192
+                _sc_download_mp3(stream, path, bitrate, progress=(lambda stage: message(stage)) if progress else None)
+                ok = True
+            except Exception as exc:
+                try:
+                    if os.path.exists(path): os.remove(path)
+                except OSError: pass
+                message(self._t("stream_err", e=str(exc)[:200]),True); return
 
         elif svc == SERVICE_SP:
             sp_dc = self._sp_dc()
             if not sp_dc:
-                send_text(pid, self._t("no_sp_dc")); return
-            dl_path, err = sp_download(track["id"], sp_dc=sp_dc)
+                message(self._t("no_sp_dc"),True); return
+            dl_path, err = sp_download(track["id"], sp_dc=sp_dc, progress=(lambda value: progress('percent',value)) if progress else None)
             if not dl_path:
-                send_text(pid, self._t("sp_dl_err", e=err)); return
+                message(self._t("sp_dl_err", e=err),True); return
             path = dl_path; ok = True
 
         elif svc == SERVICE_TD:
@@ -1077,11 +2029,12 @@ class MusicPlugin(BasePlugin):
             except: pass
             stream, err = td_stream(track["id"], custom_token=self._td_tok())
             if not stream:
-                send_text(pid, self._t("td_dl_err", e=err)); return
-            ok = _dl_file(stream, path)
+                message(self._t("td_dl_err", e=err),True); return
+            ok = _dl_file(stream, path, progress=(lambda value: progress('percent',value)) if progress else None)
             if not ok:
-                send_text(pid, self._t("dl_err")); return
+                message(self._t("dl_err"),True); return
 
+        if progress: message(self._ui('Подготавливаем название и обложку…'))
         art_th.join(timeout=12)
         write_id3(path=path, title=track["title"], artist=track["artist"],
                   performer=self._performer(track["artist"]),
@@ -1091,13 +2044,18 @@ class MusicPlugin(BasePlugin):
         if self.get_setting("auto_like_downloads",True):
             self._upsert_fav(track, query=track.get("query",""), delta=1)
 
-        caption  = f"🎧 {track['title']} — {track['artist']}{dur}\n"
-        caption += f"📡 {icon} {SERVICE_NAMES.get(svc,svc)}"
-        if track.get("plays"): caption += f"\n▶ {int(track['plays']):,}"
-        if track.get("likes"): caption += f"  ♥ {int(track['likes']):,}"
-        if track.get("genre"): caption += f"\n🎵 {track['genre']}"
-        caption += f"\n\n♥ via music_dl by {self._wm()}"
+        caption  = f"{track['title']} — {track['artist']}{dur}\n"
+        caption += SERVICE_NAMES.get(svc,svc)
+        if track.get("plays"): caption += self._ui("\nПрослушиваний: ") + f"{int(track['plays']):,}"
+        if track.get("likes"): caption += self._ui("  Лайков: ") + f"{int(track['likes']):,}"
+        if track.get("genre"): caption += self._ui("\nЖанр: ") + str(track["genre"])
+        if expected_account is not None:
+            from org.telegram.messenger import UserConfig
+            if int(UserConfig.selectedAccount)!=expected_account:
+                message(self._ui('Аккаунт изменился; отправка отменена.'),True);return
+        if progress: message(self._ui('Передаём файл в Telegram…'))
         send_audio(pid, path, caption=caption)
+        if progress: progress('done','')
 
     # ── info / help ───────────────────────────────────────────────────────────
 
@@ -1125,7 +2083,7 @@ class MusicPlugin(BasePlugin):
         if pid is None: return
         svc = self._svc()
         send_text(pid, "\n".join([
-            f"🎵 Music Downloader [{SERVICE_NAMES.get(svc,svc)}]","",
+            f"Music Downloader [{SERVICE_NAMES.get(svc,svc)}]","",
             self._t("usage_find"), "dlf [N]",
             ".like [N]", ".unlike [N]", ".rec", ".liked", ".info",
             self._t("usage_service"),
@@ -1202,6 +2160,11 @@ class MusicPlugin(BasePlugin):
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         if not isinstance(params.message, str): return HookResult()
         msg = params.message.strip(); pid = params.peer
+
+        if msg.lower() == ".search":
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(lambda: self._open_search_ui(pid))
+            return HookResult(strategy=HookStrategy.CANCEL)
 
         # .service
         if msg.lower().startswith(".service"):
@@ -1299,6 +2262,7 @@ class MusicPlugin(BasePlugin):
         # dlf [N]
         if msg.lower().startswith("dlf"):
             arg=msg[3:].strip()
+            if not arg: arg = "1"
             if not arg.isdigit():
                 params.message=self._t("usage_dlf")
                 return HookResult(strategy=HookStrategy.MODIFY,params=params)
