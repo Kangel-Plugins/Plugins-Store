@@ -1,0 +1,1996 @@
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import run_on_ui_thread
+from client_utils import send_request
+from java.lang import Class as JClass
+from java.util import ArrayList
+from java import jclass, dynamic_proxy
+import time
+import weakref
+import json
+import re
+import traceback
+from collections import deque
+
+__id__ = "participants_channels"
+__name__ = "Participants Channels"
+__description__ = "Adds a **Channels** tab to the group/channel profile showing participants' personal channels.\n\nTap a channel = open the channel.\nLong press = open the admin profile."
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "4.4"
+__icon__ = "MaxExteraPluginsStickers/19"
+__min_version__ = "12.1.1"
+__app_version__ = ">=12.1.1"
+__sdk_version__ = ">=1.4.3.3"
+
+TAB_ID = 10
+CACHE_TTL = 300
+DEFAULT_HISTORY_LIMIT = 100
+MAX_HISTORY_LIMIT = 100000
+MAX_CACHED_CHATS = 3
+MAX_USERS_CACHE = 300
+MAX_SCAN_PER_CHAT = 20000
+
+PARTICIPANTS_PAGE = 200
+MAX_PAGES = 100
+FULL_WINDOW = 16
+FULL_COUNT_WINDOW = 4
+TICK_MS = 120
+UI_INTERVAL = 0.2
+
+# retry config
+MAX_PAGE_RETRIES = 3
+PAGE_RETRY_DELAY_MS = 1000
+
+STRINGS = {
+    "en": {
+        "tab_label": "Channels",
+        "localization": "Localization",
+        "language": "Language",
+        "info": "Information",
+        "author_channel": "Author's channel",
+        "documentation": "Documentation",
+        "settings": "Settings",
+        "load_from_history": "Search channels in chat history",
+        "load_from_history_sub": "Loads message authors from history (useful when the members list is hidden by admins)",
+        "only_if_hidden": "Only if members list is hidden",
+        "only_if_hidden_sub": "History search will only work in chats where admins have hidden the members list",
+        "history_limit": "Number of messages",
+        "history_limit_sub": "How many recent messages will be checked for channels in their senders' profiles.\n\nFrom 1 to {max} (a large value may cause lag; recommended: 5000).",
+        "channel_owners": "Channel owners",
+        "close": "Close",
+        "scanning": "Scanning...",
+    },
+    "ru": {
+        "tab_label": "Каналы",
+        "localization": "Локализация",
+        "language": "Язык",
+        "info": "Информация",
+        "author_channel": "Канал автора",
+        "documentation": "Документация",
+        "settings": "Настройки",
+        "load_from_history": "Искать каналы в истории чата",
+        "load_from_history_sub": "Загружает авторов сообщений из истории (полезно, если список участников скрыт администраторами)",
+        "only_if_hidden": "Только если скрыт список участников",
+        "only_if_hidden_sub": "Поиск в истории будет работать только в чатах, где администраторы скрыли список участников",
+        "history_limit": "Количество сообщений",
+        "history_limit_sub": "Сколько последних сообщений будут проверятся, на наличие каналов в профиле у их отправителей.\n\nОт 1 до {max} (большое значение может вызвать лаги; рекомендуется: 5000).",
+        "channel_owners": "Владельцы канала",
+        "close": "Закрыть",
+        "scanning": "Поиск...",
+    },
+}
+
+LANG_ITEMS = ["English", "Русский"]
+LANG_CODES = ["en", "ru"]
+
+
+class GroupChannelsTabPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._user_channels = {}
+        self._no_channel = set()
+        self._loading = set()
+        self._channels_cache = {}
+        self._channels_cache_time = {}
+        self._history_loaded = {}
+        self._history_running = set()
+        self._cache_order = []
+        self._active_sml = {}
+        self._active_acc = {}
+        self._update_pending = set()
+        self._mc_cache = {}
+        self._last_count = {}
+        self._channel_to_users = {}
+        self._long_click_hooked_pages = set()
+        self._patched_chats = set()
+        self._members_queue = {}
+        self._members_seen = {}
+        self._inflight = {}
+        self._page_inflight = {}
+        self._page_offset = {}
+        self._paging_done = {}
+        self._page_retries = {}
+        self._flood_until = {}
+        self._ticking = {}
+        self._pending_channels = {}
+        self._dirty = {}
+        self._last_ui = {}
+        self._storage_counter = {}
+        self._scan_started = {}
+        self._user_retries = {}
+        self._count_loading = set()
+        self._count_failed = set()
+        self._count_done = set()
+        self._ui_dirty = {}
+        self._chat_loading = set()
+        self._chat_load_tries = {}
+        self._chat_failed = set()
+        self._chat_single = {}
+        self._full_interval = {}
+        self._full_clean = {}
+        self._next_slot = {}
+
+    def _log(self, msg):
+        try:
+            self.log("PC: " + str(msg))
+        except Exception:
+            pass
+
+    def _lang(self):
+        try:
+            idx = int(self.get_setting("language", 0))
+        except (ValueError, TypeError):
+            idx = 0
+        if idx < 0 or idx >= len(LANG_CODES):
+            idx = 0
+        return LANG_CODES[idx]
+
+    def _t(self, key, **kwargs):
+        lang = self._lang()
+        text = STRINGS.get(lang, STRINGS["en"]).get(key)
+        if text is None:
+            text = STRINGS["en"].get(key, key)
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
+
+    def on_plugin_load(self):
+        try:
+            self._load_storage()
+            self._setup()
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        self._save_storage()
+        self._user_channels.clear()
+        self._no_channel.clear()
+        self._loading.clear()
+        self._channels_cache.clear()
+        self._channels_cache_time.clear()
+        self._history_loaded.clear()
+        self._history_running.clear()
+        self._cache_order.clear()
+        self._active_sml.clear()
+        self._active_acc.clear()
+        self._update_pending.clear()
+        self._mc_cache.clear()
+        self._last_count.clear()
+        self._channel_to_users.clear()
+        self._long_click_hooked_pages.clear()
+        self._patched_chats.clear()
+        self._members_queue.clear()
+        self._members_seen.clear()
+        self._inflight.clear()
+        self._page_inflight.clear()
+        self._page_offset.clear()
+        self._paging_done.clear()
+        self._flood_until.clear()
+        self._ticking.clear()
+        self._pending_channels.clear()
+        self._dirty.clear()
+        self._last_ui.clear()
+        self._storage_counter.clear()
+        self._scan_started.clear()
+        self._user_retries.clear()
+        self._count_loading.clear()
+        self._count_failed.clear()
+        self._count_done.clear()
+        self._ui_dirty.clear()
+        self._chat_loading.clear()
+        self._chat_load_tries.clear()
+        self._chat_failed.clear()
+        self._chat_single.clear()
+        self._full_interval.clear()
+        self._full_clean.clear()
+        self._next_slot.clear()
+
+    def _load_storage(self):
+        try:
+            data = self.get_setting("_storage", "")
+            if data:
+                obj = json.loads(data)
+                for did_str, cids in obj.get("ch", {}).items():
+                    try:
+                        self._channels_cache[int(did_str)] = list(cids)
+                        self._channels_cache_time[int(did_str)] = time.time()
+                    except Exception:
+                        pass
+                for uid_str, cid in obj.get("uc", {}).items():
+                    try:
+                        self._user_channels[int(uid_str)] = int(cid)
+                    except Exception:
+                        pass
+                for cid_str, uids in obj.get("cu", {}).items():
+                    try:
+                        self._channel_to_users[int(cid_str)] = [int(u) for u in uids]
+                    except Exception:
+                        pass
+                for uid_str in obj.get("nc", []):
+                    try:
+                        self._no_channel.add(int(uid_str))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _save_storage(self):
+        try:
+            ch = {}
+            for did, cids in list(self._channels_cache.items())[-50:]:
+                ch[str(did)] = list(cids)[:200]
+            uc = {}
+            for uid, cid in list(self._user_channels.items())[-2000:]:
+                uc[str(uid)] = cid
+            cu = {}
+            for cid, uids in list(self._channel_to_users.items())[:500]:
+                cu[str(cid)] = list(uids)[:20]
+            nc = [int(u) for u in list(self._no_channel)[-5000:]]
+            self.set_setting("_storage", json.dumps({"ch": ch, "uc": uc, "cu": cu, "nc": nc}))
+        except Exception:
+            pass
+
+    def _open_url_internal(self, url):
+        def handler(view):
+            try:
+                Browser = jclass("org.telegram.messenger.browser.Browser")
+                ctx = view.getContext()
+                uri = jclass("android.net.Uri").parse(url)
+                Browser.openUrl(ctx, uri, True, False, None)
+            except Exception:
+                try:
+                    Browser = jclass("org.telegram.messenger.browser.Browser")
+                    ctx = view.getContext()
+                    Browser.openInTelegramBrowser(ctx, url, None)
+                except Exception:
+                    pass
+        return handler
+
+    def _on_language_change(self, new_index):
+        try:
+            self.set_setting("language", int(new_index), reload_settings=True)
+            self._refresh_all_tabs()
+        except Exception:
+            pass
+
+    def _refresh_all_tabs(self):
+        try:
+            for did in list(self._channels_cache.keys()):
+                cached = self._channels_cache.get(did)
+                if cached:
+                    self._show_channels(did, cached)
+        except Exception:
+            pass
+
+    def create_settings(self):
+        from ui.settings import Switch, Header, Text, Divider, Input, Selector
+        return [
+            Header(text=self._t("localization")),
+            Selector(
+                key="language",
+                text=self._t("language"),
+                default=0,
+                items=LANG_ITEMS,
+                icon="msg_translate",
+                on_change=self._on_language_change,
+            ),
+            Divider(),
+            Header(text=self._t("info")),
+            Text(
+                text=self._t("author_channel"),
+                icon="msg_channel",
+                on_click=self._open_url_internal("https://t.me/MaxExteraPlugins"),
+            ),
+            Text(
+                text=self._t("documentation"),
+                icon="msg_link",
+                on_click=self._open_url_internal("https://telegra.ph/Dokumentaciya-k-plaginu-Kanaly-uchastnikov-chata-07-01"),
+            ),
+            Divider(),
+            Header(text=self._t("settings")),
+            Switch(
+                key="load_from_history",
+                text=self._t("load_from_history"),
+                subtext=self._t("load_from_history_sub"),
+                default=False
+            ),
+            Switch(
+                key="only_if_hidden",
+                text=self._t("only_if_hidden"),
+                subtext=self._t("only_if_hidden_sub"),
+                default=False
+            ),
+            Input(
+                key="history_limit",
+                text=self._t("history_limit"),
+                subtext=self._t("history_limit_sub", max=MAX_HISTORY_LIMIT),
+                default=str(DEFAULT_HISTORY_LIMIT),
+                icon="msg_edit",
+            )
+        ]
+
+    def _get_history_limit(self):
+        raw = self.get_setting("history_limit", str(DEFAULT_HISTORY_LIMIT))
+        try:
+            val = int(str(raw).strip())
+        except (ValueError, TypeError):
+            return DEFAULT_HISTORY_LIMIT
+        if val < 1:
+            return DEFAULT_HISTORY_LIMIT
+        if val > MAX_HISTORY_LIMIT:
+            return MAX_HISTORY_LIMIT
+        return val
+
+    def _setup(self):
+        plugin = self
+        sml_cls = JClass.forName("org.telegram.ui.Components.SharedMediaLayout")
+
+        for m in sml_cls.getDeclaredMethods():
+            if m.getName() == "updateTabs":
+                m.setAccessible(True)
+
+                class H1(MethodHook):
+                    def after_hooked_method(self, param):
+                        try:
+                            sml_obj = param.thisObject
+                            run_on_ui_thread(lambda: plugin._on_tabs_safe(sml_obj), 50)
+                        except Exception:
+                            pass
+
+                self.hook_method(m, H1())
+                break
+
+        for m in sml_cls.getDeclaredMethods():
+            if m.getName() == "switchToCurrentSelectedMode":
+                m.setAccessible(True)
+
+                class H2(MethodHook):
+                    def after_hooked_method(self, param):
+                        try:
+                            plugin._on_switch_mode(param.thisObject)
+                        except Exception:
+                            pass
+
+                self.hook_method(m, H2())
+                break
+
+        try:
+            pa_cls = find_class("org.telegram.ui.ProfileActivity")
+            if pa_cls:
+                self.hook_all_methods(pa_cls, "updateSelectedMediaTabText", _CounterHook(plugin))
+        except BaseException:
+            pass
+
+        try:
+            JClass.forName("org.telegram.ui.ProfileActivity2")
+            try:
+                pa2_cls = find_class("org.telegram.ui.ProfileActivity2")
+                if pa2_cls:
+                    self.hook_all_methods(pa2_cls, "updateSelectedMediaTabText", _CounterHook(plugin))
+            except BaseException:
+                pass
+        except BaseException:
+            pass
+
+    def _on_switch_mode(self, sml):
+        try:
+            selected = self._get_selected_type(sml)
+            if selected != TAB_ID:
+                return
+            did = self._get_did(sml)
+            if did is None or did not in self._patched_chats:
+                return
+            self._flush_ui(did)
+            acc = self._active_acc.get(did)
+            if acc is None:
+                return
+            cached = self._channels_cache.get(did, [])
+            if cached:
+                channels = self._get_chats_by_ids(did, cached, acc)
+                if channels:
+                    self._fill_adapter(sml, channels)
+        except Exception:
+            pass
+
+    def _get_did(self, sml):
+        try:
+            did = get_private_field(sml, "dialog_id")
+            if did is not None:
+                return int(did)
+        except Exception:
+            pass
+        return None
+
+    def _get_mc(self, acc):
+        if acc not in self._mc_cache:
+            from org.telegram.messenger import MessagesController
+            self._mc_cache[acc] = MessagesController.getInstance(acc)
+        return self._mc_cache[acc]
+
+    def _trim_caches(self):
+        if len(self._user_channels) > MAX_USERS_CACHE:
+            keys = list(self._user_channels.keys())[:MAX_USERS_CACHE // 2]
+            for k in keys:
+                self._user_channels.pop(k, None)
+        if len(self._no_channel) > MAX_USERS_CACHE:
+            to_remove = list(self._no_channel)[:MAX_USERS_CACHE // 2]
+            for k in to_remove:
+                self._no_channel.discard(k)
+        while len(self._cache_order) > MAX_CACHED_CHATS:
+            old_did = self._cache_order.pop(0)
+            self._channels_cache.pop(old_did, None)
+            self._channels_cache_time.pop(old_did, None)
+            self._active_sml.pop(old_did, None)
+            self._active_acc.pop(old_did, None)
+            self._last_count.pop(old_did, None)
+            self._patched_chats.discard(old_did)
+
+    def _on_tabs_safe(self, sml):
+        try:
+            self._on_tabs(sml)
+        except Exception:
+            pass
+
+    def _on_tabs(self, sml):
+        try:
+            did = get_private_field(sml, "dialog_id")
+            if did is None or int(did) >= 0:
+                return
+            did = int(did)
+        except Exception:
+            return
+
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            acc = int(pa.getCurrentAccount())
+        except Exception:
+            return
+
+        if not self._can_show_tab(did, acc):
+            return
+
+        self._trim_caches()
+        self._active_sml[did] = weakref.ref(sml)
+        self._active_acc[did] = acc
+        self._patched_chats.add(did)
+
+        self._hook_long_click(sml)
+
+        self._ensure_tab(sml)
+
+        cached_ids = self._channels_cache.get(did)
+        if cached_ids:
+            self._show_channels(did, cached_ids)
+
+        self._start_scan(did, acc)
+        run_on_ui_thread(lambda: self._flush_ui(did), 600)
+
+    def _can_show_tab(self, dialog_id, account):
+        if dialog_id >= 0:
+            return False
+        try:
+            from org.telegram.messenger import ChatObject
+            from java.lang import Long as JLong
+            mc = self._get_mc(account)
+            chat = mc.getChat(JLong(int(-dialog_id)))
+            if chat is None:
+                return False
+            is_channel = bool(ChatObject.isChannel(chat))
+            is_mega = bool(chat.megagroup)
+            is_creator = bool(chat.creator)
+            has_admin = chat.admin_rights is not None
+            if not is_channel:
+                return True
+            if is_mega:
+                return True
+            if is_creator:
+                return True
+            if has_admin:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _hook_long_click(self, sml):
+        try:
+            mp = get_private_field(sml, "mediaPages")
+            if not mp:
+                return
+            plugin = self
+            for page in mp:
+                if page is None:
+                    continue
+                page_id = id(page)
+                if page_id in self._long_click_hooked_pages:
+                    continue
+                self._long_click_hooked_pages.add(page_id)
+                lv = get_private_field(page, "listView")
+                if lv is None:
+                    continue
+                self._wrap_long_click(lv, sml, page)
+        except Exception:
+            pass
+
+    def _wrap_long_click(self, listView, sml, page):
+        plugin = self
+        try:
+            original_listener = get_private_field(listView, "onItemLongClickListenerExtended")
+        except Exception:
+            original_listener = None
+
+        try:
+            original_simple = get_private_field(listView, "onItemLongClickListener")
+        except Exception:
+            original_simple = None
+
+        class LongClickProxy(dynamic_proxy(jclass("org.telegram.ui.Components.RecyclerListView$OnItemLongClickListenerExtended"))):
+            def onItemClick(self, view, position, x, y):
+                try:
+                    sel_type = plugin._get_selected_type_page(page)
+                    if sel_type == TAB_ID:
+                        handled = plugin._handle_long_click(view, position, sml)
+                        if handled:
+                            return True
+                except Exception:
+                    pass
+                if original_listener is not None:
+                    try:
+                        return original_listener.onItemClick(view, position, x, y)
+                    except Exception:
+                        pass
+                if original_simple is not None:
+                    try:
+                        return original_simple.onItemClick(view, position)
+                    except Exception:
+                        pass
+                return False
+
+            def onMove(self, dx, dy):
+                if original_listener is not None:
+                    try:
+                        original_listener.onMove(dx, dy)
+                    except Exception:
+                        pass
+
+        proxy = LongClickProxy()
+        listView.setOnItemLongClickListener(proxy)
+
+    def _get_selected_type_page(self, page):
+        try:
+            return int(get_private_field(page, "selectedType"))
+        except Exception:
+            return -1
+
+    def _handle_long_click(self, view, position, sml):
+        try:
+            did = int(get_private_field(sml, "dialog_id"))
+            acc = self._active_acc.get(did)
+            if acc is None:
+                return False
+
+            adapter = get_private_field(sml, "channelRecommendationsAdapter")
+            if adapter is None:
+                return False
+
+            chat = None
+            try:
+                adapter_cls = adapter.getClass()
+                chats_field = None
+                for f in adapter_cls.getDeclaredFields():
+                    f.setAccessible(True)
+                    if f.getName() == "chats":
+                        chats_field = f
+                        break
+                if chats_field is not None:
+                    chats_list = chats_field.get(adapter)
+                    if chats_list is not None and position < chats_list.size():
+                        chat = chats_list.get(position)
+            except Exception:
+                pass
+
+            if chat is None:
+                return False
+
+            channel_id = int(chat.id)
+            owners = self._channel_to_users.get(channel_id, [])
+
+            if len(owners) == 1:
+                self._open_user_profile(owners[0], sml, acc)
+                return True
+            elif len(owners) > 1:
+                self._show_owners_dialog(owners, sml, acc, channel_id)
+                return True
+            else:
+                self._open_channel_profile(channel_id, sml, acc)
+                return True
+
+        except Exception:
+            pass
+        return False
+
+    def _open_user_profile(self, uid, sml, acc):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            from android.os import Bundle as AndroidBundle
+            args = AndroidBundle()
+            args.putLong("user_id", int(uid))
+            ProfileActivity = jclass("org.telegram.ui.ProfileActivity")
+            fragment = ProfileActivity(args)
+            pa.presentFragment(fragment)
+        except Exception:
+            pass
+
+    def _open_channel_profile(self, channel_id, sml, acc):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            chat = mc.getChat(JLong(int(channel_id)))
+            if chat is None:
+                return
+            from android.os import Bundle as AndroidBundle
+            args = AndroidBundle()
+            args.putLong("chat_id", int(channel_id))
+            ProfileActivity = jclass("org.telegram.ui.ProfileActivity")
+            fragment = ProfileActivity(args)
+            pa.presentFragment(fragment)
+        except Exception:
+            pass
+
+    def _show_owners_dialog(self, owner_uids, sml, acc, channel_id):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            ctx = pa.getParentActivity()
+            if ctx is None:
+                return
+
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+
+            AlertDialog = jclass("org.telegram.ui.ActionBar.AlertDialog$Builder")
+            builder = AlertDialog(ctx)
+            builder.setTitle(self._t("channel_owners"))
+
+            names = []
+            uids_ordered = []
+            for uid in owner_uids:
+                user = mc.getUser(JLong(uid))
+                if user is not None:
+                    try:
+                        UserObject = jclass("org.telegram.messenger.UserObject")
+                        name = str(UserObject.getUserName(user))
+                    except Exception:
+                        name = str(uid)
+                    names.append(name)
+                    uids_ordered.append(uid)
+
+            if not names:
+                return
+
+            items = [jclass("java.lang.String")(n) for n in names]
+            items_arr = jclass("java.lang.reflect.Array").newInstance(jclass("java.lang.CharSequence"), len(items))
+            for i, item in enumerate(items):
+                items_arr[i] = item
+
+            plugin = self
+
+            from java.lang import Object as JObject
+
+            class DialogClickListener(dynamic_proxy(jclass("android.content.DialogInterface$OnClickListener"))):
+                def onClick(self, dialog, which):
+                    try:
+                        if which < len(uids_ordered):
+                            plugin._open_user_profile(uids_ordered[which], sml, acc)
+                    except Exception:
+                        pass
+
+            builder.setItems(items_arr, DialogClickListener())
+            builder.setNegativeButton(self._t("close"), None)
+            builder.show()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # scanner: paged participants + parallel full-user lookups
+    # ------------------------------------------------------------------
+
+    def _start_scan(self, did, acc):
+        if did in self._scan_started:
+            if self._ticking.get(did):
+                return
+            cache_time = self._channels_cache_time.get(did, 0)
+            if time.time() - cache_time <= CACHE_TTL:
+                return
+            self._scan_started.pop(did, None)
+        self._scan_started[did] = True
+        self._page_offset[did] = 0
+        self._paging_done[did] = False
+        self._page_retries[did] = 0
+        self._page_inflight[did] = 0
+        try:
+            from org.telegram.messenger import ChatObject
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            chat = mc.getChat(JLong(int(-did)))
+            if chat is None:
+                return
+            if not ChatObject.isChannel(chat):
+                # regular group: use chatFull participants
+                self._paging_done[did] = True
+                uids = self._get_member_uids(did, acc)
+                if uids:
+                    self._enqueue_uids(did, acc, uids)
+            else:
+                pass
+        except Exception:
+            self._log("start_scan did=%s EXC: %s" % (did, traceback.format_exc()))
+        self._start_ticker(did, acc)
+
+        if self.get_setting("load_from_history", False):
+            should_load = True
+            if self.get_setting("only_if_hidden", False):
+                should_load = self._is_members_hidden(did, acc)
+            if should_load and did not in self._history_running:
+                last_hist = self._history_loaded.get(did, 0)
+                if time.time() - last_hist > CACHE_TTL:
+                    self._history_loaded[did] = time.time()
+                    self._load_from_history(did, acc)
+
+    def _start_ticker(self, did, acc):
+        if self._ticking.get(did):
+            return
+        self._ticking[did] = True
+        self._reschedule_tick(did)
+
+    def _reschedule_tick(self, did):
+        if not self._ticking.get(did):
+            return
+        run_on_ui_thread(lambda: self._tick(did), TICK_MS)
+
+    def _stop_scan(self, did):
+        if not self._ticking.get(did):
+            return
+        self._ticking[did] = False
+        self._flush_ui(did)
+        try:
+            self._get_full_channels(did, self._active_acc.get(did))
+        except Exception:
+            pass
+        self._members_queue.pop(did, None)
+        self._members_seen.pop(did, None)
+        self._page_inflight.pop(did, None)
+        self._page_offset.pop(did, None)
+        self._paging_done.pop(did, None)
+        self._page_retries.pop(did, None)
+        self._flood_until.pop(did, None)
+        self._pending_channels.pop(did, None)
+        self._dirty.pop(did, None)
+        self._last_ui.pop(did, None)
+        self._storage_counter.pop(did, None)
+
+    def _tick(self, did):
+        try:
+            if not self._ticking.get(did):
+                return
+            sml_ref = self._active_sml.get(did)
+            if not sml_ref or sml_ref() is None:
+                self._stop_scan(did)
+                return
+            acc = self._active_acc.get(did)
+            if acc is None:
+                self._stop_scan(did)
+                return
+
+            now = time.time()
+            if now < self._flood_until.get(did, 0):
+                # during flood wait: keep ticker alive, flush UI, no requests
+                self._flush_ui(did)
+                self._reschedule_tick(did)
+                return
+
+            if not self._paging_done.get(did) and not self._page_inflight.get(did, 0):
+                self._page_inflight[did] = 1
+                self._load_participants_page(did, acc)
+
+            self._send_next_full_users(did, acc)
+
+            if not self._paging_done.get(did) or self._page_inflight.get(did, 0) or \
+               self._inflight.get(did, 0) or self._members_queue.get(did):
+                self._reschedule_tick(did)
+            else:
+                self._stop_scan(did)
+                return
+        except Exception:
+            self._log("tick did=%s EXC: %s" % (did, traceback.format_exc()))
+            try:
+                if self._ticking.get(did):
+                    self._reschedule_tick(did)
+            except Exception:
+                pass
+        # force UI flush every tick to show progress immediately
+        try:
+            if self._ticking.get(did):
+                self._flush_ui(did)
+        except Exception:
+            pass
+
+    def _load_participants_page(self, did, acc):
+        try:
+            from org.telegram.tgnet import TLRPC
+            from org.telegram.messenger import ChatObject
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            chat_id = int(-did)
+            chat = mc.getChat(JLong(chat_id))
+            if chat is None or not ChatObject.isChannel(chat):
+                self._paging_done[did] = True
+                self._page_inflight[did] = 0
+                return
+            page = self._page_offset.get(did, 0)
+            req = TLRPC.TL_channels_getParticipants()
+            inp = TLRPC.TL_inputChannel()
+            inp.channel_id = chat_id
+            try:
+                inp.access_hash = chat.access_hash
+            except Exception:
+                inp.access_hash = 0
+            req.channel = inp
+            req.limit = PARTICIPANTS_PAGE
+            req.offset = page
+            req.hash = 0
+            # Recent filter supports offset pagination and works everywhere
+            req.filter = TLRPC.TL_channelParticipantsRecent()
+
+            plugin = self
+
+            def cb(response, error):
+                try:
+                    plugin._page_inflight[did] = 0
+                except Exception:
+                    pass
+                if response is not None and not error:
+                    plugin._on_participants_page(did, acc, response, page)
+                else:
+                    err_text = ""
+                    try:
+                        err_text = str(error)
+                    except Exception:
+                        pass
+                    plugin._log("page did=%s offset=%s ERROR: %s" % (did, page, err_text))
+                    plugin._check_flood(error)
+                    if not plugin._schedule_page_retry(did, acc):
+                        plugin._log("page did=%s giving up, paging_done" % did)
+                        plugin._paging_done[did] = True
+
+            send_request(req, cb)
+        except Exception:
+            self._log("load_page did=%s EXC: %s" % (did, traceback.format_exc()))
+            try:
+                self._page_inflight[did] = 0
+            except Exception:
+                pass
+            if not self._schedule_page_retry(did, acc):
+                self._paging_done[did] = True
+
+    def _schedule_page_retry(self, did, acc):
+        """Schedule a page retry; returns False when giving up.
+        During an active flood the retry waits until the flood ends without
+        consuming a retry attempt."""
+        retries = self._page_retries.get(did, 0)
+        if retries >= MAX_PAGE_RETRIES:
+            return False
+        delay = PAGE_RETRY_DELAY_MS
+        now = time.time()
+        flood_until = self._flood_until.get(did, 0)
+        if now < flood_until:
+            delay = int((flood_until - now) * 1000) + 500
+        else:
+            self._page_retries[did] = retries + 1
+        self._page_inflight[did] = 1
+        run_on_ui_thread(lambda: self._load_participants_page(did, acc), delay)
+        return True
+
+    def _on_participants_page(self, did, acc, response, page):
+        try:
+            mc = self._get_mc(acc)
+            users = getattr(response, 'users', None)
+            if users:
+                for i in range(users.size()):
+                    mc.putUser(users.get(i), False)
+            chats = getattr(response, 'chats', None)
+            if chats:
+                for i in range(chats.size()):
+                    mc.putChat(chats.get(i), False)
+                try:
+                    from org.telegram.messenger import ChatObject
+                    main_id = int(-did)
+                    for i in range(chats.size()):
+                        try:
+                            ch = chats.get(i)
+                            cid = int(ch.id)
+                            if cid == main_id:
+                                continue
+                            if ChatObject.isChannel(ch):
+                                self._note_channel(did, cid)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            parts = getattr(response, 'participants', None)
+            users = getattr(response, 'users', None)
+
+            # fast path: personal_channel_id may already be present on User objects
+            direct = {}
+            saw_nonzero = False
+            if users:
+                for i in range(users.size()):
+                    try:
+                        u = users.get(i)
+                        uid = int(u.id)
+                        pc = int(u.personal_channel_id)
+                        direct[uid] = pc
+                        if pc > 0:
+                            saw_nonzero = True
+                    except Exception:
+                        pass
+
+            uids = []
+            if parts:
+                n = parts.size()
+                for i in range(n):
+                    try:
+                        p = parts.get(i)
+                        u = 0
+                        try:
+                            u = int(p.user_id)
+                        except Exception:
+                            try:
+                                u = int(p.getUser_id())
+                            except Exception:
+                                u = 0
+                        if u <= 0:
+                            continue
+                        uids.append(u)
+                    except Exception:
+                        pass
+
+            if saw_nonzero:
+                # server populates personal_channel_id: trust it, no fullUser needed
+                for uid, pc in direct.items():
+                    if pc > 0:
+                        self._user_channels[uid] = pc
+                        self._note_channel(did, pc)
+                    else:
+                        self._no_channel.add(uid)
+                self._ui_dirty[did] = True
+                # keep only users without the field for fullUser lookup
+                uids = [u for u in uids if u not in direct]
+            else:
+                if not uids and users:
+                    # fallback: use response.users ids (real user objects)
+                    for i in range(users.size()):
+                        try:
+                            u = int(users.get(i).id)
+                            if u > 0:
+                                uids.append(u)
+                        except Exception:
+                            pass
+
+            if uids:
+                self._enqueue_uids(did, acc, uids)
+            elif saw_nonzero:
+                try:
+                    run_on_ui_thread(lambda: self._flush_ui(did), 50)
+                except Exception:
+                    pass
+
+            self._page_retries[did] = 0
+
+            total_count = 0
+            try:
+                total_count = int(getattr(response, 'count', 0))
+            except Exception:
+                total_count = 0
+
+            page_n = 0
+            if parts:
+                try:
+                    page_n = parts.size()
+                except Exception:
+                    page_n = 0
+            if not page_n and users:
+                try:
+                    page_n = users.size()
+                except Exception:
+                    page_n = 0
+
+            if page_n == 0:
+                self._paging_done[did] = True
+            elif total_count > 0 and page + page_n >= total_count:
+                self._paging_done[did] = True
+            elif page >= MAX_PAGES:
+                self._paging_done[did] = True
+            else:
+                self._page_offset[did] = page + PARTICIPANTS_PAGE
+        except Exception:
+            self._log("on_page did=%s EXC: %s" % (did, traceback.format_exc()))
+            if not self._schedule_page_retry(did, self._active_acc.get(did)):
+                self._paging_done[did] = True
+
+    def _enqueue_uids(self, did, acc, uids):
+        try:
+            q = self._members_queue.setdefault(did, deque())
+            seen = self._members_seen.setdefault(did, set())
+            for uid in uids:
+                uid = int(uid)
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                if uid in self._no_channel:
+                    continue
+                pcid = self._user_channels.get(uid)
+                if pcid:
+                    self._note_channel(did, pcid)
+                    continue
+                if uid in self._loading:
+                    continue
+                q.append(uid)
+            if len(seen) > MAX_SCAN_PER_CHAT:
+                self._paging_done[did] = True
+            if q or self._dirty.get(did) or self._pending_channels.get(did):
+                self._start_ticker(did, acc)
+        except Exception:
+            self._log("enqueue did=%s EXC: %s" % (did, traceback.format_exc()))
+
+    def _send_next_full_users(self, did, acc):
+        try:
+            q = self._members_queue.get(did)
+            if not q:
+                return
+            now = time.time()
+            if now < self._next_slot.get(did, 0):
+                return
+            interval = self._full_interval.get(did, 0.4)
+            self._next_slot[did] = now + interval
+            sent = 0
+            while self._inflight.get(did, 0) < 4 and sent < 2 and q:
+                uid = q.popleft()
+                if uid in self._no_channel or uid in self._user_channels:
+                    continue
+                if uid in self._loading:
+                    continue
+                self._loading.add(uid)
+                self._inflight[did] = self._inflight.get(did, 0) + 1
+                sent += 1
+                self._send_full_user(did, acc, uid)
+        except Exception:
+            pass
+
+    def _send_full_user(self, did, acc, uid):
+        try:
+            from org.telegram.tgnet import TLRPC
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            user = mc.getUser(JLong(uid))
+            if user is None:
+                self._no_channel.add(uid)
+                self._inflight[did] = max(0, self._inflight.get(did, 1) - 1)
+                self._loading.discard(uid)
+                return
+
+            req = TLRPC.TL_users_getFullUser()
+            inp = TLRPC.TL_inputUser()
+            inp.user_id = user.id
+            try:
+                inp.access_hash = user.access_hash
+            except Exception:
+                inp.access_hash = 0
+            req.id = inp
+            plugin = self
+
+            def cb(response, error):
+                try:
+                    plugin._inflight[did] = max(0, plugin._inflight.get(did, 1) - 1)
+                except Exception:
+                    pass
+                try:
+                    plugin._loading.discard(uid)
+                except Exception:
+                    pass
+                if response is not None and not error:
+                    plugin._process_user_response(response, uid, did, acc)
+                    try:
+                        plugin._full_clean[did] = plugin._full_clean.get(did, 0) + 1
+                        if plugin._full_clean[did] >= 10:
+                            plugin._full_clean[did] = 0
+                            plugin._full_interval[did] = max(0.25, plugin._full_interval.get(did, 0.4) - 0.1)
+                    except Exception:
+                        pass
+                else:
+                    err_text = ""
+                    try:
+                        err_text = str(error)
+                    except Exception:
+                        err_text = "unknown"
+                    plugin._log("fulluser uid=%s ERROR: %s" % (uid, err_text))
+                    if not plugin._retry_user_after_flood(did, uid, error):
+                        plugin._no_channel.add(uid)
+
+            send_request(req, cb)
+        except Exception:
+            self._log("send_full_user uid=%s EXC: %s" % (uid, traceback.format_exc()))
+            try:
+                self._inflight[did] = max(0, self._inflight.get(did, 1) - 1)
+            except Exception:
+                pass
+            try:
+                self._loading.discard(uid)
+            except Exception:
+                pass
+
+    def _retry_user_after_flood(self, did, uid, error):
+        """Re-queue a full-user lookup after FLOOD_WAIT. Returns True if retried."""
+        try:
+            text = ""
+            try:
+                text = str(error.text)
+            except Exception:
+                text = str(error)
+            if "FLOOD_WAIT" not in text:
+                return False
+            self._check_flood(error)
+            try:
+                plugin = self
+                plugin._full_interval[did] = min(3.0, plugin._full_interval.get(did, 0.4) + 0.5)
+                plugin._full_clean[did] = 0
+            except Exception:
+                pass
+            retries = self._user_retries.get(uid, 0)
+            if retries >= 3:
+                self._user_retries.pop(uid, None)
+                return False
+            self._user_retries[uid] = retries + 1
+            q = self._members_queue.setdefault(did, deque())
+            if uid not in q:
+                q.append(uid)
+            self._start_ticker(did, self._active_acc.get(did))
+            return True
+        except Exception:
+            return False
+
+    def _check_flood(self, error):
+        try:
+            text = ""
+            try:
+                text = str(error.text)
+            except Exception:
+                text = str(error)
+            m = re.search(r"FLOOD_WAIT_(\d+)", text)
+            if m:
+                sec = int(m.group(1))
+                if sec > 120:
+                    sec = 120
+                until = time.time() + sec
+                for did in list(self._ticking.keys()):
+                    self._flood_until[did] = max(self._flood_until.get(did, 0), until)
+        except Exception:
+            pass
+
+    def _process_user_response(self, response, uid, did, acc):
+        mc = self._get_mc(acc)
+        try:
+            users = response.users
+            if users:
+                for i in range(users.size()):
+                    mc.putUser(users.get(i), False)
+            chats = response.chats
+            if chats:
+                for i in range(chats.size()):
+                    mc.putChat(chats.get(i), False)
+        except Exception:
+            pass
+
+        try:
+            full_user = response.full_user
+            if full_user:
+                pcid = 0
+                try:
+                    pcid = int(full_user.personal_channel_id)
+                except Exception:
+                    pass
+                if pcid != 0:
+                    self._user_channels[uid] = pcid
+                    self._no_channel.discard(uid)
+                    lst = self._channel_to_users.setdefault(pcid, [])
+                    if uid not in lst:
+                        lst.append(uid)
+                    self._note_channel(did, pcid)
+                    self._ui_dirty[did] = True
+                    try:
+                        run_on_ui_thread(lambda: self._flush_ui(did), 50)
+                    except Exception:
+                        pass
+                    c = self._storage_counter.get(did, 0) + 1
+                    self._storage_counter[did] = c
+                    if c % 5 == 0:
+                        self._save_storage()
+                else:
+                    self._no_channel.add(uid)
+        except Exception:
+            self._log("process_user_response uid=%s EXC: %s" % (uid, traceback.format_exc()))
+
+    def _note_channel(self, did, pcid):
+        try:
+            pcid = int(pcid)
+            if pcid == 0:
+                return
+            if pcid in self._chat_failed:
+                return
+            existing = self._channels_cache.get(did, [])
+            if pcid in existing:
+                return
+            pending = self._pending_channels.setdefault(did, [])
+            if pcid in pending:
+                return
+            pending.append(pcid)
+            self._dirty[did] = True
+        except Exception:
+            pass
+
+    def _flush_ui(self, did):
+        try:
+            now = time.time()
+            last = self._last_ui.get(did, 0)
+            if now - last < UI_INTERVAL:
+                return
+            self._last_ui[did] = now
+            # merge pending into cache
+            changed = bool(self._ui_dirty.get(did, False))
+            self._ui_dirty[did] = False
+            pending = self._pending_channels.pop(did, [])
+            if pending:
+                existing = self._channels_cache.get(did, [])
+                for pcid in pending:
+                    if pcid and pcid not in existing:
+                        existing.append(pcid)
+                self._channels_cache[did] = existing
+                self._channels_cache_time[did] = time.time()
+                if did in self._cache_order:
+                    self._cache_order.remove(did)
+                self._cache_order.append(did)
+                self._dirty[did] = False
+                changed = True
+            # rebuild adapter only when the list actually changed
+            cached = self._channels_cache.get(did, [])
+            sml_ref = self._active_sml.get(did)
+            sml = sml_ref() if sml_ref else None
+            if sml is not None and cached:
+                acc = self._active_acc.get(did)
+                if acc is not None:
+                    channels = self._get_chats_by_ids(did, cached, acc)
+                    if len(channels) != self._last_count.get(did, 0):
+                        changed = True
+                    if channels and changed:
+                        self._last_count[did] = len(channels)
+                        self._ensure_tab(sml)
+                        self._fill_adapter(sml, channels)
+                        self._try_update_counter(sml)
+                    if self._paging_done.get(did) and not self._members_queue.get(did) \
+                       and not self._inflight.get(did, 0) and not self._page_inflight.get(did, 0):
+                        self._get_full_channels(did, acc)
+            elif sml is not None:
+                self._refresh_counter(did)
+        except Exception:
+            self._log("flush did=%s EXC: %s" % (did, traceback.format_exc()))
+
+    def _refresh_counter(self, did):
+        try:
+            sml_ref = self._active_sml.get(did)
+            if not sml_ref:
+                return
+            sml = sml_ref()
+            if sml is None:
+                return
+            self._ensure_tab(sml, did)
+            count = self._last_count.get(did, 0)
+            if self._ticking.get(did):
+                text = self._t("tab_label") + " (" + self._t("scanning") + ")"
+                self._set_counter_text_raw(sml, text)
+            else:
+                self._set_counter_text(sml, count)
+        except Exception:
+            pass
+
+    def _show_channels(self, did, channel_ids):
+        sml_ref = self._active_sml.get(did)
+        if not sml_ref:
+            return
+        sml = sml_ref()
+        if sml is None:
+            self._active_sml.pop(did, None)
+            return
+        acc = self._active_acc.get(did)
+        if acc is None:
+            return
+        channels = self._get_chats_by_ids(did, channel_ids, acc)
+        if channels:
+            self._last_count[did] = len(channels)
+            self._show_tab(sml, channels)
+
+    def _get_chats_by_ids(self, did, channel_ids, acc):
+        from java.lang import Long as JLong
+        mc = self._get_mc(acc)
+        result = []
+        missing = []
+        for cid in channel_ids:
+            try:
+                ch = mc.getChat(JLong(cid))
+                if ch is None:
+                    missing.append(cid)
+                    continue
+                self._chat_load_tries.pop(cid, None)
+                self._chat_loading.discard(cid)
+                try:
+                    access_hash = ch.access_hash
+                    if access_hash == 0:
+                        missing.append(cid)
+                        continue
+                except Exception:
+                    pass
+                # enrich participants_count from cached chatFull
+                try:
+                    cf = mc.getChatFull(cid)
+                    if cf and hasattr(cf, 'participants_count') and cf.participants_count:
+                        ch.participants_count = cf.participants_count
+                        self._count_done.add(cid)
+                except Exception:
+                    pass
+                result.append(ch)
+            except Exception:
+                pass
+        if missing:
+            self._maybe_load_chats(did, acc, missing)
+        # sort: channels with count first (desc), then without count
+        result.sort(key=lambda c: (0 if (hasattr(c, 'participants_count') and c.participants_count) else 1, -self._get_subs(c)))
+        return result
+
+    def _maybe_load_chats(self, did, acc, cids):
+        try:
+            now = time.time()
+            if now < self._flood_until.get(did, 0):
+                return
+            need = []
+            for cid in cids:
+                if cid in self._chat_loading or cid in self._chat_failed:
+                    continue
+                tries = self._chat_load_tries.get(cid, 0)
+                if tries >= 3:
+                    continue
+                need.append(cid)
+            if not need:
+                return
+            from org.telegram.tgnet import TLRPC
+            from java.lang import Long as JLong
+            plugin = self
+            mc = self._get_mc(acc)
+
+            def send_split(batch, depth):
+                actual = []
+                for cid in batch:
+                    if cid in plugin._chat_failed or cid in plugin._chat_loading:
+                        continue
+                    actual.append(cid)
+                if not actual:
+                    return
+                for cid in actual:
+                    plugin._chat_loading.add(cid)
+                    plugin._chat_load_tries[cid] = plugin._chat_load_tries.get(cid, 0) + 1
+                req = TLRPC.TL_messages_getChats()
+                ids_list = ArrayList()
+                for cid in actual:
+                    ids_list.add(JLong(cid))
+                req.id = ids_list
+
+                def cb(response, error):
+                    if response is not None and not error:
+                        try:
+                            chats = getattr(response, 'chats', None)
+                            if chats:
+                                for i in range(chats.size()):
+                                    try:
+                                        mc.putChat(chats.get(i), False)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        for cid in actual:
+                            plugin._chat_loading.discard(cid)
+                        plugin._ui_dirty[did] = True
+                        try:
+                            run_on_ui_thread(lambda: plugin._flush_ui(did), 100)
+                        except Exception:
+                            pass
+                        return
+                    err_text = ""
+                    try:
+                        err_text = str(error.text)
+                    except Exception:
+                        try:
+                            err_text = str(error)
+                        except Exception:
+                            err_text = "unknown"
+                    plugin._check_flood(error)
+                    if "FLOOD_WAIT" in err_text:
+                        for cid in actual:
+                            plugin._chat_loading.discard(cid)
+                            plugin._chat_load_tries[cid] = max(0, plugin._chat_load_tries.get(cid, 0) - 1)
+                        return
+                    if "CHAT_ID_INVALID" in err_text:
+                        if len(actual) > 1 and depth < 4:
+                            # one bad id kills the whole batch: isolate it by splitting
+                            for cid in actual:
+                                plugin._chat_loading.discard(cid)
+                                plugin._chat_load_tries[cid] = max(0, plugin._chat_load_tries.get(cid, 0) - 1)
+                            half = (len(actual) + 1) // 2
+                            send_split(actual[:half], depth + 1)
+                            send_split(actual[half:], depth + 1)
+                        else:
+                            # single id (or too deep) confirmed bad: ban it for good
+                            for cid in actual:
+                                plugin._chat_loading.discard(cid)
+                                plugin._chat_failed.add(cid)
+                                plugin._chat_load_tries[cid] = 99
+                            bad_cid = actual[0]
+                            try:
+                                cached = plugin._channels_cache.get(did)
+                                if cached and bad_cid in cached:
+                                    cached.remove(bad_cid)
+                                    plugin._channels_cache[did] = cached
+                            except Exception:
+                                pass
+                            # drop user->channel mappings pointing at the banned id
+                            try:
+                                dead = [u for u, c in list(plugin._user_channels.items()) if c == bad_cid]
+                                for u in dead:
+                                    plugin._user_channels.pop(u, None)
+                                plugin._channel_to_users.pop(bad_cid, None)
+                            except Exception:
+                                pass
+                        return
+                    # permanent-ish error: drop whole batch to stop hammering
+                    for cid in actual:
+                        plugin._chat_loading.discard(cid)
+                        plugin._chat_failed.add(cid)
+
+                send_request(req, cb)
+
+            for i in range(0, len(need), 20):
+                send_split(need[i:i + 20], 0)
+        except Exception:
+            self._log("maybe_load_chats EXC: %s" % traceback.format_exc())
+
+    def _has_participant_count(self, mc, cid):
+        if cid in self._count_done:
+            return True
+        try:
+            cf = mc.getChatFull(cid)
+            if cf and getattr(cf, 'participants_count', 0):
+                self._count_done.add(cid)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_full_channels(self, did, acc):
+        """Fetch chatFull (participants count) for channels that lack it."""
+        try:
+            if time.time() < self._flood_until.get(did, 0):
+                return
+            mc = self._get_mc(acc)
+            cached = self._channels_cache.get(did, [])
+            need = []
+            for cid in cached:
+                if len(need) >= FULL_COUNT_WINDOW:
+                    break
+                if cid in self._count_done or cid in self._count_loading or cid in self._count_failed:
+                    continue
+                if self._has_participant_count(mc, cid):
+                    continue
+                need.append(cid)
+            for cid in need:
+                self._count_loading.add(cid)
+                self._load_full_channel(did, acc, cid)
+        except Exception:
+            pass
+
+    def _load_full_channel(self, did, acc, cid):
+        try:
+            from org.telegram.tgnet import TLRPC
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            chat = mc.getChat(JLong(cid))
+            if chat is None:
+                self._count_loading.discard(cid)
+                self._count_failed.add(cid)
+                return
+            req = TLRPC.TL_channels_getFullChannel()
+            inp = TLRPC.TL_inputChannel()
+            inp.channel_id = int(cid)
+            try:
+                inp.access_hash = chat.access_hash
+            except Exception:
+                inp.access_hash = 0
+            req.channel = inp
+            plugin = self
+
+            def cb(response, error):
+                try:
+                    plugin._count_loading.discard(cid)
+                except Exception:
+                    pass
+                if response is not None and not error:
+                    plugin._on_full_channel(did, acc, cid, response)
+                else:
+                    plugin._check_flood(error)
+                    text = ""
+                    try:
+                        text = str(error.text)
+                    except Exception:
+                        text = str(error)
+                    if "FLOOD_WAIT" in text:
+                        plugin._count_failed.discard(cid)
+                    else:
+                        plugin._count_failed.add(cid)
+
+            send_request(req, cb)
+        except Exception:
+            try:
+                self._count_loading.discard(cid)
+            except Exception:
+                pass
+            self._count_failed.add(cid)
+
+    def _on_full_channel(self, did, acc, cid, response):
+        try:
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+            full_chat = getattr(response, 'full_chat', None)
+            count = 0
+            try:
+                count = int(full_chat.participants_count)
+            except Exception:
+                count = 0
+            if count > 0:
+                self._count_done.add(cid)
+                chat = mc.getChat(JLong(cid))
+                if chat is not None:
+                    try:
+                        chat.participants_count = count
+                        mc.putChat(chat, False)
+                    except Exception:
+                        pass
+            else:
+                self._count_failed.add(cid)
+            try:
+                if full_chat is not None:
+                    mc.putChatFull(full_chat, False)
+            except Exception:
+                pass
+            chats = getattr(response, 'chats', None)
+            if chats:
+                for i in range(chats.size()):
+                    try:
+                        mc.putChat(chats.get(i), False)
+                    except Exception:
+                        pass
+            # refresh UI on the UI thread only
+            try:
+                plugin = self
+                plugin._ui_dirty[did] = True
+                run_on_ui_thread(lambda: plugin._flush_ui(did), 50)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _get_subs(self, chat):
+        try:
+            return int(chat.participants_count)
+        except Exception:
+            return 0
+
+    def _load_from_history(self, did, acc):
+        self._history_running.add(did)
+        total_limit = self._get_history_limit()
+        self._load_history_page(did, acc, 0, total_limit)
+
+    def _load_history_page(self, did, acc, offset_id, remaining):
+        from org.telegram.tgnet import TLRPC
+        from java.lang import Long as JLong
+
+        if remaining <= 0:
+            self._history_running.discard(did)
+            return
+
+        mc = self._get_mc(acc)
+        chat_id = int(-did)
+        chat = mc.getChat(JLong(chat_id))
+        if chat is None:
+            self._history_running.discard(did)
+            return
+
+        req = TLRPC.TL_messages_getHistory()
+        try:
+            from org.telegram.messenger import ChatObject
+            if ChatObject.isChannel(chat):
+                inp = TLRPC.TL_inputPeerChannel()
+                inp.channel_id = chat_id
+                try:
+                    inp.access_hash = chat.access_hash
+                except Exception:
+                    inp.access_hash = 0
+            else:
+                inp = TLRPC.TL_inputPeerChat()
+                inp.chat_id = chat_id
+            req.peer = inp
+        except Exception:
+            self._history_running.discard(did)
+            return
+
+        batch = min(100, remaining)
+        req.limit = batch
+        req.offset_id = offset_id
+        req.offset_date = 0
+        req.add_offset = 0
+        req.max_id = 0
+        req.min_id = 0
+        req.hash = 0
+        plugin = self
+
+        def on_resp(response, error):
+            if error or response is None:
+                plugin._check_flood(error)
+                plugin._history_running.discard(did)
+                return
+            try:
+                users = getattr(response, 'users', None)
+                if users:
+                    for i in range(users.size()):
+                        mc.putUser(users.get(i), False)
+                chats = getattr(response, 'chats', None)
+                if chats:
+                    for i in range(chats.size()):
+                        mc.putChat(chats.get(i), False)
+
+                messages = getattr(response, 'messages', None)
+                last_id = 0
+                count = 0
+                page_uids = set()
+                if messages:
+                    count = messages.size()
+                    for i in range(count):
+                        msg = messages.get(i)
+                        last_id = int(msg.id)
+                        from_id = getattr(msg, 'from_id', None)
+                        if from_id:
+                            uid = getattr(from_id, 'user_id', None)
+                            if uid:
+                                page_uids.add(int(uid))
+
+                if page_uids:
+                    plugin._enqueue_uids(did, acc, list(page_uids))
+
+                if count < batch or last_id == 0:
+                    plugin._history_running.discard(did)
+                else:
+                    plugin._load_history_page(did, acc, last_id, remaining - batch)
+            except Exception:
+                plugin._history_running.discard(did)
+
+        send_request(req, on_resp)
+
+    def _is_members_hidden(self, did, acc):
+        try:
+            mc = self._get_mc(acc)
+            cid = int(-did)
+            ci = mc.getChatFull(cid)
+            if ci is None:
+                return False
+            return bool(getattr(ci, "participants_hidden", False))
+        except Exception:
+            return False
+
+    def _get_member_uids(self, did, acc):
+        try:
+            mc = self._get_mc(acc)
+            cid = int(-did)
+            ci = mc.getChatFull(cid)
+            if ci is None:
+                return []
+            parts = None
+            try:
+                p = ci.participants
+                if p:
+                    parts = p.participants
+            except Exception:
+                pass
+            if parts is None:
+                return []
+            uids = []
+            size = parts.size()
+            for i in range(size):
+                try:
+                    uids.append(int(parts.get(i).user_id))
+                except Exception:
+                    pass
+            return uids
+        except Exception:
+            return []
+
+    def _show_tab(self, sml, channels):
+        try:
+            ss = get_private_field(sml, "scrollSlidingTextTabStrip")
+            if ss is None:
+                return
+            self._ensure_tab(sml)
+            self._fill_adapter(sml, channels)
+            self._try_update_counter(sml)
+        except Exception:
+            pass
+
+    def _ensure_tab(self, sml):
+        try:
+            ss = get_private_field(sml, "scrollSlidingTextTabStrip")
+            if ss is None:
+                return
+            tab_label = self._t("tab_label")
+            tab_exists = False
+            try:
+                ids = ss.getTabIds()
+                if ids:
+                    for i in range(ids.size()):
+                        if int(ids.get(i)) == TAB_ID:
+                            tab_exists = True
+                            break
+            except Exception:
+                pass
+            if not tab_exists:
+                try:
+                    ss.addTextTab(TAB_ID, tab_label, None)
+                except Exception:
+                    try:
+                        ss.addTextTab(TAB_ID, tab_label)
+                    except Exception:
+                        return
+                try:
+                    ss.updateTabStyles()
+                except Exception:
+                    pass
+            else:
+                self._rename_tab(sml, ss, tab_label)
+        except Exception:
+            pass
+
+    def _rename_tab(self, sml, ss, tab_label):
+        try:
+            id_to_pos = get_private_field(ss, "idToPosition")
+            if id_to_pos is None:
+                return
+            pos = id_to_pos.get(TAB_ID, -1)
+            if pos == -1:
+                return
+            tabs_container = get_private_field(ss, "tabsContainer")
+            if tabs_container is None:
+                return
+            tab_view = tabs_container.getChildAt(pos)
+            if tab_view is None:
+                return
+            current_text = str(tab_view.getText())
+            if current_text != tab_label:
+                tab_view.setText(tab_label)
+        except Exception:
+            pass
+
+    def _try_update_counter(self, sml):
+        try:
+            selected = self._get_selected_type(sml)
+            if selected != TAB_ID:
+                return
+            did = int(get_private_field(sml, "dialog_id"))
+            count = self._last_count.get(did, 0)
+            self._set_counter_text(sml, count)
+        except Exception:
+            pass
+
+    def _set_counter_text_raw(self, sml, text):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            counter_view = get_private_field(pa, "mediaCounterTextView")
+            if counter_view is None:
+                return
+            counter_view.setText(text)
+        except Exception:
+            pass
+
+    def _set_counter_text(self, sml, count):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            counter_view = get_private_field(pa, "mediaCounterTextView")
+            if counter_view is None:
+                return
+            if count > 0:
+                LocaleController = jclass("org.telegram.messenger.LocaleController")
+                text = LocaleController.formatPluralString("Channels", count)
+                counter_view.setText(text)
+            else:
+                counter_view.setText(self._t("tab_label"))
+        except Exception:
+            pass
+
+    def _on_counter_update(self, pa):
+        try:
+            sml = get_private_field(pa, "sharedMediaLayout")
+            if sml is None:
+                return
+            selected = self._get_selected_type(sml)
+            if selected != TAB_ID:
+                return
+            did = self._get_did(sml)
+            if did is None or did not in self._patched_chats:
+                return
+            count = self._last_count.get(did, 0)
+            self._set_counter_text(sml, count)
+        except Exception:
+            pass
+
+    def _get_selected_type(self, sml):
+        try:
+            mp = get_private_field(sml, "mediaPages")
+            if mp and mp[0]:
+                return int(get_private_field(mp[0], "selectedType"))
+        except Exception:
+            pass
+        return -1
+
+    def _fill_adapter(self, sml, channels):
+        try:
+            adapter = get_private_field(sml, "channelRecommendationsAdapter")
+            if adapter is None:
+                return
+            chat_list = ArrayList()
+            for ch in channels:
+                chat_list.add(ch)
+            adapter_cls = adapter.getClass()
+            set_chats = False
+            for f in adapter_cls.getDeclaredFields():
+                f.setAccessible(True)
+                name = f.getName()
+                if name == "chats":
+                    f.set(adapter, chat_list)
+                    set_chats = True
+                elif name == "more":
+                    f.setInt(adapter, 0)
+                elif name == "chatsCount":
+                    try:
+                        f.setInt(adapter, 0)
+                    except Exception:
+                        pass
+                elif name == "loading":
+                    try:
+                        f.setBoolean(adapter, False)
+                    except Exception:
+                        pass
+                elif name == "loaded":
+                    try:
+                        f.setBoolean(adapter, True)
+                    except Exception:
+                        pass
+            adapter.notifyDataSetChanged()
+        except Exception:
+            self._log("fill_adapter EXC: %s" % traceback.format_exc())
+        # second chance: refresh the adapter actually bound to our page's list
+        try:
+            mp = get_private_field(sml, "mediaPages")
+            if mp:
+                for page in mp:
+                    if page is None:
+                        continue
+                    st = -1
+                    try:
+                        st = self._get_selected_type_page(page)
+                    except Exception:
+                        pass
+                    lv = get_private_field(page, "listView")
+                    if lv is None:
+                        continue
+                    lv_adapter = None
+                    try:
+                        lv_adapter = lv.getAdapter()
+                    except Exception:
+                        pass
+                    if st != TAB_ID or lv_adapter is None:
+                        continue
+                    try:
+                        page.notifyDataSetChanged()
+                    except Exception:
+                        pass
+                    try:
+                        lv_adapter.notifyDataSetChanged()
+                    except Exception:
+                        pass
+                    try:
+                        lv.invalidate()
+                    except Exception:
+                        pass
+        except Exception:
+            self._log("fill_adapter page pass EXC: %s" % traceback.format_exc())
+
+
+class _CounterHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self._plugin._on_counter_update(param.thisObject)
+        except Exception:
+            pass
+
+# __DEX_BEGIN__
+# eNpllU1sG0UUx9/sel07cRzHLSlxUGQtHArEcZzYxnYMgrYUtTIFqVFUVarQZHdjr7tZb73ryAgI
+# QYqgEkLiwgkuXFDFkROquHFDHDly6Q2hInHuIeI/O5PYFZZ/+96+mTfvw5MX2xnPrG/W6Ld/vn9l
+# uee0tK/+/fVG7cfHgfbnifdz7fGbSaKAiMY71TypzwODaIWkPQ3+AthGGUakQW5DzkHakPjS73hs
+# J4ieQF7WiTpgG3TBx+BTcAy+AF+CH8Aj8Dc4AXn4lkAD3AS3wA64A+4CB/SADw7B5+Ab8BD8BB4B
+# fCml8p0BsyJfknkugPPAUPW9pMt6Tt/PqfpW9Yle1aXfObUnr/Q27Do8cyRkip4n2ZPn4vdEvFdI
+# puQiyf2L6n1JyYKSL5DIXe5PnkmNLsRSV5LRcrxf9juhcsoqeRuFHBlyTXyeanJPnvqwZQGL106U
+# PcilYu9EnDsjDQe/Cr1A82QxRg2mYzW/0IdeYBrdLxLqvbQ8x/JaX2NkakmckYZvQb9IfnGWNiij
+# +cUZRMwwP5fBmRkmvbLq9zDiHHIqE6J5XeZyP67qtBL0UZd1TCxES2d7jXhFUz1f0eXvLOsU2ReQ
+# +WncFEiCWcqOX79bWGmzxRwtoh9tKsL8olAKeIzjs4w4QxmHqbvBYlJty3N9N3qDkm0pF66+fbu4
+# P7BHnlP0Btx2bDo/ZRr5ysiuk3690yHWIQ1iqcN9ezhw7bI18CPHj8pXhBxHW5Q/WxpFrlfuDLpb
+# tNaxBvtlLDtDHnijruuH5YAPI9dyA+5H4QdWj/u+44Xld7nrizP6/ICXPe53y+/t9h0retZ2Kxq6
+# Ps5d+p/t8sj1bGe4RWlx0ppYpgvvT4W6oiKRvv3WO8R2SNtBVXcoyYPA8VGoTQlRM2XF89LLRWc4
+# HAxbRUqqTswFH17zRmEPBe+5XVp45vXayPMoFQ1kMpSU/aNv2eHh1cZH5i637iGI2TJtZ2yumuhK
+# 4Ho8cgd+CR134oXdURdLPR6WrJ5j3QtH+6HZ2uNe6Kya+65f4oFrtiqrZtjjpQo81htV3mhWNurc
+# Wa8161at2axUN+292mu8XqvWq3W+t9HYrGzi0ANnGCIWnJprG2vVku0cmJ/gzmAaFNgN9uAo8URn
+# nx0ljhMs/R342mDph+AX8IfBLs7L+67uMpuSpzNWm5qz+tSsTdBk3ho0mblJmsxdVpRzScxeXeni
+# 75/lpL+YdVpRxhKzGXc/9hUzw1C6mB16TurHIpDSxf+B/wCIVfIv
+# __DEX_END__
