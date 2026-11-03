@@ -1,0 +1,331 @@
+import os
+import math
+import struct
+import threading
+import time
+from array import array
+from base_plugin import BasePlugin, HookResult
+from ui.settings import Header, Switch, Selector, Input, Divider
+from android_utils import log, run_on_ui_thread
+from java import jclass, dynamic_proxy
+
+__id__ = "melodic_piano_typing"
+__name__ = "Melodic Piano Typing"
+__description__ = "Озвучка клавиш уникальными нотами пианино в гармоническом строе и аккордами на Пробел/Enter"
+__author__ = "@itzMahmudj"
+__version__ = "1.0.2"
+__icon__ = "urphey/1"
+__min_version__ = "12.10.6"
+__category__ = ["fun"]
+
+AppLoader = jclass("org.telegram.messenger.ApplicationLoader")
+SPBuilder = jclass("android.media.SoundPool$Builder")
+AABuilder = jclass("android.media.AudioAttributes$Builder")
+AAttr = jclass("android.media.AudioAttributes")
+TextWatcher = jclass("android.text.TextWatcher")
+EditText = jclass("android.widget.EditText")
+ViewGroup = jclass("android.view.ViewGroup")
+Sys = jclass("java.lang.System")
+
+SR = 22050
+TSZ = 2048
+TMSK = 2047
+
+SCALE = [
+    110.0, 123.5, 130.8, 146.8, 164.8, 174.6, 196.0, 207.7, 220.0, 246.9, 261.6,
+    293.7, 329.6, 349.2, 392.0, 415.3, 440.0, 493.9, 523.3, 587.3, 659.3, 698.5,
+    784.0, 830.6, 880.0, 987.8, 1046.5, 1174.7, 1318.5, 1396.9, 1568.0, 1661.2, 1760.0
+]
+
+KMAP = {"ё": 2, "`": 2}
+for _r, _o in [
+    ("йцукенгшщзхъ", 2), ("qwertyuiop[]", 2), ("1234567890-=", 2),
+    ("фывапролджэ", 1), ("asdfghjkl;'", 1),
+    ("ячсмитьбю.", 0), ("zxcvbnm,./", 0)
+]:
+    for _i, _ch in enumerate(_r):
+        KMAP[_ch] = min(_i * 3 + _o, 32)
+
+# 4 тембра: (гармоники, затухание, расстройка, множитель высоты, атака мс)
+TIMBRES = [
+    ([(1, 1.0), (2, 0.32), (3, 0.09), (4, 0.03)], 4.2, 1.0008, 1.0, 8.0),
+    ([(1, 0.8), (2, 0.55), (3, 0.35), (4, 0.20), (5, 0.12)], 3.5, 1.0015, 1.0, 2.5),
+    ([(1, 0.85), (2, 0.45), (3, 0.12), (7, 0.28)], 2.8, 1.0040, 1.0, 3.5),
+    ([(1, 0.9), (3, 0.20), (5, 0.38), (6, 0.18)], 4.8, 1.0005, 1.5, 1.5),
+]
+
+
+class _Watcher(dynamic_proxy(TextWatcher)):
+    def __init__(self, plg, vid: int):
+        super().__init__()
+        self.plg = plg
+        self.vid = vid
+
+    def beforeTextChanged(self, s, st, c, a):
+        pass
+
+    def onTextChanged(self, s, st, bef, cnt):
+        try:
+            self.plg.on_text(self.vid, s, st, bef, cnt)
+        except Exception:
+            pass
+
+    def afterTextChanged(self, s):
+        pass
+
+
+class MelodicPianoTypingPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._sp = None
+        self._nids = {}
+        self._sp_id = 0
+        self._en_id = 0
+        self._bs_id = 0
+        self._busy = False
+        self._stop = threading.Event()
+        self._thr = None
+        self._views = set()
+        self._wlist = []
+        self._vtime = {}
+        self._lts = 0.0
+
+    def on_plugin_load(self):
+        self._init_sp()
+        self.add_on_send_message_hook()
+        if self.get_setting("enabled", True):
+            self._load_async(self._tid(), False)
+            self._start_mon()
+
+    def on_plugin_unload(self):
+        self._stop_mon()
+        if self._sp:
+            try:
+                self._sp.release()
+            except Exception:
+                pass
+            self._sp = None
+
+    def create_settings(self):
+        return [
+            Header(text="Основные настройки"),
+            Switch(key="enabled", text="Включить озвучку клавиш", subtext="Гармонический строй по рядам клавиатуры", default=True, icon="msg_music", on_change=self._on_tgl),
+            Selector(key="timbre", text="Тембр инструмента", default=0, items=["Мягкое пианино", "Яркое фортепиано", "Электро-пианино Rhodes", "Музыкальная шкатулка"], icon="msg_voice_pip", on_change=self._on_tmb),
+            Input(key="volume", text="Громкость (10-100)", default="75", icon="msg_notifications", on_change=lambda _: self._play(self._sp_id, 0.85)),
+            Divider(),
+            Header(text="Аккорды"),
+            Switch(key="enable_chords", text="Аккорды на Пробел и Enter", default=True, icon="msg_ton"),
+            Switch(key="chord_on_send", text="Аккорд при отправке сообщения", default=True, icon="msg_send"),
+            Switch(key="enable_backspace", text="Мягкий звук Backspace", default=True, icon="msg_delete"),
+        ]
+
+    def _tid(self) -> int:
+        try:
+            return max(0, min(3, int(self.get_setting("timbre", 0))))
+        except Exception:
+            return 0
+
+    def _vol(self) -> float:
+        try:
+            return max(5, min(100, int(str(self.get_setting("volume", "75")).strip()))) / 100.0
+        except Exception:
+            return 0.75
+
+    def _on_tgl(self, en: bool):
+        if en:
+            self._load_async(self._tid(), True)
+            self._start_mon()
+        else:
+            self._stop_mon()
+
+    def _on_tmb(self, v):
+        self._load_async(int(v) if str(v).isdigit() else self._tid(), True)
+
+    def _init_sp(self):
+        try:
+            a = AABuilder().setUsage(AAttr.USAGE_MEDIA).setContentType(AAttr.CONTENT_TYPE_MUSIC).build()
+            self._sp = SPBuilder().setMaxStreams(12).setAudioAttributes(a).build()
+        except Exception as e:
+            log(f"[Piano] SP err: {e}")
+
+    def _load_async(self, tid: int, prev: bool):
+        def _run():
+            if self._busy:
+                return
+            self._busy = True
+            try:
+                self._synth_all(tid)
+                if prev:
+                    time.sleep(0.08)
+                    self._play(self._sp_id, 0.9)
+            except Exception as e:
+                log(f"[Piano] Synth err: {e}")
+            finally:
+                self._busy = False
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _write_wav(self, path: str, freqs, wt, dec, det, pm, att_s, dur, strum):
+        if os.path.exists(path):
+            return
+        ntot = int(SR * dur)
+        buf = [0.0] * ntot
+        g = 13500.0 / max(1, len(freqs))
+        for ni, bf in enumerate(freqs):
+            off = int(ni * strum * SR)
+            f = min(bf * pm, 2400.0)
+            s1 = int(f * TSZ * 1024.0 / SR)
+            s2 = int(f * det * TSZ * 1024.0 / SR)
+            for i in range(ntot - off):
+                rmp = (i / att_s) if i < att_s else 1.0
+                env = g * rmp * math.exp(-dec * (i / SR))
+                buf[off + i] += env * (wt[((i * s1) >> 10) & TMSK] + wt[((i * s2) >> 10) & TMSK])
+        fst = int(ntot * 0.8)
+        fln = max(1, ntot - fst)
+        for i in range(fst, ntot):
+            buf[i] *= (ntot - i) / fln
+        raw = array("h", [max(-32000, min(32000, int(x))) for x in buf]).tobytes()
+        sz = len(raw)
+        with open(path, "wb") as fp:
+            fp.write(struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + sz, b"WAVE", b"fmt ", 16, 1, 1, SR, SR * 2, 2, 16, b"data", sz))
+            fp.write(raw)
+
+    def _synth_all(self, tid: int):
+        if not self._sp:
+            self._init_sp()
+        if not self._sp:
+            return
+        cdir = os.path.join(str(AppLoader.applicationContext.getCacheDir().getAbsolutePath()), "piano_v3")
+        os.makedirs(cdir, exist_ok=True)
+        harms, dec, det, pm, ams = TIMBRES[tid]
+        wt = [0.0] * TSZ
+        k = 2.0 * math.pi / TSZ
+        for h, amp in harms:
+            for i in range(TSZ):
+                wt[i] += amp * math.sin(k * h * i)
+        pk = max(abs(x) for x in wt) or 1.0
+        wt = [x / pk for x in wt]
+        att_s = max(1, int(SR * (ams / 1000.0)))
+
+        nids = {}
+        for idx, f in enumerate(SCALE):
+            p = os.path.join(cdir, f"t{tid}_n{idx}.wav")
+            self._write_wav(p, [f], wt, dec, det, pm, att_s, 0.46, 0.0)
+            nids[idx] = self._sp.load(p, 1)
+
+        p_sp = os.path.join(cdir, f"t{tid}_sp.wav")
+        self._write_wav(p_sp, [261.6, 329.6, 392.0, 587.3], wt, dec * 0.9, det, min(pm, 1.25), att_s, 0.68, 0.018)
+        p_en = os.path.join(cdir, f"t{tid}_en.wav")
+        self._write_wav(p_en, [174.6, 220.0, 261.6, 329.6, 523.3], wt, dec * 0.85, det, min(pm, 1.25), att_s, 0.80, 0.022)
+        p_bs = os.path.join(cdir, f"t{tid}_bs.wav")
+        self._write_wav(p_bs, [196.0, 146.8], wt, dec * 1.3, det, min(pm, 1.25), att_s, 0.25, 0.012)
+
+        old = list(self._nids.values()) + [self._sp_id, self._en_id, self._bs_id]
+        self._nids = nids
+        self._sp_id = self._sp.load(p_sp, 1)
+        self._en_id = self._sp.load(p_en, 1)
+        self._bs_id = self._sp.load(p_bs, 1)
+        for oid in old:
+            if oid > 0:
+                try:
+                    self._sp.unload(oid)
+                except Exception:
+                    pass
+
+    def _play(self, sid: int, sc: float = 1.0):
+        if sid and self._sp:
+            v = max(0.02, min(1.0, self._vol() * sc))
+            try:
+                self._sp.play(sid, v, v, 1, 0, 1.0)
+            except Exception:
+                pass
+
+    def on_text(self, vid: int, s, st: int, bef: int, cnt: int):
+        if not self.get_setting("enabled", True) or s is None:
+            return
+        if time.time() - self._vtime.get(vid, 0.0) < 0.18:
+            return
+        txt = str(s)
+        if not txt and bef > 1:
+            return
+        df = cnt - bef
+        idx = st + cnt - 1
+        if (df == 1 or df == 2) and 0 <= idx and idx < len(txt):
+            now = time.time()
+            if now - self._lts < 0.015:
+                return
+            self._lts = now
+            ch = txt[idx]
+            if ch == " ":
+                if self.get_setting("enable_chords", True):
+                    self._play(self._sp_id, 0.82)
+            elif ch == "\n":
+                if self.get_setting("enable_chords", True):
+                    self._play(self._en_id, 0.90)
+            else:
+                low = ch.lower()
+                n = KMAP.get(low, ord(low[0]) % 33)
+                self._play(self._nids.get(n, 0), 1.0)
+        elif df == -1 and cnt >= 0 and self.get_setting("enable_backspace", True):
+            if time.time() - self._lts >= 0.025:
+                self._lts = time.time()
+                self._play(self._bs_id, 0.55)
+
+    def on_send_message_hook(self, account, params):
+        if self.get_setting("enabled", True) and self.get_setting("chord_on_send", True):
+            self._play(self._en_id, 0.90)
+        return HookResult()
+
+    def _start_mon(self):
+        self._stop_mon()
+        self._stop.clear()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+
+    def _stop_mon(self):
+        self._stop.set()
+        if self._thr and self._thr.is_alive():
+            self._thr.join(timeout=1.0)
+        self._thr = None
+
+    def _hook(self, v):
+        if v is None:
+            return
+        try:
+            if isinstance(v, EditText):
+                vid = int(Sys.identityHashCode(v))
+                if vid not in self._views:
+                    self._views.add(vid)
+                    self._vtime[vid] = time.time()
+                    w = _Watcher(self, vid)
+                    self._wlist.append(w)
+                    v.addTextChangedListener(w)
+            elif isinstance(v, ViewGroup):
+                for i in range(v.getChildCount()):
+                    self._hook(v.getChildAt(i))
+        except Exception:
+            pass
+
+    def _scan(self):
+        try:
+            from client_utils import get_last_fragment
+            f = get_last_fragment()
+            if not f:
+                return
+            a = f.getParentActivity()
+            if a:
+                self._hook(a.getCurrentFocus())
+            d = f.getVisibleDialog()
+            if d:
+                self._hook(d.getCurrentFocus())
+            fv = f.getFragmentView()
+            if fv:
+                self._hook(fv.findFocus())
+        except Exception:
+            pass
+
+    def _loop(self):
+        while not self._stop.is_set():
+            if self.get_setting("enabled", True):
+                run_on_ui_thread(self._scan)
+            if self._stop.wait(timeout=0.35):
+                break
