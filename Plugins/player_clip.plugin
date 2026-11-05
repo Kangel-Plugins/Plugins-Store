@@ -1,0 +1,1585 @@
+__id__ = "player_clip"
+__name__ = "Player Clip"
+__description__ = "Клипы для песен как в Я.Музыке, загружаете самостоятельно из памяти, нажатие - добавить/начать видео, зажать кнопку при желании заменить/сбросить клип для песни."
+__author__ = "GPT-Sol-6.1, @OnlyOneShik, @Repentagon"
+__version__ = "1.0.0"
+__app_version__ = ">=13.1.1"
+__category__ = ["appearance", "media", "fun"]
+__sdk_version__ = ">=1.4.6.1"
+__icon__ = "Zuioisus/31"
+__requirements__ = []
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import threading
+import time
+import uuid
+
+from base_plugin import BasePlugin, AppEvent
+
+
+MAX_BYTES = 250 * 1024 * 1024
+MAX_DURATION = 3600
+PLAYER_CLASS = "com.exteragram.messenger.player.MusicPlayerSheet"
+
+
+IDLE_SECONDS = 7.0
+EXPRESSIVE_CLASS = "com.exteragram.messenger.player.ui.ExpressiveStateDrawable"
+
+
+def smoothstep(value):
+    value = max(0.0, min(1.0, value))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def genie_vertices(rect, target, progress, columns=8, rows=24):
+    """Pull the lower edge first, bending the artwork into a narrow funnel."""
+    left, top, right, bottom = rect
+    tx, ty = target
+    vertices = []
+    for row in range(rows + 1):
+        v = row / rows
+        delay = (1.0 - v) * 0.30
+        q = smoothstep((progress - delay) / (1.0 - delay))
+        pinch = 1.0 - (1.0 - q) ** 2.2
+        y = top + (bottom - top) * v
+        for column in range(columns + 1):
+            x = left + (right - left) * column / columns
+            vertices.extend((x + (tx - x) * pinch, y + (ty - y) * q))
+    return vertices
+
+
+class CoverGenie:
+    """Draw a deformed snapshot in the native cover view, below player controls."""
+    def __init__(self, session):
+        self.session = session
+        self.bitmap = None
+        self.running = self.capturing = False
+        self.progress = 0.0
+        self.token = 0
+        self.callback = None
+        self.paint = None
+
+    def snapshot(self):
+        cover = self.session.cover
+        rect = cover.getCoverRect()
+        self.rect = tuple(float(getattr(rect, name)) for name in ("left", "top", "right", "bottom"))
+        left, top, right, bottom = self.rect
+        width, height = right - left, bottom - top
+        if min(width, height) <= 0:
+            raise RuntimeError("Обложка ещё не готова к анимации")
+        factor = min(1.0, 768.0 / max(width, height))
+        bitmap = jclass("android.graphics.Bitmap").createBitmap(
+            max(1, int(width * factor)), max(1, int(height * factor)),
+            jclass("android.graphics.Bitmap$Config").ARGB_8888)
+        self.capturing = True
+        try:
+            canvas = jclass("android.graphics.Canvas")(bitmap)
+            canvas.scale(jfloat(factor), jfloat(factor))
+            canvas.translate(jfloat(-left), jfloat(-top))
+            cover.draw(canvas)
+        except Exception:
+            bitmap.recycle()
+            raise
+        finally:
+            self.capturing = False
+        return bitmap
+
+    def animate(self, reverse, callback):
+        if reverse and not self.running:
+            # Artwork and its pause scale may have changed while the big cover
+            # was hidden. End the return on the current native image exactly.
+            self.bitmap = None
+        if self.bitmap is None:
+            self.bitmap = self.snapshot()
+            self.progress = 1.0 if reverse else 0.0
+        self.token += 1
+        token = self.token
+        session = self.session
+        generation = session.generation
+        start, end = self.progress, 0.0 if reverse else 1.0
+        self.end = end
+        self.root_size = (int(session.root.getWidth()), int(session.root.getHeight()))
+        self.callback = callback
+        self.running = True
+        button = session.button
+        self.target = (float(button.getLeft() + button.getWidth() / 2 - session.cover.getLeft()),
+                       float(button.getTop() + button.getHeight() / 2 - session.cover.getTop()))
+        session.cover.animate().cancel()
+        session.cover.setTranslationY(jfloat(session.saved_cover[0]))
+        session.cover.setAlpha(jfloat(session.saved_cover[1]))
+        session.cover.setVisibility(0)
+        began = time.monotonic()
+        duration = max(0.10, 0.60 * abs(end - start))
+
+        def frame():
+            if token != self.token or session.closed or generation != session.generation:
+                return
+            t = (time.monotonic() - began) / duration
+            self.progress = start + (end - start) * smoothstep(t)
+            if reverse:
+                session.layer.setAlpha(jfloat(self.progress))
+            session.cover.postInvalidateOnAnimation()
+            if t >= 1.0:
+                self.finish()
+            else:
+                ui(frame, 16)
+        frame()
+
+    def draw(self, canvas):
+        from java import jarray, jfloat as float_type
+        vertices = jarray(float_type)(genie_vertices(self.rect, self.target, self.progress))
+        if self.paint is None:
+            self.paint = jclass("android.graphics.Paint")(3)
+        canvas.drawBitmapMesh(self.bitmap, jint(8), jint(24), vertices, jint(0), None, jint(0), self.paint)
+
+    def finish(self):
+        self.token += 1
+        self.running = False
+        self.progress = self.end
+        callback, self.callback = self.callback, None
+        if callback:
+            callback()
+
+    def clear(self):
+        self.token += 1
+        self.running = False
+        self.callback = None
+        self.progress = 0.0
+        # A hardware canvas may still reference the last frame; let Android
+        # release displayed bitmaps after its render commands finish.
+        self.bitmap = None
+
+
+class IdleAutoplay:
+    """Ineligible time never counts; interactions restart a full seven seconds."""
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.was_eligible = False
+        self.reset()
+
+    def reset(self):
+        self.since = self.clock()
+
+    def due(self, eligible):
+        if not eligible:
+            self.reset()
+            self.was_eligible = False
+            return False
+        if not self.was_eligible:
+            self.reset()
+            self.was_eligible = True
+        return self.clock() - self.since >= IDLE_SECONDS
+
+
+def container_extension(source):
+    with Path(source).open("rb") as stream:
+        header = stream.read(12)
+    if header[4:8] == b"ftyp":
+        return "mp4"
+    if header[:4] == b"\x1aE\xdf\xa3":
+        return "mkv"  # EBML: ExoPlayer sniffs both Matroska and WebM.
+    raise ValueError("Нужен видеофайл MP4, MOV, WebM или MKV")
+
+
+def callback_int(value):
+    """Unbox numeric Object[] arguments without relying on a Python __int__."""
+    method = getattr(value, "intValue", None)
+    return int(method()) if method is not None else int(value)
+
+
+class CompatibleVideoPlayer:
+    """Use the stable player API; adapt optional methods between app builds."""
+    REQUIRED = ("setDelegate", "setTextureView", "preparePlayer", "getDuration",
+                "getCurrentPosition", "seekTo", "releasePlayer")
+
+    def __init__(self, native):
+        self.native = native
+        self.speed = 1.0
+        self.looping = False
+        self.missing = []
+        self.methods = {}
+        for name in self.REQUIRED:
+            method = getattr(native, name, None)
+            if not callable(method):
+                raise RuntimeError("VideoPlayer: нет метода " + name)
+            self.methods[name] = method
+        self.ready_method = getattr(native, "setPlayWhenReady", None)
+        if not callable(self.ready_method):
+            if not callable(getattr(native, "play", None)) or not callable(getattr(native, "pause", None)):
+                raise RuntimeError("VideoPlayer: нет setPlayWhenReady или play/pause")
+            self.missing.append("setPlayWhenReady")
+        self.speed_method = getattr(native, "setPlaybackSpeed", None)
+        self.loop_method = getattr(native, "setLooping", None)
+        self.focus_method = getattr(native, "handleAudioFocus", None)
+        self.mute_method = getattr(native, "setMute", None)
+        self.volume_method = getattr(native, "setVolume", None)
+        if not callable(self.mute_method) and not callable(self.volume_method):
+            raise RuntimeError("VideoPlayer: нет setMute или setVolume для отключения звука")
+        # Constructor(False, True) already disables audio and pauseOther. Some
+        # builds lack these additional options, so never require them to start.
+        if hasattr(native, "allowMultipleInstances"):
+            try:
+                native.allowMultipleInstances = True
+            except AttributeError:
+                self.missing.append("allowMultipleInstances (read-only)")
+        else:
+            self.missing.append("allowMultipleInstances")
+        if callable(self.focus_method):
+            self.focus_method(False)
+        else:
+            self.missing.append("handleAudioFocus")
+        if not callable(self.loop_method):
+            self.missing.append("setLooping")
+        if not callable(self.speed_method):
+            self.missing.append("setPlaybackSpeed")
+        self.mute()
+
+    def setDelegate(self, delegate):
+        self.methods["setDelegate"](delegate)
+
+    def setTextureView(self, texture):
+        self.methods["setTextureView"](texture)
+
+    def mute(self):
+        if callable(self.mute_method):
+            self.mute_method(True)
+        else:
+            self.volume_method(jfloat(0.0))
+
+    def preparePlayer(self, uri, kind):
+        self.methods["preparePlayer"](uri, kind)
+        # The native ExoPlayer may only exist after preparePlayer. Muting once
+        # before preparation is insufficient in wrappers with lazy creation.
+        self.mute()
+        if callable(self.focus_method):
+            self.focus_method(False)
+        if callable(self.loop_method):
+            self.loop_method(self.looping)
+
+    def setLooping(self, looping):
+        self.looping = bool(looping)
+        if callable(self.loop_method):
+            self.loop_method(self.looping)
+
+    def getDuration(self):
+        return self.methods["getDuration"]()
+
+    def getCurrentPosition(self):
+        return self.methods["getCurrentPosition"]()
+
+    def seekTo(self, position):
+        return self.methods["seekTo"](position)
+
+    def getPlaybackSpeed(self):
+        # Older wrappers expose a setter without a corresponding getter.
+        return self.speed
+
+    def setPlaybackSpeed(self, speed):
+        value = float(speed)
+        if callable(self.speed_method):
+            self.speed_method(speed)
+        elif abs(value - 1.0) > 0.01:
+            raise RuntimeError("VideoPlayer: эта версия не поддерживает скорость " + str(value))
+        self.speed = value
+
+    def setPlayWhenReady(self, ready):
+        if callable(self.ready_method):
+            self.ready_method(bool(ready))
+        elif ready:
+            self.native.play()
+        else:
+            self.native.pause()
+
+    def pause(self):
+        self.setPlayWhenReady(False)
+
+    def releasePlayer(self, asynchronous):
+        return self.methods["releasePlayer"](asynchronous)
+
+
+def track_key(account, document_id=0, dialog_id=0, message_id=0):
+    if document_id:
+        identity = f"{int(account)}:document:{int(document_id)}"
+    else:
+        identity = f"{int(account)}:message:{int(dialog_id)}:{int(message_id)}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def loop_position(music_ms, duration_ms):
+    return max(0, int(music_ms)) % int(duration_ms) if duration_ms > 0 else 0
+
+
+class Cancelled(Exception):
+    pass
+
+
+class ClipCache:
+    """Unique media files plus an atomically replaced index; failed swaps keep old clip."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.index = self.root / "index.json"
+        if self.index.exists():
+            # Preserve broken metadata instead of silently overwriting associations.
+            self.entries = json.loads(self.index.read_text(encoding="utf-8"))
+            if not isinstance(self.entries, dict):
+                raise ValueError("Повреждён индекс видео")
+        else:
+            self.entries = {}
+
+    def _path(self, name):
+        if not isinstance(name, str) or not re.fullmatch(r"[a-f0-9]{64}_[a-f0-9]{32}\.(?:mp4|mkv)", name):
+            raise ValueError("Некорректное имя файла в кеше")
+        return self.root / name
+
+    def get(self, key):
+        with self.lock:
+            entry = self.entries.get(key)
+            if not isinstance(entry, dict):
+                return None
+            path = self._path(entry.get("file"))
+            return dict(entry, path=str(path)) if path.is_file() and path.stat().st_size else None
+
+    def _write(self, entries):
+        temporary = self.root / ("index_" + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(entries, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.index)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def commit(self, key, source, title, cancel):
+        if not re.fullmatch(r"[a-f0-9]{64}", key):
+            raise ValueError("Некорректный идентификатор трека")
+        source = Path(source)
+        size = source.stat().st_size
+        if not 0 < size <= MAX_BYTES:
+            raise ValueError("Видео пустое или больше 250 МБ")
+        extension = container_extension(source)
+        with self.lock:
+            if cancel.is_set():
+                raise Cancelled()
+            old = self.entries.get(key)
+            name = key + "_" + uuid.uuid4().hex + "." + extension
+            target = self._path(name)
+            os.replace(source, target)
+            updated = dict(self.entries)
+            updated[key] = {"file": name, "source": "gallery", "title": str(title), "bytes": size}
+            try:
+                self._write(updated)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+            self.entries = updated
+            if old:
+                try:
+                    self._path(old["file"]).unlink(missing_ok=True)
+                except OSError:
+                    pass  # An orphan is preferable to rolling back a committed index.
+            return self.get(key)
+
+    def delete(self, key):
+        with self.lock:
+            old = self.entries.get(key)
+            if not old:
+                return
+            updated = dict(self.entries)
+            del updated[key]
+            self._write(updated)
+            self.entries = updated
+            self._path(old["file"]).unlink(missing_ok=True)
+
+
+def import_clip(cache, key, read, title, cancel, progress, validate, size=0):
+    """Copy a selected stream; never move/delete the user's gallery original."""
+    if size > MAX_BYTES:
+        raise ValueError("Видео больше 250 МБ")
+    with tempfile.TemporaryDirectory(prefix="import_", dir=cache.root) as staging:
+        source = Path(staging) / "video"
+        copied = 0
+        with source.open("wb") as target:
+            while True:
+                if cancel.is_set():
+                    raise Cancelled()
+                chunk = read(64 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_BYTES:
+                    raise ValueError("Видео больше 250 МБ")
+                target.write(chunk)
+                progress(min(99, int(copied * 100 / size)) if size > 0 else None)
+            target.flush()
+            os.fsync(target.fileno())
+        if cancel.is_set():
+            raise Cancelled()
+        container_extension(source)
+        validate(str(source))  # Android checks that a real video track is present.
+        if cancel.is_set():
+            raise Cancelled()
+        result = cache.commit(key, source, title, cancel)
+        progress(100)
+        return result
+
+
+def validate_android_video(path):
+    retriever = jclass("android.media.MediaMetadataRetriever")()
+    try:
+        retriever.setDataSource(path)
+        width = int(str(retriever.extractMetadata(18) or "0"))
+        height = int(str(retriever.extractMetadata(19) or "0"))
+        duration = int(str(retriever.extractMetadata(9) or "0"))
+        if width <= 0 or height <= 0 or duration <= 0:
+            raise ValueError("В файле не найдена видеодорожка")
+        if duration > MAX_DURATION * 1000:
+            raise ValueError("Ролик длиннее часа")
+    finally:
+        retriever.release()
+
+
+def load_android():
+    """Delay Android imports so cache/import logic can also be tested on a PC."""
+    global jclass, dynamic_proxy, jint, jlong, jfloat, ui, field, find_class
+    global OnClickListener, OnLongClickListener, get_media_controller, get_last_fragment
+    from java import jclass, dynamic_proxy, jint, jlong, jfloat
+    from android_utils import run_on_ui_thread as ui, OnClickListener, OnLongClickListener
+    from hook_utils import get_private_field as field, find_class
+    from client_utils import get_media_controller, get_last_fragment
+
+
+class PlayerVideoPlugin(BasePlugin):
+    def on_plugin_load(self):
+        load_android()
+        self.alive = True
+        self.foreground = True
+        self.session = None
+        self.job = None
+        self.job_lock = threading.Lock()
+        self.picker = None
+        self.panels = []
+        choices = self.get_setting("background_choices", {})
+        self.background_choices = choices if isinstance(choices, dict) else {}
+        self.last_error = self.get_setting("last_error", "")
+        self.request_code = 0x6000 + (uuid.uuid4().int % 0x1FFF)
+        context = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+        self.cache = ClipCache(str(context.getFilesDir().getAbsolutePath()) + "/player_video_v1")
+        sheet = find_class(PLAYER_CLASS)
+        layout = find_class(PLAYER_CLASS + "$PlayerLayout")
+        if sheet is None or layout is None or find_class(EXPRESSIVE_CLASS) is None:
+            raise RuntimeError("Нужен exteraGram с новым плеером MusicPlayerSheet. Эта версия приложения не поддерживается.")
+        self.hook_all_constructors(sheet, after=lambda p: ui(lambda: self.attach(p.thisObject), 60))
+        self.hook_all_methods(layout, "onLayout", after=self.layout_hook)
+        self.hook_all_methods(layout, "layoutModeSegments", after=self.layout_hook)
+        self.hook_all_methods(sheet, "applyTransitions", after=self.transition_hook)
+        cover_class = find_class("com.exteragram.messenger.player.ui.PlayerCoverView")
+        if cover_class is not None:
+            self.hook_all_methods(cover_class, "onDraw", before=self.cover_draw_hook)
+        self.hook_all_methods(sheet, "dispatchTouchEvent", before=self.touch_hook)
+        self.hook_all_methods(find_class(EXPRESSIVE_CLASS), "getCornerRadius", after=self.corner_hook)
+        self.hook_all_methods(find_class("org.telegram.ui.LaunchActivity"),
+                              "onActivityResult", after=self.picker_result)
+        self.hook_all_methods(layout, "onDetachedFromWindow", after=self.detach_hook)
+        self.hook_all_methods(layout, "onAttachedToWindow", after=self.reattach_hook)
+        from hook_utils import get_static_private_field
+        existing = get_static_private_field(sheet, "instance")
+        if existing is not None:
+            ui(lambda: self.attach(existing))
+
+    def attach(self, sheet):
+        if not self.alive or sheet.isDismissed():
+            return
+        if self.session and not self.session.closed and self.session.sheet == sheet:
+            return
+        if self.session:
+            self.session.close()
+        session = None
+        try:
+            session = PlayerSession(self, sheet)
+            self.session = session
+            session.install()
+        except Exception as error:
+            if session:
+                session.close()
+            self.session = None
+            self.log("Player Video: " + str(error))
+            self.notice(sheet.getContext(), "Не удалось встроить кнопку. Нужен новый полноэкранный плеер.\n" + str(error)[:240])
+
+    def layout_hook(self, param):
+        session = self.session
+        if session and session.root == param.thisObject:
+            session.layout()
+
+    def transition_hook(self, param):
+        session = self.session
+        if session and session.sheet == param.thisObject:
+            session.style()
+            session.sync_cover()
+
+    def cover_draw_hook(self, param):
+        session = self.session
+        if not session or session.closed or session.cover != param.thisObject:
+            return
+        genie = session.genie
+        if genie.running and not genie.capturing:
+            try:
+                genie.draw(param.args[0])
+                param.setResult(None)
+            except Exception as error:
+                self.log("Player Clip animation: " + str(error))
+                genie.finish()
+
+    def selected_background(self, key):
+        kind = getattr(self, "background_choices", {}).get(key)
+        return kind if kind in ("cover", "video") else None
+
+    def remember_background(self, key, kind):
+        if not key:
+            return
+        choices = dict(getattr(self, "background_choices", {}))
+        if kind is None:
+            if key not in choices:
+                return
+            choices.pop(key)
+        else:
+            if choices.get(key) == kind:
+                return
+            choices[key] = kind
+        self.background_choices = choices
+        self.set_setting("background_choices", choices)
+
+    def corner_hook(self, param):
+        session = self.session
+        if session and not session.closed and session.lyrics_background == param.thisObject:
+            # Middle segment: rounded inner corners on both sides, same host ripple.
+            param.setResult(jfloat(session.dp(8 + 4 * float(param.thisObject.getPressProgress()))))
+
+    def touch_hook(self, param):
+        session = self.session
+        if session and session.sheet == param.thisObject:
+            session.idle.reset()  # Observe all touches without consuming controls/gestures.
+
+    def detach_hook(self, param):
+        session = self.session
+        if session and session.root == param.thisObject:
+            # Android may temporarily detach a dialog when opening another Activity.
+            # The host also distinguishes that from isDismissed() in its detach hook.
+            if session.sheet.isDismissed():
+                session.close()
+                self.session = None
+            else:
+                session.suspend()
+
+    def reattach_hook(self, param):
+        session = self.session
+        if session and not session.closed and session.root == param.thisObject:
+            session.idle.reset()
+            session.layout()
+            session.style()
+
+    def dispatch_button(self, session, manage=False):
+        if not self.alive:
+            return True
+        try:
+            if session.closed:
+                self.attach(session.sheet)
+                session = self.session
+            if session is None or session.closed:
+                raise RuntimeError("Закрой плеер и открой его снова")
+            session.manage() if manage else session.tap()
+        except Exception as error:
+            self.action_error(session.context if session else None, "Нажатие на кнопку", error)
+        return True
+
+    def action_error(self, context, action, error):
+        import traceback
+        self.record_error("Player Video " + action + ": " + str(error) + "\n" + traceback.format_exc())
+        if context is not None:
+            self.notice(context, action + ":\n" + str(error)[:350])
+
+    def record_error(self, message):
+        self.last_error = str(message)
+        self.log(self.last_error)
+        try:
+            self.set_setting("last_error", self.last_error)
+        except Exception as error:
+            self.log("Player Video cannot save diagnostics: " + str(error))
+
+    def copy_last_error(self, view):
+        from android_utils import copy_to_clipboard
+        message = getattr(self, "last_error", "") or self.get_setting("last_error", "")
+        copy_to_clipboard(message or "Ошибок пока не было")
+        jclass("android.widget.Toast").makeText(view.getContext(), "Ошибка скопирована", 0).show()
+
+    def on_app_event(self, event_type):
+        if event_type in (AppEvent.PAUSE, AppEvent.STOP):
+            self.foreground = False
+            ui(lambda: self.session.suspend() if self.session else None)
+        elif event_type == AppEvent.RESUME:
+            self.foreground = True
+            ui(lambda: self.session.idle.reset() if self.session else None)
+
+    def on_plugin_unload(self):
+        self.alive = False
+        self.picker = None
+        if getattr(self, "job", None):
+            self.job["cancel"].set()
+        def cleanup():
+            if self.session:
+                self.session.close()
+                self.session = None
+            for panel in list(self.panels):
+                panel.dismiss()
+        ui(cleanup)
+
+    def create_settings(self):
+        from ui.settings import Header, Switch, Selector, Text
+        return [Header(text="Видео в музыкальном плеере"),
+                Switch(key="auto", text="Клип через 7 секунд бездействия", default=True,
+                       subtext="Только на вкладке с обложкой, если видео уже добавлено"),
+                Selector(key="dimming", text="Затемнение видео", default=1,
+                         items=["Лёгкое", "Среднее", "Сильное"]),
+                Selector(key="default_background", text="Фон по умолчанию", default=0,
+                         items=["Видео", "Обложка на весь фон"]),
+                Text(text="▷ — включить / выключить видео",
+                     subtext="Удержание — выбрать видео из галереи, удалить или отменить импорт. Видео без звука; музыка играет как обычно."),
+                Text(text="Скопировать последнюю ошибку",
+                     subtext="Полный текст, который обрезается во всплывающем сообщении",
+                     on_click=self.copy_last_error)]
+
+    def notice(self, context, message):
+        if self.alive:
+            try:
+                show_panel(self, context, self.session, "Видео в плеере", message, [("Понятно", None, True)])
+            except Exception as error:
+                # Never let a dialog/API failure make a listener silently do nothing.
+                self.log("Player Video message UI: " + str(error)[:300])
+                try:
+                    jclass("android.widget.Toast").makeText(context, message[:450], 1).show()
+                except Exception as fallback:
+                    self.log("Player Video toast: " + str(fallback)[:200])
+
+    def choose_gallery(self, session, key, files=False):
+        if self.job or self.picker:
+            self.notice(session.context, "Сначала заверши выбор или импорт текущего видео.")
+            return
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            self.notice(session.context, "Не удалось открыть галерею. Открой плеер заново.")
+            return
+        Intent = jclass("android.content.Intent")
+        intent = None
+        if not files:
+            intent = Intent("android.provider.action.PICK_IMAGES")
+            intent.setType("video/*")
+        if (files or int(jclass("android.os.Build$VERSION").SDK_INT) < 33
+                or intent.resolveActivity(activity.getPackageManager()) is None):
+            intent = Intent("android.intent.action.OPEN_DOCUMENT")
+            intent.addCategory("android.intent.category.OPENABLE")
+            # Download providers may not yet index a clip or may label it as
+            # application/octet-stream. Validate bytes/metadata after selection.
+            intent.setType("*/*" if files else "video/*")
+            intent.putExtra("android.intent.extra.LOCAL_ONLY", True)
+        intent.addFlags(1)  # Temporary read grant; copied before it expires.
+        self.picker = {"key": key, "activity": activity}
+        session.idle.reset()
+        try:
+            activity.startActivityForResult(intent, self.request_code)
+        except Exception as error:
+            self.picker = None
+            self.notice(session.context, "Не удалось открыть выбор видео.\n" + str(error)[:240])
+
+    def picker_result(self, param):
+        if not self.alive or not self.picker:
+            return
+        pending = self.picker
+        try:
+            if (callback_int(param.args[0]) != self.request_code
+                    or param.thisObject != pending["activity"]):
+                return
+        except Exception as error:
+            self.action_error(pending["activity"], "Результат галереи", error)
+            return
+        # Run AFTER the host callback, preserving Activity/fragment lifecycle work.
+        # Clear pending before processing so malformed provider data cannot lock selection.
+        self.picker = None
+        if self.session:
+            self.session.idle.reset()
+        try:
+            data = param.args[2]
+            if callback_int(param.args[1]) != -1 or data is None:
+                return
+            uri = data.getData()
+            if uri is None:
+                clips = data.getClipData()
+                if clips is not None and clips.getItemCount() > 0:
+                    uri = clips.getItemAt(0).getUri()
+            if uri is None or str(uri.getScheme()) != "content":
+                raise ValueError("Галерея не вернула доступный видеофайл")
+            # Capture the original track at launch; music may change while picking.
+            self.begin_import(pending["activity"], pending["key"], uri)
+        except Exception as error:
+            self.action_error(pending["activity"], "Выбор видео", error)
+
+    def begin_import(self, context, key, uri):
+        with self.job_lock:
+            if self.job or not self.alive:
+                return
+            job = {"key": key, "cancel": threading.Event(), "percent": None}
+            self.job = job
+
+        def worker():
+            error, success, stream = None, False, None
+            try:
+                resolver = context.getContentResolver()
+                title, size = "Видео из галереи", 0
+                cursor = resolver.query(uri, None, None, None, None)
+                if cursor is not None:
+                    try:
+                        if cursor.moveToFirst():
+                            column = cursor.getColumnIndex("_display_name")
+                            if column >= 0 and not cursor.isNull(column):
+                                title = str(cursor.getString(column))
+                            column = cursor.getColumnIndex("_size")
+                            if column >= 0 and not cursor.isNull(column):
+                                size = int(cursor.getLong(column))
+                    finally:
+                        cursor.close()
+                stream = resolver.openInputStream(uri)
+                if stream is None:
+                    raise ValueError("Нет доступа к выбранному видео")
+                from java import jarray, jbyte
+                buffer = jarray(jbyte)(64 * 1024)
+
+                def read(_size):
+                    count = int(stream.read(buffer))
+                    return bytes(buffer)[:count] if count > 0 else b""
+
+                import_clip(self.cache, key, read, title, job["cancel"],
+                            lambda value: job.update(percent=value), validate_android_video, size)
+                success = True
+            except Exception as caught:
+                if not job["cancel"].is_set():
+                    error = str(caught)
+            finally:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                with self.job_lock:
+                    if self.job is job:
+                        self.job = None
+
+            ui(lambda: self.import_finished(context, key, success, error))
+
+        threading.Thread(target=worker, name="PlayerVideo-import", daemon=True).start()
+
+
+    def import_finished(self, context, key, success, error):
+        if not self.alive:
+            return
+        current = self.session
+        try:
+            if success:
+                self.set_setting("default_background", 0)
+                self.remember_background(key, "video")
+            if current and not current.closed:
+                current.idle.reset()
+                current.refresh_progress()
+            if error:
+                self.log("Gallery import failed: " + error[:500])
+                self.notice(current.context if current else context,
+                            "Не удалось добавить видео. Предыдущий клип сохранён.\n\n" + error[:350])
+            elif success and current and not current.closed and current.current()[1] == key:
+                # Even if result arrives before RESUME/focus, the saved clip remains
+                # eligible later; do not leave a stale failed-key block after replacement.
+                current.auto_failed_key = None
+                if (self.foreground and int(current.root.getWindowVisibility()) == 0
+                        and current.root.hasWindowFocus() and not current.dialogs):
+                    current.key = key
+                    current.start(kind="video")
+        except Exception as caught:
+            self.action_error(current.context if current else context, "Завершение импорта", caught)
+
+
+def player_palette(session=None):
+    colors = field(session.sheet, "colors") if session else None
+    if colors is not None:
+        return {name: int(getattr(colors, name)) for name in
+                ("background", "surfaceContainer", "icon", "text", "textSecondary", "accent", "onAccent")}
+    Theme = jclass("org.telegram.ui.ActionBar.Theme")
+    return {"background": int(Theme.getColor(Theme.key_dialogBackground)),
+            "surfaceContainer": int(Theme.getColor(Theme.key_dialogBackgroundGray)),
+            "icon": int(Theme.getColor(Theme.key_dialogTextBlack)),
+            "text": int(Theme.getColor(Theme.key_dialogTextBlack)),
+            "textSecondary": int(Theme.getColor(Theme.key_dialogTextGray)),
+            "accent": int(Theme.getColor(Theme.key_dialogTextBlue)),
+            "onAccent": -1}
+
+
+def rounded_background(radius, color):
+    drawable = jclass("android.graphics.drawable.GradientDrawable")()
+    drawable.setCornerRadius(jfloat(radius))
+    drawable.setColor(jint(color))
+    return drawable
+
+
+class ExpressivePanel:
+    """One MD3E bottom-sheet style for notices, management, progress and deletion."""
+    def __init__(self, plugin, context, session, title, message, actions):
+        self.plugin, self.session = plugin, session
+        self.closed = False
+        self.listeners = []
+        density = float(context.getResources().getDisplayMetrics().density)
+        dp = lambda value: int(value * density + 0.5)
+        colors = player_palette(session)
+        Linear = jclass("android.widget.LinearLayout")
+        Params = jclass("android.widget.LinearLayout$LayoutParams")
+        content = Linear(context)
+        content.setOrientation(1)
+        content.setPadding(dp(24), dp(12), dp(24), dp(24))
+        content.setBackground(rounded_background(dp(28), colors["background"]))
+        handle = jclass("android.view.View")(context)
+        handle.setBackground(rounded_background(dp(2), colors["textSecondary"]))
+        hp = Params(dp(32), dp(4))
+        hp.gravity = 1
+        hp.bottomMargin = dp(24)
+        content.addView(handle, hp)
+
+        def text(value, size, color, medium=False):
+            view = jclass("android.widget.TextView")(context)
+            view.setText(value)
+            view.setTextSize(jfloat(size))
+            view.setTextColor(jint(color))
+            view.setTypeface(jclass("android.graphics.Typeface").create(
+                "sans-serif-medium" if medium else "sans-serif", 0))
+            return view
+
+        heading = text(title, 26, colors["text"], True)
+        content.addView(heading, Params(-1, -2))
+        self.message_view = text(message, 16, colors["textSecondary"])
+        self.message_view.setPadding(0, dp(12), 0, dp(20))
+        content.addView(self.message_view, Params(-1, -2))
+        for label, callback, primary in actions:
+            action = text(label, 16, colors["onAccent"] if primary else colors["text"], True)
+            action.setGravity(17)
+            action.setMinHeight(dp(56))
+            action.setPadding(dp(20), dp(12), dp(20), dp(12))
+            try:
+                bg = jclass(EXPRESSIVE_CLASS)(jfloat(16))
+                bg.setSelectedRadius(jfloat(28))
+                bg.setAlwaysShowContainer(True)
+                bg.setColors(jint(colors["onAccent"] if primary else colors["icon"]),
+                             jint(colors["accent"] if primary else colors["surfaceContainer"]))
+            except Exception:
+                # Compatibility notice when the host has no new expressive player.
+                bg = rounded_background(dp(28), colors["accent"] if primary else colors["surfaceContainer"])
+            action.setBackground(bg)
+            action.setFocusable(True)
+
+            def clicked(_view, fn=callback):
+                self.dismiss()
+                if fn and plugin.alive:
+                    # Defer until the dialog dismiss hook has reset the idle timer.
+                    def invoke():
+                        if plugin.alive:
+                            try:
+                                fn()
+                            except Exception as error:
+                                plugin.action_error(context, "Действие в окне", error)
+                    ui(invoke)
+            listener = OnClickListener(clicked)
+            self.listeners.append(listener)
+            action.setOnClickListener(listener)
+            params = Params(-1, -2)
+            params.topMargin = dp(8)
+            content.addView(action, params)
+        scroll = jclass("android.widget.ScrollView")(context)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.addView(content)
+        # Stable overload on the user's build: the third argument, if supplied,
+        # is a Theme.ResourcesProvider, not an integer background color.
+        builder = jclass("org.telegram.ui.ActionBar.BottomSheet$Builder")(context, False)
+        builder.setCustomView(scroll)
+        builder.setApplyTopPadding(False)
+        builder.setApplyBottomPadding(False)
+        self.dialog = builder.create()
+        panel = self
+
+        class Dismiss(dynamic_proxy(jclass("android.content.DialogInterface$OnDismissListener"))):
+            def onDismiss(self, _dialog):
+                panel.closed = True
+                if panel in plugin.panels:
+                    plugin.panels.remove(panel)
+                if session:
+                    if panel in session.dialogs:
+                        session.dialogs.remove(panel)
+                    session.idle.reset()
+        self.dismiss_listener = Dismiss()
+        self.dialog.setOnDismissListener(self.dismiss_listener)
+        plugin.panels.append(self)
+        if session:
+            session.idle.reset()
+            session.dialogs.append(self)
+        try:
+            self.dialog.show()
+        except Exception:
+            self.dismiss_listener.onDismiss(self.dialog)
+            raise
+
+    def dismiss(self):
+        if not self.closed:
+            self.dialog.dismiss()
+
+    def set_message(self, message):
+        if not self.closed:
+            self.message_view.setText(message)
+
+
+def show_panel(plugin, context, session, title, message, actions):
+    return ExpressivePanel(plugin, context, session, title, message, actions)
+
+
+class PlayerSession:
+    def __init__(self, plugin, sheet):
+        self.plugin, self.sheet = plugin, sheet
+        self.context = sheet.getContext()
+        self.root = field(sheet, "playerLayout")
+        self.cover = field(sheet, "coverView")
+        self.lyrics = field(sheet, "lyricsButton")
+        self.speed = field(sheet, "speedButton")
+        if any(view is None for view in (self.root, self.cover, self.lyrics, self.speed)):
+            raise RuntimeError("Не найдены элементы MusicPlayerSheet")
+        self.closed = False
+        self.active = False
+        self.revealed = False
+        self.generation = 0
+        self.player = self.delegate = None
+        self.key = None
+        self.dimensions = None
+        self.video_visible = False
+        self.returning = False
+        self.restore_pending = None
+        self.background_kind = "video"
+        self.genie = CoverGenie(self)
+        self.artwork = None
+        self.art_bitmap = self.art_source = None
+        self.art_checked_at = 0.0
+        self.saved_cover = (float(self.cover.getTranslationY()), float(self.cover.getAlpha()), int(self.cover.getVisibility()))
+        self.saved_clip = bool(self.root.getClipChildren())
+        self.button = self.layer = self.texture = self.scrim = None
+        self.dialogs = []
+        self.progress_panel = None
+        self.idle = IdleAutoplay()
+        self.auto_failed_key = None
+        self.lyrics_background = field(sheet, "lyricsBackground")
+        self.saved_inner_side = int(field(self.lyrics_background, "innerSide"))
+        self.saved_inner_radius = float(field(self.lyrics_background, "innerRadius"))
+
+    def dp(self, value):
+        return int(self.context.getResources().getDisplayMetrics().density * value + 0.5)
+
+    def install(self):
+        Frame = jclass("android.widget.FrameLayout")
+        Params = jclass("android.widget.FrameLayout$LayoutParams")
+        self.layer = Frame(self.context)
+        self.layer.setClickable(False)
+        self.layer.setVisibility(4)
+        self.layer.setClipChildren(True)
+        self.texture = jclass("android.view.TextureView")(self.context)
+        self.texture.setOpaque(True)
+        self.artwork = jclass("android.widget.ImageView")(self.context)
+        self.artwork.setScaleType(jclass("android.widget.ImageView$ScaleType").CENTER_CROP)
+        self.artwork.setVisibility(4)
+        self.layer.addView(self.artwork, Params(-1, -1))
+        self.layer.addView(self.texture, Params(-1, -1))
+        self.scrim = jclass("android.view.View")(self.context)
+        self.layer.addView(self.scrim, Params(-1, -1))
+        self.root.addView(self.layer, 0, Params(-1, -1))
+        self.button = jclass("android.widget.ImageView")(self.context)
+        self.button.setImageDrawable(self.video_icon())
+        self.button.setScaleType(jclass("android.widget.ImageView$ScaleType").CENTER_INSIDE)
+        self.button.setPadding(self.dp(12), self.dp(12), self.dp(12), self.dp(12))
+        self.button_background = jclass(EXPRESSIVE_CLASS)(jfloat(24))
+        self.button_background.setInnerCorners(2, jfloat(8))
+        self.button_background.setAlwaysShowContainer(True)
+        # The former left segment is now the middle: preserve its host ripple,
+        # selection animation and callbacks while rounding both inner edges.
+        self.lyrics_background.setInnerCorners(0, jfloat(8))
+        self.button.setBackground(self.button_background)
+        self.button.setFocusable(True)
+        self.button.setContentDescription("Видео трека. Удержание — заменить или удалить")
+        self.click = OnClickListener(lambda v: self.plugin.dispatch_button(self))
+        self.long_click = OnLongClickListener(lambda v: self.plugin.dispatch_button(self, manage=True))
+        self.button.setOnClickListener(self.click)
+        self.button.setOnLongClickListener(self.long_click)
+        self.root.addView(self.button, Params(self.dp(48), self.dp(48)))
+        self.root.requestLayout()
+        self.style()
+        self.tick()
+
+    def video_icon(self):
+        # Render a clean rounded triangle at device density; tint follows the player.
+        Bitmap = jclass("android.graphics.Bitmap")
+        bitmap = Bitmap.createBitmap(self.dp(24), self.dp(24), jclass("android.graphics.Bitmap$Config").ARGB_8888)
+        bitmap.setDensity(int(self.context.getResources().getDisplayMetrics().densityDpi))
+        canvas = jclass("android.graphics.Canvas")(bitmap)
+        scale = jfloat(self.dp(24) / 24.0)
+        canvas.scale(scale, scale)
+        path = jclass("android.graphics.Path")()
+        path.moveTo(jfloat(8), jfloat(5.8))
+        path.quadTo(jfloat(8), jfloat(4.7), jfloat(9), jfloat(5.3))
+        path.lineTo(jfloat(19), jfloat(11.2))
+        path.quadTo(jfloat(20.3), jfloat(12), jfloat(19), jfloat(12.8))
+        path.lineTo(jfloat(9), jfloat(18.7))
+        path.quadTo(jfloat(8), jfloat(19.3), jfloat(8), jfloat(18.2))
+        path.close()
+        paint = jclass("android.graphics.Paint")(3)
+        paint.setColor(jint(-1))
+        canvas.drawPath(path, paint)
+        return jclass("android.graphics.drawable.BitmapDrawable")(self.context.getResources(), bitmap)
+
+    def style(self):
+        if self.closed or self.button is None:
+            return
+        colors = field(self.sheet, "colors")
+        p = player_palette(self)
+        selected = self.active
+        self.button.setColorFilter(jint(p["onAccent"] if selected else p["icon"]))
+        self.button_background.setColors(jint(p["icon"]), jint(p["surfaceContainer"]))
+        self.button_background.setSelectedContainerColor(jint(p["accent"]))
+        self.button_background.setSelected(selected, True)
+        self.button.setVisibility(int(self.lyrics.getVisibility()))
+        self.button.setAlpha(jfloat(float(self.lyrics.getAlpha())))
+        if self.layer is not None:
+            if self.video_visible:
+                self.scrim.setBackgroundColor(jint(self.scrim_tint()))
+                self.scrim.setAlpha(jfloat(self.dim_amount()))
+            else:
+                self.scrim.setBackgroundColor(jint(int(colors.background) if colors is not None else -16777216))
+                self.scrim.setAlpha(jfloat(1.0))
+
+    def dim_amount(self):
+        return (0.33, 0.53, 0.67)[max(0, min(2, int(self.plugin.get_setting("dimming", 1))))]
+
+    def scrim_tint(self):
+        colors = field(self.sheet, "colors")
+        # A light overlay keeps the stock dark icons legible in light themes.
+        return int(colors.background) if colors is not None and not colors.dark else -16777216
+
+    def layout(self):
+        if self.closed or self.button is None:
+            return
+        width, height = int(self.root.getWidth()), int(self.root.getHeight())
+        if width <= 0 or height <= 0:
+            return
+        if self.genie.running and self.genie.root_size != (width, height):
+            self.genie.finish()
+        exact = jclass("android.view.View$MeasureSpec")
+        self.layer.measure(exact.makeMeasureSpec(width, 1073741824), exact.makeMeasureSpec(height, 1073741824))
+        self.layer.layout(0, 0, width, height)
+        # Match the 48dp host segments and their 2dp internal gap.
+        right = int(self.lyrics.getLeft()) - self.dp(2)
+        left_limit = int(self.speed.getRight()) + self.dp(4)
+        size = min(self.dp(64), max(0, right - left_limit))
+        self.button.measure(exact.makeMeasureSpec(size, 1073741824), exact.makeMeasureSpec(self.dp(48), 1073741824))
+        top = int(self.lyrics.getTop())
+        self.button.layout(right - size, top, right, top + self.dp(48))
+        self.transform()
+
+    def current(self):
+        message = get_media_controller().getPlayingMessageObject()
+        if message is None or not message.isMusic():
+            return None, None
+        doc = message.getDocument()
+        key = track_key(message.currentAccount, int(doc.id) if doc is not None else 0,
+                        message.getDialogId(), message.getId())
+        return message, key
+
+    def default_kind(self):
+        return "cover" if int(self.plugin.get_setting("default_background", 0)) == 1 else "video"
+
+    def use_cover(self, key):
+        self.plugin.set_setting("default_background", 1)
+        self.plugin.remember_background(key, "cover")
+        if self.current()[1] == key:
+            self.key = key
+            self.start(kind="cover")
+
+    def use_video(self, key):
+        self.plugin.set_setting("default_background", 0)
+        self.plugin.remember_background(key, "video")
+        if self.current()[1] == key:
+            self.key = key
+            self.start(kind="video")
+
+    def tap(self):
+        if self.closed:
+            return
+        self.idle.reset()
+        _, key = self.current()
+        if not key:
+            self.plugin.notice(self.context, "Сейчас не выбран музыкальный трек. Запусти музыку и открой плеер заново.")
+            return
+        if self.plugin.job:
+            self.manage()
+            return
+        if key != self.key:
+            self.stop()
+            self.key = key
+        if self.active:
+            self.stop(animate=True, forget=True)
+        elif self.default_kind() == "cover" or self.plugin.cache.get(key):
+            self.start()
+        else:
+            self.prompt(key)
+
+    def prompt(self, key):
+        self.panel("Фон плеера", "Выбери видео или обложку на весь фон. Если ролика нет в галерее, открой «Из файлов». Выбранный режим станет фоном по умолчанию.", [
+            ("Из файлов", lambda: self.plugin.choose_gallery(self, key, files=True), True),
+            ("Из галереи", lambda: self.plugin.choose_gallery(self, key), False),
+            ("Обложка на весь фон", lambda: self.use_cover(key), False),
+            ("Отмена", None, False)])
+
+    def panel(self, title, message, actions):
+        return show_panel(self.plugin, self.context, self, title, message, actions)
+
+    def manage(self):
+        if self.closed:
+            return True
+        self.idle.reset()
+        if self.plugin.job:
+            job = self.plugin.job
+            self.progress_panel = self.panel("Добавление видео", self.progress_text(job), [
+                ("Продолжить в фоне", None, True),
+                ("Отменить импорт", lambda: job["cancel"].set(), False)])
+            return True
+        _, key = self.current()
+        if not key:
+            self.plugin.notice(self.context, "Сейчас не выбран музыкальный трек. Запусти музыку и открой плеер заново.")
+            return True
+        clip = self.plugin.cache.get(key)
+        if not clip:
+            self.prompt(key)
+            return True
+
+        def toggle():
+            if self.current()[1] == key:
+                self.stop(animate=True, forget=True) if self.active else self.tap()
+        actions = [
+            ("Вернуть обычную обложку" if self.active else "Включить фон", toggle, True),
+            ("Выбрать другой из галереи", lambda: self.plugin.choose_gallery(self, key), False),
+            ("Выбрать другой из файлов", lambda: self.plugin.choose_gallery(self, key, files=True), False),
+            ("Обложка на весь фон", lambda: self.use_cover(key), False),
+            ("Включить клип", lambda: self.use_video(key), False),
+            ("Удалить клип", lambda: self.confirm_delete(key), False),
+            ("Закрыть", None, False)]
+        self.panel("Фон этого трека", str(clip.get("title", "Видео из галереи")), actions)
+        return True
+
+    def progress_text(self, job):
+        if job["cancel"].is_set():
+            return "Отмена импорта… Предыдущий клип сохранён."
+        percent = job["percent"]
+        return ("Копируем видео…" if percent is None else f"Копируем видео · {percent}%") + "\nОригинал останется в галерее."
+
+    def refresh_progress(self):
+        if self.progress_panel and not self.progress_panel.closed:
+            job = self.plugin.job
+            if job:
+                self.progress_panel.set_message(self.progress_text(job))
+            else:
+                self.progress_panel.dismiss()
+        if self.progress_panel and self.progress_panel.closed:
+            self.progress_panel = None
+
+    def confirm_delete(self, key):
+        def delete():
+            if self.key == key:
+                self.stop(forget=True)
+            try:
+                self.plugin.cache.delete(key)
+            except Exception as error:
+                self.plugin.notice(self.context, "Не удалось удалить: " + str(error)[:200])
+        self.panel("Удалить клип?", "Удалится только копия для этого трека. Видео в галерее и музыка останутся.", [
+            ("Удалить клип", delete, True), ("Оставить", None, False)])
+
+    def idle_eligible(self, key):
+        return bool(key and not self.active and not self.returning and not self.closed and self.plugin.foreground
+                    and self.plugin.get_setting("auto", True)
+                    and not self.dialogs and not self.plugin.picker and not self.plugin.job
+                    and int(self.root.getWindowVisibility()) == 0 and self.root.hasWindowFocus()
+                    and int(field(self.sheet, "mode")) == 0
+                    and float(field(self.sheet, "modeProgress")) < 0.01
+                    and key != self.auto_failed_key
+                    and (self.default_kind() == "cover" or self.plugin.cache.get(key)))
+
+    def make_delegate(self, generation):
+        session = self
+        class Delegate(dynamic_proxy(jclass("org.telegram.ui.Components.VideoPlayer$VideoPlayerDelegate"))):
+            def onStateChanged(self, playWhenReady, playbackState):
+                if int(playbackState) == 4:
+                    ui(lambda: session.loop_ended(generation))
+
+            def onError(self, player, error):
+                ui(lambda: session.failed(generation, str(error)))
+
+            def onVideoSizeChanged(self, width, height, rotation, ratio):
+                if session.generation == generation:
+                    session.dimensions = (int(width), int(height), int(rotation), float(ratio))
+                    session.transform()
+
+            def onRenderedFirstFrame(self, *args):
+                if session.generation == generation:
+                    session.first_frame = True
+
+            def onSurfaceTextureUpdated(self, surface):
+                pass
+
+            def onSurfaceDestroyed(self, surface):
+                # No PiP/surface handoff: let TextureView release the texture.
+                return True
+
+            def onSeekStarted(self, event):
+                pass
+
+            def onSeekFinished(self, event):
+                pass
+
+            def onCues(self, group):
+                pass
+        return Delegate()
+
+    def start(self, kind=None, animate=True):
+        if self.closed:
+            return
+        _, key = self.current()
+        if not key or key != self.key:
+            return
+        kind = kind or self.default_kind()
+        clip = self.plugin.cache.get(key) if kind == "video" else None
+        if kind == "video" and not clip:
+            self.plugin.remember_background(key, None)
+            return
+        self.stop()
+        self.generation += 1
+        generation = self.generation
+        self.active = True
+        self.background_kind = kind
+        self.animate_reveal = animate
+        self.plugin.remember_background(key, kind)
+        self.first_frame = False
+        self.revealed = False
+        self.started_at = time.monotonic()
+        self.layer.setVisibility(0)
+        # TextureView must actually draw to create its SurfaceTexture. Hiding it
+        # with parent alpha=0 can deadlock first-frame delivery on Android.
+        # An opaque scrim covers the video until the cover has left the screen.
+        self.layer.setAlpha(jfloat(1.0))
+        self.texture.setVisibility(0 if kind == "video" else 4)
+        self.artwork.setVisibility(0 if kind == "cover" else 4)
+        self.style()
+        try:
+            if kind == "cover":
+                self.player_stage = "подготовка обложки"
+                self.update_artwork(force=True)
+                self.first_frame = self.art_bitmap is not None
+                if self.first_frame:
+                    self.reveal()
+                return
+            self.player_stage = "создание VideoPlayer"
+            self.player = jclass("org.telegram.ui.Components.VideoPlayer")(False, True)
+            self.player_stage = "проверка API VideoPlayer"
+            self.player = CompatibleVideoPlayer(self.player)
+            if self.player.missing:
+                self.plugin.log("Player Video compatibility: " + ", ".join(self.player.missing))
+            self.delegate = self.make_delegate(generation)
+            self.player.setDelegate(self.delegate)
+            self.player_stage = "setTextureView"
+            self.player.setTextureView(self.texture)
+            self.player.setLooping(True)
+            uri = jclass("android.net.Uri").fromFile(jclass("java.io.File")(clip["path"]))
+            self.player_stage = "preparePlayer"
+            self.player.preparePlayer(uri, "other")
+            self.player_stage = "синхронизация видео"
+            self.sync(force=True)
+        except Exception as error:
+            self.failed(generation, str(error))
+
+    def loop_ended(self, generation):
+        if self.closed or not self.active or generation != self.generation:
+            return
+        # Also covers app builds without the optional native setLooping method.
+        try:
+            self.sync(force=True)
+        except Exception as error:
+            self.failed(generation, str(error))
+
+    def sync_cover(self):
+        if self.closed or (not self.active and not self.returning):
+            return
+        # The host uses this SAME full-size view to draw the compact artwork
+        # beside the title in lyrics/queue. Leave its native cover rect and
+        # keyboard hide progress alone; hide only the large cover over video.
+        progress = max(0.0, min(1.0, float(field(self.sheet, "modeProgress"))))
+        if self.genie.running:
+            if progress > 0.0:
+                self.genie.finish()
+            else:
+                return
+        if not self.active or not self.revealed:
+            return
+        if progress == 0.0 and not self.video_visible:
+            return
+        self.cover.animate().cancel()
+        self.cover.setTranslationY(jfloat(self.saved_cover[0]))
+        self.cover.setAlpha(jfloat(self.saved_cover[1] * progress if progress > 0.0 else self.saved_cover[1]))
+        self.cover.setVisibility(self.saved_cover[2] if progress > 0.0 else 4)
+
+    def reveal(self):
+        if self.revealed or not self.active:
+            return
+        self.revealed = True
+        generation = self.generation
+        self.root.setClipChildren(True)
+        def finish():
+            if self.closed or generation != self.generation or not self.active:
+                return
+            self.video_visible = True
+            self.sync_cover()
+            self.scrim.setBackgroundColor(jint(self.scrim_tint()))
+            self.scrim.animate().alpha(jfloat(self.dim_amount())).setDuration(jlong(180)).start()
+
+        if (not self.animate_reveal or float(field(self.sheet, "modeProgress")) > 0.0):
+            finish()
+        else:
+            try:
+                self.genie.animate(False, finish)
+            except Exception as error:
+                self.plugin.log("Player Clip animation setup: " + str(error))
+                self.genie.clear()
+                finish()
+
+    def update_artwork(self, force=False):
+        if self.artwork is None:
+            return
+        now = time.monotonic()
+        if not force and now - self.art_checked_at < 0.75:
+            return
+        self.art_checked_at = now
+        source = None
+        try:
+            receiver = self.cover.getImageReceiver()
+            getter = getattr(receiver, "getBitmap", None)
+            if callable(getter):
+                source = getter()
+        except Exception:
+            pass
+        if not force and source == self.art_source and self.art_bitmap is not None:
+            return
+        bitmap = None
+        if source is not None and not source.isRecycled():
+            config = jclass("android.graphics.Bitmap$Config").ARGB_8888
+            width, height = int(source.getWidth()), int(source.getHeight())
+            factor = min(1.0, 1200.0 / max(width, height))
+            scaled = jclass("android.graphics.Bitmap").createScaledBitmap(
+                source, max(1, int(width * factor)), max(1, int(height * factor)), True)
+            try:
+                bitmap = scaled.copy(config, False)
+            finally:
+                if scaled != source:
+                    scaled.recycle()
+        if bitmap is None:
+            try:
+                bitmap = self.genie.snapshot()
+            except RuntimeError:
+                return  # Wait for the first native layout rather than losing selection.
+        self.art_bitmap, self.art_source = bitmap, source
+        self.artwork.setImageBitmap(bitmap)
+        self.first_frame = True
+
+    def transform(self):
+        if not self.dimensions or self.texture is None:
+            return
+        width, height = int(self.texture.getWidth()), int(self.texture.getHeight())
+        vw, vh, rotation, ratio = self.dimensions
+        if min(width, height, vw, vh) <= 0:
+            return
+        # ExoPlayer's TextureView handles rotation. Only account for it in aspect.
+        aspect = vw * (ratio or 1.0) / vh
+        if rotation in (90, 270):
+            aspect = 1 / aspect
+        screen = width / height
+        sx, sy = (aspect / screen, 1.0) if aspect > screen else (1.0, screen / aspect)
+        matrix = jclass("android.graphics.Matrix")()
+        matrix.setScale(jfloat(sx), jfloat(sy), jfloat(width / 2), jfloat(height / 2))
+        self.texture.setTransform(matrix)
+
+    def sync(self, force=False):
+        if not self.player:
+            return
+        controller = get_media_controller()
+        message, key = self.current()
+        if key != self.key or message is None:
+            return
+        duration = int(self.player.getDuration())
+        if duration > 0:
+            expected = loop_position(controller.getProgressMs(message), duration)
+            actual = int(self.player.getCurrentPosition())
+            difference = abs(expected - actual)
+            difference = min(difference, abs(duration - difference))
+            if force or difference > 900:
+                self.player.seekTo(jlong(expected))
+        speed = float(controller.getPlaybackSpeed(True))
+        if abs(float(self.player.getPlaybackSpeed()) - speed) > 0.01:
+            self.player.setPlaybackSpeed(jfloat(speed))
+        visible = self.plugin.foreground and int(self.root.getWindowVisibility()) == 0
+        self.player.setPlayWhenReady(visible and not controller.isMessagePaused())
+
+    def tick(self):
+        if self.closed or not self.plugin.alive:
+            return
+        try:
+            _, key = self.current()
+            if key != self.key:
+                self.stop()
+                self.key = key
+                self.idle.reset()
+                self.auto_failed_key = None
+                self.restore_pending = self.plugin.selected_background(key)
+            if (self.restore_pending and self.plugin.foreground
+                    and int(self.root.getWidth()) > 0 and int(self.root.getHeight()) > 0
+                    and int(self.root.getWindowVisibility()) == 0):
+                selected, self.restore_pending = self.restore_pending, None
+                self.start(kind=selected, animate=False)
+            if self.idle.due(self.idle_eligible(key)):
+                self.start()
+                self.idle.reset()
+            self.refresh_progress()
+            if self.active:
+                if self.background_kind == "cover":
+                    self.update_artwork()
+                self.sync()
+                # First frame can wait for music to resume when opened while paused.
+                if self.first_frame:
+                    self.reveal()
+                elif (not self.plugin.foreground or int(self.root.getWindowVisibility()) != 0
+                      or get_media_controller().isMessagePaused()):
+                    self.started_at = time.monotonic()
+                elif time.monotonic() - self.started_at > 25:
+                    self.failed(self.generation, "Не удалось подготовить фон за 25 секунд")
+            if self.button is not None:
+                job = self.plugin.job
+                self.button.setContentDescription(
+                    "Видео добавляется. Удержание — прогресс и отмена" if job and job["key"] == key
+                    else "Выключить фон. Удержание — выбрать фон" if self.active
+                    else "Фон трека. Удержание — выбрать фон")
+        except Exception as error:
+            if self.active:
+                self.failed(self.generation, str(error))
+            else:
+                self.plugin.log("Player Video idle sync: " + str(error))
+                self.stop()
+        ui(self.tick, 250)
+
+    def failed(self, generation, message):
+        if self.closed or generation != self.generation or not self.active:
+            return
+        import traceback
+        stage = getattr(self, "player_stage", "воспроизведение")
+        detail = ("Обложка" if self.background_kind == "cover" else "VideoPlayer") + " / " + stage + ": " + message
+        trace = traceback.format_exc()
+        self.plugin.record_error(detail + ("\n" + trace if trace.strip() != "NoneType: None" else ""))
+        self.stop(forget=True)
+        self.auto_failed_key = self.key
+        self.plugin.notice(self.context, detail + "\nПолный текст: настройки плагина → Скопировать последнюю ошибку.")
+
+    def suspend(self):
+        self.idle.reset()
+        if self.genie.running:
+            self.genie.finish()
+        if self.player:
+            self.player.pause()
+
+    def stop(self, animate=False, forget=False):
+        self.idle.reset()
+        self.restore_pending = None
+        if forget:
+            self.plugin.remember_background(self.key, None)
+        can_return = (animate and self.revealed and not self.closed
+                      and float(field(self.sheet, "modeProgress")) < 0.01)
+        self.generation += 1
+        generation = self.generation
+        self.active = False
+        self.returning = can_return
+        if can_return:
+            if self.player is not None:
+                try:
+                    self.player.pause()
+                except Exception as error:
+                    self.plugin.log("Player Clip pause: " + str(error))
+            try:
+                self.genie.animate(True, lambda: self.finish_stop(generation))
+                self.style()
+                return
+            except Exception as error:
+                self.plugin.log("Player Clip return animation: " + str(error))
+        self.finish_stop(generation)
+
+    def finish_stop(self, generation):
+        if generation != self.generation:
+            return
+        self.genie.clear()
+        self.returning = False
+        self.revealed = False
+        self.video_visible = False
+        if self.player is not None:
+            player, self.player = self.player, None
+            try:
+                player.releasePlayer(False)
+            except Exception as error:
+                self.plugin.log("Player Video release: " + str(error)[:180])
+        self.delegate = None
+        if self.artwork is not None:
+            self.artwork.setImageDrawable(None)
+            self.artwork.setVisibility(4)
+        self.art_bitmap = self.art_source = None
+        if self.layer is not None:
+            self.layer.animate().cancel()
+            if self.scrim is not None:
+                self.scrim.animate().cancel()
+            self.layer.setVisibility(4)
+            self.layer.setAlpha(jfloat(0.0))
+        self.cover.animate().cancel()
+        self.cover.setTranslationY(jfloat(self.saved_cover[0]))
+        self.cover.setAlpha(jfloat(self.saved_cover[1]))
+        self.cover.setVisibility(self.saved_cover[2])
+        self.root.setClipChildren(self.saved_clip)
+        self.style()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.stop()
+        for dialog in list(self.dialogs):
+            dialog.dismiss()
+        self.dialogs.clear()
+        if self.lyrics_background is not None:
+            self.lyrics_background.setInnerCorners(self.saved_inner_side, jfloat(self.saved_inner_radius / (
+                self.context.getResources().getDisplayMetrics().density)))
+        for view in (self.button, self.layer):
+            if view is not None and view.getParent() is not None:
+                self.root.removeView(view)
