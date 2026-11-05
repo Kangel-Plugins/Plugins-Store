@@ -1,0 +1,870 @@
+import json
+import time
+import traceback
+from collections import deque
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from hook_utils import find_class
+from android_utils import copy_to_clipboard, run_on_ui_thread, OnClickListener, R
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text, Divider
+
+from java import jclass, jlong, jint, jboolean
+from java.lang import System, String as JString
+from java.util import Locale
+from android.text import SpannableStringBuilder, SpannableString, Spanned
+from android.view import Gravity
+from android.widget import ImageView
+from android.graphics import PorterDuff, PorterDuffColorFilter
+from org.telegram.messenger import AndroidUtilities, UserConfig
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import LayoutHelper
+
+__id__ = "custom_emoji_nick"
+__name__ = "Custom Emoji Nick"
+__description__ = "Выбор кастомных эмодзи в имени контакта"
+__author__ = "@shit_plugins"
+__version__ = "1.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.10.6"
+__category__ = ["appearance", "chats"]
+__sdk_version__ = ">=1.4.4.3"
+
+KEY_ENABLED = "enabled"
+KEY_ENTRIES = "entries"
+TYPE_EMOJI_STATUS = 0      # SelectAnimatedEmojiDialog.TYPE_EMOJI_STATUS
+WRAP_CONTENT = -2          # LayoutHelper.WRAP_CONTENT
+FALLBACK_EMOJI = "⭐"
+
+PLACEHOLDER_NAME = "-"
+
+
+SCREENS = (
+    ("org.telegram.ui.UserInfoActivity", "firstNameEdit", "lastNameEdit", None),
+    ("org.telegram.ui.ContactAddActivity", "firstNameField", "lastNameField", "user_id"),
+)
+
+STRINGS = {
+    "ru": {
+        "error": "Ошибка плагина, подробности в журнале",
+        "header": "Кастомные эмодзи в нике",
+        "enabled": "Показывать кастомные эмодзи",
+        "enabled_sub": "Только на этом устройстве. Остальные видят имя без этих эмодзи",
+        "saved": "Имён с кастомными эмодзи: {n}",
+        "clear_all": "Удалить все сохранённые",
+        "cleared": "Удалено",
+        "howto": "Откройте редактирование своего имени или имени контакта и нажмите смайлик справа от поля. Эмодзи отображаются в списке чатов, профиле и заголовке чата. Имя из одних эмодзи тоже можно.",
+        "diag": "Диагностика",
+        "copy_log": "Скопировать журнал",
+        "copy_log_sub": "Пришлите его автору при ошибке",
+    },
+    "en": {
+        "error": "Plugin error, see the log",
+        "header": "Custom emoji in names",
+        "enabled": "Show custom emoji",
+        "enabled_sub": "Only on this device. Others see the name without them",
+        "saved": "Names with custom emoji: {n}",
+        "clear_all": "Delete all saved",
+        "cleared": "Deleted",
+        "howto": "Open your name editor or a contact's name editor and tap the smiley next to the field. Emoji appear in the chat list, profile and chat header. Emoji-only names work too.",
+        "diag": "Diagnostics",
+        "copy_log": "Copy log",
+        "copy_log_sub": "Send it to the author if something breaks",
+    },
+}
+
+
+def tr(key: str) -> str:
+    try:
+        lang = str(Locale.getDefault().getLanguage())
+    except Exception:
+        lang = "en"
+    table = STRINGS["ru"] if lang in ("ru", "uk", "be") else STRINGS["en"]
+    return table.get(key, STRINGS["en"].get(key, key))
+
+
+def ident(obj) -> int:
+    return int(System.identityHashCode(obj))
+
+
+def u16(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+class _Hook(MethodHook):
+    def __init__(self, plugin, name, before=None, after=None):
+        self.plugin = plugin
+        self.name = name
+        self.before = before
+        self.after = after
+
+    def before_hooked_method(self, param):
+        if self.before is not None:
+            try:
+                self.before(param)
+            except Exception:
+                self.plugin._record_error(self.name, traceback.format_exc())
+
+    def after_hooked_method(self, param):
+        if self.after is not None:
+            try:
+                self.after(param)
+            except Exception:
+                self.plugin._record_error(self.name, traceback.format_exc())
+
+
+class CustomEmojiNickPlugin(BasePlugin):
+    _active = False
+    _in_cell = False
+    _force = False
+    _gen = 0            # растёт при каждом изменении набора имён
+    _cur_cell = None
+    _cell_gen = {}      # id ячейки -> поколение имён, с которым она построена
+    _cell_calls = 0
+    _cell_hits = 0
+    _diag = None
+    _error_count = 0
+
+    # ---------- lifecycle ----------
+
+    def on_plugin_load(self):
+        self._diag = deque(maxlen=150)
+        self._error_count = 0
+        self._unhooks = []
+        self._screens = {}      # id фрагмента -> {"key", "cells"}
+        self._cell_roles = {}   # id поля -> (id фрагмента, "first"/"last")
+        self._picker = None
+        self._entries = {}
+        self._render_map = {}
+        self._cell_gen = {}
+        try:
+            self._span_cls = jclass("org.telegram.ui.Components.AnimatedEmojiSpan")
+            # java.lang.Class берём у живого объекта: find_class отдаёт Python-обёртку, а не Class
+            probe = self._span_cls(jlong(0), None)
+            self._span_class_obj = probe.getClass()
+            self._replacement_cls = self._span_class_obj.getSuperclass()
+            self._dialog_cls = jclass("org.telegram.ui.SelectAnimatedEmojiDialog")
+            self._load_entries()
+
+            self._hook("org.telegram.ui.ActionBar.SimpleTextView", "setText", before=self._decorate_title)
+            # Список чатов рисует имя не через SimpleTextView, а собирает его в DialogCell.buildLayout
+            self._hook("org.telegram.ui.Cells.DialogCell", "buildLayout", before=self._cell_enter,
+                       after=lambda p: setattr(self, "_in_cell", False))
+            self._hook("org.telegram.ui.Cells.DialogCell", "onAttachedToWindow", after=self._on_cell_attached)
+            self._hook("org.telegram.ui.Cells.DialogCell$DialogUpdateHelper", "update", after=self._force_update)
+            self._hook("org.telegram.messenger.Emoji", "replaceEmoji", after=self._decorate_dialog_name)
+            self._hook("org.telegram.ui.Cells.EditTextCell", "setText", after=self._on_cell_set_text)
+            self._hook("org.telegram.ui.SelectAnimatedEmojiDialog", "onEmojiClick", before=self._on_emoji_click)
+            for spec in SCREENS:
+                self._hook(spec[0], "createView", after=lambda p, s=spec: self._on_create_view(s, p))
+                self._hook(spec[0], "onFragmentDestroy", before=lambda p, s=spec: self._on_destroy(s, p))
+
+            # Перехват запросов нужен, чтобы отправить на сервер имя без кастомных эмодзи
+            for name in ("addContact", "updateProfile"):
+                self.add_hook(name, match_substring=True)
+
+            self._active = True
+            # Ячейки, построенные до загрузки плагина, остаются без эмодзи, пока их не перерисовать
+            run_on_ui_thread(lambda: self._safe("refresh lists", self._refresh_lists))
+            self._note(f"loaded, entries={len(self._entries)}")
+        except Exception:
+            self._record_error("on_plugin_load", traceback.format_exc())
+
+    def on_plugin_unload(self):
+        self._active = False
+        try:
+            if self._picker is not None:
+                try:
+                    self._picker["popup"].dismiss()
+                except Exception:
+                    pass
+            self._picker = None
+            for u in self._unhooks:
+                try:
+                    self.unhook_method(u)
+                except Exception:
+                    pass
+            self._unhooks = []
+            self._screens = {}
+            self._cell_roles = {}
+            run_on_ui_thread(lambda: self._safe("refresh lists", self._refresh_lists))
+            self._note("unloaded")
+        except Exception:
+            self._record_error("on_plugin_unload", traceback.format_exc())
+
+    def _hook(self, class_name, method, before=None, after=None):
+        cls = find_class(class_name)
+        if cls is None:
+            self._note(f"class not found: {class_name}")
+            return
+        name = f"{class_name.rsplit('.', 1)[-1]}.{method}"
+        handles = self.hook_all_methods(cls, method, _Hook(self, name, before, after)) or []
+        self._unhooks.extend(handles)
+        self._note(f"hook {name}: {len(handles)}")
+
+    # ---------- storage ----------
+
+    def _load_entries(self):
+        raw = self.get_setting(KEY_ENTRIES, "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else {}
+        except Exception:
+            self._record_error("load entries", traceback.format_exc())
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        # Записи старого формата (эмодзи внутри имени на сервере) больше не годятся
+        self._entries = {k: v for k, v in data.items() if isinstance(v, dict) and "fi" in v}
+        self._rebuild_render_map()
+
+    def _save_entries(self, reload_settings=False):
+        self.set_setting(KEY_ENTRIES, json.dumps(self._entries, ensure_ascii=False), reload_settings=reload_settings)
+        self._rebuild_render_map()
+        run_on_ui_thread(lambda: self._safe("refresh lists", self._refresh_lists))
+
+    def _rebuild_render_map(self):
+        m = {}
+        for entry in self._entries.values():
+            first, last = entry.get("first", ""), entry.get("last", "")
+            for variant in (f"{first} {last}".strip(), f"{last} {first}".strip()):
+                if variant:
+                    m[variant] = entry
+        self._render_map = m
+        self._gen += 1
+
+    # ---------- name model ----------
+
+    def _split_field(self, editable):
+        """Разбирает текст поля на чистое имя и список вставок кастомных эмодзи."""
+        text = str(editable.toString())
+        units = text.encode("utf-16-le")
+        spans = []
+        for sp in editable.getSpans(0, editable.length(), self._span_class_obj):
+            a, b = int(editable.getSpanStart(sp)), int(editable.getSpanEnd(sp))
+            if 0 <= a < b <= len(units) // 2:
+                spans.append((a, b, int(sp.getDocumentId())))
+        spans.sort()
+        plain_parts, inserts, cursor, plain_len = [], [], 0, 0
+        for a, b, doc_id in spans:
+            if a < cursor:
+                continue
+            chunk = units[cursor * 2:a * 2].decode("utf-16-le", errors="ignore")
+            plain_parts.append(chunk)
+            plain_len += a - cursor
+            alt = units[a * 2:b * 2].decode("utf-16-le", errors="ignore") or FALLBACK_EMOJI
+            inserts.append([plain_len, doc_id, alt])
+            cursor = b
+        plain_parts.append(units[cursor * 2:].decode("utf-16-le", errors="ignore"))
+        plain = "".join(plain_parts)
+        lead = u16(plain) - u16(plain.lstrip())
+        stripped = plain.strip()
+        size = u16(stripped)
+        fixed = [[min(max(pos - lead, 0), size), doc_id, alt] for pos, doc_id, alt in inserts]
+        return text, stripped, fixed
+
+    def _capture_screen(self, scr):
+        entry = {"first": "", "last": "", "fi": [], "li": [], "raw_first": "", "raw_last": ""}
+        for role, cell in scr["cells"].items():
+            raw, plain, inserts = self._split_field(cell.editText.getText())
+            entry[role] = plain
+            entry["raw_" + role] = raw.strip()
+            entry["fi" if role == "first" else "li"] = inserts
+        if not entry["first"] and entry["fi"]:
+            entry["first"] = PLACEHOLDER_NAME
+            entry["ph"] = True
+        return entry
+
+    def _store_entry(self, key, entry):
+        total = len(entry["fi"]) + len(entry["li"])
+        if total:
+            self._entries[key] = entry
+        else:
+            self._entries.pop(key, None)
+        self._save_entries()
+        return total
+
+    def _build_with_inserts(self, cs, text, entry, paint, fm=None):
+        """Вставляет кастомные эмодзи в строку, где встречается чистое имя."""
+        # (позиция, порядок, id эмодзи или None для удаления заглушки, alt, длина удаления)
+        ops = []
+        for name, inserts, finder, ph in ((entry.get("first", ""), entry.get("fi") or [], text.find, entry.get("ph")),
+                                          (entry.get("last", ""), entry.get("li") or [], text.rfind, False)):
+            if not name or not inserts:
+                continue
+            idx = finder(name)
+            if idx < 0:
+                continue
+            base = u16(text[:idx])
+            if ph:
+                ops.append((base, 1 << 30, None, "", u16(name))) 
+            for i, (pos, doc_id, alt) in enumerate(inserts):
+                ops.append((base + pos, i, doc_id, alt, 0))
+        if not ops:
+            return None
+        sb = SpannableStringBuilder(cs)        
+        for at, _, doc_id, alt, cut in sorted(ops, key=lambda o: (o[0], o[1]), reverse=True):
+            at = min(at, sb.length())
+            if doc_id is None:
+                sb.delete(at, min(at + cut, sb.length()))
+                continue
+            piece = SpannableString(JString(alt))
+            piece.setSpan(self._make_span(doc_id, paint, fm), 0, piece.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.insert(at, piece)
+        return sb
+
+    # ---------- helpers ----------
+
+    def _field(self, obj, name):
+        c = obj.getClass()
+        while c is not None:
+            try:
+                f = c.getDeclaredField(name)
+            except Exception:
+                c = c.getSuperclass()
+                continue
+            f.setAccessible(True)
+            return f.get(obj)
+        raise AttributeError(f"field {name} not found in {obj.getClass().getName()}")
+
+    def _user_key(self, spec, frag):
+        account = int(frag.getCurrentAccount())
+        if spec[3] is None:
+            uid = int(UserConfig.getInstance(account).getClientUserId())
+        else:
+            uid = int(self._field(frag, spec[3]))
+        return f"{account}:{uid}"
+
+    def _make_span(self, doc_id, paint, fm=None):
+        if fm is None:
+            try:
+                fm = paint.getFontMetricsInt()
+            except Exception:
+                fm = None
+        return self._span_cls(jlong(int(doc_id)), fm)
+
+    def _clear_replacements(self, spannable, a, b):
+        for sp in spannable.getSpans(a, b, self._replacement_cls):
+            if spannable.getSpanStart(sp) >= a and spannable.getSpanEnd(sp) <= b:
+                spannable.removeSpan(sp)
+
+    # ---------- name edit screens ----------
+
+    def _on_create_view(self, spec, param):
+        frag = param.thisObject
+        try:
+            key = self._user_key(spec, frag)
+        except Exception:
+            self._record_error("user key", traceback.format_exc())
+            key = None
+        cells = {}
+        for role, fname in (("first", spec[1]), ("last", spec[2])):
+            try:
+                cell = self._field(frag, fname)
+            except Exception:
+                self._record_error(f"field {fname}", traceback.format_exc())
+                continue
+            if cell is None:
+                continue
+            cells[role] = cell
+            self._cell_roles[ident(cell)] = (ident(frag), role)
+            try:
+                self._add_button(frag, cell)
+            except Exception:
+                self._record_error(f"button {fname}", traceback.format_exc())
+        fid = ident(frag)
+        self._screens[fid] = {"key": key, "cells": cells}
+        self._note(f"screen {spec[0].rsplit('.', 1)[-1]} key={key} cells={len(cells)}")
+        run_on_ui_thread(lambda: self._safe("restore", lambda: self._restore_screen(fid)), 150)
+
+    def _add_button(self, frag, cell):
+        ctx = cell.getContext()
+        res = ctx.getResources()
+        icon = res.getIdentifier("input_smile", "drawable", ctx.getPackageName())
+        if icon == 0:
+            icon = res.getIdentifier("msg_emoji_cat", "drawable", ctx.getPackageName())
+        btn = ImageView(ctx)
+        if icon != 0:
+            btn.setImageResource(icon)
+        btn.setScaleType(ImageView.ScaleType.CENTER)
+        btn.setColorFilter(PorterDuffColorFilter(Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon), PorterDuff.Mode.SRC_IN))
+        btn.setOnClickListener(OnClickListener(
+            lambda v: self._safe("open picker", lambda: self._open_picker(frag, cell, v))))
+        cell.addView(btn, LayoutHelper.createFrame(40, 40.0, Gravity.RIGHT | Gravity.CENTER_VERTICAL, 0.0, 0.0, 6.0, 0.0))
+        et = cell.editText
+        et.setPadding(et.getPaddingLeft(), et.getPaddingTop(),
+                      et.getPaddingRight() + AndroidUtilities.dp(40), et.getPaddingBottom())
+
+    def _restore_screen(self, fid):
+        scr = self._screens.get(fid)
+        if not scr:
+            return
+        for role, cell in scr["cells"].items():
+            self._restore_cell(cell, role, scr["key"])
+
+    def _on_cell_set_text(self, param):
+        info = self._cell_roles.get(ident(param.thisObject))
+        if not info:
+            return
+        scr = self._screens.get(info[0])
+        if scr:
+            self._restore_cell(param.thisObject, info[1], scr["key"])
+
+    def _restore_cell(self, cell, role, key):
+        if key is None:
+            return
+        entry = self._entries.get(key)
+        if not entry:
+            return
+        inserts = entry.get("fi" if role == "first" else "li") or []
+        want = entry.get(role, "")
+        if not inserts:
+            return
+        et = cell.editText
+        ed = et.getText()
+        if len(ed.getSpans(0, ed.length(), self._span_class_obj)) > 0:
+            return
+        text = str(ed.toString())
+        if text.strip() != want:
+            return
+        lead = u16(text) - u16(text.lstrip())
+        if entry.get("ph") and role == "first":
+            ed.clear()
+            lead = 0       
+        for _, (pos, doc_id, alt) in sorted(enumerate(inserts), key=lambda x: (x[1][0], x[0]), reverse=True):
+            piece = SpannableString(JString(alt))
+            piece.setSpan(self._make_span(doc_id, et.getPaint()), 0, piece.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            ed.insert(min(pos + lead, ed.length()), piece)
+        et.invalidate()
+        self._note(f"restored {len(inserts)} emoji in {role} for {key}")
+
+    def _on_destroy(self, spec, param):
+        fid = ident(param.thisObject)
+        scr = self._screens.pop(fid, None)
+        if not scr:
+            return
+        for role, cell in scr["cells"].items():
+            self._cell_roles.pop(ident(cell), None)
+        if scr["key"] is None:
+            return
+       
+        entry = self._capture_screen(scr)
+        self._pending = (scr["key"], entry)
+        total = self._store_entry(scr["key"], entry)
+        self._note(f"saved {total} emoji for {scr['key']}")
+
+    # ---------- emoji picker ----------
+
+    def _open_picker(self, frag, cell, anchor):
+        self._close_picker(animated=False)
+        peer = self._create_dialog(frag, anchor.getContext())
+        dlg = peer.java        
+        PopupWindow = jclass("android.widget.PopupWindow")
+        popup = PopupWindow(dlg, WRAP_CONTENT, WRAP_CONTENT)
+        popup.setFocusable(True)
+        popup.setOutsideTouchable(True)
+        popup.setClippingEnabled(True)
+        popup.setAnimationStyle(0)
+        dismiss_runnable = R(lambda: self._safe("popup dismiss", popup.dismiss))
+        self._picker = {"dlg": ident(dlg), "cell": cell, "popup": popup, "peer": peer,
+                        "dismiss": dismiss_runnable}
+        popup.showAsDropDown(anchor, 0, 0, Gravity.TOP | Gravity.RIGHT)
+        try:
+            dlg.onShow(dismiss_runnable)  
+        except Exception:
+            self._record_error("picker onShow", traceback.format_exc())
+        self._dim_behind(dlg)
+        self._note("picker opened")
+
+    def _dim_behind(self, content):
+        try:
+            Context = jclass("android.content.Context")
+            LP = jclass("android.view.WindowManager$LayoutParams")
+            root = content.getRootView()
+            wm = content.getContext().getSystemService(Context.WINDOW_SERVICE)
+            lp = root.getLayoutParams()
+            lp.flags = lp.flags | 0x2  # FLAG_DIM_BEHIND
+            lp.dimAmount = 0.2
+            wm.updateViewLayout(root, lp)
+        except Exception:
+            self._record_error("dim", traceback.format_exc())
+
+    def _picker_class(self, ctx):
+        """В клиенте SelectAnimatedEmojiDialog абстрактный: строим подкласс под реальные сигнатуры."""
+        if getattr(self, "_picker_cls", None) is not None:
+            return self._picker_cls
+        from java.lang.reflect import Modifier
+        from extera_utils.classes import Base, java_subclass, joverload, jconstructor
+
+        jcls = jclass("java.lang.Class").forName(
+            "org.telegram.ui.SelectAnimatedEmojiDialog", False, ctx.getClassLoader())
+        plugin = self
+        ns = {}
+        seen = set()
+        c = jcls
+        while c is not None and str(c.getName()) != "android.widget.FrameLayout":
+            for m in c.getDeclaredMethods():
+                name = str(m.getName())
+                types = [str(t.getName()) for t in m.getParameterTypes()]
+                sig = (name, tuple(types))
+                if sig in seen:
+                    continue
+                is_abstract = Modifier.isAbstract(m.getModifiers())
+                if name != "onEmojiSelected" and not is_abstract:
+                    continue
+                if Modifier.isPrivate(m.getModifiers()) or Modifier.isFinal(m.getModifiers()):
+                    continue
+                seen.add(sig)
+                ret = str(m.getReturnType().getName())
+                self._note(f"override {name}({', '.join(types)}) -> {ret}{' [abstract]' if is_abstract else ''}")
+                if name == "onEmojiSelected":
+                    def handler(self_, *args):
+                        plugin._safe("emoji selected", lambda: plugin._on_picker_selected(self_, args))
+                        return None
+                else:
+                    default = False if ret == "boolean" else (
+                        0 if ret in ("int", "long", "short", "byte", "float", "double", "char") else None)
+                    def handler(self_, *args, _d=default):
+                        return _d
+                ns[f"_ov_{len(ns)}_{name}"] = joverload(name, types)(handler)
+            c = c.getSuperclass()
+
+       
+        self._picker_ctors = []
+        for k in jcls.getDeclaredConstructors():
+            if Modifier.isPrivate(k.getModifiers()):
+                continue
+            types = [str(t.getName()) for t in k.getParameterTypes()]
+            self._picker_ctors.append(types)
+
+            def ctor(self_, *args):
+                return None
+            ns[f"_ctor_{len(types)}"] = jconstructor(types)(ctor)
+
+        cls = type("CenEmojiPicker", (Base,), ns)
+        cls = java_subclass(self._dialog_cls)(cls)  # нужен JavaClass из jclass(), а не java.lang.Class
+        ctors = [", ".join(str(t.getName()) for t in k.getParameterTypes()) for k in jcls.getDeclaredConstructors()]
+        self._note("ctors: " + " | ".join(ctors))
+        self._picker_cls = cls
+        return cls
+
+    def _create_dialog(self, frag, ctx):
+        cls = self._picker_class(ctx)
+        rp = None
+        try:
+            rp = frag.getResourceProvider()
+        except Exception:
+            rp = None
+        base = [frag, ctx, False, None, TYPE_EMOJI_STATUS]        
+        tails = {
+            6: [rp],
+            8: [True, rp, 16],
+            9: [True, rp, 16, 0],
+            10: [True, rp, 16, 0, False],
+        }
+        errors = []
+        for types in sorted(self._picker_ctors, key=lambda t: (len(t) != 8, len(t))):
+            tail = tails.get(len(types))
+            if tail is None:
+                continue
+            args = [self._as_java(v, t) for v, t in zip(base + tail, types)]
+            try:
+                peer = cls.new_instance(*args)
+                self._note(f"picker ctor with {len(types)} args")
+                return peer
+            except Exception as e:
+                head = "\n    ".join(str(e).strip().splitlines()[:6])
+                errors.append(f"[{len(types)} args] {type(e).__name__}: {head}")
+        raise RuntimeError("no usable picker constructor:\n" + "\n".join(errors))
+
+    @staticmethod
+    def _as_java(value, type_name):
+        """Python int по умолчанию уходит в Java как Long: приводим к примитивам из сигнатуры."""
+        if value is None:
+            return None
+        if type_name == "int":
+            return jint(int(value))
+        if type_name == "long":
+            return jlong(int(value))
+        if type_name == "boolean":
+            return jboolean(bool(value))
+        return value
+
+    def _on_picker_selected(self, dialog, args):
+        """Запасной путь, если перехват onEmojiClick не сработал в этой сборке."""
+        p = self._picker
+        if p is None:
+            return
+        doc_id, document = None, None
+        for a in args[1:]:
+            if a is None:
+                continue
+            if doc_id is None and isinstance(a, int):
+                doc_id = int(a)
+            elif document is None and "Document" in str(a.getClass().getSimpleName()):
+                document = a
+        if doc_id is None and document is not None:
+            doc_id = int(document.id)
+        if doc_id is None:
+            return
+        self._insert(p["cell"], doc_id, self._alt_for(document))
+        self._close_picker()
+
+    def _on_emoji_click(self, param):
+        p = self._picker
+        if p is None or ident(param.thisObject) != p["dlg"]:
+            return
+        param.setResult(None)
+        span = param.args[1]
+        if span is None:
+            return
+        doc_id = int(span.getDocumentId())
+        document = getattr(span, "document", None)
+        if document is None:
+            try:
+                AED = jclass("org.telegram.ui.Components.AnimatedEmojiDrawable")
+                document = AED.findDocument(UserConfig.selectedAccount, jlong(doc_id))
+            except Exception:
+                document = None
+        self._insert(p["cell"], doc_id, self._alt_for(document))
+        self._close_picker()
+
+    def _close_picker(self, animated=True):
+        p, self._picker = self._picker, None
+        if p is None:
+            return
+        if animated:
+            try:                
+                p["peer"].java.onDismiss(p["dismiss"])
+                return
+            except Exception:
+                self._record_error("picker onDismiss", traceback.format_exc())
+        try:
+            p["popup"].dismiss()
+        except Exception:
+            pass
+
+    def _alt_for(self, document) -> str:
+        if document is None:
+            return FALLBACK_EMOJI
+        try:
+            attrs = document.attributes
+            for i in range(attrs.size()):
+                a = attrs.get(i)
+                if str(a.getClass().getSimpleName()) == "TL_documentAttributeCustomEmoji" and a.alt:
+                    return str(a.alt)
+        except Exception:
+            self._record_error("alt", traceback.format_exc())
+        return FALLBACK_EMOJI
+
+    def _insert(self, cell, doc_id, alt):
+        et = cell.editText
+        ed = et.getText()
+        before = str(ed.toString())        
+        pos = int(et.getSelectionEnd())
+        if pos < 0 or pos > ed.length() or not et.hasFocus():
+            pos = ed.length()
+        piece = SpannableString(JString(alt))
+        piece.setSpan(self._make_span(doc_id, et.getPaint()), 0, piece.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        ed.insert(pos, piece)
+        try:
+            et.setSelection(min(pos + piece.length(), ed.length()))
+        except Exception:
+            pass
+        self._note(f"inserted {doc_id} at {pos}")
+
+    # ---------- server requests ----------
+
+    def pre_request_hook(self, request_name, account, request):
+        try:
+            if "addContact" not in request_name and "updateProfile" not in request_name:
+                return HookResult()
+            first = getattr(request, "first_name", None)
+            last = getattr(request, "last_name", None)
+            entry = self._entry_for_request(first, last)
+            if entry is None or not entry["first"]:
+                return HookResult()
+            changed = False
+            if first is not None and str(first).strip() != entry["first"]:
+                request.first_name = entry["first"]
+                changed = True
+            if last is not None and str(last).strip() != entry["last"]:
+                request.last_name = entry["last"]
+                changed = True
+            if changed:
+                return HookResult(strategy=HookStrategy.MODIFY, request=request)
+        except Exception:
+            self._record_error("pre_request", traceback.format_exc())
+        return HookResult()
+
+    def _entry_for_request(self, first, last):
+        first = str(first).strip() if first is not None else ""
+        last = str(last).strip() if last is not None else ""        
+        for key, scr in list(self._screens.items()):
+            if scr.get("key") is None:
+                continue
+            entry = self._capture_screen(scr)
+            if entry["raw_first"] == first and entry["raw_last"] == last:
+                self._store_entry(scr["key"], entry)
+                self._pending = (scr["key"], entry)
+                return entry       
+        pending = getattr(self, "_pending", None)
+        if pending and pending[1]["raw_first"] == first and pending[1]["raw_last"] == last:
+            return pending[1]
+        return None
+
+    # ---------- rendering ----------
+
+    def _decorate_title(self, param):
+        if not self._active or not self._render_map:
+            return
+        if not self.get_setting(KEY_ENABLED, True):
+            return
+        cs = param.args[0]
+        if cs is None:
+            return
+        text = str(cs)
+        entry = self._render_map.get(text.strip())
+        if entry is None:
+            return
+        paint = None
+        try:
+            paint = param.thisObject.getPaint()
+        except Exception:
+            paint = None
+        sb = self._build_with_inserts(cs, text, entry, paint)
+        if sb is not None:
+            param.args[0] = sb
+
+    def _cell_enter(self, param):
+        self._in_cell = True
+        self._cur_cell = ident(param.thisObject)
+        self._cell_calls += 1
+
+    def _on_cell_attached(self, param):
+        """Список под открытым экраном отцеплен от окна и не получает обновлений: чиним ячейки, когда он вернётся."""
+        cell = param.thisObject
+        if self._cell_gen.get(ident(cell)) == self._gen or int(cell.getMeasuredWidth()) == 0:
+            return
+        self._rebuild_cell(cell)
+
+    def _rebuild_cell(self, cell):
+        self._force = True
+        try:
+            cell.buildLayout()
+            cell.invalidate()
+        finally:
+            self._force = False
+
+    def _force_update(self, param):
+        if self._force:
+            param.setResult(True)
+
+    def _refresh_lists(self):
+        """DialogCell пропускает buildLayout, пока не изменились сообщение или счётчики (имя не в счёт): перестраиваем сами."""
+        LaunchActivity = jclass("org.telegram.ui.LaunchActivity")
+        stack, cells = [LaunchActivity.instance.getWindow().getDecorView()], []
+        while stack:
+            v = stack.pop()
+            if str(v.getClass().getName()) == "org.telegram.ui.Cells.DialogCell":
+                cells.append(v)
+                continue
+            try:
+                stack.extend(v.getChildAt(i) for i in range(int(v.getChildCount())))
+            except AttributeError:
+                pass
+        for c in cells:
+            self._rebuild_cell(c)
+        self._note(f"refreshed {len(cells)} chat list cells")
+
+    def _decorate_dialog_name(self, param):       
+        if not (self._in_cell and self._active):
+            return        
+        self._cell_gen[self._cur_cell] = self._gen
+        if not self._render_map or not self.get_setting(KEY_ENABLED, True):
+            return
+        cs = param.getResult()
+        if cs is None:
+            return
+        text = str(cs)
+        entry = self._render_map.get(text.strip()) if len(text) <= 128 else None
+        if entry is None:
+            return
+        sb = self._build_with_inserts(cs, text, entry, None, param.args[1])
+        if sb is not None:
+            param.setResult(sb)
+            self._cell_hits += 1
+            if self._cell_hits <= 5:
+                self._note("chat list name decorated")
+
+    # ---------- settings ----------
+
+    def _clear_all(self, _view=None):
+        try:
+            self._entries = {}
+            self._save_entries(reload_settings=True)
+            BulletinHelper.show_success(tr("cleared"))
+        except Exception:
+            self._record_error("clear all", traceback.format_exc())
+            BulletinHelper.show_error(tr("error"))
+
+    def _copy_log(self, _view=None):
+        try:
+            lines = [f"{__id__} {__version__}", f"enabled={self.get_setting(KEY_ENABLED, True)}",
+                     f"entries={len(getattr(self, '_entries', {}))} hooks={len(getattr(self, '_unhooks', []))}",
+                     f"errors={self._error_count} cell_calls={self._cell_calls} cell_hits={self._cell_hits}", "---"]
+            lines.extend(self._diag_buf())
+            copy_to_clipboard("\n".join(lines))
+        except Exception:
+            self._record_error("copy log", traceback.format_exc())
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text=tr("header")),
+            Switch(key=KEY_ENABLED, text=tr("enabled"), default=True, subtext=tr("enabled_sub"), icon="msg_emoji_cat"),
+            Text(text=tr("saved").format(n=len(getattr(self, "_entries", {}))), icon="msg_contacts"),
+            Text(text=tr("clear_all"), icon="msg_delete", red=True, on_click=self._clear_all),
+            Divider(text=tr("howto")),
+            Header(text=tr("diag")),
+            Text(text=tr("copy_log"), subtext=tr("copy_log_sub"), icon="msg_copy", on_click=self._copy_log),
+        ]
+
+    # ---------- diagnostics ----------
+
+    def _safe(self, where, fn):
+        try:
+            fn()
+        except Exception:
+            self._record_error(where, traceback.format_exc())
+            BulletinHelper.show_error(tr("error"))
+
+    def _diag_buf(self):
+        if self._diag is None:
+            self._diag = deque(maxlen=150)
+        return self._diag
+
+    def _note(self, msg: str):
+        self._diag_buf().append(time.strftime("%H:%M:%S ") + msg)
+        try:
+            self.logger.info(msg)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _shorten(tb: str) -> str:
+        """Начало ошибки важнее хвоста Java-стека: оставляем голову и конец."""
+        tb = tb.strip()
+        lines = [ln for ln in tb.splitlines() if not ln.strip().startswith(("at android.", "at java.lang.reflect", "at com.android.internal"))]
+        tb = "\n".join(lines)
+        if len(tb) <= 1800:
+            return tb
+        return tb[:1400] + "\n  ...\n" + tb[-400:]
+
+    def _record_error(self, where: str, tb: str):
+        self._error_count += 1
+        if self._error_count <= 30:
+            self._diag_buf().append(time.strftime("%H:%M:%S ") + f"ERROR in {where}: {self._shorten(tb)}")
+            try:
+                self.logger.error(f"{where}: {tb}")
+            except Exception:
+                pass
