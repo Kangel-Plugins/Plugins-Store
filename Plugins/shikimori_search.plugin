@@ -1,5 +1,8 @@
+import os
 import time
+import hashlib
 import threading
+from html import escape as html_escape
 from collections import deque
 from typing import Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,7 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib.parse import urlencode
 
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
-from client_utils import send_text, run_on_queue, get_last_fragment, send_message
+from client_utils import send_text, send_photo, run_on_queue, get_last_fragment, send_message
 from android_utils import run_on_ui_thread, R, OnClickListener, log
 from ui.settings import Header, Input, Text
 from ui.alert import AlertDialogBuilder
@@ -38,11 +41,12 @@ from org.telegram.ui.ActionBar import Theme
 
 __id__ = "shikimori_search"
 __name__ = "Shikimori Search"
-__description__ = "inline-поиск аниме и манги на Shikimori, с карточками и личной статистикой."
+__description__ = "Поиск аниме, манги и статистики на Shikimori"
 __author__ = "@obsidiphoria • @kaltsitu"
-__version__ = "1.4"
+__version__ = "1.5"
 __icon__ = "lidreron/1"
-__app_version__ = ">=12.5.1"
+__app_version__ = ">=12.10.6"
+__category__ = ["integrations"]
 __sdk_version__ = ">=1.4.3.3"
 
 CUSTOM_EMOJI_IDS = {
@@ -147,6 +151,25 @@ USER_AGENT = "exteraGramShikimoriPlugin/2.0"
 
 MEDIA_ENDPOINTS = {"anime": "/animes", "manga": "/mangas"}
 
+MEDIA_TOGGLE_ORDER = (("anime", "Аниме"), ("manga", "Манга"))
+MEDIA_FIELD_HINTS = {
+    "anime": "Название аниме…",
+    "manga": "Название манги…",
+}
+MEDIA_START_HINTS = {
+    "anime": "Начни вводить название аниме…",
+    "manga": "Начни вводить название манги…",
+}
+MEDIA_SITE_PATHS = {"anime": "animes", "manga": "mangas"}
+MEDIA_NOT_FOUND = {
+    "anime": "Аниме с ID {id} не найдено",
+    "manga": "Манга с ID {id} не найдена",
+}
+PHOTO_CAPTION_LIMIT = 1024
+POSTER_FILES_KEEP = 40
+GRAPHQL_URL = f"{SITE_URL}/api/graphql"
+GRAPHQL_ROOTS = {"anime": "animes", "manga": "mangas"}
+
 STATUS_LABELS = {"anons": "Анонс", "ongoing": "Онгоинг", "released": "Вышло"}
 MANGA_STATUS_LABELS = {
     "anons": "Анонс",
@@ -228,7 +251,6 @@ SESSION = _build_session()
 
 
 class _RateLimiter:
-
     def __init__(self, max_calls: int, period: float):
         self.max_calls = max_calls
         self.period = period
@@ -261,6 +283,7 @@ _SHIKI_LIMITER = _RateLimiter(max_calls=4, period=1.0)
 
 def _throttled_get(url: str, timeout, max_retries: int = 2):
     last_exc = None
+    resp = None
     for attempt in range(max_retries + 1):
         _SHIKI_LIMITER.acquire()
         try:
@@ -542,7 +565,7 @@ class ShikimoriPlugin(BasePlugin):
         kind = self._kind_labels_for(media_type).get(a.get("kind"), a.get("kind") or "?")
 
         lines = [
-            f"<b>{title_ru}</b>",
+            f"<b>{html_escape(title_ru)}</b>",
             "",
             f"\u2B50 <b>Рейтинг:</b> {score}",
             f"{status_icon} <b>Статус:</b> {status}",
@@ -572,7 +595,150 @@ class ShikimoriPlugin(BasePlugin):
         aid = anime.get("id", 0)
         media_type = anime.get("_media_type", "anime")
         caption = self._format_anime(anime, anime_id=aid, media_type=media_type)
-        run_on_ui_thread(lambda: self._send_formatted(peer_id, caption, "HTML"))
+        run_on_queue(lambda: self._send_card(peer_id, caption, media_type, anime))
+
+    def _graphql_poster_url(self, media_type: str, aid) -> str:
+        root = GRAPHQL_ROOTS.get(media_type)
+        if not root or not aid:
+            return ""
+        fields = "id poster { originalUrl previewUrl }"
+        queries = ['{ %s(ids: "%d") { %s } }' % (root, int(aid), fields)]
+
+        for query in queries:
+            try:
+                _SHIKI_LIMITER.acquire()
+                resp = SESSION.post(GRAPHQL_URL, json={"query": query}, timeout=(5, 10))
+                if resp.status_code != 200:
+                    self.log(f"GraphQL {media_type} #{aid}: HTTP {resp.status_code}")
+                    continue
+                payload = resp.json()
+            except Exception as e:
+                self.log(f"GraphQL {media_type} #{aid}: {e}")
+                continue
+            if payload.get("errors"):
+                self.log(f"GraphQL {media_type} #{aid}: {payload.get('errors')}")
+                continue
+            for row in (payload.get("data") or {}).get(root) or []:
+                if not isinstance(row, dict) or str(row.get("id")) != str(aid):
+                    continue
+                poster = row.get("poster")
+                if not isinstance(poster, dict):
+                    continue
+                url = poster.get("originalUrl") or poster.get("previewUrl") or ""
+                if url.startswith("//"):
+                    url = "https:" + url
+                elif url.startswith("/"):
+                    url = SITE_URL + url
+                if url:
+                    return url
+        return ""
+
+    def _get_hq_poster_url(self, media_type: str, item: dict) -> str:
+        aid = item.get("id")
+        key = ("hq_poster", media_type, aid)
+        if aid:
+            cached = _cache_get(key, ANIME_TTL)
+            if cached is not None:
+                return cached
+        url = ""
+        if aid:
+            try:
+                url = self._graphql_poster_url(media_type, aid)
+            except Exception as e:
+                self.log(f"GraphQL-постер недоступен ({media_type} #{aid}): {e}")
+            if url:
+                self.log(f"Обложка {media_type} #{aid} (GraphQL): {url}")
+        if not url:
+            url = self._extract_poster_url(item)
+            if url:
+                self.log(f"Обложка {media_type} #{aid} (REST, запасной вариант): {url}")
+        if not url and aid:
+            url = self._extract_poster_url(self._enrich_with_poster(dict(item, _media_type=media_type)))
+        if aid:
+            _cache_set(key, url)
+        return url
+
+    def _poster_cache_dir(self) -> str:
+        base = ""
+        try:
+            base = str(AndroidUtilities.getCacheDir().getAbsolutePath())
+        except Exception:
+            pass
+        if not base:
+            import tempfile
+            base = tempfile.gettempdir()
+        path = os.path.join(base, "shikimori_cards")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _prune_poster_cache(self, directory: str):
+        try:
+            files = [os.path.join(directory, f) for f in os.listdir(directory)]
+            files = [f for f in files if os.path.isfile(f)]
+            if len(files) <= POSTER_FILES_KEEP:
+                return
+            files.sort(key=os.path.getmtime)
+            for f in files[:len(files) - POSTER_FILES_KEEP]:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _download_poster_file(self, url: str) -> Optional[str]:
+        if not url:
+            return None
+        key = ("poster_file", url)
+        cached = _cache_get(key, POSTER_TTL)
+        if cached and os.path.exists(cached):
+            return cached
+        resp = _throttled_get(url, timeout=(6, 20))
+        resp.raise_for_status()
+        data = resp.content
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        is_image = "image" in ctype or data[:3] == b"\xff\xd8\xff" or data[:4] == b"\x89PNG"
+        if len(data) < 1024 or not is_image:
+            return None
+        ext = ".png" if "png" in ctype else (".webp" if "webp" in ctype else ".jpg")
+        directory = self._poster_cache_dir()
+        path = os.path.join(directory, hashlib.md5(url.encode("utf-8")).hexdigest() + ext)
+        with open(path, "wb") as f:
+            f.write(data)
+        self._prune_poster_cache(directory)
+        _cache_set(key, path)
+        return path
+
+    def _send_card(self, peer_id: int, caption: str, media_type: str, item: dict):
+        path = None
+        try:
+            url = self._get_hq_poster_url(media_type, item)
+            if url:
+                path = self._download_poster_file(url)
+        except Exception as e:
+            self.log(f"Не удалось получить обложку: {e}")
+
+        if not path:
+            run_on_ui_thread(lambda: self._send_formatted(peer_id, caption, "HTML"))
+            return
+
+        def _do():
+            try:
+                html_caption = _apply_custom_emoji(caption)
+                fits = True
+                try:
+                    fits = len(parse_text(html_caption, parse_mode="HTML")["message"]) <= PHOTO_CAPTION_LIMIT
+                except Exception:
+                    pass
+                if fits:
+                    send_photo(peer_id, path, caption=html_caption, high_quality=True, parse_mode="HTML")
+                else:
+                    send_photo(peer_id, path, high_quality=True)
+                    self._send_formatted(peer_id, caption, "HTML")
+            except Exception as e:
+                self.log(f"Не удалось отправить фото: {e}")
+                self._send_formatted(peer_id, caption, "HTML")
+        run_on_ui_thread(_do)
 
     def _fetch_user_payload(self, nickname: str) -> Optional[dict]:
         key = ("user_profile", nickname.lower())
@@ -624,9 +790,17 @@ class ShikimoriPlugin(BasePlugin):
                         status = rate.get("status")
                         if status not in stats:
                             continue
+                        
                         stats[status]["count"] += 1
-                        anime = rate.get("anime", {})
-                        stats[status]["episodes"] += anime.get("episodes_aired", 0)
+                        anime = rate.get("anime") or {}
+                        
+                        watched = rate.get("episodes") or 0
+                        if status == "completed" and not watched:
+                            watched = anime.get("episodes") or anime.get("episodes_aired") or 0
+                        
+                        if status != "planned":
+                            stats[status]["episodes"] += watched
+                            
                     if len(rates) < limit:
                         stop = True
                         break
@@ -695,13 +869,16 @@ class ShikimoriPlugin(BasePlugin):
                 continue
             count = data["count"]
             episodes = data.get("episodes") or 0
-            lines.append(f"{icon} {label}: {count} · {episodes} эп.")
+            if status == "planned":
+                lines.append(f"{icon} {label}: {count}")
+            else:
+                lines.append(f"{icon} {label}: {count} · {episodes} эп.")
             shown_any = True
         if not shown_any:
-            lines.append("<i>Список пуст</i>")
+            lines.append("<i>Список пуст или скрыт настройками приватности</i>")
 
         lines.append("")
-        lines.append(f"\U0001F4CA Итого: {total_count} тайтлов, {total_episodes} серий")
+        lines.append(f"\U0001F4CA Итого: {total_count} тайтлов, просмотрено {total_episodes} серий")
 
         text = f"<blockquote>{chr(10).join(lines)}</blockquote>"
         text += f"\n\U0001F517 <a href='{SITE_URL}/{user['nickname']}'>Открыть профиль на Shikimori</a>"
@@ -864,12 +1041,12 @@ class ShikimoriPlugin(BasePlugin):
                 self._bulletin_info(f" Загружаю карточку #{aid}…")
                 data = self._api_get(f"{endpoint}/{aid}")
                 if data and data.get("id"):
-                    data["_media_type"] = media_type
                     _cache_set(cache_key, data)
             if not data or not data.get("id"):
-                noun = "Манга" if media_type == "manga" else "Аниме"
-                run_on_ui_thread(lambda: self._send_formatted(peer_id, f"\u274C {noun} с ID {aid} не найдено", "HTML"))
+                not_found = MEDIA_NOT_FOUND.get(media_type, MEDIA_NOT_FOUND["anime"]).format(id=aid)
+                run_on_ui_thread(lambda: self._send_formatted(peer_id, f"\u274C {not_found}", "HTML"))
                 return
+            data["_media_type"] = media_type
             self._send_anime(peer_id, data)
         except Exception as e:
             run_on_ui_thread(lambda: self._send_formatted(peer_id, f"\u274C Ошибка: {e}", "HTML"))
@@ -1268,7 +1445,7 @@ class ShikimoriPlugin(BasePlugin):
                         tv.setEllipsize(TextUtils.TruncateAt.MARQUEE)
                         tv.setMarqueeRepeatLimit(-1)
                         tv.setHorizontalFadingEdgeEnabled(True)
-                        tv.setSelected(True)  # marquee у Android анимируется только у "selected" TextView
+                        tv.setSelected(True)
                 except Exception:
                     pass
             try:
@@ -1372,7 +1549,7 @@ class ShikimoriPlugin(BasePlugin):
             root.setPadding(dp(16), dp(12), dp(16), dp(12))
 
             query_field = EditText(activity)
-            query_field.setHint("Название манги…" if media_type == "manga" else "Название аниме…")
+            query_field.setHint(MEDIA_FIELD_HINTS.get(media_type, "Название…"))
             query_field.setSingleLine(True)
             query_field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17)
             query_field.setPadding(dp(20), dp(14), dp(20), dp(14))
@@ -1514,12 +1691,14 @@ class ShikimoriPlugin(BasePlugin):
                         total_w = media_toggle_frame.getWidth() - media_toggle_frame.getPaddingLeft() - media_toggle_frame.getPaddingRight()
                         if total_w <= 0:
                             return
-                        half_w = total_w // 2
+                        seg_w = total_w // len(MEDIA_TOGGLE_ORDER)
                         lp = toggle_highlight.getLayoutParams()
-                        if lp.width != half_w:
-                            lp.width = half_w
+                        if lp.width != seg_w:
+                            lp.width = seg_w
                             toggle_highlight.setLayoutParams(lp)
-                        target_x = float(half_w) if active_key == "manga" else 0.0
+                        keys = [k for k, _label in MEDIA_TOGGLE_ORDER]
+                        idx = keys.index(active_key) if active_key in keys else 0
+                        target_x = float(seg_w * idx)
                         if animate:
                             toggle_highlight.animate().translationX(target_x).setDuration(220).setInterpolator(_MATERIAL_STANDARD).start()
                         else:
@@ -1548,8 +1727,6 @@ class ShikimoriPlugin(BasePlugin):
             def _make_media_toggle_button(key: str, label: str):
                 btn = TextView(activity)
                 btn.setText(label)
-                # M3 labelLarge (TypeScale_kt): size 14sp, tracking 0.1sp.
-                # setLetterSpacing принимает EM, поэтому переводим из sp.
                 btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                 try:
                     btn.setLetterSpacing(0.1 / 14)
@@ -1568,7 +1745,7 @@ class ShikimoriPlugin(BasePlugin):
                         return
                     state["media_type"] = k
                     _restyle_media_toggle(k)
-                    query_field.setHint("Название манги…" if k == "manga" else "Название аниме…")
+                    query_field.setHint(MEDIA_FIELD_HINTS.get(k, "Название…"))
                     current_text = ""
                     try:
                         current_text = query_field.getText().toString()
@@ -1577,19 +1754,16 @@ class ShikimoriPlugin(BasePlugin):
                     if current_text.strip():
                         schedule_search(current_text)
                     else:
-                        status_view.setText(
-                            "Начни вводить название манги…" if k == "manga" else "Начни вводить название аниме…"
-                        )
+                        status_view.setText(MEDIA_START_HINTS.get(k, "Начни вводить запрос…"))
                 btn.setOnClickListener(OnClickListener(on_click))
 
                 btn_lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.0)
                 media_toggle_buttons[key] = btn
                 return btn, btn_lp
 
-            _anime_btn, _anime_btn_lp = _make_media_toggle_button("anime", "Аниме")
-            toggle_content_row.addView(_anime_btn, _anime_btn_lp)
-            _manga_btn, _manga_btn_lp = _make_media_toggle_button("manga", "Манга")
-            toggle_content_row.addView(_manga_btn, _manga_btn_lp)
+            for _toggle_key, _toggle_label in MEDIA_TOGGLE_ORDER:
+                _toggle_btn, _toggle_btn_lp = _make_media_toggle_button(_toggle_key, _toggle_label)
+                toggle_content_row.addView(_toggle_btn, _toggle_btn_lp)
 
             root.addView(media_toggle_frame)
 
@@ -1656,7 +1830,7 @@ class ShikimoriPlugin(BasePlugin):
                     return ""
                 return "🔍 " if with_space else "🔍"
 
-            status_view.setText("Начни вводить название манги…" if media_type == "manga" else "Начни вводить название аниме…")
+            status_view.setText(MEDIA_START_HINTS.get(media_type, "Начни вводить запрос…"))
             status_lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             status_lp.setMargins(dp(4), dp(8), dp(4), dp(8))
             root.addView(status_view, status_lp)
@@ -1769,7 +1943,7 @@ class ShikimoriPlugin(BasePlugin):
                 stale = lambda: state["seq"] != token
                 if not query:
                     clear_results(token)
-                    hint = "Начни вводить название манги…" if search_media_type == "manga" else "Начни вводить название аниме…"
+                    hint = MEDIA_START_HINTS.get(search_media_type, "Начни вводить запрос…")
                     set_status(hint, token)
                     return
 
@@ -1798,7 +1972,7 @@ class ShikimoriPlugin(BasePlugin):
 
                     if not results:
                         clear_results(token)
-                        list_path = "mangas" if search_media_type == "manga" else "animes"
+                        list_path = MEDIA_SITE_PATHS.get(search_media_type, "animes")
                         site_url = f"{SITE_URL}/{list_path}?" + urlencode({"search": query})
                         set_status(f"Ничего не найдено по «{query}». Открыть на сайте: {site_url}", token)
                         return
@@ -1951,7 +2125,8 @@ class ShikimoriPlugin(BasePlugin):
     def _send_help_fallback(self, peer_id: int):
         text = (
             "<b>Shikimori Search</b>\n\n"
-            ".s <запрос>  — поиск аниме\n"
+            ".s &lt;запрос&gt;  — поиск аниме\n"
+            ".m &lt;запрос&gt;  — поиск манги\n"
             ".i           — статистика профиля (нужен никнейм в настройках)"
         )
         run_on_ui_thread(lambda: self._send_formatted(peer_id, text, "HTML"))
