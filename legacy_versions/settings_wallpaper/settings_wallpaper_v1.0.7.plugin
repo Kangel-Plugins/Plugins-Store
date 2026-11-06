@@ -1,0 +1,558 @@
+from typing import Optional, Any
+from base_plugin import BasePlugin
+
+from android_utils import run_on_ui_thread, log
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment
+
+from ui.settings import Header, Text, Selector, Switch, Divider
+
+from java import jclass
+from android.content import Intent
+from android.net import Uri
+from android.app import Activity
+from android.graphics import Color, Bitmap, BitmapFactory, PorterDuff, PorterDuffColorFilter, ColorMatrix, ColorMatrixColorFilter
+from android.widget import ImageView, FrameLayout
+from android.view import View, ViewGroup
+from org.telegram.messenger import Utilities
+
+__id__ = "settings_wallpaper"
+__name__ = "Settings Wallpaper"
+__description__ = "Фото на фоне настроек, затемнение и прозрачные блоки"
+__author__ = "@Kcharter"
+__version__ = "1.0.7"
+__icon__ = "Tagsforsaved_by_TgEmodziBot/36"
+__min_version__ = "12.10.6"
+__category__ = ["appearance"]
+
+REQUEST_CODE_PICK = 0xC11B
+BG_TAG = "settings_wallpaper_bg"
+
+
+KEY_CARD = "key_windowBackgroundWhite"
+KEY_PAGE = "key_windowBackgroundGray"
+
+EXTRA_CARD_KEYS = ("key_graySection", "key_windowBackgroundWhiteSection", "key_card_background")
+
+
+def _int_setting(plugin, key: str, default: int) -> int:
+    v = plugin.get_setting(key, None)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+class SettingsWallpaperPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hook_refs = []
+        self._settings_frag = None
+        self._orig_colors = {}
+        self._cached_bitmap = None
+        self._cached_params = None
+        self._poll_token = 0
+
+
+    def create_settings(self):
+        def on_pick(_v):
+            try:
+                self._open_picker()
+            except Exception as e:
+                log(f"SettingsWallpaper: picker error: {e}")
+
+        def changed(_v):
+            run_on_ui_thread(self._reapply)
+
+        has_img = bool(self.get_setting("wallpaper_uri", "") or "")
+        blur_items = ["Нет", "5", "10", "15", "20", "25"]
+
+        return [
+            Header(text="Обои настроек"),
+            Text(
+                text="Заменить изображение" if has_img else "Выбрать изображение",
+                accent=True,
+                on_click=on_pick,
+            ),
+            Divider(text="Внешний вид"),
+            Selector(
+                key="blur_radius",
+                text="Размытие",
+                default=_int_setting(self, "blur_radius", 0),
+                items=blur_items,
+                on_change=changed,
+                icon="msg_edit",
+            ),
+            Selector(
+                key="dimming",
+                text="Затемнение фото",
+                default=_int_setting(self, "dimming", 3),
+                items=[f"{i * 10}%" for i in range(11)],
+                on_change=changed,
+                icon="msg_edit",
+            ),
+            Selector(
+                key="card_opacity",
+                text="Непрозрачность блоков",
+                default=_int_setting(self, "card_opacity", 5),
+                items=[f"{i * 10}%" for i in range(11)],
+                on_change=changed,
+                icon="msg_edit",
+            ),
+            Divider(text="0% непрозрачности — блоки полностью прозрачные."),
+        ]
+
+
+    def on_plugin_load(self):
+        for name, fn in (
+            ("onResume", self._hook_on_resume),
+            ("onPause", self._hook_on_pause),
+            ("createView", self._hook_create_view),
+            ("onActivityResult", self._hook_activity_result),
+        ):
+            try:
+                fn()
+            except Exception as e:
+                log(f"SettingsWallpaper: hook {name} failed: {e}")
+        self._poll_token = 1
+        run_on_ui_thread(self._tick, 500)
+
+    def on_plugin_unload(self):
+        try:
+            for ref in self._hook_refs:
+                if ref:
+                    self.unhook_method(ref)
+        except Exception:
+            pass
+        run_on_ui_thread(self._remove_all)
+
+    def _hook_on_resume(self):
+        cls = find_class("org.telegram.ui.SettingsActivity")
+        m = cls.getClass().getDeclaredMethod("onResume")
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _ResumeHook(self)))
+
+    def _hook_on_pause(self):
+        cls = find_class("org.telegram.ui.SettingsActivity")
+        m = cls.getClass().getDeclaredMethod("onPause")
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _PauseHook(self)))
+
+    def _hook_create_view(self):
+        cls = find_class("org.telegram.ui.SettingsActivity")
+        ctx_cls = jclass("android.content.Context")
+        m = cls.getClass().getDeclaredMethod("createView", ctx_cls)
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _CreateViewHook(self)))
+
+    def _hook_activity_result(self):
+        cls = find_class("org.telegram.ui.LaunchActivity")
+        int_cls = jclass("java.lang.Integer").TYPE
+        intent_cls = jclass("android.content.Intent")
+        m = cls.getClass().getDeclaredMethod("onActivityResult", int_cls, int_cls, intent_cls)
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _ResultHook(self)))
+
+
+    def _open_picker(self):
+        def _run():
+            try:
+                act = self._get_activity()
+                if act is None:
+                    return
+                intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("image/*")
+                intent.addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                )
+                act.startActivityForResult(intent, REQUEST_CODE_PICK)
+            except Exception as e:
+                log(f"SettingsWallpaper: cannot start picker: {e}")
+        run_on_ui_thread(_run)
+
+    def _on_activity_result(self, activity: Any, request_code: int, result_code: int, data: Any):
+        try:
+            if request_code != REQUEST_CODE_PICK or result_code != Activity.RESULT_OK or data is None:
+                return
+            uri = data.getData()
+            if uri is None:
+                return
+            try:
+                activity.getContentResolver().takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            except Exception:
+                pass
+            self.set_setting("wallpaper_uri", str(uri.toString()))
+            self._cached_bitmap = None
+            self._cached_params = None
+            run_on_ui_thread(self._reapply)
+        except Exception as e:
+            log(f"SettingsWallpaper: activity result error: {e}")
+
+
+    def _is_active(self) -> bool:
+        return bool(self.get_setting("wallpaper_uri", "") or "")
+
+    def _reapply(self):
+        frag = self._settings_frag
+        if frag is None:
+            return
+        self._apply(frag)
+
+    def _apply(self, frag: Any):
+        try:
+            self._settings_frag = frag
+            root = frag.getFragmentView()
+            if root is None:
+                return
+            if not self._is_active():
+                self._stop_polling()
+                try:
+                    lv0 = get_private_field(frag, "listView")
+                    if lv0 is not None:
+                        self._set_paint_filters(lv0, None)
+                except Exception:
+                    pass
+                self._remove_bg(root)
+                self._restore_backgrounds(frag, root)
+                self._restore_colors()
+                self._refresh(frag)
+                return
+
+            self._ensure_bg(root, self.get_setting("wallpaper_uri", ""))
+            self._set_transparent_colors()
+            self._start_polling()
+
+            try:
+                root.setBackgroundColor(Color.TRANSPARENT)
+            except Exception:
+                pass
+            try:
+                lv = get_private_field(frag, "listView")
+                if lv is not None:
+                    lv.setBackgroundColor(Color.TRANSPARENT)
+            except Exception:
+                pass
+            self._refresh(frag)
+        except Exception as e:
+            log(f"SettingsWallpaper: apply error: {e}")
+
+    def _restore_backgrounds(self, frag: Any, root: Any):
+        try:
+            Theme = find_class("org.telegram.ui.ActionBar.Theme")
+            color = Theme.getColor(getattr(Theme, KEY_PAGE))
+            root.setBackgroundColor(color)
+            lv = get_private_field(frag, "listView")
+            if lv is not None:
+                lv.setBackgroundColor(color)
+        except Exception:
+            pass
+
+    def _refresh(self, frag: Any):
+        try:
+            lv = get_private_field(frag, "listView")
+            if lv is not None:
+                lv.invalidateViews()
+                lv.invalidate()
+            root = frag.getFragmentView()
+            if root is not None:
+                root.invalidate()
+        except Exception:
+            pass
+
+    def _remove_all(self):
+        self._stop_polling()
+        try:
+            if self._settings_frag is not None:
+                lv0 = get_private_field(self._settings_frag, "listView")
+                if lv0 is not None:
+                    self._set_paint_filters(lv0, None)
+        except Exception:
+            pass
+        try:
+            frag = self._settings_frag
+            if frag is not None:
+                root = frag.getFragmentView()
+                self._remove_bg(root)
+                self._restore_backgrounds(frag, root)
+                self._restore_colors()
+                self._refresh(frag)
+            else:
+                self._restore_colors()
+        except Exception:
+            pass
+
+
+    def _set_transparent_colors(self):
+        pass
+
+    def _restore_colors(self):
+        pass
+
+
+    def _card_alpha(self) -> int:
+        return int(255 * (_int_setting(self, "card_opacity", 5) * 10) / 100)
+
+    def _start_polling(self):
+        pass
+
+    def _stop_polling(self):
+        pass
+
+    def _settings_visible(self) -> bool:
+        frag = self._settings_frag
+        if frag is None:
+            return False
+        root = frag.getFragmentView()
+        if root is None or not root.isShown():
+            return False
+        try:
+            last = get_last_fragment()
+            top = last.getFragmentView() if last is not None else None
+            if top is None:
+                return True
+            p = root
+            while p is not None:
+                if p.equals(top):
+                    return True
+                if not isinstance(p, View):
+                    break
+                p = p.getParent()
+            return False
+        except Exception:
+            return True
+
+    def _tick(self):
+        if not self._poll_token:
+            return
+        try:
+            frag = self._settings_frag
+            if frag is not None and self._is_active() and self._settings_visible():
+                self._tint_views(frag)
+        except Exception as e:
+            log(f"SettingsWallpaper: tick error: {e}")
+        try:
+            run_on_ui_thread(self._tick, 250)
+        except Exception:
+            self._poll_token = 0
+
+    def _tint_views(self, frag: Any):
+        lv = get_private_field(frag, "listView")
+        if lv is None:
+            return
+        alpha = self._card_alpha()
+        self._tint_fields(lv, alpha)
+        min_w = int(lv.getWidth() * 0.85)
+        for i in range(lv.getChildCount()):
+            self._tint_tree(lv.getChildAt(i), alpha, min_w, 0)
+
+    _CARD_PAINTS = ("sectionBackgroundPaint", "backgroundPaint", "sectionBackgroundStrokePaint")
+
+    def _iter_fields(self, obj: Any):
+        c = obj.getClass()
+        while c is not None and str(c.getName()) not in ("android.view.ViewGroup", "java.lang.Object"):
+            for f in c.getDeclaredFields():
+                yield c, f
+            c = c.getSuperclass()
+
+    def _set_paint_filters(self, lv: Any, alpha):
+        flt = None
+        if alpha is not None and alpha < 255:
+            cm = ColorMatrix()
+            cm.setScale(1.0, 1.0, 1.0, alpha / 255.0)
+            flt = ColorMatrixColorFilter(cm)
+        for _c, f in self._iter_fields(lv):
+            try:
+                if str(f.getName()) not in self._CARD_PAINTS:
+                    continue
+                f.setAccessible(True)
+                paint = f.get(lv)
+                if paint is not None:
+                    paint.setColorFilter(flt)
+            except Exception:
+                pass
+
+    def _tint_fields(self, lv: Any, alpha: int):
+        self._set_paint_filters(lv, alpha)
+
+    def _tint_tree(self, v: Any, alpha: int, min_w: int, depth: int):
+        try:
+            if v is None or isinstance(v, ImageView):
+                return
+            if v.getWidth() >= min_w:
+                bg = v.getBackground()
+                if bg is not None:
+                    name = str(bg.getClass().getSimpleName())
+                    if name == "ColorDrawable":
+                        c = bg.getColor()
+                        v.setBackgroundColor(Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c)))
+                    elif "Ripple" not in name and "Selector" not in name:
+                        bg.setAlpha(alpha)
+            if depth < 3 and isinstance(v, ViewGroup):
+                for i in range(v.getChildCount()):
+                    self._tint_tree(v.getChildAt(i), alpha, min_w, depth + 1)
+        except Exception:
+            pass
+
+
+    def _ensure_bg(self, container: Any, uri_str: str):
+        try:
+            blur = _int_setting(self, "blur_radius", 0) * 5
+            dimming = _int_setting(self, "dimming", 3) * 10
+            params = f"{uri_str}|{blur}"
+
+            iv = None
+            for i in range(container.getChildCount()):
+                child = container.getChildAt(i)
+                if isinstance(child, ImageView) and child.getTag() == BG_TAG:
+                    iv = child
+                    break
+
+            if iv is None:
+                iv = ImageView(container.getContext())
+                iv.setTag(BG_TAG)
+                try:
+                    container.addView(iv, 0, FrameLayout.LayoutParams(-1, -1))
+                except Exception:
+                    container.addView(iv, 0)
+
+            if iv.getContentDescription() != params:
+                bmp = self._get_bitmap(uri_str, blur)
+                if bmp is not None:
+                    iv.setImageBitmap(bmp)
+                    iv.setContentDescription(params)
+
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP)
+
+            if dimming > 0:
+                a = int(dimming * 2.55)
+                iv.setColorFilter(PorterDuffColorFilter(Color.argb(a, 0, 0, 0), PorterDuff.Mode.SRC_ATOP))
+            else:
+                iv.clearColorFilter()
+        except Exception as e:
+            log(f"SettingsWallpaper: ensure bg error: {e}")
+
+    def _remove_bg(self, container: Any):
+        try:
+            if container is None:
+                return
+            for i in range(container.getChildCount()):
+                child = container.getChildAt(i)
+                if isinstance(child, ImageView) and child.getTag() == BG_TAG:
+                    container.removeView(child)
+                    break
+        except Exception:
+            pass
+
+    def _get_bitmap(self, uri_str: str, blur: int):
+        try:
+            params = f"{uri_str}|{blur}"
+            if self._cached_bitmap is not None and self._cached_params == params:
+                return self._cached_bitmap
+
+            act = self._get_activity()
+            if act is None:
+                return None
+            stream = act.getContentResolver().openInputStream(Uri.parse(uri_str))
+            bmp = BitmapFactory.decodeStream(stream)
+            stream.close()
+            if bmp is None:
+                return None
+
+            max_dim = 1920
+            w, h = bmp.getWidth(), bmp.getHeight()
+            if w > max_dim or h > max_dim:
+                r = min(max_dim / w, max_dim / h)
+                bmp = Bitmap.createScaledBitmap(bmp, int(w * r), int(h * r), True)
+
+            if not bmp.isMutable():
+                bmp = bmp.copy(Bitmap.Config.ARGB_8888, True)
+
+            if blur > 0:
+                Utilities.stackBlurBitmap(bmp, blur)
+
+            self._cached_bitmap = bmp
+            self._cached_params = params
+            return bmp
+        except Exception as e:
+            log(f"SettingsWallpaper: bitmap error: {e}")
+            return None
+
+    def _get_activity(self) -> Optional[Any]:
+        try:
+            frag = get_last_fragment()
+            if frag is not None:
+                act = frag.getParentActivity()
+                if act is not None:
+                    return act
+        except Exception:
+            pass
+        try:
+            from org.telegram.ui import LaunchActivity
+            return LaunchActivity.instance
+        except Exception:
+            return None
+
+
+class _ResumeHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            frag = param.thisObject
+            if frag is not None:
+                run_on_ui_thread(lambda: self.plugin._apply(frag))
+        except Exception:
+            pass
+
+
+class _CreateViewHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin._is_active():
+                self.plugin._set_transparent_colors()
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        try:
+            frag = param.thisObject
+            if frag is not None:
+                run_on_ui_thread(lambda: self.plugin._apply(frag))
+        except Exception:
+            pass
+
+
+class _PauseHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+
+            run_on_ui_thread(self.plugin._restore_colors)
+            self.plugin._stop_polling()
+        except Exception:
+            pass
+
+
+class _ResultHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            args = getattr(param, "args", None)
+            if not args or len(args) < 3:
+                return
+            self.plugin._on_activity_result(param.thisObject, int(args[0]), int(args[1]), args[2])
+        except Exception:
+            pass
