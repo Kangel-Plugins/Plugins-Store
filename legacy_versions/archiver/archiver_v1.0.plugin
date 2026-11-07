@@ -1,0 +1,377 @@
+from typing import Any, List
+import threading
+
+from java import jlong
+from java.util import ArrayList
+
+from org.telegram.messenger import MessagesController, UserConfig, ChatObject, NotificationCenter, AndroidUtilities
+from org.telegram.tgnet import TLRPC
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from client_utils import get_last_fragment, send_request, RequestCallback
+from hook_utils import find_class, get_private_field, set_private_field
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "archiver"
+__name__ = "Archiver"
+__description__ = ("[EN]: Automatic chat archiver: archive bots, channels, groups and more.\n\n"
+                   "[RU]: Автоматический архиватор: архивируйте ботов, каналы, группы и другое.")
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "1.0"
+__icon__ = "MaxExteraPluginsStickers/31"
+__min_version__ = "12.1.1"
+__app_version__ = ">=12.1.1"
+__sdk_version__ = ">=1.4.3.3"
+
+SETTING_PRIVATE = "archive_private"
+SETTING_BOTS = "archive_bots"
+SETTING_GROUPS = "archive_groups"
+SETTING_SUPERGROUPS = "archive_supergroups"
+SETTING_CHANNELS = "archive_channels"
+
+_lock = threading.Lock()
+_plugin_ref = None
+
+
+def _activity():
+    try:
+        f = get_last_fragment()
+        if f is not None:
+            return f.getParentActivity()
+    except Exception:
+        pass
+    return None
+
+
+def _detect_lang():
+    try:
+        account = int(UserConfig.selectedAccount)
+        mc = MessagesController.getInstance(account)
+        if mc is not None:
+            code = str(getattr(mc, "suggestedLangCode", "") or "").lower()
+            if code.startswith("ru"):
+                return "ru"
+            if code:
+                return "en"
+    except Exception:
+        pass
+    try:
+        from java.util import Locale
+        code = str(Locale.getDefault().getLanguage()).lower()
+        if code == "ru":
+            return "ru"
+    except Exception:
+        pass
+    return "en"
+
+
+def _tr(ru_text, en_text, lang=None):
+    if lang is None:
+        lang = _detect_lang()
+    if lang == "en":
+        return en_text
+    return ru_text
+
+
+def _get_dialog_type(did, mc):
+    if did > 0:
+        user = mc.getUser(jlong(did))
+        if user is not None and getattr(user, "bot", False):
+            return "bot"
+        return "private"
+    else:
+        chat = mc.getChat(jlong(-did))
+        if chat is None:
+            return "unknown"
+        if ChatObject.isChannel(chat):
+            if getattr(chat, "megagroup", False):
+                return "supergroup"
+            return "channel"
+        return "group"
+
+
+def _get_selected_types(plugin):
+    types = []
+    if plugin.get_setting(SETTING_PRIVATE, False):
+        types.append("private")
+    if plugin.get_setting(SETTING_BOTS, False):
+        types.append("bot")
+    if plugin.get_setting(SETTING_GROUPS, False):
+        types.append("group")
+    if plugin.get_setting(SETTING_SUPERGROUPS, False):
+        types.append("supergroup")
+    if plugin.get_setting(SETTING_CHANNELS, False):
+        types.append("channel")
+    return types
+
+
+def _archive_dialogs(dialog_ids, account, mc, plugin):
+    if not dialog_ids:
+        return 0
+
+    try:
+        req = TLRPC.TL_folders_editPeerFolders()
+        req.folder_peers = ArrayList()
+
+        for did in dialog_ids:
+            try:
+                peer = mc.getInputPeer(jlong(did))
+                if peer is None:
+                    plugin.log("archiver: inputPeer is None for %d" % did)
+                    continue
+
+                dialog = mc.dialogs_dict.get(jlong(did))
+                if dialog is not None:
+                    dialog.folder_id = 1
+
+                folder_peer = TLRPC.TL_inputFolderPeer()
+                folder_peer.folder_id = 1
+                folder_peer.peer = peer
+                req.folder_peers.add(folder_peer)
+                plugin.log("archiver: added %d to request" % did)
+            except Exception as e:
+                plugin.log("archiver: error building peer for %d: %s" % (did, repr(e)))
+
+        if req.folder_peers.size() == 0:
+            plugin.log("archiver: no peers to archive")
+            return 0
+
+        count = req.folder_peers.size()
+        plugin.log("archiver: sending TL_folders_editPeerFolders with %d peers" % count)
+
+        send_request(req, RequestCallback(lambda r, e: plugin.log(
+            "archiver: server response err=%s" % repr(e))))
+
+        try:
+            NotificationCenter.getInstance(int(account)).postNotificationName(
+                NotificationCenter.dialogsNeedReload
+            )
+        except Exception:
+            pass
+
+        return count
+    except Exception as e:
+        plugin.log("archiver: _archive_dialogs exception: %s" % repr(e))
+        return 0
+
+
+def _run_archive(plugin):
+    with _lock:
+        try:
+            account = int(UserConfig.selectedAccount)
+            mc = MessagesController.getInstance(account)
+            if mc is None:
+                plugin.log("archiver: MessagesController is None")
+                return
+
+            selected = _get_selected_types(plugin)
+            plugin.log("archiver: selected types = %s" % repr(selected))
+            if not selected:
+                return
+
+            dialogs = mc.dialogs_dict
+            plugin.log("archiver: dialogs_dict size = %d" % dialogs.size())
+            to_archive = []
+
+            for i in range(dialogs.size()):
+                did = int(dialogs.keyAt(i))
+                if did == 0:
+                    continue
+
+                dialog = dialogs.get(jlong(did))
+                if dialog is None:
+                    continue
+
+                if int(getattr(dialog, "folder_id", 0)) == 1:
+                    continue
+
+                dtype = _get_dialog_type(did, mc)
+                if dtype in selected:
+                    to_archive.append(did)
+
+            plugin.log("archiver: found %d dialogs to archive" % len(to_archive))
+
+            if to_archive:
+                archived = _archive_dialogs(to_archive, account, mc, plugin)
+                final_count = archived
+
+                def show_result():
+                    BulletinHelper.show_info(
+                        _tr("Архивировано: %d чатов" % final_count,
+                            "Archived: %d chats" % final_count))
+
+                run_on_ui_thread(show_result)
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(
+                    _tr("Нет чатов для архивации", "No chats to archive")))
+
+        except Exception as e:
+            plugin.log("archiver: _run_archive exception: %s" % repr(e))
+
+
+def _on_switch_changed(plugin, key, value):
+    plugin.log("archiver: on_change key=%s value=%s" % (key, repr(value)))
+    if value:
+        threading.Thread(target=_run_archive, args=(plugin,), daemon=True).start()
+
+
+class _NewDialogHook(MethodHook):
+    def __init__(self, plugin):
+        MethodHook.__init__(self)
+        self._plugin = plugin
+
+    def after_hooked_method(self, param):
+        plugin = self._plugin
+        try:
+            selected = _get_selected_types(plugin)
+            if not selected:
+                return
+
+            account = int(UserConfig.selectedAccount)
+            mc = MessagesController.getInstance(account)
+            if mc is None:
+                return
+
+            messages = param.args[1] if len(param.args) > 1 else None
+            if messages is None:
+                return
+
+            dialog_ids_to_archive = []
+
+            for i in range(messages.size()):
+                msg_obj = messages.get(i)
+                if msg_obj is None:
+                    continue
+
+                try:
+                    did = int(msg_obj.getDialogId())
+                except Exception:
+                    continue
+
+                if did == 0:
+                    continue
+
+                dialog = mc.dialogs_dict.get(jlong(did))
+                if dialog is None:
+                    continue
+
+                if int(getattr(dialog, "folder_id", 0)) == 1:
+                    continue
+
+                dtype = _get_dialog_type(did, mc)
+                if dtype in selected:
+                    dialog_ids_to_archive.append(did)
+
+            if dialog_ids_to_archive:
+                plugin.log("archiver: auto-archiving %d new dialogs" % len(dialog_ids_to_archive))
+                _archive_dialogs(dialog_ids_to_archive, account, mc, plugin)
+
+        except Exception as e:
+            plugin.log("archiver: hook error: %s" % repr(e))
+
+
+class Archiver(BasePlugin):
+
+    def on_plugin_load(self):
+        global _plugin_ref
+        _plugin_ref = self
+        self.log("archiver: plugin loaded")
+        self._install_hooks()
+
+    def on_plugin_unload(self):
+        global _plugin_ref
+        _plugin_ref = None
+
+    def _install_hooks(self):
+        try:
+            mc_cls = find_class("org.telegram.messenger.MessagesController")
+            if mc_cls is None:
+                self.log("archiver: MessagesController class not found")
+                return
+
+            hook = _NewDialogHook(self)
+
+            for m in mc_cls.getClass().getDeclaredMethods():
+                if str(m.getName()) == "updateInterfaceWithMessages":
+                    try:
+                        m.setAccessible(True)
+                    except Exception:
+                        pass
+                    ref = self.hook_method(m, hook)
+                    if ref is not None:
+                        self.log("archiver: hooked updateInterfaceWithMessages")
+                    break
+        except Exception as e:
+            self.log("archiver: hook install error: %s" % repr(e))
+
+    def create_settings(self) -> List[Any]:
+        me = self
+        lang = _detect_lang()
+
+        def make_on_change(key):
+            def on_change(value):
+                _on_switch_changed(me, key, value)
+            return on_change
+
+        items = [
+            Header(text=_tr("Типы чатов для архивации", "Chat types to archive", lang)),
+            Switch(
+                key=SETTING_PRIVATE,
+                text=_tr("Личные сообщения", "Private chats", lang),
+                default=False,
+                subtext=_tr("Архивировать личные переписки с пользователями",
+                            "Archive private chats with users", lang),
+                on_change=make_on_change(SETTING_PRIVATE),
+            ),
+            Switch(
+                key=SETTING_BOTS,
+                text=_tr("Боты", "Bots", lang),
+                default=False,
+                subtext=_tr("Архивировать чаты с ботами",
+                            "Archive chats with bots", lang),
+                on_change=make_on_change(SETTING_BOTS),
+            ),
+            Switch(
+                key=SETTING_GROUPS,
+                text=_tr("Группы", "Groups", lang),
+                default=False,
+                subtext=_tr("Архивировать обычные группы",
+                            "Archive basic groups", lang),
+                on_change=make_on_change(SETTING_GROUPS),
+            ),
+            Switch(
+                key=SETTING_SUPERGROUPS,
+                text=_tr("Супергруппы", "Supergroups", lang),
+                default=False,
+                subtext=_tr("Архивировать супергруппы",
+                            "Archive supergroups", lang),
+                on_change=make_on_change(SETTING_SUPERGROUPS),
+            ),
+            Switch(
+                key=SETTING_CHANNELS,
+                text=_tr("Каналы", "Channels", lang),
+                default=False,
+                subtext=_tr("Архивировать каналы",
+                            "Archive channels", lang),
+                on_change=make_on_change(SETTING_CHANNELS),
+            ),
+        ]
+        return items
+
+
+# __DEX_BEGIN__
+# eNpVk8trE0Ecx3+zj9hUW0OgWOJlu4h4SLJ5bGIeIhQqUoh4UKoHD052J8m0m92Y3YRFsdoinnsX
+# BUU8Cd5FEMF7Lx486M1/wINX9TfZCaS7fDIzv/fufuOyeLlUrcHa0eGb9TvHzy61v2SfPFzxPzx/
+# +e/gz8W/RyrACADiHTsL8vquAJyFxJ5C3iNogq8IQX4gGvJLnjX88TDgAq4jJEYOkVfIa+Qd8hH5
+# ifxGdIzNIGvIOnIe2UBwFNBlz1PIEnJa9hLXgCRnXZ4V9CzLGc7MzkTaCayAqDc/JzGqzEvL9TM6
+# jhXhIzP/PZL0GmVE5OosT3CfJLPkMCpHFHhg4Pzo15E0rMbzHhreqSvc59FVWNocOwM+ZWPIzXfG
+# 1rW7xjBwJx4zvIC6zAWyDep2pwPZDvXdccBdaxJxz+oE/TZsdJxgaLE4YmM68iZ97ocWlaWsG5T7
+# bUzbpVNqedTvWze7u8yJTtpuRWPuY6m0CC8KO6i3N68D2QHigiaGgBdkf3+r8cjsUmeP+a7ZMl0W
+# m3kTm4+4RyMe+AUcms0c3UkfXQMaFpwBc/bCyTA0Wz3qhSxvDrlfoCNutsp5MxzQQhkzSg2bNprl
+# Sp2yUq1Zd2rNZtmuur3aZVqv2XW7TnuVRrVcxaL4VCH2wqRmsVK0Cy6bmo/xheOLzZGDp9pbhaQ/
+# KeRc8kln+gT5XefrXLPKgm7VBe1qC/rVFzScWtAxMZJ4oWVV7oUuSCaJERpUDNlLGIzELrSky73Q
+# lCrjv4kCci/+V/8Bod+TwQ==
+# __DEX_END__
