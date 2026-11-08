@@ -1,0 +1,5255 @@
+"""
+Theme Color Editor — редактор цветов интерфейса для exteraGram.
+
+Что умеет:
+  • плавающее окно со списком всех цветовых ключей темы (как встроенный
+    редактор Telegram), поиск, вкладки «На экране / Все / Изменённые»;
+  • нажатие на ключ — плагин показывает, где этот элемент на экране
+    (рамка вокруг элементов + мигание цветом);
+  • пипетка: нажмите на любой элемент экрана — плагин найдёт его ключи;
+  • удобный выбор цвета: HSV-круг, слайдеры HSV/RGB, прозрачность, HEX,
+    недавние цвета и палитра, живой предпросмотр;
+  • изменения сохраняются и действуют поверх любой темы, переживают
+    перезапуск и смену темы; экспорт/импорт в формате .attheme.
+"""
+
+__id__ = "color_inspector"
+__name__ = "Theme Color Editor"
+__description__ = "Редактор цветов каждого элемента интерфейса: понятные названия, пипетка «найти элемент по нажатию», подсветка элемента с переходом на нужный экран, RGB-перелив и «лента», HSV-круг, RGB/HEX, живой предпросмотр, экспорт и импорт."
+__author__ = "@resotez"
+__version__ = "1.3.3"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "12.10.6"
+__category__ = ["appearance"]
+
+import json
+import math
+import re
+import time
+import colorsys
+import traceback
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Text, Switch, Selector, Divider
+from java import jclass, jarray, jint, jfloat, dynamic_proxy, cast
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:  # pragma: no cover
+    BulletinHelper = None
+
+try:
+    from ui.alert import AlertDialogBuilder
+except Exception:  # pragma: no cover
+    AlertDialogBuilder = None
+
+try:
+    from hook_utils import find_class
+except Exception:  # pragma: no cover
+    find_class = None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Общие помощники
+# ════════════════════════════════════════════════════════════════════
+
+_PLUGIN = None
+
+MATCH = -1
+WRAP = -2
+
+G_CENTER = 17
+G_CENTER_V = 16
+G_CENTER_H = 1
+G_LEFT = 3
+G_RIGHT = 5
+G_TOP = 48
+G_BOTTOM = 80
+G_START = 0x00800003
+G_END = 0x00800005
+
+VISIBLE = 0
+INVISIBLE = 4
+GONE = 8
+
+A_DOWN, A_UP, A_MOVE, A_CANCEL = 0, 1, 2, 3
+
+FLAG_DIM_BEHIND = 0x2
+FLAG_NOT_FOCUSABLE = 0x8
+FLAG_NOT_TOUCH_MODAL = 0x20
+SOFT_ADJUST_RESIZE = 0x10
+SOFT_STATE_HIDDEN = 0x2
+
+NON_COLOR_KEYS = {"wallpaperFileOffset", "chat_wallpaper_gradient_rotation"}
+# для «RGB-ленты» берём текст, иконки, линии, кнопки — но не фоны, тени и обои
+RIBBON_SKIP = re.compile(r"background|wallpaper|shadow|selector|ripple|overlay|divider|"
+                         r"gradient|bubble|offset", re.I)
+WALLPAPER_KEYS = {"chat_wallpaper", "chat_wallpaper_gradient_to1",
+                  "chat_wallpaper_gradient_to2", "chat_wallpaper_gradient_to3"}
+
+
+def log(msg):
+    try:
+        if _PLUGIN is not None:
+            _PLUGIN.log("[ThemeColorEditor] " + str(msg))
+            return
+    except Exception:
+        pass
+    try:
+        print("[ThemeColorEditor] " + str(msg))
+    except Exception:
+        pass
+
+
+def log_exc(where):
+    log(where + ":\n" + traceback.format_exc())
+
+
+_JC = {}
+
+
+def J(name):
+    cls = _JC.get(name)
+    if cls is None:
+        cls = jclass(name)
+        _JC[name] = cls
+    return cls
+
+
+def s32(c):
+    c = int(c) & 0xFFFFFFFF
+    return c - 0x100000000 if c & 0x80000000 else c
+
+
+def u32(c):
+    return int(c) & 0xFFFFFFFF
+
+
+def ji(c):
+    """Цвет как jint (для перегруженных методов int/long)."""
+    return jint(s32(c))
+
+
+def c_a(c):
+    return (c >> 24) & 0xFF
+
+
+def c_r(c):
+    return (c >> 16) & 0xFF
+
+
+def c_g(c):
+    return (c >> 8) & 0xFF
+
+
+def c_b(c):
+    return c & 0xFF
+
+
+def argb(a, r, g, b):
+    return ((int(a) & 0xFF) << 24) | ((int(r) & 0xFF) << 16) | ((int(g) & 0xFF) << 8) | (int(b) & 0xFF)
+
+
+def hsv_color(h, s, v, a=255):
+    r, g, b = colorsys.hsv_to_rgb((h % 360.0) / 360.0, max(0.0, min(1.0, s)), max(0.0, min(1.0, v)))
+    return argb(a, round(r * 255), round(g * 255), round(b * 255))
+
+
+def color_hsv(c):
+    h, s, v = colorsys.rgb_to_hsv(c_r(c) / 255.0, c_g(c) / 255.0, c_b(c) / 255.0)
+    return h * 360.0, s, v
+
+
+def hex_color(c, force_alpha=True):
+    c = u32(c)
+    if not force_alpha and c_a(c) == 255:
+        return "#%06X" % (c & 0xFFFFFF)
+    return "#%08X" % c
+
+
+def parse_color(text):
+    """'#RGB', '#RRGGBB', '#AARRGGBB', без '#', или десятичное int (.attheme)."""
+    if text is None:
+        return None
+    t = str(text).strip().replace(" ", "")
+    if not t:
+        return None
+    if t.startswith("#"):
+        t = t[1:]
+    elif t.lower().startswith("0x"):
+        t = t[2:]
+    else:
+        if t.lstrip("-").isdigit() and (t.startswith("-") or len(t) > 8):
+            try:
+                return u32(int(t))
+            except Exception:
+                return None
+    if not all(ch in "0123456789abcdefABCDEF" for ch in t):
+        return None
+    if len(t) == 3:
+        t = "".join(ch * 2 for ch in t)
+    if len(t) == 4:
+        t = "".join(ch * 2 for ch in t)
+    if len(t) == 6:
+        return 0xFF000000 | int(t, 16)
+    if len(t) == 8:
+        return int(t, 16)
+    return None
+
+
+def luminance(c):
+    def ch(x):
+        x /= 255.0
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c_r(c)) + 0.7152 * ch(c_g(c)) + 0.0722 * ch(c_b(c))
+
+
+def color_dist(c1, c2):
+    return max(abs(c_r(c1) - c_r(c2)), abs(c_g(c1) - c_g(c2)), abs(c_b(c1) - c_b(c2)))
+
+
+def highlight_for(c):
+    """Яркий цвет, максимально заметный на фоне исходного."""
+    cands = [0xFFFF2D95, 0xFF00E5FF, 0xFFFFE600, 0xFF39FF14]
+    best, bd = cands[0], -1
+    for x in cands:
+        d = abs(c_r(x) - c_r(c)) + abs(c_g(x) - c_g(c)) + abs(c_b(x) - c_b(c))
+        if d > bd:
+            best, bd = x, d
+    return best
+
+
+def as_int(x, default=0):
+    if x is None:
+        return default
+    try:
+        return int(x)
+    except Exception:
+        pass
+    try:
+        return int(x.intValue())
+    except Exception:
+        return default
+
+
+def post_ui(fn, delay=0):
+    """Выполнить на UI-потоке, проглатывая ошибки."""
+    def run():
+        try:
+            fn()
+        except Exception:
+            log_exc("ui callback")
+    run_on_ui_thread(run, delay)
+
+
+def toast(text, kind="info"):
+    # когда панель раскрыта, штатный bulletin оказался бы под ней — показываем в панели
+    try:
+        panel = getattr(_PLUGIN, "panel", None) if _PLUGIN is not None else None
+        if panel is not None and panel.state == "expanded" and panel.dialog is not None:
+            if panel.snack(str(text), kind):
+                return
+    except Exception:
+        pass
+    try:
+        if BulletinHelper is not None:
+            if kind == "ok":
+                BulletinHelper.show_success(text)
+            elif kind == "err":
+                BulletinHelper.show_error(text)
+            else:
+                BulletinHelper.show_info(text)
+            return
+    except Exception:
+        pass
+    try:
+        J("android.widget.Toast").makeText(app_context(), str(text), 0).show()
+    except Exception:
+        log("toast failed: " + str(text))
+
+
+def app_context():
+    return J("org.telegram.messenger.ApplicationLoader").applicationContext
+
+
+def get_activity():
+    try:
+        act = J("org.telegram.ui.LaunchActivity").instance
+        if act is not None:
+            return act
+    except Exception:
+        pass
+    try:
+        from client_utils import get_last_fragment
+        f = get_last_fragment()
+        if f is not None:
+            return f.getParentActivity()
+    except Exception:
+        pass
+    return None
+
+
+def dp(v):
+    try:
+        return int(J("org.telegram.messenger.AndroidUtilities").dp(float(v)))
+    except Exception:
+        try:
+            return int(round(float(v) * app_context().getResources().getDisplayMetrics().density))
+        except Exception:
+            return int(round(float(v) * 2.75))
+
+
+def clipboard_set(text):
+    ctx = app_context()
+    cm = ctx.getSystemService("clipboard")
+    cm.setPrimaryClip(J("android.content.ClipData").newPlainText("colors", str(text)))
+
+
+def clipboard_get():
+    try:
+        ctx = app_context()
+        cm = ctx.getSystemService("clipboard")
+        clip = cm.getPrimaryClip()
+        if clip is None or clip.getItemCount() == 0:
+            return ""
+        t = clip.getItemAt(0).coerceToText(ctx)
+        return str(t) if t is not None else ""
+    except Exception:
+        log_exc("clipboard_get")
+        return ""
+
+
+# ── reflection ──────────────────────────────────────────────────────
+
+_FIELD_CACHE = {}
+_CLASS_CACHE = {}
+
+
+def java_class_of(name):
+    c = _CLASS_CACHE.get(name)
+    if c is not None:
+        return c
+    try:
+        if find_class is not None:
+            c = find_class(name)
+    except Exception:
+        c = None
+    if c is None:
+        c = J("java.lang.Class").forName(name)
+    _CLASS_CACHE[name] = c
+    return c
+
+
+def is_ui_thread():
+    try:
+        L = J("android.os.Looper")
+        return L.myLooper() is not None and L.myLooper().equals(L.getMainLooper())
+    except Exception:
+        return False
+
+
+def ident(obj):
+    try:
+        return int(J("java.lang.System").identityHashCode(obj))
+    except Exception:
+        return id(obj)
+
+
+def _find_field(cls, name):
+    key = (str(cls.getName()), name)
+    if key in _FIELD_CACHE:
+        return _FIELD_CACHE[key]
+    f = None
+    c = cls
+    while c is not None:
+        try:
+            f = c.getDeclaredField(name)
+            f.setAccessible(True)
+            break
+        except Exception:
+            f = None
+            c = c.getSuperclass()
+    _FIELD_CACHE[key] = f
+    return f
+
+
+def get_field(obj, name):
+    try:
+        f = _find_field(obj.getClass(), name)
+        return f.get(obj) if f is not None else None
+    except Exception:
+        return None
+
+
+def set_field(obj, name, value):
+    try:
+        f = _find_field(obj.getClass(), name)
+        if f is None:
+            return False
+        f.set(obj, value)
+        return True
+    except Exception:
+        return False
+
+
+def get_static(class_name, name):
+    try:
+        f = _find_field(java_class_of(class_name), name)
+        return f.get(None) if f is not None else None
+    except Exception:
+        return None
+
+
+# ── dynamic proxies (Java-интерфейсы из Python) ─────────────────────
+
+_PROXY_CLASSES = {}
+
+
+def _forwarder(name, is_bool, default):
+    def fwd(self, *args):
+        res = None
+        fn = None
+        try:
+            fn = self._ci_fns.get(name)
+        except Exception:
+            fn = None
+        if fn is not None:
+            try:
+                res = fn(*args)
+            except Exception:
+                log_exc("proxy " + name)
+                res = None
+        if res is None:
+            res = default
+        if is_bool:
+            return bool(res)
+        return res
+    fwd.__name__ = name
+    return fwd
+
+
+def make_proxy(iface, fns, extra=(), bools=(), defaults=None):
+    defaults = defaults or {}
+    methods = tuple(sorted(set(fns) | set(extra)))
+    key = (iface, methods, tuple(sorted(bools)), tuple(sorted(defaults.items())))
+    cls = _PROXY_CLASSES.get(key)
+    if cls is None:
+        ns = {}
+        for m in methods:
+            ns[m] = _forwarder(m, m in bools, defaults.get(m, False if m in bools else None))
+        cls = type("CI_" + iface.rsplit(".", 1)[-1].replace("$", "_"),
+                   (dynamic_proxy(J(iface)),), ns)
+        _PROXY_CLASSES[key] = cls
+    obj = cls()
+    obj._ci_fns = dict(fns)
+    return obj
+
+
+def on_click(view, fn, refs=None):
+    p = make_proxy("android.view.View$OnClickListener", {"onClick": lambda v: fn()})
+    view.setOnClickListener(p)
+    if refs is not None:
+        refs.append(p)
+    return p
+
+
+def on_long_click(view, fn, refs=None):
+    def handler(v):
+        fn()
+        return True
+    p = make_proxy("android.view.View$OnLongClickListener", {"onLongClick": handler}, bools=("onLongClick",))
+    view.setOnLongClickListener(p)
+    if refs is not None:
+        refs.append(p)
+    return p
+
+
+def on_touch(view, fn, refs=None):
+    p = make_proxy("android.view.View$OnTouchListener", {"onTouch": fn}, bools=("onTouch",))
+    view.setOnTouchListener(p)
+    if refs is not None:
+        refs.append(p)
+    return p
+
+
+def text_watcher(edit, fn, refs=None):
+    def after(s):
+        fn(str(s.toString()) if s is not None else "")
+    p = make_proxy("android.text.TextWatcher", {"afterTextChanged": after},
+                   extra=("beforeTextChanged", "onTextChanged"))
+    edit.addTextChangedListener(p)
+    if refs is not None:
+        refs.append(p)
+    return p
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Подсказки: что за ключ и где искать
+# ════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════
+#  Понятные названия ключей
+# ════════════════════════════════════════════════════════════════════
+
+FRIENDLY = {
+    # фон и текст экранов
+    "windowBackgroundWhite": "Фон экранов и ячеек",
+    "windowBackgroundGray": "Фон между блоками настроек",
+    "windowBackgroundGrayShadow": "Тень между блоками",
+    "windowBackgroundWhiteBlackText": "Основной текст",
+    "windowBackgroundWhiteGrayText": "Серый текст (подписи)",
+    "windowBackgroundWhiteGrayText2": "Серый текст в ячейках",
+    "windowBackgroundWhiteGrayText3": "Светло-серый текст",
+    "windowBackgroundWhiteGrayText4": "Серый текст (ещё светлее)",
+    "windowBackgroundWhiteGrayText5": "Серый текст №5",
+    "windowBackgroundWhiteGrayText6": "Серый текст №6",
+    "windowBackgroundWhiteGrayText7": "Серый текст №7",
+    "windowBackgroundWhiteGrayText8": "Серый текст №8",
+    "windowBackgroundWhiteBlueHeader": "Заголовки разделов настроек",
+    "windowBackgroundWhiteBlueText": "Синий текст",
+    "windowBackgroundWhiteBlueText2": "Синий текст №2",
+    "windowBackgroundWhiteBlueText3": "Синий текст №3",
+    "windowBackgroundWhiteBlueText4": "Синий текст-кнопка («Изменить», ссылки)",
+    "windowBackgroundWhiteBlueButton": "Синие текстовые кнопки",
+    "windowBackgroundWhiteBlueIcon": "Синие иконки",
+    "windowBackgroundWhiteValueText": "Значения справа в настройках",
+    "windowBackgroundWhiteLinkText": "Ссылки в тексте",
+    "windowBackgroundWhiteLinkSelection": "Выделение ссылки",
+    "windowBackgroundWhiteGrayIcon": "Серые иконки в списках",
+    "windowBackgroundWhiteHintText": "Текст-подсказка в полях",
+    "windowBackgroundWhiteInputField": "Линия поля ввода",
+    "windowBackgroundWhiteInputFieldActivated": "Линия поля ввода (при вводе)",
+    "windowBackgroundWhiteRedText": "Красный текст",
+    "windowBackgroundWhiteRedText2": "Красный текст №2",
+    "windowBackgroundWhiteRedText5": "Красный текст (удалить/выйти)",
+    "windowBackgroundWhiteGreenText": "Зелёный текст",
+    "windowBackgroundWhiteGreenText2": "Зелёный текст №2",
+    "windowBackgroundChecked": "Фон отмеченного переключателя-строки",
+    "windowBackgroundUnchecked": "Фон неотмеченного переключателя-строки",
+    "windowBackgroundCheckText": "Текст переключателя-строки",
+    # верхняя панель
+    "actionBarDefault": "Фон верхней панели",
+    "actionBarDefaultIcon": "Иконки верхней панели",
+    "actionBarDefaultTitle": "Заголовок верхней панели",
+    "actionBarDefaultSubtitle": "Подзаголовок верхней панели («в сети», «печатает»)",
+    "actionBarDefaultSelector": "Эффект нажатия на кнопки верхней панели",
+    "actionBarDefaultSearch": "Текст поиска в верхней панели",
+    "actionBarDefaultSearchPlaceholder": "Подсказка «Поиск» в верхней панели",
+    "actionBarDefaultSubmenuBackground": "Фон меню «⋮»",
+    "actionBarDefaultSubmenuItem": "Текст пунктов меню «⋮»",
+    "actionBarDefaultSubmenuItemIcon": "Иконки пунктов меню «⋮»",
+    "actionBarDefaultSubmenuSeparator": "Разделитель в меню «⋮»",
+    "actionBarDefaultArchived": "Фон верхней панели в архиве",
+    "actionBarDefaultArchivedIcon": "Иконки верхней панели в архиве",
+    "actionBarDefaultArchivedTitle": "Заголовок верхней панели в архиве",
+    "actionBarActionModeDefault": "Фон панели выделения сообщений",
+    "actionBarActionModeDefaultIcon": "Иконки панели выделения",
+    "actionBarActionModeDefaultSelector": "Нажатие в панели выделения",
+    "actionBarActionModeDefaultTop": "Верх панели выделения",
+    "actionBarTabActiveText": "Текст активной вкладки (папки)",
+    "actionBarTabUnactiveText": "Текст неактивной вкладки (папки)",
+    "actionBarTabLine": "Линия под активной вкладкой (папкой)",
+    "actionBarTabSelector": "Нажатие на вкладку",
+    "actionBarWhiteSelector": "Нажатие на светлой панели",
+    "actionBarBrowser": "Верхняя панель встроенного браузера",
+    # список чатов
+    "chats_name": "Имена в списке чатов",
+    "chats_nameMessage": "Имя отправителя в превью сообщения",
+    "chats_nameMessageArchived": "Имя отправителя (архив)",
+    "chats_nameArchived": "Имена в архиве",
+    "chats_message": "Текст последнего сообщения",
+    "chats_messageArchived": "Текст последнего сообщения (архив)",
+    "chats_message_threeLines": "Текст сообщения (3 строки)",
+    "chats_draft": "Черновик в списке чатов",
+    "chats_attachMessage": "Подпись «Фото», «Видео» в списке чатов",
+    "chats_actionMessage": "Служебное сообщение в списке чатов",
+    "chats_date": "Время последнего сообщения",
+    "chats_pinnedIcon": "Иконка закрепа (булавка)",
+    "chats_pinnedOverlay": "Фон закреплённых чатов",
+    "chats_tabletSelectedOverlay": "Выбранный чат (планшет)",
+    "chats_unreadCounter": "Счётчик непрочитанных",
+    "chats_unreadCounterMuted": "Счётчик непрочитанных (чат без звука)",
+    "chats_unreadCounterText": "Цифры в счётчике",
+    "chats_mentionIcon": "Значок упоминания «@»",
+    "chats_muteIcon": "Значок «без звука»",
+    "chats_sentCheck": "Галочка «отправлено»",
+    "chats_sentReadCheck": "Галочки «прочитано»",
+    "chats_sentClock": "Часики «отправляется»",
+    "chats_sentError": "Значок ошибки отправки",
+    "chats_sentErrorIcon": "Восклицательный знак ошибки",
+    "chats_verifiedBackground": "Галочка верификации (фон)",
+    "chats_verifiedCheck": "Галочка верификации (знак)",
+    "chats_secretName": "Имя секретного чата",
+    "chats_secretIcon": "Замок секретного чата",
+    "chats_onlineCircle": "Кружок «в сети» на аватарке",
+    "chats_actionBackground": "Плавающая кнопка «Написать» (карандаш)",
+    "chats_actionPressedBackground": "Плавающая кнопка (нажата)",
+    "chats_actionIcon": "Иконка плавающей кнопки",
+    "chats_archiveBackground": "Фон аватарки архива",
+    "chats_archivePinBackground": "Фон закреплённого архива",
+    "chats_archiveIcon": "Иконка архива",
+    "chats_archiveText": "Текст подсказки архива",
+    "chats_menuBackground": "Фон бокового меню",
+    "chats_menuItemText": "Текст пунктов бокового меню",
+    "chats_menuItemIcon": "Иконки бокового меню",
+    "chats_menuItemCheck": "Галочка выбранного аккаунта в меню",
+    "chats_menuName": "Ваше имя в боковом меню",
+    "chats_menuPhone": "Ваш номер в боковом меню",
+    "chats_menuPhoneCats": "Номер в меню (на фоне-картинке)",
+    "chats_menuTopBackground": "Шапка бокового меню",
+    "chats_menuTopBackgroundCats": "Шапка меню (тема с картинкой)",
+    "chats_menuTopShadow": "Тень шапки бокового меню",
+    "chats_menuTopShadowCats": "Тень шапки меню (картинка)",
+    "chats_sentCheckShadow": "Тень галочек",
+    # чат
+    "chat_wallpaper": "Цвет обоев чата",
+    "chat_wallpaper_gradient_to1": "Обои чата: градиент, цвет 2",
+    "chat_wallpaper_gradient_to2": "Обои чата: градиент, цвет 3",
+    "chat_wallpaper_gradient_to3": "Обои чата: градиент, цвет 4",
+    "chat_inBubble": "Фон входящих сообщений",
+    "chat_inBubbleSelected": "Фон входящего сообщения (выделено)",
+    "chat_inBubbleShadow": "Тень входящих сообщений",
+    "chat_outBubble": "Фон исходящих сообщений",
+    "chat_outBubbleGradient": "Исходящие: градиент, цвет 2",
+    "chat_outBubbleGradient2": "Исходящие: градиент, цвет 3",
+    "chat_outBubbleGradient3": "Исходящие: градиент, цвет 4",
+    "chat_outBubbleSelected": "Фон исходящего сообщения (выделено)",
+    "chat_outBubbleShadow": "Тень исходящих сообщений",
+    "chat_messageTextIn": "Текст входящих сообщений",
+    "chat_messageTextOut": "Текст исходящих сообщений",
+    "chat_messageLinkIn": "Ссылки во входящих",
+    "chat_messageLinkOut": "Ссылки в исходящих",
+    "chat_inTimeText": "Время во входящих",
+    "chat_outTimeText": "Время в исходящих",
+    "chat_inTimeSelectedText": "Время во входящих (выделено)",
+    "chat_outTimeSelectedText": "Время в исходящих (выделено)",
+    "chat_outSentCheck": "Галочка «отправлено» в сообщении",
+    "chat_outSentCheckRead": "Галочки «прочитано» в сообщении",
+    "chat_outSentClock": "Часики отправки в сообщении",
+    "chat_inViews": "Счётчик просмотров (входящие)",
+    "chat_outViews": "Счётчик просмотров (исходящие)",
+    "chat_inReplyLine": "Полоска ответа во входящих",
+    "chat_outReplyLine": "Полоска ответа в исходящих",
+    "chat_inReplyNameText": "Имя в ответе (входящие)",
+    "chat_outReplyNameText": "Имя в ответе (исходящие)",
+    "chat_inReplyMessageText": "Текст ответа (входящие)",
+    "chat_outReplyMessageText": "Текст ответа (исходящие)",
+    "chat_inForwardedNameText": "«Переслано от» (входящие)",
+    "chat_outForwardedNameText": "«Переслано от» (исходящие)",
+    "chat_selectedBackground": "Подсветка выделенного сообщения",
+    "chat_serviceBackground": "Фон служебных плашек (дата, «вступил»)",
+    "chat_serviceBackgroundSelected": "Фон служебных плашек (нажато)",
+    "chat_serviceText": "Текст служебных плашек",
+    "chat_serviceLink": "Ссылки в служебных плашках",
+    "chat_serviceIcon": "Иконки на служебных плашках",
+    "chat_messagePanelBackground": "Фон поля ввода сообщения",
+    "chat_messagePanelText": "Текст в поле ввода",
+    "chat_messagePanelHint": "Подсказка «Сообщение» в поле ввода",
+    "chat_messagePanelIcons": "Иконки поля ввода (скрепка, эмодзи)",
+    "chat_messagePanelSend": "Кнопка «Отправить»",
+    "chat_messagePanelShadow": "Тень над полем ввода",
+    "chat_messagePanelVoiceBackground": "Кружок записи голосового",
+    "chat_messagePanelCursor": "Курсор в поле ввода",
+    "chat_topPanelBackground": "Фон панели закрепа вверху чата",
+    "chat_topPanelTitle": "Заголовок закреплённого сообщения",
+    "chat_topPanelMessage": "Текст закреплённого сообщения",
+    "chat_topPanelLine": "Полоска закрепа",
+    "chat_topPanelClose": "Крестик закрепа",
+    "chat_goDownButton": "Кнопка «вниз» в чате",
+    "chat_goDownButtonIcon": "Стрелка кнопки «вниз»",
+    "chat_goDownButtonCounter": "Счётчик на кнопке «вниз»",
+    "chat_goDownButtonCounterBackground": "Фон счётчика кнопки «вниз»",
+    "chat_emojiPanelBackground": "Фон панели эмодзи и стикеров",
+    "chat_emojiPanelIcon": "Иконки вкладок панели эмодзи",
+    "chat_emojiPanelIconSelected": "Выбранная вкладка панели эмодзи",
+    "chat_attachIcon": "Иконки меню вложений",
+    "chat_inLoader": "Кнопка загрузки файла (входящие)",
+    "chat_outLoader": "Кнопка загрузки файла (исходящие)",
+    "chat_inFileNameText": "Имя файла (входящие)",
+    "chat_outFileNameText": "Имя файла (исходящие)",
+    "chat_inAudioSeekbarFill": "Прогресс голосового (входящие)",
+    "chat_outAudioSeekbarFill": "Прогресс голосового (исходящие)",
+    "chat_recordedVoiceBackground": "Фон записанного голосового",
+    "chat_recordVoiceCancel": "«Отмена» при записи голосового",
+    "chat_recordTime": "Время записи голосового",
+    "chat_unreadMessagesStartBackground": "Плашка «Непрочитанные сообщения»",
+    "chat_unreadMessagesStartText": "Текст плашки «Непрочитанные»",
+    "chat_reactionServiceButtonBackgroundInner": "Фон реакций",
+    "chat_searchPanelText": "Текст панели поиска в чате",
+    "chat_searchPanelIcons": "Иконки панели поиска в чате",
+    "chat_botKeyboardButtonBackground": "Кнопки клавиатуры бота",
+    "chat_botKeyboardButtonText": "Текст кнопок клавиатуры бота",
+    "chat_inlineResultIcon": "Иконки инлайн-результатов",
+    "chat_stickersHintPanel": "Панель подсказки стикеров",
+    # окна
+    "dialogBackground": "Фон всплывающих окон и меню",
+    "dialogBackgroundGray": "Серый фон всплывающих окон",
+    "dialogTextBlack": "Основной текст во всплывающих окнах",
+    "dialogTextGray": "Серый текст во всплывающих окнах",
+    "dialogTextGray2": "Серый текст в окнах №2",
+    "dialogTextGray3": "Серый текст в окнах №3",
+    "dialogTextBlue": "Синий текст в окнах",
+    "dialogTextLink": "Ссылки во всплывающих окнах",
+    "dialogTextHint": "Подсказка в полях окон",
+    "dialogButton": "Кнопки «ОК / Отмена» в окнах",
+    "dialogButtonSelector": "Нажатие на кнопки в окнах",
+    "dialogIcon": "Иконки во всплывающих окнах",
+    "dialogRedIcon": "Красные иконки в окнах",
+    "dialogInputField": "Линия поля ввода в окнах",
+    "dialogInputFieldActivated": "Линия поля ввода в окнах (при вводе)",
+    "dialogCheckboxSquareBackground": "Квадратный чекбокс в окнах",
+    "dialogCheckboxSquareCheck": "Галочка квадратного чекбокса",
+    "dialogRoundCheckBox": "Круглый чекбокс в окнах",
+    "dialogRoundCheckBoxCheck": "Галочка круглого чекбокса",
+    "dialogRadioBackground": "Радиокнопка в окнах",
+    "dialogRadioBackgroundChecked": "Радиокнопка в окнах (выбрана)",
+    "dialogLineProgress": "Полоса загрузки в окнах",
+    "dialogLineProgressBackground": "Фон полосы загрузки",
+    "dialogGrayLine": "Разделитель в окнах",
+    "dialogTopBackground": "Верх всплывающих окон",
+    "dialogScrollGlow": "Свечение при прокрутке в окнах",
+    "dialogShadowLine": "Тень в окнах",
+    "dialogSearchBackground": "Фон поиска в окнах",
+    "dialogSearchHint": "Подсказка поиска в окнах",
+    "dialogSearchIcon": "Иконка поиска в окнах",
+    "dialogSearchText": "Текст поиска в окнах",
+    "dialogFloatingButton": "Плавающая кнопка в окнах",
+    "dialogFloatingIcon": "Иконка плавающей кнопки в окнах",
+    "dialogEmptyImage": "Картинка пустого списка в окнах",
+    "dialogEmptyText": "Текст пустого списка в окнах",
+    "dialogSwipeRemove": "Удаление свайпом",
+    "dialogBadgeBackground": "Фон значков в окнах",
+    "dialogBadgeText": "Текст значков в окнах",
+    # переключатели и кнопки
+    "switchTrack": "Переключатель — дорожка (выкл.)",
+    "switchTrackChecked": "Переключатель — дорожка (вкл.)",
+    "switchTrackBlue": "Синий переключатель (выкл.)",
+    "switchTrackBlueChecked": "Синий переключатель (вкл.)",
+    "switchTrackBlueThumb": "Синий переключатель — кружок",
+    "switchTrackBlueThumbChecked": "Синий переключатель — кружок (вкл.)",
+    "switchTrackBlueSelector": "Синий переключатель — нажатие",
+    "switchTrackBlueSelectorChecked": "Синий переключатель — нажатие (вкл.)",
+    "switch2Track": "Переключатель №2 (выкл.)",
+    "switch2TrackChecked": "Переключатель №2 (вкл.)",
+    "checkbox": "Чекбокс (фон)",
+    "checkboxCheck": "Галочка чекбокса",
+    "checkboxDisabled": "Чекбокс (недоступен)",
+    "checkboxSquareBackground": "Квадратный чекбокс",
+    "checkboxSquareCheck": "Галочка квадратного чекбокса",
+    "checkboxSquareUnchecked": "Квадратный чекбокс (пустой)",
+    "checkboxSquareDisabled": "Квадратный чекбокс (недоступен)",
+    "radioBackground": "Радиокнопка",
+    "radioBackgroundChecked": "Радиокнопка (выбрана)",
+    "featuredStickers_addButton": "Основные синие кнопки (фон)",
+    "featuredStickers_addButtonPressed": "Основные кнопки (нажаты)",
+    "featuredStickers_buttonText": "Текст основных кнопок",
+    "featuredStickers_addedIcon": "Иконка «добавлено»",
+    "featuredStickers_buttonProgress": "Загрузка на кнопке",
+    "featuredStickers_removeButtonText": "Текст кнопки «Удалить»",
+    "featuredStickers_unread": "Точка «новое»",
+    "listSelectorSDK21": "Эффект нажатия на строки",
+    "listSelector": "Эффект нажатия на строки (старый)",
+    "divider": "Линии-разделители",
+    "progressCircle": "Круг загрузки",
+    "fastScrollActive": "Быстрая прокрутка (активна)",
+    "fastScrollInactive": "Быстрая прокрутка",
+    "fastScrollText": "Буква на быстрой прокрутке",
+    "graySection": "Фон серых заголовков секций",
+    "key_graySectionText": "Текст серых заголовков секций",
+    "contextProgressInner1": "Индикатор загрузки (внутри)",
+    "contextProgressOuter1": "Индикатор загрузки (снаружи)",
+    "undo_background": "Плашка «Отменить» (фон)",
+    "undo_cancelColor": "Кнопка «Отменить»",
+    "undo_infoColor": "Текст плашки «Отменить»",
+    # аватарки и профиль
+    "avatar_text": "Буквы на аватарках без фото",
+    "avatar_backgroundSaved": "Аватарка «Избранное»",
+    "avatar_backgroundArchived": "Аватарка архива",
+    "avatar_backgroundArchivedHidden": "Аватарка скрытого архива",
+    "avatar_backgroundRed": "Аватарки: красная",
+    "avatar_backgroundOrange": "Аватарки: оранжевая",
+    "avatar_backgroundViolet": "Аватарки: фиолетовая",
+    "avatar_backgroundGreen": "Аватарки: зелёная",
+    "avatar_backgroundCyan": "Аватарки: бирюзовая",
+    "avatar_backgroundBlue": "Аватарки: синяя",
+    "avatar_backgroundPink": "Аватарки: розовая",
+    "avatar_backgroundInProfileBlue": "Фон шапки профиля",
+    "avatar_backgroundActionBarBlue": "Фон шапки профиля (панель)",
+    "avatar_actionBarIconBlue": "Иконки шапки профиля",
+    "avatar_actionBarSelectorBlue": "Нажатие в шапке профиля",
+    "avatar_subtitleInProfileBlue": "Статус в шапке профиля («был(а) недавно»)",
+    "profile_title": "Имя в профиле",
+    "profile_status": "Статус в профиле",
+    "profile_verifiedBackground": "Галочка верификации в профиле (фон)",
+    "profile_verifiedCheck": "Галочка верификации в профиле (знак)",
+    "profile_actionBackground": "Плавающая кнопка в профиле",
+    "profile_actionIcon": "Иконка плавающей кнопки в профиле",
+    "profile_actionPressedBackground": "Плавающая кнопка в профиле (нажата)",
+    "profile_tabText": "Вкладки медиа в профиле",
+    "profile_tabSelectedText": "Выбранная вкладка медиа в профиле",
+    "profile_tabSelectedLine": "Линия выбранной вкладки в профиле",
+    "profile_tabSelector": "Нажатие на вкладки в профиле",
+    # плееры, звонки и прочее
+    "player_actionBarTitle": "Заголовок музыкального плеера",
+    "player_background": "Фон музыкального плеера",
+    "player_button": "Кнопки плеера",
+    "player_buttonActive": "Активная кнопка плеера",
+    "player_progress": "Прогресс трека",
+    "player_progressBackground": "Фон прогресса трека",
+    "player_time": "Время трека",
+    "inappPlayerBackground": "Фон мини-плеера сверху",
+    "inappPlayerPlayPause": "Кнопка «пауза» мини-плеера",
+    "inappPlayerTitle": "Название трека в мини-плеере",
+    "inappPlayerPerformer": "Исполнитель в мини-плеере",
+    "inappPlayerClose": "Крестик мини-плеера",
+    "returnToCallBackground": "Плашка «Вернуться к звонку»",
+    "returnToCallText": "Текст «Вернуться к звонку»",
+    "calls_callReceivedGreenIcon": "Иконка принятого звонка",
+    "calls_callReceivedRedIcon": "Иконка пропущенного звонка",
+    "location_sendLocationBackground": "Кнопка «Отправить геопозицию»",
+    "location_sendLiveLocationBackground": "Кнопка «Трансляция геопозиции»",
+    "sessions_devicesImage": "Картинка в «Устройствах»",
+    "code_background": "Фон блоков кода",
+    "telegram_color": "Фирменный синий",
+}
+
+# section-префиксы → контекст в названии
+_SECTIONS = [
+    (("window", "background", "white"), ""),
+    (("window", "background", "gray"), ""),
+    (("window", "background"), ""),
+    (("action", "bar", "default", "submenu"), "в меню «⋮»"),
+    (("action", "bar", "default", "search"), "поиска в верхней панели"),
+    (("action", "bar", "default", "archived"), "верхней панели архива"),
+    (("action", "bar", "action", "mode", "default"), "панели выделения"),
+    (("action", "bar", "default"), "верхней панели"),
+    (("action", "bar", "tab"), "вкладок-папок"),
+    (("action", "bar"), "верхней панели"),
+    (("chats", "menu"), "бокового меню"),
+    (("chats",), "в списке чатов"),
+    (("chat",), "в чате"),
+    (("dialog",), "во всплывающих окнах"),
+    (("avatar",), "аватарки"),
+    (("profile",), "в профиле"),
+    (("voipgroup",), "в видеочате"),
+    (("inapp", "player"), "мини-плеера"),
+    (("player",), "музыкального плеера"),
+    (("location",), "на карте"),
+    (("passport",), "паспорта"),
+    (("premium",), "Premium"),
+    (("stories",), "историй"),
+    (("calls",), "звонков"),
+    (("files",), "файлов"),
+    (("groupcreate",), "при создании группы"),
+    (("statistic", "chart"), "графиков статистики"),
+    (("iv",), "мгновенного просмотра"),
+    (("login",), "экрана входа"),
+    (("undo",), "плашки «Отменить»"),
+    (("featured", "stickers"), "основных кнопок"),
+    (("context", "progress"), "индикатора загрузки"),
+    (("sheet",), "нижней панели"),
+    (("picker",), "выбора медиа"),
+    (("shared",), "общих медиа"),
+    (("glass",), "стеклянных элементов"),
+    (("gift",), "подарков"),
+    (("code",), "блока кода"),
+    (("table",), "таблицы"),
+    (("wallet",), "кошелька"),
+    (("bot",), "бота"),
+    (("topics",), "тем"),
+    (("key",), ""),
+]
+
+# слово → именительный | родительный | род (m/f/n/p); * = главное слово
+_WORDS_SRC = """
+*text=текст|текста|m
+*background=фон|фона|m
+*icon=иконка|иконки|f
+*icons=иконки|иконок|p
+*line=линия|линии|f
+*lines=линии|линий|p
+*shadow=тень|тени|f
+*border=рамка|рамки|f
+*fill=заливка|заливки|f
+*circle=круг|круга|m
+*dot=точка|точки|f
+*glow=свечение|свечения|n
+*selector=эффект нажатия|эффекта нажатия|m
+*ripple=эффект нажатия|эффекта нажатия|m
+*thumb=ползунок|ползунка|m
+*track=дорожка|дорожки|f
+*overlay=затемнение|затемнения|n
+*highlight=подсветка|подсветки|f
+*cursor=курсор|курсора|m
+*hint=подсказка|подсказки|f
+*placeholder=подсказка|подсказки|f
+*title=заголовок|заголовка|m
+*subtitle=подзаголовок|подзаголовка|m
+*header=заголовок|заголовка|m
+*button=кнопка|кнопки|f
+*arrow=стрелка|стрелки|f
+*badge=значок|значка|m
+*counter=счётчик|счётчика|m
+*check=галочка|галочки|f
+*color=цвет|цвета|m
+*bubble=фон сообщения|фона сообщения|m
+*name=имя|имени|n
+*link=ссылка|ссылки|f
+*progress=прогресс|прогресса|m
+*loader=кнопка загрузки|кнопки загрузки|f
+*seekbar=полоса перемотки|полосы перемотки|f
+*divider=разделитель|разделителя|m
+*separator=разделитель|разделителя|m
+*gradient=градиент|градиента|m
+*panel=панель|панели|f
+*bar=панель|панели|f
+*menu=меню|меню|n
+*tab=вкладка|вкладки|f
+*tabs=вкладки|вкладок|p
+*field=поле|поля|n
+*box=блок|блока|m
+*time=время|времени|n
+*date=дата|даты|f
+*item=пункт|пункта|m
+*items=пункты|пунктов|p
+*square=квадрат|квадрата|m
+*status=статус|статуса|m
+*clock=часики|часиков|p
+*image=изображение|изображения|n
+*photo=фото|фото|n
+*keyboard=клавиатура|клавиатуры|f
+*checkbox=чекбокс|чекбокса|m
+*radio=радиокнопка|радиокнопки|f
+*switch=переключатель|переключателя|m
+*avatar=аватарка|аватарки|f
+*sticker=стикер|стикера|m
+*label=подпись|подписи|f
+*signature=подпись|подписи|f
+*span=метка|метки|f
+*tag=метка|метки|f
+*mark=отметка|отметки|f
+*lock=замок|замка|m
+*card=карточка|карточки|f
+*sheet=панель|панели|f
+*scrollbar=полоса прокрутки|полосы прокрутки|f
+*scroll=прокрутка|прокрутки|f
+*chevron=стрелка|стрелки|f
+*logo=логотип|логотипа|m
+*ribbon=лента|ленты|f
+*wallpaper=обои|обоев|p
+*chart=график|графика|m
+*alpha=прозрачность|прозрачности|f
+*duration=длительность|длительности|f
+*views=просмотры|просмотров|p
+*description=описание|описания|n
+*value=значение|значения|n
+*info=информация|информации|f
+*details=подробности|подробностей|p
+*result=результат|результата|m
+*preview=превью|превью|n
+*answer=ответ|ответа|m
+*quote=цитата|цитаты|f
+*selection=выделение|выделения|n
+*poll=опрос|опроса|m
+*venue=место|места|n
+*mention=упоминание|упоминания|n
+*reaction=реакция|реакции|f
+*gift=подарок|подарка|m
+*gifts=подарки|подарков|p
+*star=звезда|звезды|f
+*stars=звёзды|звёзд|p
+*coin=монета|монеты|f
+*folder=папка|папки|f
+*cache=кэш|кэша|m
+*keyword=ключевое слово|ключевого слова|n
+*operator=оператор|оператора|m
+*constant=константа|константы|f
+*string=строка|строки|f
+*number=число|числа|n
+*function=функция|функции|f
+*comment=комментарий|комментария|m
+*error=ошибка|ошибки|f
+*image=изображение|изображения|n
+*bot=бот|бота|m
+*members=участники|участников|p
+*thumbnail=миниатюра|миниатюры|f
+message=сообщение|сообщения|n
+messages=сообщения|сообщений|p
+msg=сообщение|сообщения|n
+chat=чат|чата|m
+chats=чаты|чатов|p
+dialog=окно|окна|n
+dialogs=чаты|чатов|p
+window=окно|окна|n
+action=действие|действия|n
+search=поиск|поиска|m
+reply=ответ|ответа|m
+voice=голосовое|голосового|n
+audio=аудио|аудио|n
+media=медиа|медиа|n
+file=файл|файла|m
+files=файлы|файлов|p
+location=геопозиция|геопозиции|f
+live=трансляция|трансляции|f
+contact=контакт|контакта|m
+contacts=контакты|контактов|p
+admin=админ|админа|m
+inline=инлайн|инлайн-режима|m
+instant=мгновенный просмотр|мгновенного просмотра|m
+attach=вложения|вложений|p
+emoji=эмодзи|эмодзи|n
+stickers=стикеры|стикеров|p
+player=плеер|плеера|m
+service=служебное|служебных сообщений|n
+input=ввод|ввода|m
+send=отправка|отправки|f
+sent=отправлено|отправки|n
+record=запись|записи|f
+recorded=запись|записи|f
+call=звонок|звонка|m
+calls=звонки|звонков|p
+phone=телефон|телефона|m
+unread=непрочитанные|непрочитанных|p
+online=«в сети»|«в сети»|n
+pinned=закреп|закреплённых|m
+secret=секретный чат|секретного чата|m
+verified=верификация|верификации|f
+topic=тема|темы|f
+topics=темы|тем|p
+forwarded=пересланное|пересланного|n
+archive=архив|архива|m
+table=таблица|таблицы|f
+code=код|кода|m
+stories=истории|историй|p
+story=история|истории|f
+premium=Premium|Premium|n
+share=«Поделиться»|«Поделиться»|n
+down=«вниз»|«вниз»|n
+view=просмотр|просмотра|m
+select=выбор|выбора|m
+profile=профиль|профиля|m
+statistic=статистика|статистики|f
+passport=паспорт|паспорта|m
+undo=«Отменить»|«Отменить»|n
+login=вход|входа|m
+iv=мгновенный просмотр|мгновенного просмотра|m
+voipgroup=видеочат|видеочата|m
+featured=популярное|популярного|n
+trending=популярное|популярного|n
+return=возврат|возврата|m
+picker=выбор медиа|выбора медиа|m
+mode=режим|режима|m
+article=статья|статьи|f
+creator=создатель|создателя|m
+speaking=говорящий|говорящего|m
+listening=слушатель|слушателя|m
+wallet=кошелёк|кошелька|m
+gallery=галерея|галереи|f
+draft=черновик|черновика|m
+sound=звук|звука|m
+permission=разрешение|разрешения|n
+invite=приглашение|приглашения|n
+leave=выход|выхода|m
+close=закрытие|закрытия|n
+cancel=отмена|отмены|f
+delete=удаление|удаления|n
+remove=удаление|удаления|n
+add=добавление|добавления|n
+added=добавлено|добавленного|n
+save=сохранение|сохранения|n
+saved=«Избранное»|«Избранного»|n
+edit=редактирование|редактирования|n
+play=воспроизведение|воспроизведения|n
+pause=пауза|паузы|f
+alert=уведомление|уведомления|n
+success=успех|успеха|m
+danger=опасное действие|опасного действия|n
+primary=основное|основного|n
+swipe=свайп|свайпа|m
+pull=оттягивание|оттягивания|n
+blur=размытие|размытия|n
+gif=GIF|GIF|m
+psa=PSA|PSA|m
+site=сайт|сайта|m
+pack=набор|набора|m
+set=набор|набора|m
+browser=браузер|браузера|m
+sessions=сеансы|сеансов|p
+devices=устройства|устройств|p
+tablet=планшет|планшета|m
+navigation=навигация|навигации|f
+rtmp=RTMP|RTMP|m
+connecting=подключение|подключения|n
+received=полученное|полученного|n
+friends=друзья|друзей|p
+golden=золото|золотого|n
+game=игра|игры|f
+admin=админ|админа|m
+spoiler=спойлер|спойлера|m
+via=via|via|m
+seen=просмотр|просмотра|m
+contact=контакт|контакта|m
+member=участник|участника|m
+group=группа|группы|f
+channel=канал|канала|m
+user=пользователь|пользователя|m
+camera=камера|камеры|f
+mute=звук|звука|m
+authorize=авторизация|авторизации|f
+back=«назад»|«назад»|n
+backspace=удаление символа|удаления символа|n
+create=создание|создания|n
+currency=валюта|валюты|f
+list=список|списка|m
+load=загрузка|загрузки|f
+neutral=нейтральное|нейтрального|n
+other=другое|другого|n
+performer=исполнитель|исполнителя|m
+perfomer=исполнитель|исполнителя|m
+pin=закреп|закрепа|m
+place=место|места|n
+rotation=поворот|поворота|m
+section=раздел|раздела|m
+start=начало|начала|n
+stop=остановка|остановки|f
+submenu=подменю|подменю|n
+target=цель|цели|f
+up=«вверх»|«вверх»|n
+zoom=масштаб|масштаба|m
+offset=смещение|смещения|n
+telegram=Telegram|Telegram|m
+glass=стекло|стекла|n
+changephoneinfo=смена номера|смены номера|f
+"""
+
+_WORDS = {}
+_HEADS = set()
+for _ln in _WORDS_SRC.strip().splitlines():
+    _ln = _ln.strip()
+    if not _ln or "=" not in _ln:
+        continue
+    _k, _v = _ln.split("=", 1)
+    _head = _k.startswith("*")
+    _k = _k.lstrip("*")
+    _parts = _v.split("|")
+    if len(_parts) == 3:
+        _WORDS[_k] = tuple(_parts)
+        if _head:
+            _HEADS.add(_k)
+
+_ADJ = {
+    "gray": ("серый", "серая", "серое", "серые"),
+    "grey": ("серый", "серая", "серое", "серые"),
+    "blue": ("синий", "синяя", "синее", "синие"),
+    "lightblue": ("голубой", "голубая", "голубое", "голубые"),
+    "red": ("красный", "красная", "красное", "красные"),
+    "green": ("зелёный", "зелёная", "зелёное", "зелёные"),
+    "fast": ("быстрый", "быстрая", "быстрое", "быстрые"),
+    "slow": ("медленный", "медленная", "медленное", "медленные"),
+    "lightgreen": ("салатовый", "салатовая", "салатовое", "салатовые"),
+    "white": ("белый", "белая", "белое", "белые"),
+    "black": ("чёрный", "чёрная", "чёрное", "чёрные"),
+    "orange": ("оранжевый", "оранжевая", "оранжевое", "оранжевые"),
+    "violet": ("фиолетовый", "фиолетовая", "фиолетовое", "фиолетовые"),
+    "purple": ("пурпурный", "пурпурная", "пурпурное", "пурпурные"),
+    "pink": ("розовый", "розовая", "розовое", "розовые"),
+    "cyan": ("бирюзовый", "бирюзовая", "бирюзовое", "бирюзовые"),
+    "yellow": ("жёлтый", "жёлтая", "жёлтое", "жёлтые"),
+    "indigo": ("индиго", "индиго", "индиго", "индиго"),
+    "main": ("основной", "основная", "основное", "основные"),
+    "secondary": ("второстепенный", "второстепенная", "второстепенное", "второстепенные"),
+    "empty": ("пустой", "пустая", "пустое", "пустые"),
+    "floating": ("плавающий", "плавающая", "плавающее", "плавающие"),
+    "round": ("круглый", "круглая", "круглое", "круглые"),
+    "small": ("маленький", "маленькая", "маленькое", "маленькие"),
+    "inner": ("внутренний", "внутренняя", "внутреннее", "внутренние"),
+    "outer": ("внешний", "внешняя", "внешнее", "внешние"),
+    "top": ("верхний", "верхняя", "верхнее", "верхние"),
+    "bottom": ("нижний", "нижняя", "нижнее", "нижние"),
+    "new": ("новый", "новая", "новое", "новые"),
+    "last": ("последний", "последняя", "последнее", "последние"),
+}
+_GENDER_IDX = {"m": 0, "f": 1, "n": 2, "p": 3}
+
+_MODS = {
+    "selected": "выделено", "pressed": "нажато", "muted": "без звука", "unmuted": "со звуком",
+    "unmute": "со звуком", "disabled": "недоступно", "checked": "вкл.", "unchecked": "выкл.",
+    "active": "активно", "activated": "при вводе", "unactive": "неактивно", "inactive": "неактивно",
+    "archived": "архив", "scrolled": "при прокрутке", "unscrolled": "без прокрутки",
+    "hidden": "скрыто", "dark": "тёмная тема", "darker": "темнее", "bold": "жирный",
+    "read": "прочитано", "cached": "в кэше", "unselected": "не выбрано", "loading": "загрузка",
+    "enabled": "вкл.", "correct": "верно", "wrong": "неверно", "shadow2": "тень",
+    "sdk21": "", "cats": "тема с картинкой", "three": "", "default": "", "go": "", "key": "",
+    "ab": "", "by": "", "to": "", "the": "", "sdk": "", "of": "", "unread2": "",
+    "context": "", "inapp": "", "regular": "", "normal": "", "soldout": "распродано",
+    "animated": "анимация",
+}
+
+
+def _tokens(key):
+    out = []
+    for part in key.split("_"):
+        out.extend(t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", part))
+    return out
+
+
+def friendly_name(key):
+    if not key:
+        return ""
+    f = FRIENDLY.get(key)
+    if f:
+        return f
+    try:
+        return _auto_name(key)
+    except Exception:
+        return key
+
+
+def _auto_name(key):
+    toks = _tokens(key)
+    ctx = ""
+    for seq, phrase in _SECTIONS:
+        n = len(seq)
+        if tuple(toks[:n]) == seq and len(toks) > n:
+            toks = toks[n:]
+            ctx = phrase
+            break
+    direction = ""
+    mods = []
+    adjs = []
+    base = []
+    for i, t in enumerate(toks):
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t == "in" and nxt in ("message", "messages", "profile", "chat"):
+            continue
+        if t == "in":
+            direction = "во входящих"
+        elif t == "out":
+            direction = "в исходящих"
+        elif t.isdigit():
+            if t not in ("1", "21"):
+                mods.append("№" + t)
+        elif t in _MODS:
+            if _MODS[t]:
+                mods.append(_MODS[t])
+        elif t in _ADJ:
+            adjs.append(t)
+        else:
+            base.append(t)
+    if direction and ctx == "в чате":
+        ctx = ""
+    if not base:
+        if adjs:
+            base = [adjs.pop()]
+        else:
+            base = ["color"]
+    head_i = None
+    for i in range(len(base) - 1, -1, -1):
+        if base[i] in _HEADS:
+            head_i = i
+            break
+    if head_i is None:
+        head_i = len(base) - 1
+    head = base[head_i]
+    quals = base[:head_i] + base[head_i + 1:]
+    quals.reverse()
+    hw = _WORDS.get(head)
+    if hw:
+        head_nom, gender = hw[0], hw[2]
+    else:
+        head_nom, gender = head, "m"
+    words = []
+    for a in adjs:
+        words.append(_ADJ[a][_GENDER_IDX.get(gender, 0)])
+    words.append(head_nom)
+    for q in quals:
+        w = _WORDS.get(q)
+        words.append(w[1] if w else q)
+    if direction:
+        words.append(direction)
+    if ctx:
+        words.append(ctx)
+    name = " ".join(w for w in words if w)
+    seen = []
+    for m in mods:
+        if m not in seen:
+            seen.append(m)
+    if seen:
+        name += " (" + ", ".join(seen) + ")"
+    return name[:1].upper() + name[1:]
+
+for _c, _ru in (("Red", "красный"), ("Orange", "оранжевый"), ("Violet", "фиолетовый"), ("Green", "зелёный"),
+                ("Cyan", "бирюзовый"), ("Blue", "синий"), ("Pink", "розовый")):
+    FRIENDLY.setdefault("avatar_nameInMessage" + _c, "Цвет имён в группах: " + _ru)
+    FRIENDLY.setdefault("avatar_background" + _c, "Аватарки без фото: " + _ru)
+    FRIENDLY.setdefault("avatar_background2" + _c, "Аватарки без фото (градиент): " + _ru)
+
+
+PREFIX_HINTS = [
+    ("actionBarDefaultSubmenu", "Меню «⋮»"),
+    ("actionBarActionMode", "Панель выделения"),
+    ("actionBarDefaultSearch", "Поиск в шапке"),
+    ("actionBarDefaultArchived", "Шапка архива"),
+    ("actionBarTab", "Вкладки"),
+    ("actionBarBrowser", "Шапка браузера"),
+    ("actionBarWhite", "Белая шапка"),
+    ("actionBar", "Верхняя панель"),
+    ("windowBackgroundWhiteInput", "Поля ввода"),
+    ("windowBackground", "Фон и текст экранов"),
+    ("dialog", "Всплывающие окна"),
+    ("chats_menu", "Боковое меню"),
+    ("chats_archive", "Архив"),
+    ("chats_", "Список чатов"),
+    ("chat_inBubble", "Входящие сообщения"),
+    ("chat_outBubble", "Исходящие сообщения"),
+    ("chat_in", "Входящие сообщения"),
+    ("chat_out", "Исходящие сообщения"),
+    ("chat_messagePanel", "Поле ввода"),
+    ("chat_emoji", "Панель эмодзи"),
+    ("chat_attach", "Меню вложений"),
+    ("chat_service", "Служебные сообщения"),
+    ("chat_topPanel", "Панели вверху чата"),
+    ("chat_wallpaper", "Обои чата"),
+    ("chat_searchPanel", "Поиск в чате"),
+    ("chat_recordedVoice", "Голосовые"),
+    ("chat_reply", "Ответ на сообщение"),
+    ("chat_", "Чат"),
+    ("avatar_", "Аватарки"),
+    ("profile_", "Профиль"),
+    ("player", "Плеер"),
+    ("inappPlayer", "Мини-плеер"),
+    ("switch", "Переключатели"),
+    ("checkbox", "Чекбоксы"),
+    ("radioBackground", "Радиокнопки"),
+    ("featuredStickers", "Кнопки"),
+    ("contextProgress", "Индикаторы загрузки"),
+    ("listSelector", "Эффект нажатия"),
+    ("fastScroll", "Быстрая прокрутка"),
+    ("passport", "Паспорт"),
+    ("calls", "Звонки"),
+    ("voipgroup", "Видеочаты"),
+    ("statisticChart", "Статистика"),
+    ("location", "Геопозиция"),
+    ("files", "Файлы"),
+    ("graySection", "Серые секции"),
+    ("undo", "Плашка «Отменить»"),
+    ("sheet", "Нижние панели"),
+    ("stickers", "Стикеры"),
+    ("returnToCall", "Возврат к звонку"),
+    ("gift", "Подарки"),
+    ("premium", "Premium"),
+    ("picker", "Выбор медиа"),
+    ("groupcreate", "Создание группы"),
+    ("login", "Экран входа"),
+    ("emptyList", "Пустой список"),
+    ("text_", "Текст"),
+    ("table", "Таблицы"),
+    ("code", "Код"),
+    ("key_", "Разное"),
+]
+
+FLAG_LABELS = [
+    (0x00000001, "фон"),
+    (0x00000010, "фон ячейки"),
+    (0x00000020, "фон"),
+    (0x00000004, "текст"),
+    (0x00000002, "ссылка"),
+    (0x00000008, "иконка"),
+    (0x00000040, "иконки шапки"),
+    (0x00000080, "заголовок"),
+    (0x00000400, "подзаголовок"),
+    (0x00000100, "нажатие"),
+    (0x00001000, "нажатие"),
+    (0x10000000, "нажатие"),
+    (0x00000800, "прогресс"),
+    (0x00002000, "чекбокс"),
+    (0x00004000, "галочка"),
+    (0x00800000, "подсказка"),
+    (0x01000000, "курсор"),
+    (0x04000000, "поиск"),
+    (0x08000000, "поиск"),
+    (0x40000000, "пункт меню"),
+    (0x80000000, "фон меню"),
+    (0x00100000, "панель выделения"),
+    (0x20000000, "служебный фон"),
+]
+
+
+def key_hint(name):
+    """Раздел интерфейса, к которому относится ключ."""
+    if not name:
+        return ""
+    for prefix, text in PREFIX_HINTS:
+        if name.startswith(prefix):
+            return text
+    return "Цвет темы"
+
+
+def flag_labels(flags):
+    flags = u32(flags)
+    out = []
+    for bit, label in FLAG_LABELS:
+        if flags & bit and label not in out:
+            out.append(label)
+    return out
+
+
+PALETTE = [
+    0xFFF44336, 0xFFE91E63, 0xFF9C27B0, 0xFF673AB7, 0xFF3F51B5, 0xFF2196F3,
+    0xFF2AABEE, 0xFF03A9F4, 0xFF00BCD4, 0xFF009688, 0xFF4CAF50, 0xFF8BC34A,
+    0xFFCDDC39, 0xFFFFEB3B, 0xFFFFC107, 0xFFFF9800, 0xFFFF5722, 0xFF795548,
+    0xFF9E9E9E, 0xFF607D8B, 0xFFFFFFFF, 0xFF8E8E93, 0xFF2C2C2E, 0xFF1C1C1E,
+    0xFF000000, 0x80000000, 0x00000000,
+]
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Движок: работа с цветами темы
+# ════════════════════════════════════════════════════════════════════
+
+THEME = "org.telegram.ui.ActionBar.Theme"
+
+
+class _ApplyCommonThemeHook(MethodHook):
+    """Перед Theme.applyCommonTheme() заново кладём свои цвета в тему:
+    так изменения переживают смену темы, ночной режим и т.п."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+
+    def before_hooked_method(self, param):
+        try:
+            self.engine.reapply_quick()
+        except Exception:
+            log_exc("hook")
+
+    def after_hooked_method(self, param):
+        pass
+
+
+class _PinnedFillHook(MethodHook):
+    """В новых версиях Telegram заливка закреплённых чатов отключена в самом
+    коде. Если пользователь задал chats_pinnedOverlay — рисуем её сами
+    (под содержимым ячейки, поверх её фона)."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+        self.paint = None
+
+    def before_hooked_method(self, param):
+        try:
+            color = self.engine.overrides.get("chats_pinnedOverlay")
+            if color is None or c_a(color) == 0:
+                return
+            cell = param.thisObject
+            if cell is None or not bool(cell.getIsPinned()):
+                return
+            if self.paint is None:
+                self.paint = J("android.graphics.Paint")()
+            self.paint.setColor(ji(color))
+            canvas = param.args[0]
+            canvas.drawRect(0.0, 0.0, float(cell.getMeasuredWidth()), float(cell.getMeasuredHeight()), self.paint)
+        except Exception:
+            log_exc("pinned fill")
+
+    def after_hooked_method(self, param):
+        pass
+
+
+class _ChatThemeHook(MethodHook):
+    """У чатов со своей темой (обои/цвета чата) цвета берутся из отдельной
+    таблицы ThemeDelegate. После её заполнения дописываем туда наши цвета,
+    иначе при повторном входе в чат изменения «откатываются»."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+
+    def before_hooked_method(self, param):
+        pass
+
+    def after_hooked_method(self, param):
+        try:
+            self.engine.patch_delegate(param.thisObject)
+        except Exception:
+            log_exc("chat theme hook")
+
+
+class Engine:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.overrides = {}          # name -> u32
+        self._names = None           # index -> name
+        self._ids = {}               # name -> index
+        self._orig_defaults = {}     # kid -> исходное значение defaultColors[kid]
+        self._hook = None
+        self.hook_ok = False
+        self._preview = None         # (kid, present, value) для отмены
+        self._blink_token = 0
+        self._blink_state = None
+        self.dirty = False
+        self.anims = {}              # name -> {speed, phase, s, v, a}  (живые)
+        self.anims_saved = {}        # то, что записано в настройках
+        self._anim_token = 0
+        self._anim_running = False
+        self._anim_paused = False
+        self._anim_owner = False     # мы включили Theme.animatingColors
+        self.screen = {"title": "", "keys": [], "descs": [], "fragments": []}
+
+    # ── ключи ──
+    @property
+    def T(self):
+        return J(THEME)
+
+    def names(self):
+        if self._names is None:
+            TC = J("org.telegram.ui.ActionBar.ThemeColors")
+            count = int(self.T.colorsCount)
+            names = []
+            for i in range(count):
+                n = None
+                try:
+                    n = TC.getStringName(i)
+                except Exception:
+                    n = None
+                names.append(str(n) if n is not None else None)
+            self._names = names
+            self._ids = {n: i for i, n in enumerate(names) if n}
+        return self._names
+
+    def all_keys(self):
+        return [n for n in self.names() if n and n not in NON_COLOR_KEYS]
+
+    def key_id(self, name):
+        self.names()
+        kid = self._ids.get(name, -1)
+        if kid < 0:
+            try:
+                kid = int(J("org.telegram.ui.ActionBar.ThemeColors").stringKeyToInt(name))
+            except Exception:
+                kid = -1
+        return kid
+
+    def name_of(self, kid):
+        names = self.names()
+        if 0 <= kid < len(names):
+            return names[kid]
+        return None
+
+    def get(self, kid):
+        """Цвет ключа без учёта перелива/мигания (то, что сохранится)."""
+        try:
+            return u32(self.T.getColor(int(kid), None, True))
+        except Exception:
+            pass
+        try:
+            return u32(self.T.getColor(int(kid)))
+        except Exception:
+            return 0xFFFF00FF
+
+    # ── хранение ──
+    def load(self):
+        raw = self.plugin.get_setting("overrides", "{}")
+        data = {}
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        self.overrides = {}
+        for k, v in data.items():
+            c = parse_color(v) if isinstance(v, str) else (u32(v) if isinstance(v, int) else None)
+            if c is not None:
+                self.overrides[str(k)] = c
+
+    def save(self):
+        data = {k: hex_color(v) for k, v in sorted(self.overrides.items())}
+        self.plugin.set_setting("overrides", json.dumps(data))
+
+    # ── низкий уровень ──
+    def _current_colors(self):
+        return get_static(THEME, "currentColors")
+
+    def _read_default_raw(self, kid):
+        arr = get_static(THEME, "defaultColors")
+        if arr is not None:
+            try:
+                return int(arr[kid])
+            except Exception:
+                pass
+        try:
+            return int(self.T.getDefaultColor(int(kid)))
+        except Exception:
+            return 0
+
+    def _put(self, kid, color):
+        """Поставить цвет ключу (в текущие цвета темы и в дефолтные —
+        чтобы работало и на стандартной теме, где currentColors игнорируется)."""
+        if kid < 0:
+            return
+        c = s32(color)
+        try:
+            self.T.setColor(int(kid), c, False)
+        except Exception:
+            log_exc("setColor")
+        if kid not in self._orig_defaults:
+            self._orig_defaults[kid] = self._read_default_raw(kid)
+        try:
+            self.T.setDefaultColor(int(kid), c)
+        except Exception:
+            pass
+
+    def _restore_default(self, kid):
+        if kid in self._orig_defaults:
+            raw = self._orig_defaults.pop(kid)
+            try:
+                self.T.setDefaultColor(int(kid), int(raw))
+            except Exception:
+                pass
+
+    def reapply_quick(self):
+        """Вызывается из хука: только положить цвета, без побочных эффектов."""
+        if not self.overrides:
+            return
+        cc = self._current_colors()
+        for name, color in self.overrides.items():
+            kid = self.key_id(name)
+            if kid < 0:
+                continue
+            if cc is not None:
+                try:
+                    cc.put(int(kid), s32(color))
+                    continue
+                except Exception:
+                    cc = None
+            try:
+                self.T.setColor(int(kid), s32(color), False)
+            except Exception:
+                pass
+
+    def reapply_all(self):
+        for name, color in self.overrides.items():
+            self._put(self.key_id(name), color)
+
+    # ── хук ──
+    def install_hook(self):
+        try:
+            cls = java_class_of(THEME)
+            m = cls.getDeclaredMethod("applyCommonTheme")
+            m.setAccessible(True)
+            self._hook = self.plugin.hook_method(m, _ApplyCommonThemeHook(self))
+            self.hook_ok = self._hook is not None
+        except Exception:
+            log_exc("install_hook")
+            self.hook_ok = False
+
+    def install_chat_theme_hook(self):
+        self._chat_hooks = None
+        try:
+            cls = java_class_of("org.telegram.ui.ChatActivity$ThemeDelegate")
+            self._chat_hooks = self.plugin.hook_all_methods(cls, "setupChatTheme", _ChatThemeHook(self))
+        except Exception:
+            log_exc("install_chat_theme_hook")
+
+    def patch_delegate(self, td):
+        """Положить наши цвета в таблицу темы чата (если у чата своя тема)."""
+        if td is None or not self.overrides:
+            return False
+        if get_field(td, "chatTheme") is None:
+            return False          # обычный чат берёт цвета из общей темы
+        cc = get_field(td, "currentColors")
+        if cc is None:
+            return False
+        for name, color in self.overrides.items():
+            kid = self.key_id(name)
+            if kid >= 0:
+                try:
+                    cc.put(int(kid), s32(color))
+                except Exception:
+                    return False
+        return True
+
+    def chat_fragments(self):
+        out = []
+        try:
+            act = get_activity()
+            layout = act.getActionBarLayout() if act is not None else None
+            if layout is None:
+                return out
+            ChatC = java_class_of("org.telegram.ui.ChatActivity")
+            stack = layout.getFragmentStack()
+            for i in range(int(stack.size())):
+                f = stack.get(i)
+                if f is not None and ChatC.isInstance(f):
+                    out.append(f)
+        except Exception:
+            log_exc("chat_fragments")
+        return out
+
+    def resync_chat_delegates(self):
+        """Пересобрать таблицы открытых чатов со своей темой: цвета темы чата + наши."""
+        for f in self.chat_fragments():
+            try:
+                td = get_field(f, "themeDelegate")
+                if td is None:
+                    continue
+                theme = get_field(td, "chatTheme")
+                if theme is None:
+                    continue
+                try:
+                    acc = int(f.getCurrentAccount())
+                    dark = bool(get_field(td, "isDark"))
+                    fresh = theme.createColors(acc, 1 if dark else 0)
+                    if fresh is not None:
+                        set_field(td, "currentColors", fresh)
+                except Exception:
+                    pass
+                self.patch_delegate(td)
+            except Exception:
+                log_exc("resync delegate")
+
+    def install_pinned_hook(self):
+        try:
+            cls = java_class_of("org.telegram.ui.Cells.DialogCell")
+            m = cls.getDeclaredMethod("onDraw", java_class_of("android.graphics.Canvas"))
+            m.setAccessible(True)
+            self._pin_hook = self.plugin.hook_method(m, _PinnedFillHook(self))
+        except Exception:
+            log_exc("install_pinned_hook")
+            self._pin_hook = None
+
+    def remove_hook(self):
+        ch = getattr(self, "_chat_hooks", None)
+        if ch:
+            for u in (ch if isinstance(ch, (list, tuple)) else [ch]):
+                try:
+                    self.plugin.unhook_method(u)
+                except Exception:
+                    pass
+            self._chat_hooks = None
+        pin = getattr(self, "_pin_hook", None)
+        if pin is not None:
+            try:
+                self.plugin.unhook_method(pin)
+            except Exception:
+                pass
+            self._pin_hook = None
+        if self._hook is not None:
+            try:
+                self.plugin.unhook_method(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+            self.hook_ok = False
+
+    # ── обновление интерфейса ──
+    def refresh_theme(self):
+        """Пересобрать цвета темы (хук вернёт наши изменения) и обновить UI."""
+        T = self.T
+        # дефолтные цвета (нужны стандартной теме) переживают refresh сами
+        self.reapply_all()
+        try:
+            T.refreshThemeColors(False, True)
+        except Exception:
+            try:
+                T.refreshThemeColors()
+            except Exception:
+                log_exc("refreshThemeColors")
+        if not self.hook_ok:
+            self.reapply_all()
+            for fn in ("applyCommonTheme", "applyDialogsTheme", "applyProfileTheme"):
+                try:
+                    getattr(T, fn)()
+                except Exception:
+                    pass
+            try:
+                T.applyChatTheme(False, False)
+            except Exception:
+                pass
+        self.resync_chat_delegates()
+        self.refresh_views(None)
+        self.rebuild_hidden()
+
+    def rebuild_hidden(self):
+        try:
+            act = get_activity()
+            layout = act.getActionBarLayout() if act is not None else None
+            if layout is not None:
+                layout.rebuildAllFragmentViews(False, False)
+        except Exception:
+            log_exc("rebuild_hidden")
+
+    def rebuild_all(self):
+        try:
+            act = get_activity()
+            layout = act.getActionBarLayout() if act is not None else None
+            if layout is not None:
+                layout.rebuildAllFragmentViews(True, True)
+        except Exception:
+            log_exc("rebuild_all")
+
+    def visible_fragments(self):
+        LA = J("org.telegram.ui.LaunchActivity")
+        frags = []
+        seen = set()
+        System = J("java.lang.System")
+        for getter in ("getLastFragmentIncludeMainTabs", "getLastFragment"):
+            try:
+                f = getattr(LA, getter)()
+            except Exception:
+                f = None
+            if f is None:
+                continue
+            try:
+                hid = int(System.identityHashCode(f))
+            except Exception:
+                hid = id(f)
+            if hid not in seen:
+                seen.add(hid)
+                frags.append(f)
+        return frags
+
+    def descriptions(self, fragment):
+        out = []
+        try:
+            arr = fragment.getThemeDescriptions()
+        except Exception:
+            log_exc("getThemeDescriptions")
+            arr = None
+        if arr is None:
+            return out
+        try:
+            n = int(arr.size())
+            for i in range(n):
+                d = arr.get(i)
+                if d is None:
+                    continue
+                try:
+                    out.append((int(d.getCurrentKey()), d))
+                except Exception:
+                    pass
+        except Exception:
+            log_exc("descriptions iterate")
+        return out
+
+    def snapshot_screen(self):
+        frags = self.visible_fragments()
+        descs = []
+        keys = []
+        seen = set()
+        title = ""
+        for f in frags:
+            if not title:
+                try:
+                    title = str(f.getClass().getSimpleName())
+                except Exception:
+                    title = ""
+            for kid, d in self.descriptions(f):
+                descs.append((kid, d))
+                n = self.name_of(kid)
+                if n and n not in seen and n not in NON_COLOR_KEYS:
+                    seen.add(n)
+                    keys.append(n)
+        self.screen = {"title": title, "keys": keys, "descs": descs, "fragments": frags}
+        return self.screen
+
+    def descs_for(self, kid):
+        return [d for k, d in self.screen.get("descs", []) if k == kid]
+
+    def apply_descs(self, kid, color=None):
+        c = self.get(kid) if color is None else color
+        for d in self.descs_for(kid):
+            try:
+                d.setColor(s32(c), False, False)
+            except Exception:
+                pass
+
+    def refresh_views(self, kids=None):
+        try:
+            if not self.screen.get("descs"):
+                self.snapshot_screen()
+            for kid, d in self.screen.get("descs", []):
+                if kids is not None and kid not in kids:
+                    continue
+                try:
+                    d.setColor(s32(self.get(kid)), False, False)
+                except Exception:
+                    pass
+        except Exception:
+            log_exc("refresh_views")
+        self.invalidate_all()
+
+    def invalidate_all(self):
+        act = get_activity()
+        if act is None:
+            return
+        try:
+            invalidate_tree(act.getWindow().getDecorView())
+        except Exception:
+            log_exc("invalidate_all")
+
+    # ── редактирование ──
+    def begin_preview(self, kid):
+        present, value = None, None
+        cc = self._current_colors()
+        if cc is not None:
+            try:
+                idx = int(cc.indexOfKey(int(kid)))
+                present = idx >= 0
+                value = int(cc.valueAt(idx)) if present else 0
+            except Exception:
+                present = None
+        self._preview = (kid, present, value)
+
+    def preview(self, kid, color, final=False):
+        name = self.name_of(kid)
+        if name in WALLPAPER_KEYS and not final:
+            return
+        self.stop_blink()
+        self.dirty = True
+        self._put(kid, color)
+        if final:
+            for f in self.chat_fragments():
+                td = get_field(f, "themeDelegate")
+                cc = get_field(td, "currentColors") if td is not None and get_field(td, "chatTheme") is not None else None
+                if cc is not None:
+                    try:
+                        cc.put(int(kid), s32(color))
+                    except Exception:
+                        pass
+        self.apply_descs(kid, color)
+        if final:
+            self.invalidate_all()
+
+    def cancel_preview(self):
+        if self._preview is None:
+            return
+        kid, present, value = self._preview
+        self._preview = None
+        name = self.name_of(kid)
+        if name in self.overrides:
+            self._put(kid, self.overrides[name])
+        elif present is None:
+            self._restore_default(kid)
+            self.refresh_theme()
+            return
+        else:
+            try:
+                if present:
+                    self.T.setColor(int(kid), int(value), False)
+                else:
+                    self.T.setColor(int(kid), 0, True)
+            except Exception:
+                log_exc("cancel setColor")
+            self._restore_default(kid)
+        self.resync_chat_delegates()
+        self.apply_descs(kid)
+        self.invalidate_all()
+
+    def commit(self, kid, color):
+        name = self.name_of(kid)
+        if not name:
+            return
+        self._preview = None
+        self.dirty = True
+        self.overrides[name] = u32(color)
+        self.save()
+        self._put(kid, color)
+        self.resync_chat_delegates()
+        self.apply_descs(kid, color)
+        self.invalidate_all()
+
+    def remove_override(self, name, refresh=True):
+        if name not in self.overrides:
+            return
+        self.overrides.pop(name, None)
+        self.dirty = True
+        self.save()
+        kid = self.key_id(name)
+        self._restore_default(kid)
+        if refresh:
+            self.refresh_theme()
+
+    def reset_all(self):
+        self.anims = {}
+        self.anims_saved = {}
+        self.save_anims()
+        self._anim_sync()
+        if self.overrides:
+            data = {k: hex_color(v) for k, v in sorted(self.overrides.items())}
+            self.plugin.set_setting("overrides_backup", json.dumps(data))
+        self.overrides = {}
+        self.dirty = True
+        self.save()
+        for kid in list(self._orig_defaults.keys()):
+            self._restore_default(kid)
+        self.refresh_theme()
+
+    def restore_everything(self):
+        """При выгрузке плагина: вернуть тему как была."""
+        self.anim_halt()
+        self.remove_hook()
+        for kid in list(self._orig_defaults.keys()):
+            self._restore_default(kid)
+        try:
+            self.T.refreshThemeColors(False, True)
+        except Exception:
+            try:
+                self.T.refreshThemeColors()
+            except Exception:
+                pass
+        if is_ui_thread():
+            try:
+                self.refresh_views(None)
+                self.rebuild_hidden()
+            except Exception:
+                pass
+
+    # ── RGB-перелив ──
+    def anim_fps(self):
+        try:
+            i = int(self.plugin.get_setting("anim_fps", 1) or 0)
+        except Exception:
+            i = 1
+        return (10, 20, 30)[max(0, min(2, i))]
+
+    @staticmethod
+    def clean_anim(v):
+        def f(x, lo, hi, d):
+            try:
+                return max(lo, min(hi, float(x)))
+            except Exception:
+                return d
+        return {"speed": f(v.get("speed"), 10, 360, 90), "phase": f(v.get("phase"), 0, 360, 0),
+                "s": f(v.get("s"), 0, 1, 1), "v": f(v.get("v"), 0, 1, 1),
+                "a": int(f(v.get("a"), 0, 255, 255))}
+
+    def load_anims(self):
+        raw = self.plugin.get_setting("anims", "{}")
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        self.anims = {}
+        for k, v in data.items():
+            if isinstance(v, dict) and str(k) not in WALLPAPER_KEYS and str(k) not in NON_COLOR_KEYS:
+                self.anims[str(k)] = self.clean_anim(v)
+        self.anims_saved = {k: dict(v) for k, v in self.anims.items()}
+
+    def save_anims(self):
+        self.plugin.set_setting("anims", json.dumps(self.anims_saved))
+
+    def anim_set(self, name, cfg, persist=False):
+        """Включить/обновить перелив ключа (cfg=None — выключить)."""
+        if name in WALLPAPER_KEYS or name in NON_COLOR_KEYS:
+            return False
+        if cfg is None:
+            self.anims.pop(name, None)
+            if persist:
+                self.anims_saved.pop(name, None)
+                self.save_anims()
+            self._anim_sync()
+            return True
+        self.anims[name] = self.clean_anim(cfg)
+        if persist:
+            self.anims_saved[name] = dict(self.anims[name])
+            self.save_anims()
+        self.anim_kick()
+        return True
+
+    def anim_revert(self, name):
+        saved = self.anims_saved.get(name)
+        if saved is None:
+            if name in self.anims:
+                self.anims.pop(name, None)
+                self._anim_sync()
+        else:
+            self.anims[name] = dict(saved)
+            self.anim_kick()
+
+    def anim_clear_all(self):
+        names = list(self.anims)
+        self.anims = {}
+        self.anims_saved = {}
+        self.save_anims()
+        self._anim_sync()
+        return len(names)
+
+    def anim_ribbon(self, names, speed=90.0, step=28.0):
+        """«RGB-лента»: радуга по ключам со сдвигом фазы — цвет бежит по элементам."""
+        n = 0
+        for name in names:
+            kid = self.key_id(name)
+            if kid < 0 or name in WALLPAPER_KEYS or name in NON_COLOR_KEYS:
+                continue
+            c = self.get(kid)
+            h, sat, val = color_hsv(c)
+            self.anims[name] = self.clean_anim({
+                "speed": speed, "phase": (n * step) % 360.0,
+                "s": max(sat, 0.75), "v": max(val, 0.85), "a": c_a(c) or 255})
+            self.anims_saved[name] = dict(self.anims[name])
+            n += 1
+        if n:
+            self.save_anims()
+            self.anim_kick()
+        return n
+
+    def anim_pause(self, paused):
+        self._anim_paused = bool(paused)
+        if paused:
+            self._anim_token += 1
+            self._anim_running = False
+        else:
+            self.anim_kick()
+
+    def anim_kick(self):
+        if not self.anims:
+            self._anim_sync()
+            return
+        if self._anim_running or self._anim_paused:
+            return
+        self._anim_running = True
+        self._anim_token += 1
+        token = self._anim_token
+        self._anim_tick(token, 0)
+
+    def _anim_tick(self, token, n):
+        if token != self._anim_token:
+            return
+        try:
+            if not self.anims:
+                self._anim_running = False
+                return
+            T = self.T
+            if not T.isAnimatingColor():
+                T.setAnimatingColor(True)
+                self._anim_owner = True
+            if n % 30 == 0:
+                self.snapshot_screen()      # экран мог смениться
+            now = time.time()
+            for name, cfg in list(self.anims.items()):
+                kid = self.key_id(name)
+                if kid < 0:
+                    continue
+                hue = (now * cfg["speed"] + cfg["phase"]) % 360.0
+                c = hsv_color(hue, cfg["s"], cfg["v"], cfg["a"])
+                T.setAnimatedColor(int(kid), s32(c))
+                self.apply_descs(kid, c)
+            if n % 2 == 0:
+                self.invalidate_all()
+        except Exception:
+            log_exc("anim tick")
+        post_ui(lambda: self._anim_tick(token, n + 1), int(1000 / self.anim_fps()))
+
+    def _anim_sync(self):
+        """Пересоздать таблицу анимированных цветов только из живых переливов."""
+        self._anim_token += 1
+        self._anim_running = False
+        try:
+            self.T.setAnimatingColor(False)
+        except Exception:
+            pass
+        self._anim_owner = False
+        if self.anims and not self._anim_paused:
+            self.anim_kick()
+        else:
+            try:
+                self.refresh_views(None)
+            except Exception:
+                pass
+
+    def anim_halt(self):
+        self.anims = {}
+        self._anim_sync()
+
+    # ── мигание: показать, где ключ ──
+    def blink(self, kid, times=6, interval=260, on_end=None):
+        self.stop_blink()
+        self._blink_token += 1
+        token = self._blink_token
+        T = self.T
+        orig = self.get(kid)
+        hi = highlight_for(orig)
+        use_anim = False
+        try:
+            if not T.isAnimatingColor():
+                T.setAnimatingColor(True)
+                use_anim = True
+        except Exception:
+            use_anim = False
+        self._blink_state = (kid, use_anim)
+
+        def step(i):
+            if token != self._blink_token:
+                return
+            if i >= times:
+                self.stop_blink()
+                if on_end:
+                    on_end()
+                return
+            c = hi if i % 2 == 0 else orig
+            try:
+                T.setAnimatedColor(int(kid), s32(c))
+            except Exception:
+                pass
+            self.apply_descs(kid, c)
+            self.invalidate_all()
+            post_ui(lambda: step(i + 1), interval)
+
+        step(0)
+
+    def stop_blink(self):
+        st = self._blink_state
+        if st is None:
+            return
+        self._blink_state = None
+        self._blink_token += 1
+        kid, use_anim = st
+        if self.anims:
+            # таблицу делит перелив: пересоберём её, чтобы не осталось следов мигания
+            self._anim_sync()
+        elif use_anim:
+            try:
+                self.T.setAnimatingColor(False)
+            except Exception:
+                pass
+        self.apply_descs(kid)
+        self.invalidate_all()
+
+    # ── геометрия: где на экране элементы ключа ──
+    def desc_views(self, d, cache=None):
+        """Вью, которые красит ThemeDescription (повторяет его логику)."""
+        out = []
+        view = get_field(d, "viewToInvalidate")
+        if view is None:
+            return out
+        classes = get_field(d, "listClasses")
+        if classes is None or len(classes) == 0:
+            out.append(view)
+            return out
+        fields = get_field(d, "listClassesFieldName")
+        flags = as_int(get_field(d, "changeFlags"), 0)
+        kid = as_int(d.getCurrentKey(), -1)
+        if cache is not None:
+            vid = ident(view)
+            cands = cache.get(vid)
+            if cands is None:
+                cands = [view] + children_of(view, 120)
+                cache[vid] = cands
+        else:
+            cands = [view] + children_of(view, 120)
+        ViewC = java_class_of("android.view.View")
+        for child in cands:
+            for b in range(len(classes)):
+                cls = classes[b]
+                if cls is None:
+                    continue
+                try:
+                    if not cls.isInstance(child):
+                        continue
+                except Exception:
+                    continue
+                if (u32(flags) & 0x00040000) and as_int(child.getTag(), -999) != kid:
+                    continue
+                target = child
+                if fields is not None and b < len(fields) and fields[b] is not None:
+                    fv = get_field(child, str(fields[b]))
+                    try:
+                        if fv is not None and ViewC.isInstance(fv):
+                            target = cast(J("android.view.View"), fv)
+                    except Exception:
+                        pass
+                out.append(target)
+                break
+        return out
+
+    def rects_for_key(self, kid, limit=40):
+        rects = []
+        seen = set()
+        cache = {}
+        for d in self.descs_for(kid):
+            try:
+                views = self.desc_views(d, cache)
+            except Exception:
+                log_exc("desc_views")
+                views = []
+            for v in views:
+                r = view_rect(v)
+                if r is None:
+                    continue
+                key = tuple(r)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rects.append(r)
+                if len(rects) >= limit:
+                    return rects
+        return rects
+
+    def find_at(self, x, y, pixel, samples=None):
+        """Пипетка: какие ключи отвечают за точку (x, y) окна.
+        pixel — цвет точно под пальцем, samples — цвета вокруг (радиус ~6dp).
+        -> [(rank, area, name, tags, rect)], лучшие первыми."""
+        hits = {}  # name -> [area, tags, desc_hit, rect]
+        cache = {}
+        rect_cache = {}
+        for kid, d in self.screen.get("descs", []):
+            name = self.name_of(kid)
+            if not name or name in NON_COLOR_KEYS:
+                continue
+            try:
+                views = self.desc_views(d, cache)
+            except Exception:
+                views = []
+            for v in views:
+                vid = ident(v)
+                if vid in rect_cache:
+                    r = rect_cache[vid]
+                else:
+                    r = view_rect(v)
+                    rect_cache[vid] = r
+                if r is None:
+                    continue
+                if r[0] <= x <= r[0] + r[2] and r[1] <= y <= r[1] + r[3]:
+                    area = max(1, r[2] * r[3])
+                    e = hits.get(name)
+                    if e is None:
+                        e = [area, [], True, r]
+                        hits[name] = e
+                    if area < e[0]:
+                        e[0] = area
+                        e[3] = r
+                    for lb in flag_labels(as_int(get_field(d, "changeFlags"), 0)):
+                        if lb not in e[1]:
+                            e[1].append(lb)
+        # совпадения по цвету: точно под пальцем и рядом
+        samples = [c for c in (samples or []) if c is not None]
+        dominant = None
+        if samples:
+            counts = {}
+            for c in samples:
+                counts[c & 0xFFFFFF] = counts.get(c & 0xFFFFFF, 0) + 1
+            dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+        center, near = set(), set()
+        if pixel is not None or samples:
+            for name in self.all_keys():
+                if name in NON_COLOR_KEYS:
+                    continue
+                c = self.get(self.key_id(name))
+                if c_a(c) < 0xF5:
+                    continue
+                if pixel is not None and color_dist(c, pixel) <= 3:
+                    center.add(name)
+                elif any(color_dist(c, sc) <= 3 for sc in samples):
+                    if dominant is None or color_dist(c, dominant) > 3:
+                        near.add(name)       # мелкая деталь рядом (иконка, текст)
+            for name in center | near:
+                if name not in hits:
+                    hits[name] = [10 ** 12, [], False, None]
+        items = []
+        for name, e in hits.items():
+            tags = list(e[1])
+            desc = e[2]
+            if name in center:
+                tags.append("цвет под пальцем")
+            elif name in near:
+                tags.append("цвет рядом")
+            if desc and name in center:
+                rank = 0
+            elif desc and name in near:
+                rank = 1
+            elif name in center:
+                rank = 2
+            elif desc:
+                rank = 3
+            else:
+                rank = 4
+            items.append((rank, e[0], name, tags, e[3]))
+        items.sort(key=lambda t: (t[0], t[1], t[2]))
+        return items[:60]
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Навигатор: на каком экране используется цвет и как туда попасть
+# ════════════════════════════════════════════════════════════════════
+
+ROUTE_LABELS = {
+    "dialogs": "Список чатов",
+    "chat": "Чат",
+    "profile": "Ваш профиль",
+    "settings": "Настройки уведомлений",
+    "chat_settings": "Настройки оформления",
+    "privacy": "Конфиденциальность",
+    "calls": "Звонки",
+    "contacts": "Контакты",
+    "drawer": "Боковое меню",
+    "dialog": "Всплывающее окно",
+}
+
+ROUTE_CLASSES = {
+    "dialogs": "org.telegram.ui.DialogsActivity",
+    "chat": "org.telegram.ui.ChatActivity",
+    "profile": "org.telegram.ui.ProfileActivity",
+    "settings": "org.telegram.ui.NotificationsSettingsActivity",
+    "chat_settings": "org.telegram.ui.ThemeActivity",
+    "privacy": "org.telegram.ui.PrivacySettingsActivity",
+    "calls": "org.telegram.ui.CallLogActivity",
+    "contacts": "org.telegram.ui.ContactsActivity",
+}
+
+# порядок важен: первое совпадение префикса
+STATIC_ROUTES = [
+    ("chats_menu", "drawer"),
+    ("chats_", "dialogs"),
+    ("actionBarDefaultSubmenu", None),
+    ("actionBarActionMode", "chat"),
+    ("actionBarTab", "dialogs"),
+    ("actionBar", "dialogs"),
+    ("avatar_backgroundActionBar", "profile"),
+    ("avatar_actionBar", "profile"),
+    ("avatar_backgroundInProfile", "profile"),
+    ("avatar_subtitleInProfile", "profile"),
+    ("avatar_nameInMessage", "chat"),
+    ("avatar_", "dialogs"),
+    ("profile_", "profile"),
+    ("chat_", "chat"),
+    ("code_", "chat"),
+    ("table_", "chat"),
+    ("dialog", "dialog"),
+    ("switch", "settings"),
+    ("checkbox", "settings"),
+    ("radio", "settings"),
+    ("windowBackground", "settings"),
+    ("graySection", "settings"),
+    ("key_graySection", "settings"),
+    ("divider", "settings"),
+    ("listSelector", "settings"),
+    ("calls_", "calls"),
+    ("contacts_", "contacts"),
+    ("fastScroll", "contacts"),
+    ("stories", "dialogs"),
+    ("topics", "dialogs"),
+]
+
+PROBE_ORDER = ["dialogs", "chat", "profile", "settings", "chat_settings", "privacy", "calls", "contacts"]
+
+
+def static_route(name):
+    for prefix, rid in STATIC_ROUTES:
+        if name.startswith(prefix):
+            return rid
+    return None
+
+
+class Navigator:
+    def __init__(self, engine):
+        self.engine = engine
+        self._probe = None    # name -> [route ids]
+        self._probed_ok = set()
+
+    # ── аккаунт / цели ──
+    def _account(self):
+        try:
+            return int(J("org.telegram.messenger.UserConfig").selectedAccount)
+        except Exception:
+            return 0
+
+    def _self_id(self):
+        try:
+            return int(J("org.telegram.messenger.UserConfig").getInstance(self._account()).getClientUserId())
+        except Exception:
+            return 0
+
+    def _chat_target(self):
+        """Первый личный чат из списка (там есть и входящие, и исходящие), иначе «Избранное»."""
+        me = self._self_id()
+        try:
+            mc = J("org.telegram.messenger.MessagesController").getInstance(self._account())
+            dialogs = mc.getAllDialogs()
+            DO = J("org.telegram.messenger.DialogObject")
+            n = min(int(dialogs.size()), 60)
+            for i in range(n):
+                d = dialogs.get(i)
+                did = int(d.id)
+                if did > 0 and did != me and bool(DO.isUserDialog(did)):
+                    return did
+        except Exception:
+            log_exc("chat target")
+        return me
+
+    def _bundle(self, user_id):
+        b = J("android.os.Bundle")()
+        b.putLong("user_id", int(user_id))
+        return b
+
+    def make_fragment(self, rid):
+        if rid == "dialogs":
+            return J(ROUTE_CLASSES[rid])(None)
+        if rid == "chat":
+            return J(ROUTE_CLASSES[rid])(self._bundle(self._chat_target()))
+        if rid == "profile":
+            return J(ROUTE_CLASSES[rid])(self._bundle(self._self_id()))
+        if rid == "chat_settings":
+            return J(ROUTE_CLASSES[rid])(0)
+        if rid == "contacts":
+            return J(ROUTE_CLASSES[rid])(None)
+        if rid in ROUTE_CLASSES:
+            return J(ROUTE_CLASSES[rid])()
+        return None
+
+    # ── где используется ключ ──
+    def probe(self):
+        """Один раз собрать ключи популярных экранов (без их показа)."""
+        if self._probe is not None:
+            return self._probe
+        res = {}
+        for rid in PROBE_ORDER:
+            descs = []
+            try:
+                frag = self.make_fragment(rid)
+                if frag is not None:
+                    arr = frag.getThemeDescriptions()
+                    if arr is not None:
+                        for i in range(int(arr.size())):
+                            d = arr.get(i)
+                            if d is not None:
+                                descs.append((int(d.getCurrentKey()), d))
+                        self._probed_ok.add(rid)
+            except Exception:
+                descs = []
+            for kid, d in descs:
+                n = self.engine.name_of(kid)
+                if not n:
+                    continue
+                lst = res.setdefault(n, [])
+                if rid not in lst:
+                    lst.append(rid)
+        self._probe = res
+        return res
+
+    def is_current(self, rid):
+        cls_name = ROUTE_CLASSES.get(rid)
+        if not cls_name:
+            return False
+        try:
+            c = java_class_of(cls_name)
+        except Exception:
+            return False
+        for f in self.engine.visible_fragments():
+            try:
+                if c.isInstance(f):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def route_for(self, name):
+        """-> id экрана, где виден ключ, или None. Текущий экран не предлагается."""
+        st = static_route(name)
+        try:
+            cands = self.probe().get(name, [])
+        except Exception:
+            cands = []
+        order = []
+        # статический маршрут — первым, если опрос экрана его не опроверг
+        if st and (st in cands or st not in self._probed_ok):
+            order.append(st)
+        order.extend(r for r in cands if r not in order)
+        if st and st not in order:
+            order.append(st)
+        for rid in order:
+            if not self.is_current(rid):
+                return rid
+        return None
+
+    def where_label(self, name):
+        if name in self.engine.screen.get("keys", []):
+            return "на этом экране"
+        rid = self.route_for(name)
+        return ROUTE_LABELS.get(rid, "") if rid else ""
+
+    # ── переходы ──
+    def _last(self):
+        try:
+            return J("org.telegram.ui.LaunchActivity").getLastFragment()
+        except Exception:
+            return None
+
+    def go_root(self):
+        act = get_activity()
+        layout = act.getActionBarLayout() if act is not None else None
+        if layout is None:
+            return False
+        stack = layout.getFragmentStack()
+        n = int(stack.size())
+        roots = []
+        for cn in ("org.telegram.ui.DialogsActivity", "org.telegram.ui.MainTabsActivity"):
+            try:
+                roots.append(java_class_of(cn))
+            except Exception:
+                pass
+        idx = None
+        for i in range(n):
+            f = stack.get(i)
+            if any(rc.isInstance(f) for rc in roots):
+                idx = i
+                break
+        if idx is None:
+            last = self._last()
+            return bool(last.presentFragment(self.make_fragment("dialogs"))) if last is not None else False
+        if idx >= n - 1:
+            return True
+        frags = [stack.get(i) for i in range(idx + 1, n)]
+        for f in frags[:-1]:
+            try:
+                f.removeSelfFromStack()
+            except Exception:
+                pass
+        frags[-1].finishFragment()
+        return True
+
+    def open_drawer(self):
+        act = get_activity()
+        dlc = None
+        try:
+            dlc = act.drawerLayoutContainer
+        except Exception:
+            dlc = get_field(act, "drawerLayoutContainer")
+        if dlc is None:
+            return False
+        try:
+            dlc.openDrawer(False)
+            return True
+        except Exception:
+            return False
+
+    def navigate(self, rid):
+        """Перейти на экран. True, если переход начат."""
+        try:
+            if rid == "dialogs":
+                return self.go_root()
+            if rid == "drawer":
+                self.go_root()
+                post_ui(lambda: (self.open_drawer() or toast("Откройте боковое меню вручную")), 420)
+                return True
+            last = self._last()
+            frag = self.make_fragment(rid)
+            if last is None or frag is None:
+                return False
+            return bool(last.presentFragment(frag))
+        except Exception:
+            log_exc("navigate " + str(rid))
+            return False
+
+
+def children_of(view, limit=200):
+    """Прямые дети ViewGroup (как в ThemeDescription)."""
+    out = []
+    try:
+        VG = J("android.view.ViewGroup")
+        if not java_class_of("android.view.ViewGroup").isInstance(view):
+            return out
+        g = cast(VG, view)
+        n = min(int(g.getChildCount()), limit)
+        for i in range(n):
+            c = g.getChildAt(i)
+            if c is not None:
+                out.append(c)
+    except Exception:
+        pass
+    return out
+
+
+def invalidate_tree(root, limit=5000):
+    VGc = java_class_of("android.view.ViewGroup")
+    VG = J("android.view.ViewGroup")
+    stack = [root]
+    n = 0
+    while stack and n < limit:
+        v = stack.pop()
+        n += 1
+        try:
+            v.invalidate()
+            if VGc.isInstance(v):
+                g = cast(VG, v)
+                for i in range(int(g.getChildCount())):
+                    c = g.getChildAt(i)
+                    if c is not None:
+                        stack.append(c)
+        except Exception:
+            pass
+
+
+def view_rect(v):
+    """[x, y, w, h] во координатах окна, или None если не видно."""
+    try:
+        if v is None or not v.isShown():
+            return None
+        w, h = int(v.getWidth()), int(v.getHeight())
+        if w <= 0 or h <= 0:
+            return None
+        loc = jarray(jint)([0, 0])
+        v.getLocationInWindow(loc)
+        x, y = int(loc[0]), int(loc[1])
+        act = get_activity()
+        if act is not None:
+            dv = act.getWindow().getDecorView()
+            W, H = int(dv.getWidth()), int(dv.getHeight())
+            if x + w <= 0 or y + h <= 0 or x >= W or y >= H:
+                return None
+        return [x, y, w, h]
+    except Exception:
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  UI-кит: стили, drawable, базовые вью
+# ════════════════════════════════════════════════════════════════════
+
+DARK = dict(bg=0xFF15151C, card=0xFF1F1F29, card2=0xFF2A2A36, stroke=0xFF30303E,
+            text=0xFFF4F4F8, sub=0xFF9C9CAE, hint=0xFF6F6F82, accent=0xFF8E7CFF,
+            accent2=0xFF5B8CFF, on_accent=0xFFFFFFFF, danger=0xFFFF5C72, ok=0xFF3DDC97,
+            ripple=0x26FFFFFF, handle=0xFF3E3E4E, shadow=0x66000000)
+LIGHT = dict(bg=0xFFFFFFFF, card=0xFFF3F3F8, card2=0xFFE8E8F0, stroke=0xFFE0E0EA,
+             text=0xFF15151C, sub=0xFF6C6C7E, hint=0xFF9A9AAC, accent=0xFF6B5BEA,
+             accent2=0xFF3F7BFF, on_accent=0xFFFFFFFF, danger=0xFFE5484D, ok=0xFF16A34A,
+             ripple=0x1F000000, handle=0xFFD3D3DE, shadow=0x33000000)
+
+
+class Kit:
+    def __init__(self, ctx, pal):
+        self.ctx = ctx
+        self.p = pal
+        self.refs = []
+        self._bold = None
+        self._checker_bmp = None
+
+    def dp(self, v):
+        return dp(v)
+
+    @property
+    def bold(self):
+        if self._bold is None:
+            AU = J("org.telegram.messenger.AndroidUtilities")
+            tf = None
+            try:
+                tf = AU.bold()
+            except Exception:
+                tf = None
+            if tf is None:
+                try:
+                    tf = AU.getTypeface("fonts/rmedium.ttf")
+                except Exception:
+                    tf = None
+            if tf is None:
+                tf = J("android.graphics.Typeface").DEFAULT_BOLD
+            self._bold = tf
+        return self._bold
+
+    # ── drawables ──
+    def shape(self, color, radius=0, stroke=0, stroke_color=0, oval=False, radii=None):
+        d = J("android.graphics.drawable.GradientDrawable")()
+        if oval:
+            d.setShape(1)
+        d.setColor(ji(color))
+        if radii is not None:
+            d.setCornerRadii(jarray(jfloat)([float(self.dp(r)) for r in radii for _ in (0, 1)]))
+        elif radius and not oval:
+            d.setCornerRadius(float(self.dp(radius)))
+        if stroke:
+            d.setStroke(max(1, int(self.dp(stroke))), ji(stroke_color))
+        return d
+
+    def gradient(self, colors, orientation="LEFT_RIGHT", radius=0, oval=False):
+        GD = J("android.graphics.drawable.GradientDrawable")
+        orient = getattr(J("android.graphics.drawable.GradientDrawable$Orientation"), orientation)
+        d = GD(orient, jarray(jint)([s32(c) for c in colors]))
+        if oval:
+            d.setShape(1)
+        elif radius:
+            d.setCornerRadius(float(self.dp(radius)))
+        return d
+
+    def ripple(self, content=None, radius=12, oval=False, color=None):
+        mask = self.shape(0xFFFFFFFF, radius=radius, oval=oval)
+        csl = J("android.content.res.ColorStateList").valueOf(ji(color if color is not None else self.p["ripple"]))
+        return J("android.graphics.drawable.RippleDrawable")(csl, content, mask)
+
+    def checker(self):
+        if self._checker_bmp is None:
+            Bitmap = J("android.graphics.Bitmap")
+            cell = max(2, self.dp(4))
+            bmp = Bitmap.createBitmap(cell * 2, cell * 2, J("android.graphics.Bitmap$Config").ARGB_8888)
+            cv = J("android.graphics.Canvas")(bmp)
+            cv.drawColor(ji(0xFFFFFFFF))
+            p = J("android.graphics.Paint")()
+            p.setColor(ji(0xFFCFCFD8))
+            cv.drawRect(0.0, 0.0, float(cell), float(cell), p)
+            cv.drawRect(float(cell), float(cell), float(cell * 2), float(cell * 2), p)
+            self._checker_bmp = bmp
+        d = J("android.graphics.drawable.BitmapDrawable")(self.ctx.getResources(), self._checker_bmp)
+        TM = J("android.graphics.Shader$TileMode")
+        d.setTileModeXY(TM.REPEAT, TM.REPEAT)
+        return d
+
+    def icon(self, name, color, fallback=None):
+        """Иконка Telegram по имени ресурса, подкрашенная; None если нет."""
+        ctx = self.ctx
+        res = ctx.getResources()
+        rid = 0
+        for pkg in (str(ctx.getPackageName()), "org.telegram.messenger"):
+            try:
+                rid = int(res.getIdentifier(name, "drawable", pkg))
+            except Exception:
+                rid = 0
+            if rid:
+                break
+        if not rid:
+            try:
+                rid = int(getattr(J("org.telegram.messenger.R$drawable"), name))
+            except Exception:
+                rid = 0
+        if not rid:
+            return None
+        try:
+            d = ctx.getResources().getDrawable(rid).mutate()
+            PDM = J("android.graphics.PorterDuff$Mode")
+            d.setColorFilter(J("android.graphics.PorterDuffColorFilter")(ji(color), PDM.SRC_IN))
+            return d
+        except Exception:
+            return None
+
+    def target_icon(self, color):
+        """Иконка «прицел» для пипетки: кольцо + точка (рисуется в 22dp)."""
+        ring = self.shape(0x00000000, oval=True, stroke=2, stroke_color=color)
+        dot = self.shape(color, oval=True)
+        LD = J("android.graphics.drawable.LayerDrawable")
+        Drawable = J("android.graphics.drawable.Drawable")
+        ld = LD(jarray(Drawable)([ring, dot]))
+        ld.setLayerInset(0, self.dp(1), self.dp(1), self.dp(1), self.dp(1))
+        ld.setLayerInset(1, self.dp(7), self.dp(7), self.dp(7), self.dp(7))
+        return ld
+
+    # ── views ──
+    def text(self, s="", size=14, color=None, bold=False, lines=1, gravity=None, mono=False):
+        t = J("android.widget.TextView")(self.ctx)
+        t.setText(str(s))
+        t.setTextSize(1, float(size))
+        t.setTextColor(ji(self.p["text"] if color is None else color))
+        if bold:
+            t.setTypeface(self.bold)
+        if mono:
+            t.setTypeface(J("android.graphics.Typeface").MONOSPACE)
+        if lines == 1:
+            t.setSingleLine(True)
+            t.setEllipsize(J("android.text.TextUtils$TruncateAt").END)
+        elif lines:
+            t.setMaxLines(int(lines))
+            t.setEllipsize(J("android.text.TextUtils$TruncateAt").END)
+        if gravity is not None:
+            t.setGravity(int(gravity))
+        return t
+
+    def linear(self, vertical=True, gravity=None):
+        l = J("android.widget.LinearLayout")(self.ctx)
+        l.setOrientation(1 if vertical else 0)
+        if gravity is not None:
+            l.setGravity(int(gravity))
+        return l
+
+    def frame(self):
+        return J("android.widget.FrameLayout")(self.ctx)
+
+    def view(self):
+        return J("android.view.View")(self.ctx)
+
+    def llp(self, w, h, weight=0.0, l=0, t=0, r=0, b=0, gravity=None):
+        lp = J("android.widget.LinearLayout$LayoutParams")(int(w), int(h), float(weight))
+        lp.setMargins(self.dp(l), self.dp(t), self.dp(r), self.dp(b))
+        if gravity is not None:
+            lp.gravity = int(gravity)
+        return lp
+
+    def flp(self, w, h, gravity=G_TOP | G_LEFT, l=0, t=0, r=0, b=0):
+        lp = J("android.widget.FrameLayout$LayoutParams")(int(w), int(h), int(gravity))
+        lp.setMargins(self.dp(l), self.dp(t), self.dp(r), self.dp(b))
+        return lp
+
+    def icon_button(self, icon_name, fallback, color=None, size=40, drawable=None, on_tap=None):
+        color = self.p["sub"] if color is None else color
+        fl = self.frame()
+        fl.setBackground(self.ripple(None, oval=True))
+        d = drawable if drawable is not None else self.icon(icon_name, color)
+        if d is not None:
+            iv = J("android.widget.ImageView")(self.ctx)
+            iv.setImageDrawable(d)
+            iv.setScaleType(J("android.widget.ImageView$ScaleType").CENTER_INSIDE)
+            pad = self.dp(9)
+            iv.setPadding(pad, pad, pad, pad)
+            fl.addView(iv, self.flp(MATCH, MATCH))
+        else:
+            fl.addView(self.text(fallback, 17, color, gravity=G_CENTER), self.flp(MATCH, MATCH))
+        fl.setClickable(True)
+        if on_tap is not None:
+            on_click(fl, on_tap, self.refs)
+        return fl
+
+    def swatch(self, size, color, ring=True):
+        """Кружок цвета с шахматкой под прозрачностью. -> (view, color_view)."""
+        fl = self.frame()
+        fl.setBackground(self.shape(0xFFFFFFFF, oval=True))
+        try:
+            fl.setClipToOutline(True)
+        except Exception:
+            pass
+        chk = self.view()
+        chk.setBackground(self.checker())
+        fl.addView(chk, self.flp(MATCH, MATCH))
+        cv = self.view()
+        cv.setBackgroundColor(s32(color))
+        fl.addView(cv, self.flp(MATCH, MATCH))
+        if ring:
+            rv = self.view()
+            rv.setBackground(self.shape(0x00000000, oval=True, stroke=1, stroke_color=0x40808090))
+            fl.addView(rv, self.flp(MATCH, MATCH))
+        return fl, cv
+
+    def pill_button(self, label, filled=False, color=None, on_tap=None):
+        color = self.p["accent"] if color is None else color
+        t = self.text(label, 14.5, self.p["on_accent"] if filled else color, bold=True, gravity=G_CENTER)
+        bg = self.shape(color if filled else (color & 0x00FFFFFF) | 0x1F000000, radius=14)
+        t.setBackground(self.ripple(bg, radius=14, color=0x33FFFFFF if filled else None))
+        t.setPadding(self.dp(14), 0, self.dp(14), 0)
+        t.setClickable(True)
+        if on_tap is not None:
+            on_click(t, on_tap, self.refs)
+        return t
+
+    def edit(self, hint="", mono=False, size=15):
+        e = J("android.widget.EditText")(self.ctx)
+        e.setHint(str(hint))
+        e.setTextSize(1, float(size))
+        e.setTextColor(ji(self.p["text"]))
+        e.setHintTextColor(ji(self.p["hint"]))
+        e.setSingleLine(True)
+        e.setBackground(None)
+        e.setPadding(0, 0, 0, 0)
+        e.setImeOptions(6 | 0x10000000)
+        e.setInputType(1 | 0x80000)
+        if mono:
+            e.setTypeface(J("android.graphics.Typeface").MONOSPACE)
+        return e
+
+
+def hide_keyboard(view):
+    try:
+        J("org.telegram.messenger.AndroidUtilities").hideKeyboard(view)
+        return
+    except Exception:
+        pass
+    try:
+        imm = app_context().getSystemService("input_method")
+        imm.hideSoftInputFromWindow(view.getWindowToken(), 0)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Слайдер с градиентной дорожкой
+# ════════════════════════════════════════════════════════════════════
+
+class Slider:
+    def __init__(self, kit, on_change):
+        self.k = kit
+        self.on_change = on_change
+        self.frac = 0.0
+        self.colors = [0xFF000000, 0xFFFFFFFF]
+        self.thumb_color = 0xFFFFFFFF
+        k = kit
+        self.view = k.linear(False, G_CENTER_V)
+        self.label = k.text("", 12.5, k.p["sub"], bold=True, gravity=G_CENTER)
+        self.view.addView(self.label, k.llp(k.dp(18), MATCH))
+
+        self.track = k.frame()
+        self.view.addView(self.track, k.llp(0, k.dp(34), 1.0, l=6, r=8))
+
+        self.bar_host = k.frame()
+        self.bar_host.setBackground(k.shape(0xFFFFFFFF, radius=8))
+        try:
+            self.bar_host.setClipToOutline(True)
+        except Exception:
+            pass
+        self.chk = k.view()
+        self.chk.setBackground(k.checker())
+        self.chk.setVisibility(GONE)
+        self.bar_host.addView(self.chk, k.flp(MATCH, MATCH))
+        self.bar = k.view()
+        self.grad = k.gradient(self.colors)
+        self.bar.setBackground(self.grad)
+        self.bar_host.addView(self.bar, k.flp(MATCH, MATCH))
+        self.track.addView(self.bar_host, k.flp(MATCH, k.dp(16), G_CENTER_V | G_LEFT, l=11, r=11))
+
+        self.thumb = k.frame()
+        self.thumb.setBackground(k.shape(0x33000000, oval=True))
+        self.thumb_fill = k.view()
+        self.thumb_fill_d = k.shape(self.thumb_color, oval=True, stroke=3, stroke_color=0xFFFFFFFF)
+        self.thumb_fill.setBackground(self.thumb_fill_d)
+        self.thumb.addView(self.thumb_fill, k.flp(MATCH, MATCH, G_CENTER, 1, 1, 1, 1))
+        self.track.addView(self.thumb, k.flp(k.dp(24), k.dp(24), G_CENTER_V | G_LEFT))
+
+        self.value = k.text("", 12.5, k.p["sub"], gravity=G_RIGHT | G_CENTER_V, mono=True)
+        self.view.addView(self.value, k.llp(k.dp(44), MATCH))
+        on_touch(self.track, self._touch, k.refs)
+
+    def _touch(self, v, e):
+        act = int(e.getActionMasked())
+        if act == A_DOWN:
+            try:
+                v.getParent().requestDisallowInterceptTouchEvent(True)
+            except Exception:
+                pass
+        w = int(self.track.getWidth())
+        pad = self.k.dp(11)
+        span = max(1, w - pad * 2)
+        f = (float(e.getX()) - pad) / span
+        f = max(0.0, min(1.0, f))
+        final = act in (A_UP, A_CANCEL)
+        if act in (A_DOWN, A_MOVE, A_UP, A_CANCEL):
+            self.frac = f
+            self._place()
+            try:
+                self.on_change(f, final)
+            except Exception:
+                log_exc("slider change")
+        if final:
+            try:
+                v.getParent().requestDisallowInterceptTouchEvent(False)
+            except Exception:
+                pass
+        return True
+
+    def _place(self, retry=0):
+        w = int(self.track.getWidth())
+        if w <= 0:
+            if retry < 12:
+                post_ui(lambda: self._place(retry + 1), 60)
+            return
+        pad = self.k.dp(11)
+        tw = self.k.dp(24)
+        x = pad + self.frac * (w - pad * 2) - tw / 2.0
+        self.thumb.setTranslationX(float(x))
+
+    def set(self, label, frac, colors, value_text, thumb_color, checker=False):
+        self.label.setText(label)
+        self.frac = max(0.0, min(1.0, float(frac)))
+        if colors != self.colors:
+            self.colors = list(colors)
+            try:
+                self.grad.setColors(jarray(jint)([s32(c) for c in colors]))
+            except Exception:
+                self.grad = self.k.gradient(colors)
+                self.bar.setBackground(self.grad)
+        self.chk.setVisibility(VISIBLE if checker else GONE)
+        self.value.setText(value_text)
+        if thumb_color != self.thumb_color:
+            self.thumb_color = thumb_color
+            self.thumb_fill_d.setColor(ji(thumb_color | 0xFF000000))
+        self._place()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Страница выбора цвета
+# ════════════════════════════════════════════════════════════════════
+
+class ColorPicker:
+    def __init__(self, panel):
+        self.panel = panel
+        self.k = panel.k
+        self.engine = panel.engine
+        self.name = None
+        self.kid = -1
+        self.old = 0
+        self.h, self.s, self.v, self.a = 0.0, 0.0, 0.0, 255
+        self.mode = "hsv"
+        self.anim = None
+        self._hex_guard = False
+        self._live_pending = False
+        self._live_color = None
+        self.view = None
+        self.wheel_size = 0
+
+    # ── построение ──
+    def build(self):
+        k = self.k
+        p = k.p
+        scroll = J("android.widget.ScrollView")(k.ctx)
+        scroll.setFillViewport(True)
+        scroll.setVerticalScrollBarEnabled(False)
+        root = k.linear(True)
+        root.setPadding(k.dp(16), 0, k.dp(16), k.dp(18))
+        scroll.addView(root, J("android.widget.FrameLayout$LayoutParams")(MATCH, WRAP))
+        self.root = root
+
+        # шапка
+        head = k.linear(False, G_CENTER_V)
+        head.addView(k.icon_button("ic_ab_back", "←", p["text"], on_tap=self.panel.picker_cancel),
+                     k.llp(k.dp(40), k.dp(40), l=-8))
+        tcol = k.linear(True)
+        self.title = k.text("", 16.5, p["text"], bold=True)
+        self.subtitle = k.text("", 12.5, p["sub"])
+        tcol.addView(self.title)
+        tcol.addView(self.subtitle)
+        head.addView(tcol, k.llp(0, WRAP, 1.0, l=6))
+        head.addView(k.icon_button("msg_location", "⌖", p["accent"], on_tap=self._locate),
+                     k.llp(k.dp(40), k.dp(40)))
+        head.addView(k.icon_button("ic_ab_other", "⋮", p["sub"], on_tap=self._more),
+                     k.llp(k.dp(40), k.dp(40), r=-8))
+        root.addView(head, k.llp(MATCH, k.dp(52)))
+
+        # другие цвета там, куда нажали
+        self.alt_box = k.linear(True)
+        self.alt_box.addView(k.text("Другие цвета в этом месте", 12.5, p["sub"], bold=True), k.llp(MATCH, WRAP, b=6))
+        ahs = J("android.widget.HorizontalScrollView")(k.ctx)
+        ahs.setHorizontalScrollBarEnabled(False)
+        self.alt_row = k.linear(False, G_CENTER_V)
+        ahs.addView(self.alt_row, J("android.widget.FrameLayout$LayoutParams")(WRAP, MATCH))
+        self.alt_box.addView(ahs, k.llp(MATCH, k.dp(40)))
+        self.alt_box.setVisibility(GONE)
+        root.addView(self.alt_box, k.llp(MATCH, WRAP, b=8))
+
+        # круг + правая колонка
+        scr_w = int(k.ctx.getResources().getDisplayMetrics().widthPixels)
+        self.wheel_size = int(min(k.dp(178), (scr_w - k.dp(32)) * 0.52))
+        tsz = k.dp(26)
+        row = k.linear(False, G_TOP)
+        wheel_host = k.frame()
+        total = self.wheel_size + tsz
+        self.wheel_total = total
+        self.wheel_img = J("android.widget.ImageView")(k.ctx)
+        self.wheel_img.setImageBitmap(self._wheel_bitmap(self.wheel_size))
+        wheel_host.addView(self.wheel_img, k.flp(self.wheel_size, self.wheel_size, G_TOP | G_LEFT))
+        self.wheel_img.setTranslationX(float(tsz / 2.0))
+        self.wheel_img.setTranslationY(float(tsz / 2.0))
+        self.wheel_thumb = k.frame()
+        self.wheel_thumb.setBackground(k.shape(0x40000000, oval=True))
+        self.wheel_thumb_fill_d = k.shape(0xFFFFFFFF, oval=True, stroke=3, stroke_color=0xFFFFFFFF)
+        tf = k.view()
+        tf.setBackground(self.wheel_thumb_fill_d)
+        self.wheel_thumb.addView(tf, k.flp(MATCH, MATCH, G_CENTER, 1, 1, 1, 1))
+        wheel_host.addView(self.wheel_thumb, k.flp(tsz, tsz, G_TOP | G_LEFT))
+        on_touch(wheel_host, self._wheel_touch, k.refs)
+        row.addView(wheel_host, k.llp(total, total))
+
+        col = k.linear(True)
+        # превью было/стало
+        prev = k.linear(False)
+        prev.setBackground(k.shape(0xFFFFFFFF, radius=16))
+        try:
+            prev.setClipToOutline(True)
+        except Exception:
+            pass
+        self.prev_old_host, self.prev_old = self._preview_half("было")
+        self.prev_new_host, self.prev_new = self._preview_half("стало")
+        prev.addView(self.prev_old_host, k.llp(0, MATCH, 1.0))
+        prev.addView(self.prev_new_host, k.llp(0, MATCH, 1.0))
+        on_click(self.prev_old_host, self._revert, k.refs)
+        col.addView(prev, k.llp(MATCH, k.dp(64), b=10))
+
+        # HEX
+        hexbox = k.linear(False, G_CENTER_V)
+        hexbox.setBackground(k.shape(p["card"], radius=12))
+        hexbox.setPadding(k.dp(10), 0, k.dp(4), 0)
+        self.hex = k.edit("#AARRGGBB", mono=True, size=15)
+        self.hex.setInputType(1 | 0x80000 | 0x1000)
+        hexbox.addView(self.hex, k.llp(0, MATCH, 1.0))
+        hexbox.addView(k.icon_button("msg_copy", "⧉", p["sub"], size=34, on_tap=self._copy_hex),
+                       k.llp(k.dp(34), k.dp(34)))
+        text_watcher(self.hex, self._hex_changed, k.refs)
+        col.addView(hexbox, k.llp(MATCH, k.dp(42), b=10))
+
+        # режим HSV / RGB
+        seg = k.linear(False)
+        seg.setBackground(k.shape(p["card"], radius=12))
+        seg.setPadding(k.dp(3), k.dp(3), k.dp(3), k.dp(3))
+        self.seg_hsv = k.text("HSV", 13.5, p["text"], bold=True, gravity=G_CENTER)
+        self.seg_rgb = k.text("RGB", 13.5, p["sub"], bold=True, gravity=G_CENTER)
+        seg.addView(self.seg_hsv, k.llp(0, MATCH, 1.0))
+        seg.addView(self.seg_rgb, k.llp(0, MATCH, 1.0))
+        on_click(self.seg_hsv, lambda: self._set_mode("hsv"), k.refs)
+        on_click(self.seg_rgb, lambda: self._set_mode("rgb"), k.refs)
+        col.addView(seg, k.llp(MATCH, k.dp(38)))
+
+        row.addView(col, k.llp(0, WRAP, 1.0, l=10, t=4))
+        root.addView(row, k.llp(MATCH, WRAP, t=2))
+
+        # слайдеры
+        self.sliders = []
+        for i in range(4):
+            s = Slider(k, (lambda idx: (lambda f, final: self._slider(idx, f, final)))(i))
+            self.sliders.append(s)
+            root.addView(s.view, k.llp(MATCH, k.dp(38), t=2 if i else 10))
+
+        # RGB-перелив
+        root.addView(k.text("RGB-перелив", 12.5, p["sub"], bold=True), k.llp(MATCH, WRAP, t=14, b=6))
+        arow = k.linear(False, G_CENTER_V)
+        self.anim_chip = k.text("Выключен", 13.5, p["sub"], bold=True, gravity=G_CENTER)
+        self.anim_chip.setPadding(k.dp(16), 0, k.dp(16), 0)
+        self.anim_chip.setClickable(True)
+        on_click(self.anim_chip, self._anim_toggle, k.refs)
+        arow.addView(self.anim_chip, k.llp(WRAP, k.dp(36)))
+        self.anim_note = k.text("оттенок бежит по кругу, насыщенность и яркость — из выбранного цвета",
+                                11.5, p["hint"], lines=2)
+        arow.addView(self.anim_note, k.llp(0, WRAP, 1.0, l=10))
+        root.addView(arow, k.llp(MATCH, WRAP))
+        self.anim_speed = Slider(k, self._anim_speed_changed)
+        self.anim_speed.view.setVisibility(GONE)
+        root.addView(self.anim_speed.view, k.llp(MATCH, k.dp(38), t=6))
+
+        # недавние
+        self.recent_title = k.text("Недавние", 12.5, p["sub"], bold=True)
+        root.addView(self.recent_title, k.llp(MATCH, WRAP, t=14, b=6))
+        self.recent_row = self._swatch_row()
+        root.addView(self.recent_row[0], k.llp(MATCH, k.dp(40)))
+
+        root.addView(k.text("Палитра", 12.5, p["sub"], bold=True), k.llp(MATCH, WRAP, t=12, b=6))
+        pal_row = self._swatch_row()
+        for c in PALETTE:
+            self._add_swatch(pal_row[1], c)
+        root.addView(pal_row[0], k.llp(MATCH, k.dp(40)))
+
+        # кнопки
+        btns = k.linear(False, G_CENTER_V)
+        self.btn_reset = k.pill_button("Сбросить", color=p["danger"], on_tap=self._reset)
+        btns.addView(self.btn_reset, k.llp(WRAP, k.dp(46)))
+        btns.addView(k.view(), k.llp(0, 1, 1.0))
+        btns.addView(k.pill_button("Отмена", color=p["sub"], on_tap=self.panel.picker_cancel),
+                     k.llp(WRAP, k.dp(46), r=8))
+        btns.addView(k.pill_button("Применить", filled=True, on_tap=self._apply),
+                     k.llp(WRAP, k.dp(46)))
+        root.addView(btns, k.llp(MATCH, WRAP, t=18))
+
+        self.view = scroll
+        return scroll
+
+    def _preview_half(self, label):
+        k = self.k
+        fl = k.frame()
+        chk = k.view()
+        chk.setBackground(k.checker())
+        fl.addView(chk, k.flp(MATCH, MATCH))
+        cv = k.view()
+        fl.addView(cv, k.flp(MATCH, MATCH))
+        t = k.text(label, 11, 0xFFFFFFFF, bold=True, gravity=G_CENTER)
+        t.setShadowLayer(float(k.dp(3)), 0.0, 0.0, ji(0x99000000))
+        fl.addView(t, k.flp(MATCH, WRAP, G_BOTTOM, b=5))
+        return fl, cv
+
+    def _swatch_row(self):
+        k = self.k
+        hs = J("android.widget.HorizontalScrollView")(k.ctx)
+        hs.setHorizontalScrollBarEnabled(False)
+        ll = k.linear(False, G_CENTER_V)
+        hs.addView(ll, J("android.widget.FrameLayout$LayoutParams")(WRAP, MATCH))
+        return hs, ll
+
+    def _add_swatch(self, parent, color):
+        k = self.k
+        sw, cv = k.swatch(32, color)
+        host = k.frame()
+        host.setBackground(k.ripple(None, oval=True))
+        host.addView(sw, k.flp(k.dp(32), k.dp(32), G_CENTER))
+        host.setClickable(True)
+        on_click(host, lambda: self.set_color(color, "swatch", final=True), k.refs)
+        parent.addView(host, k.llp(k.dp(40), k.dp(40)))
+
+    def _wheel_bitmap(self, size):
+        Bitmap = J("android.graphics.Bitmap")
+        bmp = Bitmap.createBitmap(size, size, J("android.graphics.Bitmap$Config").ARGB_8888)
+        cv = J("android.graphics.Canvas")(bmp)
+        cx = cy = size / 2.0
+        r = size / 2.0 - 1.0
+        hues = [s32(hsv_color(i * 60, 1, 1)) for i in range(7)]
+        Paint = J("android.graphics.Paint")
+        p1 = Paint(1)
+        p1.setShader(J("android.graphics.SweepGradient")(float(cx), float(cy), jarray(jint)(hues), None))
+        cv.drawCircle(float(cx), float(cy), float(r), p1)
+        p2 = Paint(1)
+        TM = J("android.graphics.Shader$TileMode")
+        p2.setShader(J("android.graphics.RadialGradient")(float(cx), float(cy), float(r),
+                                                           jint(s32(0xFFFFFFFF)), jint(s32(0x00FFFFFF)), TM.CLAMP))
+        cv.drawCircle(float(cx), float(cy), float(r), p2)
+        return bmp
+
+    # ── загрузка ключа ──
+    def load(self, name, kid, color, overridden):
+        self.name, self.kid = name, kid
+        self.old = u32(color)
+        self.title.setText(friendly_name(name))
+        self.base_sub = name + ("  •  изменён" if overridden else "")
+        self.subtitle.setText(self.base_sub)
+        self.btn_reset.setVisibility(VISIBLE if overridden else GONE)
+        self.prev_old.setBackgroundColor(s32(self.old))
+        self.h, self.s, self.v = color_hsv(self.old)
+        self.a = c_a(self.old)
+        live = self.engine.anims.get(name)
+        self.anim = dict(live) if live else None
+        self._anim_ui()
+        self._fill_recent()
+        self._render("load")
+        try:
+            self.view.scrollTo(0, 0)
+        except Exception:
+            pass
+
+    def _fill_recent(self):
+        ll = self.recent_row[1]
+        ll.removeAllViews()
+        rec = self.panel.plugin.recent_colors()
+        for c in rec:
+            self._add_swatch(ll, c)
+        vis = VISIBLE if rec else GONE
+        self.recent_title.setVisibility(vis)
+        self.recent_row[0].setVisibility(vis)
+
+    # ── состояние ──
+    def color(self):
+        return hsv_color(self.h, self.s, self.v, self.a)
+
+    def set_color(self, c, source, final=False):
+        c = u32(c)
+        h, s, v = color_hsv(c)
+        if v > 0.0001:
+            if s > 0.0001:
+                self.h = h
+            self.s = s
+        self.v = v
+        self.a = c_a(c)
+        self._render(source, final=final)
+
+    def _set_mode(self, mode):
+        self.mode = mode
+        p = self.k.p
+        on = self.k.shape(p["card2"], radius=10)
+        if mode == "hsv":
+            self.seg_hsv.setBackground(on)
+            self.seg_rgb.setBackground(None)
+            self.seg_hsv.setTextColor(ji(p["text"]))
+            self.seg_rgb.setTextColor(ji(p["sub"]))
+        else:
+            self.seg_rgb.setBackground(on)
+            self.seg_hsv.setBackground(None)
+            self.seg_rgb.setTextColor(ji(p["text"]))
+            self.seg_hsv.setTextColor(ji(p["sub"]))
+        self._render_sliders()
+
+    def _render(self, source, final=False):
+        c = self.color()
+        # круг
+        total = self.wheel_total
+        tsz = self.k.dp(26)
+        rad = self.wheel_size / 2.0 - 1.0
+        ang = math.radians(self.h)
+        cx = total / 2.0 + math.cos(ang) * self.s * rad
+        cy = total / 2.0 + math.sin(ang) * self.s * rad
+        self.wheel_thumb.setTranslationX(float(cx - tsz / 2.0))
+        self.wheel_thumb.setTranslationY(float(cy - tsz / 2.0))
+        self.wheel_thumb_fill_d.setColor(ji(c | 0xFF000000))
+        g = int(round(self.v * 255))
+        PDM = J("android.graphics.PorterDuff$Mode")
+        try:
+            self.wheel_img.setColorFilter(J("android.graphics.PorterDuffColorFilter")(ji(argb(255, g, g, g)), PDM.MULTIPLY))
+        except Exception:
+            pass
+        # превью и HEX
+        self.prev_new.setBackgroundColor(s32(c))
+        if source != "hex":
+            self._hex_guard = True
+            try:
+                self.hex.setText(hex_color(c))
+            finally:
+                self._hex_guard = False
+        self._render_sliders()
+        if source != "load":
+            self._live(c, final)
+
+    def _render_sliders(self):
+        c = self.color()
+        r, g, b = c_r(c), c_g(c), c_b(c)
+        sl = self.sliders
+        opaque = c | 0xFF000000
+        if self.mode == "hsv":
+            sl[0].set("H", self.h / 360.0, [hsv_color(i * 60, 1, 1) for i in range(7)],
+                      "%d°" % int(round(self.h)) if self.h < 359.5 else "0°", hsv_color(self.h, 1, 1))
+            sl[1].set("S", self.s, [hsv_color(self.h, 0, self.v), hsv_color(self.h, 1, self.v)],
+                      "%d%%" % int(round(self.s * 100)), opaque)
+            sl[2].set("V", self.v, [0xFF000000, hsv_color(self.h, self.s, 1)],
+                      "%d%%" % int(round(self.v * 100)), opaque)
+        else:
+            sl[0].set("R", r / 255.0, [argb(255, 0, g, b), argb(255, 255, g, b)], str(r), argb(255, r, 0, 0))
+            sl[1].set("G", g / 255.0, [argb(255, r, 0, b), argb(255, r, 255, b)], str(g), argb(255, 0, g, 0))
+            sl[2].set("B", b / 255.0, [argb(255, r, g, 0), argb(255, r, g, 255)], str(b), argb(255, 0, 0, b))
+        sl[3].set("A", self.a / 255.0, [opaque & 0x00FFFFFF, opaque],
+                  "%d%%" % int(round(self.a * 100 / 255.0)), opaque, checker=True)
+
+    def _slider(self, idx, f, final):
+        if self.mode == "hsv":
+            if idx == 0:
+                self.h = f * 360.0
+            elif idx == 1:
+                self.s = f
+            elif idx == 2:
+                self.v = f
+            else:
+                self.a = int(round(f * 255))
+            self._render("slider", final)
+        else:
+            if idx == 3:
+                self.a = int(round(f * 255))
+                self._render("slider", final)
+                return
+            c = self.color()
+            ch = [c_r(c), c_g(c), c_b(c)]
+            ch[idx] = int(round(f * 255))
+            self.set_color(argb(self.a, ch[0], ch[1], ch[2]), "slider", final=final)
+
+    def _wheel_touch(self, v, e):
+        act = int(e.getActionMasked())
+        if act == A_DOWN:
+            try:
+                v.getParent().requestDisallowInterceptTouchEvent(True)
+            except Exception:
+                pass
+        total = self.wheel_total
+        rad = self.wheel_size / 2.0 - 1.0
+        dx = float(e.getX()) - total / 2.0
+        dy = float(e.getY()) - total / 2.0
+        d = math.hypot(dx, dy)
+        self.h = (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
+        self.s = max(0.0, min(1.0, d / rad))
+        if self.v < 0.02:
+            self.v = 1.0
+        final = act in (A_UP, A_CANCEL)
+        self._render("wheel", final)
+        if final:
+            try:
+                v.getParent().requestDisallowInterceptTouchEvent(False)
+            except Exception:
+                pass
+        return True
+
+    def _hex_changed(self, text):
+        if self._hex_guard:
+            return
+        digits = text.strip().lstrip("#")
+        if len(digits) not in (6, 8):
+            return  # ждём полный цвет, чтобы не мигать на полпути
+        c = parse_color(text)
+        if c is None:
+            return
+        self.set_color(c, "hex", final=True)
+
+    # ── живой предпросмотр (с ограничением частоты) ──
+    def set_alts(self, alts, current):
+        k = self.k
+        p = k.p
+        self.alt_row.removeAllViews()
+        if not alts or len(alts) < 2:
+            self.alt_box.setVisibility(GONE)
+            return
+        eng = self.engine
+        for name, tags in alts:
+            kid = eng.key_id(name)
+            if kid < 0:
+                continue
+            sel = name == current
+            chip = k.linear(False, G_CENTER_V)
+            chip.setPadding(k.dp(6), 0, k.dp(12), 0)
+            bg = k.shape(p["card2"] if sel else p["card"], radius=18,
+                         stroke=1.5 if sel else 0, stroke_color=p["accent"])
+            chip.setBackground(k.ripple(bg, radius=18))
+            sw, _ = k.swatch(24, eng.get(kid))
+            chip.addView(sw, k.llp(k.dp(24), k.dp(24)))
+            t = k.text(friendly_name(name), 13, p["text"] if sel else p["sub"], bold=sel)
+            t.setMaxWidth(k.dp(210))
+            chip.addView(t, k.llp(WRAP, WRAP, l=8))
+            chip.setClickable(True)
+            on_click(chip, (lambda nn: (lambda: self.panel.switch_alt(nn)))(name), k.refs)
+            self.alt_row.addView(chip, k.llp(WRAP, k.dp(36), r=8))
+        self.alt_box.setVisibility(VISIBLE)
+
+    # ── RGB-перелив ──
+    def _anim_ui(self):
+        k = self.k
+        p = k.p
+        on = self.anim is not None
+        if on:
+            self.anim_chip.setText("● Перелив включён")
+            self.anim_chip.setTextColor(ji(p["on_accent"]))
+            self.anim_chip.setBackground(k.gradient(
+                [0xFFFF3B6B, 0xFFFFB02E, 0xFF3DDC97, 0xFF2AABEE, 0xFF8E7CFF], "LEFT_RIGHT", radius=18))
+        else:
+            self.anim_chip.setText("Выключен")
+            self.anim_chip.setTextColor(ji(p["sub"]))
+            self.anim_chip.setBackground(k.ripple(k.shape(p["card"], radius=18), radius=18))
+        self.anim_speed.view.setVisibility(VISIBLE if on else GONE)
+        if on:
+            sp = float(self.anim["speed"])
+            self.anim_speed.set("С", (sp - 10.0) / 350.0,
+                                [hsv_color(i * 60, 1, 1) for i in range(7)],
+                                "%d°/с" % int(round(sp)), hsv_color(sp, 1, 1))
+
+    def _anim_toggle(self):
+        if self.name in WALLPAPER_KEYS:
+            toast("Обои чата переливать нельзя — выберите другой элемент", "err")
+            return
+        if self.anim is None:
+            self.anim = {"speed": 90.0, "phase": 0.0, "s": max(self.s, 0.6),
+                         "v": max(self.v, 0.75), "a": self.a or 255}
+            self.engine.anim_set(self.name, self.anim)
+        else:
+            self.anim = None
+            self.engine.anim_set(self.name, None)
+        self._anim_ui()
+
+    def _anim_speed_changed(self, f, final):
+        if self.anim is None:
+            return
+        self.anim["speed"] = 10.0 + float(f) * 350.0
+        self.engine.anim_set(self.name, self.anim)
+        sp = self.anim["speed"]
+        self.anim_speed.value.setText("%d°/с" % int(round(sp)))
+        self.anim_speed.thumb_fill_d.setColor(ji(hsv_color(sp, 1, 1)))
+
+    def _live(self, c, final):
+        if self.anim is not None:
+            self.anim["s"] = max(0.0, min(1.0, self.s))
+            self.anim["v"] = max(0.0, min(1.0, self.v))
+            self.anim["a"] = int(self.a)
+            self.engine.anim_set(self.name, self.anim)
+        self._live_color = c
+        if final:
+            self._live_pending = False
+            self.engine.preview(self.kid, c, final=True)
+            return
+        if self._live_pending:
+            return
+        self._live_pending = True
+
+        def go():
+            if not self._live_pending:
+                return
+            self._live_pending = False
+            if self._live_color is not None and self.kid >= 0:
+                self.engine.preview(self.kid, self._live_color, final=False)
+        post_ui(go, 40)
+
+    # ── действия ──
+    def _revert(self):
+        self.set_color(self.old, "revert", final=True)
+
+    def _copy_hex(self):
+        try:
+            clipboard_set(hex_color(self.color()))
+            toast("Скопировано: " + hex_color(self.color()), "ok")
+        except Exception:
+            log_exc("copy hex")
+
+    def _apply(self):
+        self._live_pending = False
+        hide_keyboard(self.hex)
+        self.panel.picker_apply(self.color())
+
+    def _reset(self):
+        self._live_pending = False
+        self.panel.picker_reset()
+
+    def _locate(self):
+        self.panel.locate_key(self.name, full=True)
+
+    def _more(self):
+        items = ["Вставить цвет из буфера", "Скопировать имя ключа", "Скопировать HEX",
+                 "Взять цвет другого ключа…", "Цвет как у «было»"]
+
+        def pick(i):
+            if i == 0:
+                c = parse_color(clipboard_get())
+                if c is None:
+                    toast("В буфере нет цвета (#RRGGBB / #AARRGGBB)", "err")
+                else:
+                    self.set_color(c, "paste", final=True)
+            elif i == 1:
+                clipboard_set(self.name)
+                toast("Скопировано: " + self.name, "ok")
+            elif i == 2:
+                self._copy_hex()
+            elif i == 3:
+                self.panel.ask_key_color(lambda c: self.set_color(c, "key", final=True))
+            elif i == 4:
+                self._revert()
+        self.panel.menu(self.name, items, pick)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Адаптер списка ключей (ListView)
+# ════════════════════════════════════════════════════════════════════
+
+class _Holder:
+    __slots__ = ("name", "swatch", "title", "sub", "dot", "locate")
+
+
+class KeyAdapter:
+    def __init__(self, panel):
+        self.panel = panel
+        self.items = []          # [(name, tags or None)]
+        self.observers = []
+        self.holders = []
+        fns = {
+            "getCount": lambda: len(self.items),
+            "getItem": lambda pos: None,
+            "getItemId": lambda pos: int(pos),
+            "getItemViewType": lambda pos: 0,
+            "getViewTypeCount": lambda: 1,
+            "hasStableIds": lambda: False,
+            "isEmpty": lambda: len(self.items) == 0,
+            "areAllItemsEnabled": lambda: True,
+            "isEnabled": lambda pos: True,
+            "registerDataSetObserver": self._reg,
+            "unregisterDataSetObserver": self._unreg,
+            "getView": self._get_view,
+            "getAutofillOptions": lambda: None,
+        }
+        self.proxy = make_proxy(
+            "android.widget.ListAdapter", fns,
+            bools=("hasStableIds", "isEmpty", "areAllItemsEnabled", "isEnabled"),
+            defaults={"getCount": 0, "getItemId": 0, "getItemViewType": 0, "getViewTypeCount": 1})
+
+    def _reg(self, o):
+        if o is not None:
+            self.observers.append(o)
+
+    def _unreg(self, o):
+        try:
+            self.observers = [x for x in self.observers if not x.equals(o)]
+        except Exception:
+            pass
+
+    def set_items(self, items):
+        self.items = items
+        self.notify()
+
+    def notify(self):
+        for o in list(self.observers):
+            try:
+                o.onChanged()
+            except Exception:
+                pass
+
+    def _build_row(self):
+        k = self.panel.k
+        p = k.p
+        row = k.linear(False, G_CENTER_V)
+        row.setPadding(k.dp(16), 0, k.dp(6), 0)
+        row.setLayoutParams(J("android.widget.AbsListView$LayoutParams")(MATCH, k.dp(62)))
+        h = _Holder()
+        sw, h.swatch = k.swatch(36, 0)
+        row.addView(sw, k.llp(k.dp(36), k.dp(36)))
+        col = k.linear(True)
+        h.title = k.text("", 15, p["text"], bold=True)
+        h.sub = k.text("", 12.5, p["sub"])
+        col.addView(h.title)
+        col.addView(h.sub, k.llp(MATCH, WRAP, t=2))
+        row.addView(col, k.llp(0, WRAP, 1.0, l=14))
+        h.dot = k.view()
+        h.dot.setBackground(k.shape(p["accent"], oval=True))
+        row.addView(h.dot, k.llp(k.dp(8), k.dp(8), l=6, r=2))
+        h.locate = k.icon_button("msg_location", "⌖", p["sub"])
+        h.name = None
+        on_click(h.locate, lambda: self.panel.locate_key(h.name, full=True), k.refs)
+        row.addView(h.locate, k.llp(k.dp(42), k.dp(42)))
+        idx = len(self.holders)
+        self.holders.append(h)
+        row.setTag(J("java.lang.Integer").valueOf(idx))
+        return row
+
+    def _get_view(self, position, convert, parent):
+        try:
+            row = convert
+            h = None
+            if row is not None:
+                i = as_int(row.getTag(), -1)
+                if 0 <= i < len(self.holders):
+                    h = self.holders[i]
+            if h is None:
+                row = self._build_row()
+                h = self.holders[-1]
+            name, tags = self.items[int(position)]
+            h.name = name
+            eng = self.panel.engine
+            kid = eng.key_id(name)
+            c = eng.get(kid)
+            h.swatch.setBackgroundColor(s32(c))
+            h.title.setText(friendly_name(name))
+            if tags:
+                sub = " · ".join(tags) + "  ·  " + name
+            else:
+                sub = key_hint(name) + "  ·  " + name + "  ·  " + hex_color(c, False)
+            h.sub.setText(sub)
+            h.dot.setVisibility(VISIBLE if name in eng.overrides else GONE)
+            return row
+        except Exception:
+            log_exc("getView")
+            if convert is not None:
+                return convert
+            return J("android.view.View")(self.panel.k.ctx)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Плавающая панель редактора
+# ════════════════════════════════════════════════════════════════════
+
+class EditorPanel:
+    def __init__(self, plugin, activity):
+        self.plugin = plugin
+        self.engine = plugin.engine
+        self.act = activity
+        style = int(plugin.get_setting("style", 0) or 0)
+        dark = True
+        if style == 0:
+            try:
+                dark = bool(J(THEME).isCurrentThemeDark())
+            except Exception:
+                dark = True
+        else:
+            dark = style == 1
+        self.k = Kit(activity, DARK if dark else LIGHT)
+        self.refs = self.k.refs
+        self.dialog = None
+        self.state = "closed"
+        self.page = "list"
+        self.tab = "screen"
+        self.query = ""
+        self.found = []
+        self.editing = None   # name
+        self.picker_alts = []
+        self._keep_alts = False
+        self.height_frac = 0.56
+        self.screen_h = int(activity.getResources().getDisplayMetrics().heightPixels)
+        self._busy = False
+
+    # ── создание ──
+    def build(self):
+        k = self.k
+        p = k.p
+        self.root = k.frame()
+
+        # раскрытая панель
+        self.sheet = k.linear(True)
+        self.sheet.setBackground(k.shape(p["bg"], radii=[22, 22, 0, 0]))
+        try:
+            self.sheet.setElevation(float(k.dp(12)))
+        except Exception:
+            pass
+        self.root.addView(self.sheet, k.flp(MATCH, MATCH))
+
+        handle_strip = k.frame()
+        pill = k.view()
+        pill.setBackground(k.shape(p["handle"], radius=3))
+        handle_strip.addView(pill, k.flp(k.dp(40), k.dp(5), G_CENTER))
+        on_touch(handle_strip, self._handle_touch, self.refs)
+        self.sheet.addView(handle_strip, k.llp(MATCH, k.dp(22)))
+
+        self.pages = k.frame()
+        self.sheet.addView(self.pages, k.llp(MATCH, 0, 1.0))
+        self.list_page = self._build_list_page()
+        self.pages.addView(self.list_page, k.flp(MATCH, MATCH))
+        self.picker = ColorPicker(self)
+        self.picker_view = self.picker.build()
+        self.picker_view.setVisibility(GONE)
+        self.pages.addView(self.picker_view, k.flp(MATCH, MATCH))
+        self.picker._set_mode("hsv")
+
+        # свёрнутый «пузырь»
+        self.bubble = k.frame()
+        self.bubble.setBackground(k.gradient([0xFFB06CFF, p["accent"], p["accent2"]], "TL_BR", oval=True))
+        try:
+            self.bubble.setElevation(float(k.dp(6)))
+        except Exception:
+            pass
+        bic = k.icon("msg_palette", 0xFFFFFFFF) or k.icon("msg_colors", 0xFFFFFFFF)
+        if bic is not None:
+            iv = J("android.widget.ImageView")(k.ctx)
+            iv.setImageDrawable(bic)
+            iv.setScaleType(J("android.widget.ImageView$ScaleType").CENTER_INSIDE)
+            self.bubble.addView(iv, k.flp(MATCH, MATCH))
+        else:
+            self.bubble.addView(k.text("🎨", 22, gravity=G_CENTER), k.flp(MATCH, MATCH))
+        self.bubble_badge = k.text("", 10, 0xFFFFFFFF, bold=True, gravity=G_CENTER)
+        self.bubble_badge.setBackground(k.shape(p["danger"], radius=8))
+        self.bubble_badge.setPadding(k.dp(4), 0, k.dp(4), 0)
+        self.bubble.addView(self.bubble_badge, k.flp(WRAP, k.dp(16), G_TOP | G_RIGHT))
+        self.bubble.setVisibility(GONE)
+        self.bubble_host = k.frame()
+        self.bubble_host.addView(self.bubble, k.flp(k.dp(54), k.dp(54), G_CENTER))
+        self.bubble_host.setVisibility(GONE)
+        self.root.addView(self.bubble_host, k.flp(k.dp(66), k.dp(66), G_BOTTOM | G_RIGHT))
+        on_touch(self.bubble, self._bubble_touch, self.refs)
+
+        # отступ снизу под навигационную панель / клавиатуру
+        def insets(v, ins):
+            try:
+                bottom = int(ins.getSystemWindowInsetBottom())
+                self.sheet.setPadding(0, 0, 0, bottom)
+            except Exception:
+                pass
+            return ins
+        try:
+            prx = make_proxy("android.view.View$OnApplyWindowInsetsListener",
+                             {"onApplyWindowInsets": insets})
+            self.root.setOnApplyWindowInsetsListener(prx)
+            self.refs.append(prx)
+        except Exception:
+            pass
+
+        # всплывающее уведомление внутри панели
+        self.snack_view = k.text("", 13.5, 0xFFFFFFFF, bold=True, lines=2, gravity=G_CENTER)
+        self.snack_view.setPadding(k.dp(14), k.dp(8), k.dp(14), k.dp(8))
+        self.snack_view.setVisibility(GONE)
+        try:
+            self.snack_view.setElevation(float(k.dp(16)))
+        except Exception:
+            pass
+        self.root.addView(self.snack_view, k.flp(WRAP, WRAP, G_TOP | G_CENTER_H, l=16, t=26, r=16))
+        self._snack_token = 0
+
+        Dialog = J("android.app.Dialog")
+        d = Dialog(self.act)
+        d.requestWindowFeature(1)
+        d.setContentView(self.root)
+        d.setCancelable(False)
+        d.setCanceledOnTouchOutside(False)
+
+        def on_key(dlg, code, ev):
+            if int(code) == 4:
+                if int(ev.getAction()) == 1:
+                    self.back()
+                return True
+            return False
+        kp = make_proxy("android.content.DialogInterface$OnKeyListener", {"onKey": on_key}, bools=("onKey",))
+        d.setOnKeyListener(kp)
+        self.refs.append(kp)
+        self.dialog = d
+        w = d.getWindow()
+        w.setBackgroundDrawable(J("android.graphics.drawable.ColorDrawable")(0))
+        w.clearFlags(FLAG_DIM_BEHIND)
+        w.addFlags(FLAG_NOT_TOUCH_MODAL)
+        w.setSoftInputMode(SOFT_ADJUST_RESIZE | SOFT_STATE_HIDDEN)
+        try:
+            w.setWindowAnimations(J("android.R$style").Animation_InputMethod)
+        except Exception:
+            pass
+
+    def _build_list_page(self):
+        k = self.k
+        p = k.p
+        page = k.linear(True)
+
+        head = k.linear(False, G_CENTER_V)
+        head.setPadding(k.dp(18), 0, k.dp(8), 0)
+        tcol = k.linear(True)
+        tcol.addView(k.text("Цвета интерфейса", 18, p["text"], bold=True))
+        self.head_sub = k.text("", 12.5, p["sub"])
+        tcol.addView(self.head_sub, k.llp(MATCH, WRAP, t=1))
+        head.addView(tcol, k.llp(0, WRAP, 1.0))
+        insp = k.icon_button(None, "⌖", p["accent"], drawable=k.target_icon(p["accent"]), on_tap=self.start_inspector)
+        insp.setBackground(k.ripple(k.shape((p["accent"] & 0xFFFFFF) | 0x24000000, oval=True), oval=True))
+        head.addView(insp, k.llp(k.dp(40), k.dp(40), r=4))
+        head.addView(k.icon_button("ic_ab_other", "⋮", p["sub"], on_tap=self._list_menu), k.llp(k.dp(40), k.dp(40)))
+        head.addView(k.icon_button("msg_go_down", "⌄", p["sub"], on_tap=self.collapse), k.llp(k.dp(40), k.dp(40)))
+        head.addView(k.icon_button("msg_close", "✕", p["sub"], on_tap=self.close), k.llp(k.dp(40), k.dp(40)))
+        page.addView(head, k.llp(MATCH, k.dp(54)))
+
+        # поиск
+        sbox = k.linear(False, G_CENTER_V)
+        sbox.setBackground(k.shape(p["card"], radius=14))
+        sbox.setPadding(k.dp(12), 0, k.dp(4), 0)
+        sic = k.icon("msg_search", p["hint"])
+        if sic is not None:
+            iv = J("android.widget.ImageView")(k.ctx)
+            iv.setImageDrawable(sic)
+            sbox.addView(iv, k.llp(k.dp(22), k.dp(22), r=8))
+        self.search = k.edit("Поиск: «фон чатов», ключ или #цвет")
+        sbox.addView(self.search, k.llp(0, MATCH, 1.0))
+        self.search_clear = k.icon_button("msg_clear_input", "✕", p["hint"], on_tap=lambda: self.search.setText(""))
+        self.search_clear.setVisibility(GONE)
+        sbox.addView(self.search_clear, k.llp(k.dp(36), k.dp(36)))
+        text_watcher(self.search, self._on_search, self.refs)
+        page.addView(sbox, k.llp(MATCH, k.dp(44), l=16, r=16, t=2))
+
+        tap = k.linear(False, G_CENTER_V)
+        tap.setPadding(k.dp(14), 0, k.dp(14), 0)
+        tap_bg = k.gradient([(p["accent"] & 0xFFFFFF) | 0x33000000, (p["accent2"] & 0xFFFFFF) | 0x26000000],
+                            "LEFT_RIGHT", radius=14)
+        tap.setBackground(k.ripple(tap_bg, radius=14))
+        tic = J("android.widget.ImageView")(k.ctx)
+        tic.setImageDrawable(k.target_icon(p["accent"]))
+        tap.addView(tic, k.llp(k.dp(22), k.dp(22)))
+        tcol2 = k.linear(True)
+        tcol2.addView(k.text("Нажмите на элемент экрана", 14.5, p["text"], bold=True))
+        tcol2.addView(k.text("и сразу откроется его цвет", 12, p["sub"]))
+        tap.addView(tcol2, k.llp(0, WRAP, 1.0, l=12))
+        tap.addView(k.text("›", 22, p["accent"], bold=True), k.llp(WRAP, WRAP))
+        tap.setClickable(True)
+        on_click(tap, self.start_inspector, self.refs)
+        page.addView(tap, k.llp(MATCH, k.dp(52), l=16, r=16, t=8))
+
+        # вкладки
+        hs = J("android.widget.HorizontalScrollView")(k.ctx)
+        hs.setHorizontalScrollBarEnabled(False)
+        chips = k.linear(False, G_CENTER_V)
+        chips.setPadding(k.dp(16), 0, k.dp(16), 0)
+        hs.addView(chips, J("android.widget.FrameLayout$LayoutParams")(WRAP, MATCH))
+        self.chips = {}
+        for key, label in (("screen", "На экране"), ("all", "Все"), ("changed", "Изменённые"), ("found", "Найдено")):
+            t = k.text(label, 13.5, p["sub"], bold=True, gravity=G_CENTER)
+            t.setPadding(k.dp(14), 0, k.dp(14), 0)
+            t.setClickable(True)
+            on_click(t, (lambda kk: (lambda: self.set_tab(kk)))(key), self.refs)
+            chips.addView(t, k.llp(WRAP, k.dp(34), r=8))
+            self.chips[key] = (t, label)
+        page.addView(hs, k.llp(MATCH, k.dp(46), t=6))
+
+        # список
+        body = k.frame()
+        lv = J("android.widget.ListView")(k.ctx)
+        lv.setDivider(None)
+        lv.setDividerHeight(0)
+        lv.setSelector(k.ripple(None, radius=0))
+        lv.setCacheColorHint(0)
+        lv.setVerticalScrollBarEnabled(False)
+        lv.setClipToPadding(False)
+        lv.setPadding(0, 0, 0, k.dp(12))
+        self.adapter = KeyAdapter(self)
+        lv.setAdapter(self.adapter.proxy)
+
+        def item_click(parent, view, pos, iid):
+            pos = int(pos)
+            if 0 <= pos < len(self.adapter.items):
+                self.open_picker(self.adapter.items[pos][0])
+
+        def item_long(parent, view, pos, iid):
+            pos = int(pos)
+            if 0 <= pos < len(self.adapter.items):
+                self._row_menu(self.adapter.items[pos][0])
+            return True
+        c1 = make_proxy("android.widget.AdapterView$OnItemClickListener", {"onItemClick": item_click})
+        c2 = make_proxy("android.widget.AdapterView$OnItemLongClickListener", {"onItemLongClick": item_long},
+                        bools=("onItemLongClick",))
+        lv.setOnItemClickListener(c1)
+        lv.setOnItemLongClickListener(c2)
+        self.refs.extend([c1, c2])
+        self.listview = lv
+        body.addView(lv, k.flp(MATCH, MATCH))
+        self.empty = k.text("", 14, p["hint"], lines=4, gravity=G_CENTER)
+        self.empty.setPadding(k.dp(32), 0, k.dp(32), 0)
+        self.empty.setVisibility(GONE)
+        body.addView(self.empty, k.flp(MATCH, WRAP, G_CENTER))
+        page.addView(body, k.llp(MATCH, 0, 1.0, t=2))
+        return page
+
+    def snack(self, text, kind="info"):
+        try:
+            if self.dialog is None or not self.dialog.isShowing():
+                return False
+            p = self.k.p
+            col = {"ok": p["ok"], "err": p["danger"]}.get(kind, p["accent"])
+            self.snack_view.setBackground(self.k.shape(0xF0141418, radius=14, stroke=1.5, stroke_color=col))
+            self.snack_view.setText(text)
+            self.snack_view.setVisibility(VISIBLE)
+            self.snack_view.setAlpha(0.0)
+            self.snack_view.setTranslationY(float(-self.k.dp(8)))
+            self.snack_view.animate().alpha(1.0).translationY(0.0).setDuration(160).start()
+            self._snack_token += 1
+            token = self._snack_token
+
+            def hide():
+                if token != self._snack_token:
+                    return
+                try:
+                    self.snack_view.animate().alpha(0.0).setDuration(200).start()
+                except Exception:
+                    pass
+                post_ui(lambda: (self.snack_view.setVisibility(GONE) if token == self._snack_token else None), 220)
+            post_ui(hide, 2000)
+            return True
+        except Exception:
+            log_exc("snack")
+            return False
+
+    # ── окно ──
+    def _win(self):
+        return self.dialog.getWindow() if self.dialog is not None else None
+
+    def _apply_expanded_window(self):
+        w = self._win()
+        if w is None:
+            return
+        w.clearFlags(FLAG_NOT_FOCUSABLE)
+        w.setGravity(G_BOTTOM)
+        lp = w.getAttributes()
+        lp.x = 0
+        lp.y = 0
+        w.setAttributes(lp)
+        w.setLayout(MATCH, int(self.screen_h * self.height_frac))
+        try:
+            w.getDecorView().setPadding(0, 0, 0, 0)
+        except Exception:
+            pass
+
+    def _apply_bubble_window(self):
+        w = self._win()
+        if w is None:
+            return
+        w.addFlags(FLAG_NOT_FOCUSABLE)
+        w.setGravity(G_BOTTOM | G_RIGHT)
+        w.setLayout(self.k.dp(66), self.k.dp(66))
+        lp = w.getAttributes()
+        lp.x = int(self.plugin.get_setting("bubble_x", self.k.dp(14)) or 0)
+        lp.y = int(self.plugin.get_setting("bubble_y", self.k.dp(110)) or 0)
+        w.setAttributes(lp)
+
+    def show(self):
+        if self.dialog is None:
+            self.build()
+        self.engine.snapshot_screen()
+        self.refresh_list(first=True)
+        self.state = "expanded"
+        self.sheet.setVisibility(VISIBLE)
+        self.bubble_host.setVisibility(GONE)
+        self.bubble.setVisibility(GONE)
+        self._apply_expanded_window()
+        self.dialog.show()
+        self._apply_expanded_window()
+
+    def expand(self):
+        if self.dialog is None:
+            return self.show()
+        hide_keyboard(self.search)
+        self.engine.snapshot_screen()
+        self.sheet.setVisibility(VISIBLE)
+        self.bubble_host.setVisibility(GONE)
+        self.bubble.setVisibility(GONE)
+        self.state = "expanded"
+        self._apply_expanded_window()
+        if self.page == "list":
+            self.refresh_list()
+        if not self.dialog.isShowing():
+            self.dialog.show()
+
+    def collapse(self):
+        if self.dialog is None:
+            return
+        hide_keyboard(self.search)
+        hide_keyboard(self.picker.hex)
+        self.sheet.setVisibility(GONE)
+        self.bubble_host.setVisibility(VISIBLE)
+        self.bubble.setVisibility(VISIBLE)
+        n = len(self.engine.overrides)
+        self.bubble_badge.setText(str(n))
+        self.bubble_badge.setVisibility(VISIBLE if n else GONE)
+        self.state = "bubble"
+        self._apply_bubble_window()
+
+    def hide_temporarily(self):
+        try:
+            hide_keyboard(self.search)
+            hide_keyboard(self.picker.hex)
+            self.dialog.hide()
+        except Exception:
+            pass
+
+    def unhide(self):
+        try:
+            if self.dialog is not None:
+                self.dialog.show()
+        except Exception:
+            pass
+
+    def close(self):
+        if self.page == "picker" and self.editing:
+            self.engine.anim_revert(self.editing)
+            self.engine.cancel_preview()
+        self.engine.stop_blink()
+        try:
+            hide_keyboard(self.search)
+        except Exception:
+            pass
+        try:
+            if self.dialog is not None:
+                self.dialog.dismiss()
+        except Exception:
+            pass
+        self.dialog = None
+        self.state = "closed"
+        if self.engine.dirty:
+            self.engine.dirty = False
+            self.engine.rebuild_hidden()
+        if self.plugin.panel is self:
+            self.plugin.panel = None
+
+    def back(self):
+        if self.state == "bubble":
+            return
+        if self.page == "picker":
+            self.picker_cancel()
+        else:
+            self.collapse()
+
+    # ── жесты ──
+    def _handle_touch(self, v, e):
+        act = int(e.getActionMasked())
+        y = float(e.getRawY())
+        if act == A_DOWN:
+            self._drag = {"y": y, "h": int(self.screen_h * self.height_frac), "moved": False}
+            return True
+        st = getattr(self, "_drag", None)
+        if st is None:
+            return True
+        dy = y - st["y"]
+        if abs(dy) > self.k.dp(6):
+            st["moved"] = True
+        if act == A_MOVE and st["moved"]:
+            h = int(st["h"] - dy)
+            h = max(int(self.screen_h * 0.2), min(int(self.screen_h * 0.93), h))
+            st["cur"] = h
+            w = self._win()
+            if w is not None:
+                w.setLayout(MATCH, h)
+        elif act in (A_UP, A_CANCEL):
+            self._drag = None
+            if not st["moved"]:
+                self.height_frac = 0.88 if self.height_frac < 0.7 else 0.56
+                self._apply_expanded_window()
+            else:
+                h = st.get("cur", st["h"])
+                if h < self.screen_h * 0.3:
+                    self.collapse()
+                else:
+                    self.height_frac = h / float(self.screen_h)
+                    self._apply_expanded_window()
+        return True
+
+    def _bubble_touch(self, v, e):
+        act = int(e.getActionMasked())
+        rx, ry = float(e.getRawX()), float(e.getRawY())
+        w = self._win()
+        if w is None:
+            return True
+        lp = w.getAttributes()
+        if act == A_DOWN:
+            self._bdrag = {"x": rx, "y": ry, "lx": int(lp.x), "ly": int(lp.y), "moved": False,
+                           "t": time.time()}
+            v.animate().scaleX(0.9).scaleY(0.9).setDuration(120).start()
+            return True
+        st = getattr(self, "_bdrag", None)
+        if st is None:
+            return True
+        dx, dy = rx - st["x"], ry - st["y"]
+        if abs(dx) > self.k.dp(8) or abs(dy) > self.k.dp(8):
+            st["moved"] = True
+        if act == A_MOVE and st["moved"]:
+            sw = int(self.act.getResources().getDisplayMetrics().widthPixels)
+            lp.x = int(max(0, min(sw - self.k.dp(66), st["lx"] - dx)))
+            lp.y = int(max(0, min(self.screen_h - self.k.dp(120), st["ly"] - dy)))
+            w.setAttributes(lp)
+        elif act in (A_UP, A_CANCEL):
+            v.animate().scaleX(1.0).scaleY(1.0).setDuration(120).start()
+            self._bdrag = None
+            if st["moved"]:
+                self.plugin.set_setting("bubble_x", int(lp.x))
+                self.plugin.set_setting("bubble_y", int(lp.y))
+            elif act == A_UP:
+                if time.time() - st.get("t", 0) > 0.45:
+                    self.expand()
+                    post_ui(self.start_inspector, 80)   # долгое нажатие — выбрать элемент
+                else:
+                    self.expand()
+        return True
+
+    # ── список ──
+    def set_tab(self, tab):
+        self.tab = tab
+        self.refresh_list()
+        try:
+            self.listview.setSelection(0)
+        except Exception:
+            pass
+
+    def _on_search(self, text):
+        self.query = text.strip()
+        self.search_clear.setVisibility(VISIBLE if self.query else GONE)
+        self.refresh_list()
+
+    def _base_items(self, tab):
+        eng = self.engine
+        if tab == "screen":
+            return [(n, None) for n in eng.screen.get("keys", [])]
+        if tab == "changed":
+            return [(n, None) for n in sorted(eng.overrides) if eng.key_id(n) >= 0]
+        if tab == "found":
+            return [(n, tags) for (n, tags) in self.found]
+        return [(n, None) for n in eng.all_keys()]
+
+    def refresh_list(self, first=False):
+        eng = self.engine
+        p = self.k.p
+        if first and not eng.screen.get("keys") and self.tab == "screen":
+            self.tab = "all"
+        if self.tab == "found" and not self.found:
+            self.tab = "screen" if eng.screen.get("keys") else "all"
+        counts = {
+            "screen": len(eng.screen.get("keys", [])),
+            "all": len(eng.all_keys()),
+            "changed": len([n for n in eng.overrides if eng.key_id(n) >= 0]),
+            "found": len(self.found),
+        }
+        for key, (t, label) in self.chips.items():
+            if key == "found" and not self.found:
+                t.setVisibility(GONE)
+                continue
+            t.setVisibility(VISIBLE)
+            sel = key == self.tab
+            t.setText("%s  %d" % (label, counts[key]))
+            if sel:
+                t.setBackground(self.k.shape(p["accent"], radius=17))
+                t.setTextColor(ji(p["on_accent"]))
+            else:
+                t.setBackground(self.k.ripple(self.k.shape(p["card"], radius=17), radius=17))
+                t.setTextColor(ji(p["sub"]))
+        items = self._base_items(self.tab)
+        q = self.query.lower()
+        if q:
+            if q.startswith("#"):
+                qq = q[1:].upper()
+                items = [(n, t) for (n, t) in items
+                         if qq in hex_color(eng.get(eng.key_id(n)))[1:]]
+            else:
+                items = [(n, t) for (n, t) in items
+                         if q in n.lower() or q in friendly_name(n).lower() or q in key_hint(n).lower()]
+        self.adapter.set_items(items)
+        title = eng.screen.get("title") or "—"
+        self.head_sub.setText("Экран: %s  ·  изменено: %d" % (title, counts["changed"]))
+        if items:
+            self.empty.setVisibility(GONE)
+        else:
+            if self.tab == "screen" and not q:
+                msg = "Этот экран не сообщает свои цвета.\nОткройте вкладку «Все» или найдите элемент пипеткой ⌖"
+            elif self.tab == "changed" and not q:
+                msg = "Пока ничего не изменено"
+            else:
+                msg = "Ничего не найдено"
+            self.empty.setText(msg)
+            self.empty.setVisibility(VISIBLE)
+
+    # ── редактирование ──
+    def open_picker(self, name, alts=None, from_tap=False):
+        eng = self.engine
+        kid = eng.key_id(name)
+        if kid < 0:
+            toast("Ключ не найден в этой версии: " + name, "err")
+            return
+        hide_keyboard(self.search)
+        if self.page == "picker" and self.editing and self.editing != name:
+            eng.anim_revert(self.editing)
+            eng.cancel_preview()
+        self.editing = name
+        eng.begin_preview(kid)
+        self.list_page.setVisibility(GONE)
+        self.picker_view.setVisibility(VISIBLE)
+        self.page = "picker"
+        self.picker.load(name, kid, eng.get(kid), name in eng.overrides)
+        if alts is not None:
+            self.picker_alts = list(alts)
+        elif not getattr(self, "_keep_alts", False):
+            self.picker_alts = []
+        self.picker.set_alts(self.picker_alts, name)
+        if self.height_frac < 0.6:
+            self.height_frac = 0.66
+            self._apply_expanded_window()
+        if from_tap:
+            # элемент точно на этом экране — только подсветить, никуда не переходить
+            post_ui(lambda: self.locate_key(name, full=False), 200)
+        elif bool(self.plugin.get_setting("auto_highlight", True)):
+            def auto():
+                on_screen = name in eng.screen.get("keys", []) or bool(eng.rects_for_key(kid))
+                if not on_screen and bool(self.plugin.get_setting("auto_navigate", True)):
+                    self.locate_key(name, full=True)     # перейти туда, где элемент
+                else:
+                    self.locate_key(name, full=False)
+            post_ui(auto, 180)
+        post_ui(lambda: self._update_where(name), 60)
+
+    def switch_alt(self, name):
+        """Переключиться на другой цвет из того же места (иконка ↔ фон ↔ текст)."""
+        if name == self.editing:
+            return
+        self._keep_alts = True
+        try:
+            self.open_picker(name, from_tap=True)
+        finally:
+            self._keep_alts = False
+
+    def _back_to_list(self):
+        self.picker_alts = []
+        self.editing = None
+        self.page = "list"
+        self.picker_view.setVisibility(GONE)
+        self.list_page.setVisibility(VISIBLE)
+        self.refresh_list()
+
+    def picker_cancel(self):
+        hide_keyboard(self.picker.hex)
+        self.engine.stop_blink()
+        if self.editing:
+            self.engine.anim_revert(self.editing)
+        self.engine.cancel_preview()
+        self._back_to_list()
+
+    def picker_apply(self, color):
+        name = self.editing
+        if not name:
+            return self._back_to_list()
+        self.engine.stop_blink()
+        self.engine.commit(self.engine.key_id(name), color)
+        self.engine.anim_set(name, self.picker.anim, persist=True)
+        self.plugin.push_recent(color)
+        toast("%s → %s" % (friendly_name(name), hex_color(color)), "ok")
+        self._back_to_list()
+
+    def picker_reset(self):
+        name = self.editing
+        self.engine.stop_blink()
+        self.engine._preview = None
+        if name:
+            self.engine.anim_set(name, None, persist=True)
+            self.engine.remove_override(name)
+            toast("Сброшено: " + friendly_name(name), "ok")
+        self._back_to_list()
+
+    def ask_key_color(self, cb):
+        """Выбрать цвет другого ключа (по имени из поиска)."""
+        k = self.k
+        if AlertDialogBuilder is None:
+            return
+        box = k.linear(True)
+        box.setPadding(k.dp(22), k.dp(6), k.dp(22), 0)
+        e = J("android.widget.EditText")(self.act)
+        e.setHint("например: actionBarDefault")
+        e.setSingleLine(True)
+        box.addView(e)
+
+        def ok(b, w):
+            name = str(e.getText().toString()).strip()
+            kid = self.engine.key_id(name)
+            if kid < 0:
+                toast("Нет такого ключа: " + name, "err")
+                return
+            cb(self.engine.get(kid))
+        try:
+            b = AlertDialogBuilder(self.act)
+            b.set_title("Цвет другого ключа")
+            b.set_view(box)
+            b.set_positive_button("Взять", ok)
+            b.set_negative_button("Отмена", None)
+            b.show()
+        except Exception:
+            log_exc("ask_key_color")
+
+    # ── меню ──
+    def menu(self, title, items, cb):
+        if AlertDialogBuilder is None:
+            return
+        try:
+            b = AlertDialogBuilder(self.act)
+            b.set_title(title)
+            b.set_items(items, lambda bb, which: post_ui(lambda: cb(int(which))))
+            b.show()
+        except Exception:
+            log_exc("menu")
+
+    def confirm(self, title, message, ok_text, cb, danger=True):
+        if AlertDialogBuilder is None:
+            cb()
+            return
+        try:
+            b = AlertDialogBuilder(self.act)
+            b.set_title(title)
+            b.set_message(message)
+            b.set_positive_button(ok_text, lambda bb, w: post_ui(cb))
+            b.set_negative_button("Отмена", None)
+            b.show()
+            if danger:
+                try:
+                    b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+                except Exception:
+                    pass
+        except Exception:
+            log_exc("confirm")
+
+    def _row_menu(self, name):
+        eng = self.engine
+        kid = eng.key_id(name)
+        changed = name in eng.overrides
+        items = ["Изменить цвет", "Показать, где это (с переходом)", "Скопировать имя ключа", "Скопировать цвет"]
+        if changed:
+            items.append("Сбросить изменение")
+
+        def pick(i):
+            if i == 0:
+                self.open_picker(name)
+            elif i == 1:
+                self.locate_key(name, full=True)
+            elif i == 2:
+                clipboard_set(name)
+                toast("Скопировано: " + name, "ok")
+            elif i == 3:
+                clipboard_set(hex_color(eng.get(kid)))
+                toast("Скопировано: " + hex_color(eng.get(kid)), "ok")
+            elif i == 4:
+                eng.remove_override(name)
+                self.refresh_list()
+                toast("Сброшено: " + friendly_name(name), "ok")
+        self.menu(friendly_name(name), items, pick)
+
+    def _list_menu(self):
+        plugin = self.plugin
+        eng = self.engine
+        hl = bool(plugin.get_setting("auto_highlight", True))
+        an = bool(plugin.get_setting("auto_navigate", True))
+        entries = []
+
+        def add(label, fn):
+            entries.append((label, fn))
+
+        def ribbon():
+            names = [n for n in eng.screen.get("keys", []) if not RIBBON_SKIP.search(n)]
+            if not names:
+                toast("На этом экране нет подходящих элементов", "err")
+                return
+            cnt = eng.anim_ribbon(names)
+            toast("RGB-лента: %d элементов" % cnt, "ok")
+            self.refresh_list()
+
+        def stop_all():
+            cnt = eng.anim_clear_all()
+            toast("Переливы остановлены: %d" % cnt if cnt else "Переливов нет", "ok" if cnt else "info")
+            self.refresh_list()
+
+        def rebuild():
+            eng.refresh_theme()
+            eng.rebuild_all()
+            post_ui(self._after_rebuild, 450)
+
+        def toggle(key, cur, text):
+            plugin.set_setting(key, not cur)
+            toast(text + (" выключено" if cur else " включено"))
+
+        def restore():
+            n = plugin.restore_backup()
+            self.refresh_list()
+            if n:
+                toast("Возвращено цветов: %d" % n, "ok")
+
+        add("RGB-лента на этом экране", ribbon)
+        if eng.anims:
+            add("Остановить все переливы (%d)" % len(eng.anims), stop_all)
+        add("Экспорт изменений в буфер", plugin.export_to_clipboard)
+        add("Импорт из буфера", lambda: (plugin.import_from_clipboard(), self.refresh_list()))
+        add("Перерисовать все экраны", rebuild)
+        add(("✓ " if hl else "") + "Подсвечивать при выборе ключа", lambda: toggle("auto_highlight", hl, "Подсветка"))
+        add(("✓ " if an else "") + "Переходить на экран элемента", lambda: toggle("auto_navigate", an, "Переход на экран"))
+        add("Сбросить ВСЕ изменения", lambda: plugin.ask_reset_all(after=self.refresh_list))
+        if plugin.get_setting("overrides_backup", ""):
+            add("Вернуть последние сброшенные", restore)
+
+        def pick(i):
+            if 0 <= i < len(entries):
+                entries[i][1]()
+        self.menu("Theme Color Editor", [e[0] for e in entries], pick)
+
+    def _after_rebuild(self):
+        self.engine.snapshot_screen()
+        if self.page == "list":
+            self.refresh_list()
+
+    # ── «где этот элемент» ──
+    def locate_key(self, name, full=True, allow_nav=True):
+        """Показать, где элемент. Если на текущем экране его нет —
+        перейти на экран, где он используется, и подсветить там."""
+        if not name:
+            return
+        eng = self.engine
+        nav = self.plugin.nav
+        kid = eng.key_id(name)
+        if kid < 0 or self._busy:
+            return
+        title = friendly_name(name)
+        p = self.k.p
+        if not full:
+            rects = eng.rects_for_key(kid)
+            Overlay.flash(self.act, rects, None, 1500, p)
+            eng.blink(kid, times=4, interval=240)
+            return
+
+        self._busy = True
+        self.hide_temporarily()
+
+        def done():
+            self._busy = False
+            self.unhide()
+            try:
+                self._after_rebuild()
+                if self.page == "picker" and self.editing:
+                    self._update_where(self.editing)
+            except Exception:
+                log_exc("locate done")
+
+        def show_here(screen_label=None):
+            try:
+                eng.snapshot_screen()
+                rects = eng.rects_for_key(kid)
+                where = ("  ·  экран «%s»" % screen_label) if screen_label else ""
+                if rects:
+                    msg = "%s%s\nнайдено мест: %d" % (title, where, len(rects))
+                else:
+                    msg = "%s%s\nсмотрите, что мигает" % (title, where)
+                Overlay.flash(self.act, rects, msg, 2400, p)
+                eng.blink(kid, times=8, interval=260, on_end=lambda: post_ui(done, 150))
+            except Exception:
+                log_exc("locate show")
+                done()
+
+        def go():
+            try:
+                eng.snapshot_screen()
+                rects = eng.rects_for_key(kid)
+                if rects or name in eng.screen.get("keys", []) or not allow_nav:
+                    show_here()
+                    return
+                rid = nav.route_for(name)
+                if rid == "dialog":
+                    self._demo_dialog(kid, title, done)
+                    return
+                if rid and nav.navigate(rid):
+                    label = ROUTE_LABELS.get(rid, rid)
+                    Overlay.flash(self.act, [], "Переход: %s…" % label, 650, p)
+                    post_ui(lambda: show_here(label), 700 if rid != "drawer" else 1000)
+                    return
+                show_here()
+            except Exception:
+                log_exc("locate")
+                done()
+        post_ui(go, 160)
+
+    def _demo_dialog(self, kid, title, done):
+        """Ключи всплывающих окон: показать пример окна, где этот цвет — ярким."""
+        eng = self.engine
+        T = J(THEME)
+        hi = highlight_for(eng.get(kid))
+        anim = False
+        try:
+            if not T.isAnimatingColor():
+                T.setAnimatingColor(True)
+                T.setAnimatedColor(int(kid), s32(hi))
+                anim = True
+        except Exception:
+            anim = False
+        b = None
+        if AlertDialogBuilder is not None:
+            try:
+                b = AlertDialogBuilder(self.act)
+                b.set_title("Пример всплывающего окна")
+                b.set_message("Ярким цветом показан элемент:\n«%s»\n\nТак выглядят окна подтверждений и меню." % title)
+                b.set_positive_button("Понятно", None)
+                b.set_negative_button("Отмена", None)
+                b.show()
+            except Exception:
+                log_exc("demo dialog")
+                b = None
+
+        def restore():
+            if anim:
+                try:
+                    T.setAnimatingColor(False)
+                except Exception:
+                    pass
+        post_ui(restore, 800)
+
+        def finish():
+            try:
+                if b is not None:
+                    b.dismiss()
+            except Exception:
+                pass
+            done()
+        post_ui(finish, 3200)
+
+    def _update_where(self, name):
+        try:
+            label = self.plugin.nav.where_label(name)
+        except Exception:
+            label = ""
+        if self.page != "picker" or self.editing != name:
+            return
+        if label == "на этом экране":
+            extra = "  •  📍 на этом экране"
+        elif label:
+            extra = "  •  📍 %s (нажмите метку — перейду)" % label
+        else:
+            extra = ""
+        self.picker.subtitle.setText(self.picker.base_sub + extra)
+
+    # ── пипетка ──
+    def start_inspector(self):
+        if self._busy:
+            return
+        self._busy = True
+        self.hide_temporarily()
+
+        def go():
+            def result(items, pt):
+                self._busy = False
+                if items is None:
+                    self.unhide()
+                    return
+                self.found = [(it[2], it[3]) for it in items]
+                if self.state != "expanded":
+                    self.expand()
+                self.unhide()
+                if self.page == "picker":
+                    self.picker_cancel()
+                self.query = ""
+                try:
+                    self.search.setText("")
+                except Exception:
+                    pass
+                if self.found:
+                    self.tab = "found"
+                    self.refresh_list()
+                    # сразу открыть цвет самого подходящего, остальные — переключателями
+                    self.open_picker(self.found[0][0], alts=self.found[:12], from_tap=True)
+                else:
+                    self.refresh_list()
+                    toast("Под пальцем не нашлось цветов темы — попробуйте точнее или вкладку «Все»", "err")
+            Overlay.inspect(self.act, self.engine, self.k.p, result)
+        post_ui(go, 180)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Оверлей поверх экрана: подсветка и пипетка
+# ════════════════════════════════════════════════════════════════════
+
+class Overlay:
+    _current = None
+
+    @staticmethod
+    def _decor(act):
+        return act.getWindow().getDecorView()
+
+    @staticmethod
+    def _remove(ov):
+        try:
+            parent = ov.getParent()
+            if parent is not None:
+                cast(J("android.view.ViewGroup"), parent).removeView(ov)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _label(k, text, p):
+        t = k.text(text, 13.5, 0xFFFFFFFF, bold=True, lines=2, gravity=G_CENTER)
+        t.setBackground(k.shape(0xE6141418, radius=18, stroke=1, stroke_color=(p["accent"] & 0xFFFFFF) | 0xAA000000))
+        t.setPadding(k.dp(16), k.dp(9), k.dp(16), k.dp(9))
+        return t
+
+    @staticmethod
+    def flash(act, rects, label, duration, p):
+        """Рамки вокруг элементов + подпись. Не перехватывает касания."""
+        try:
+            decor = Overlay._decor(act)
+            k = Kit(act, p)
+            ov = k.frame()
+            ov.setClickable(False)
+            ov.setFocusable(False)
+            OA = J("android.animation.ObjectAnimator")
+            loc = jarray(jint)([0, 0])
+            decor.getLocationInWindow(loc)
+            ox, oy = int(loc[0]), int(loc[1])
+            pad = k.dp(3)
+            for r in rects[:40]:
+                v = k.view()
+                v.setBackground(k.shape(0x22FF2D95, radius=8, stroke=2.5, stroke_color=0xFFFF2D95))
+                lp = k.flp(r[2] + pad * 2, r[3] + pad * 2)
+                lp.leftMargin = int(r[0] - ox - pad)
+                lp.topMargin = int(r[1] - oy - pad)
+                ov.addView(v, lp)
+                anim = OA.ofFloat(v, "alpha", jarray(jfloat)([1.0, 0.25]))
+                anim.setDuration(280)
+                anim.setRepeatCount(max(1, int(duration / 280) - 1))
+                anim.setRepeatMode(2)
+                anim.start()
+            if label:
+                t = Overlay._label(k, label, p)
+                top = 0
+                try:
+                    top = int(J("org.telegram.messenger.AndroidUtilities").statusBarHeight)
+                except Exception:
+                    top = k.dp(24)
+                lp = k.flp(WRAP, WRAP, G_TOP | G_CENTER_H)
+                lp.topMargin = top + k.dp(64)
+                ov.addView(t, lp)
+            cast(J("android.view.ViewGroup"), decor).addView(ov, J("android.widget.FrameLayout$LayoutParams")(MATCH, MATCH))
+            ov.setAlpha(0.0)
+            ov.animate().alpha(1.0).setDuration(150).start()
+
+            def end():
+                try:
+                    ov.animate().alpha(0.0).setDuration(200).start()
+                except Exception:
+                    pass
+                post_ui(lambda: Overlay._remove(ov), 230)
+            post_ui(end, int(duration))
+        except Exception:
+            log_exc("Overlay.flash")
+
+    @staticmethod
+    def inspect(act, engine, p, cb):
+        """Пипетка: снимок экрана → касание → список ключей."""
+        try:
+            window = act.getWindow()
+            decor = window.getDecorView()
+            W, H = int(decor.getWidth()), int(decor.getHeight())
+            Bitmap = J("android.graphics.Bitmap")
+            bmp = Bitmap.createBitmap(max(1, W), max(1, H), J("android.graphics.Bitmap$Config").ARGB_8888)
+            engine.snapshot_screen()
+            state = {"done": False}
+
+            def start_overlay():
+                if state["done"]:
+                    return
+                state["done"] = True
+                try:
+                    Overlay._inspect_overlay(act, engine, p, bmp, cb)
+                except Exception:
+                    log_exc("inspect overlay")
+                    cb(None, None)
+
+            def fallback_draw():
+                try:
+                    decor.draw(J("android.graphics.Canvas")(bmp))
+                except Exception:
+                    log_exc("decor.draw")
+                start_overlay()
+
+            used_pixelcopy = False
+            try:
+                if int(J("android.os.Build$VERSION").SDK_INT) >= 26:
+                    def finished(code):
+                        if int(code) != 0:
+                            fallback_draw()
+                        else:
+                            start_overlay()
+                    lst = make_proxy("android.view.PixelCopy$OnPixelCopyFinishedListener",
+                                     {"onPixelCopyFinished": finished})
+                    Overlay._keep = lst
+                    handler = J("android.os.Handler")(J("android.os.Looper").getMainLooper())
+                    J("android.view.PixelCopy").request(window, bmp, lst, handler)
+                    used_pixelcopy = True
+            except Exception:
+                log_exc("PixelCopy")
+                used_pixelcopy = False
+            if not used_pixelcopy:
+                fallback_draw()
+            else:
+                post_ui(lambda: (None if state["done"] else fallback_draw()), 1200)
+        except Exception:
+            log_exc("inspect")
+            cb(None, None)
+
+    @staticmethod
+    def _inspect_overlay(act, engine, p, bmp, cb):
+        k = Kit(act, p)
+        decor = Overlay._decor(act)
+        ov = k.frame()
+        ov.setBackgroundColor(s32(0x26000000))
+        ov.setClickable(True)
+
+        hint = Overlay._label(k, "👆 Нажмите на кнопку или элемент,\nцвет которого хотите изменить", p)
+        hint.setTextSize(1, 15.0)
+        top = k.dp(24)
+        try:
+            top = int(J("org.telegram.messenger.AndroidUtilities").statusBarHeight)
+        except Exception:
+            pass
+        hlp = k.flp(WRAP, WRAP, G_TOP | G_CENTER_H)
+        hlp.topMargin = top + k.dp(14)
+        ov.addView(hint, hlp)
+        try:
+            hint.setTranslationY(float(-k.dp(30)))
+            hint.animate().translationY(0.0).setDuration(260).start()
+        except Exception:
+            pass
+
+        cancel = k.pill_button("Отмена", filled=True, color=0xE6141418)
+        clp = k.flp(WRAP, k.dp(44), G_BOTTOM | G_CENTER_H)
+        clp.bottomMargin = k.dp(40)
+        ov.addView(cancel, clp)
+
+        ring_sz = k.dp(46)
+        ring = k.frame()
+        ring_d = k.shape(0x00000000, oval=True, stroke=3, stroke_color=0xFFFFFFFF)
+        ring.setBackground(ring_d)
+        dot = k.view()
+        dot.setBackground(k.shape(0xFFFF2D95, oval=True, stroke=1.5, stroke_color=0xFFFFFFFF))
+        ring.addView(dot, k.flp(k.dp(9), k.dp(9), G_CENTER))
+        ring.setVisibility(GONE)
+        ov.addView(ring, k.flp(ring_sz, ring_sz))
+
+        chip = k.text("", 13, 0xFFFFFFFF, bold=True, mono=True, gravity=G_CENTER)
+        chip_bg = k.shape(0xE6141418, radius=12)
+        chip.setBackground(chip_bg)
+        chip.setPadding(k.dp(10), k.dp(5), k.dp(10), k.dp(5))
+        chip.setVisibility(GONE)
+        ov.addView(chip, k.flp(WRAP, WRAP))
+
+        magnifier = None
+        try:
+            if int(J("android.os.Build$VERSION").SDK_INT) >= 28:
+                magnifier = J("android.widget.Magnifier")(ov)
+        except Exception:
+            magnifier = None
+
+        bw, bh = int(bmp.getWidth()), int(bmp.getHeight())
+        st = {"finished": False}
+
+        def pixel_at(x, y):
+            xi = max(0, min(bw - 1, int(x)))
+            yi = max(0, min(bh - 1, int(y)))
+            try:
+                return u32(bmp.getPixel(xi, yi))
+            except Exception:
+                return None
+
+        def finish(items, pt):
+            if st["finished"]:
+                return
+            st["finished"] = True
+            try:
+                if magnifier is not None:
+                    magnifier.dismiss()
+            except Exception:
+                pass
+            Overlay._remove(ov)
+            try:
+                bmp.recycle()
+            except Exception:
+                pass
+            cb(items, pt)
+
+        on_click(cancel, lambda: finish(None, None), k.refs)
+
+        def touch(v, e):
+            act_ = int(e.getActionMasked())
+            x, y = float(e.getX()), float(e.getY())
+            if "ox" not in st:
+                loc0 = jarray(jint)([0, 0])
+                ov.getLocationInWindow(loc0)
+                st["ox"], st["oy"] = int(loc0[0]), int(loc0[1])
+            wx, wy = int(x) + st["ox"], int(y) + st["oy"]
+            if act_ in (A_DOWN, A_MOVE):
+                ring.setVisibility(VISIBLE)
+                ring.setTranslationX(float(x - ring_sz / 2.0))
+                ring.setTranslationY(float(y - ring_sz / 2.0))
+                px = pixel_at(wx, wy)
+                if px is not None:
+                    chip.setText(hex_color(px, False))
+                    chip_bg.setStroke(k.dp(2), ji(px | 0xFF000000))
+                    chip.setVisibility(VISIBLE)
+                    chip.setTranslationX(float(x + k.dp(30)))
+                    chip.setTranslationY(float(y - k.dp(70)))
+                if magnifier is not None:
+                    try:
+                        magnifier.show(float(x), float(y))
+                    except Exception:
+                        pass
+                hint.setVisibility(INVISIBLE)
+            elif act_ == A_UP:
+                px = pixel_at(wx, wy)
+                rad = k.dp(6)
+                samples = []
+                for gx in (-2, -1, 0, 1, 2):
+                    for gy in (-2, -1, 0, 1, 2):
+                        samples.append(pixel_at(wx + gx * rad / 2.0, wy + gy * rad / 2.0))
+                ring.setVisibility(GONE)
+                chip.setVisibility(GONE)
+                try:
+                    if magnifier is not None:
+                        magnifier.dismiss()
+                except Exception:
+                    pass
+                items = []
+                try:
+                    items = engine.find_at(wx, wy, px, samples)
+                except Exception:
+                    log_exc("find_at")
+                best = None
+                for it in items:
+                    if it[4] is not None:
+                        best = it[4]
+                        break
+                label = friendly_name(items[0][2]) if items else None
+                Overlay.flash(act, [best] if best is not None else [], label, 700, p)
+                post_ui(lambda: finish(items, (wx, wy)), 480 if items else 0)
+            elif act_ == A_CANCEL:
+                ring.setVisibility(GONE)
+                chip.setVisibility(GONE)
+            return True
+
+        on_touch(ov, touch, k.refs)
+        Overlay._keep_refs = k.refs
+        cast(J("android.view.ViewGroup"), decor).addView(ov, J("android.widget.FrameLayout$LayoutParams")(MATCH, MATCH))
+        ov.setAlpha(0.0)
+        ov.animate().alpha(1.0).setDuration(160).start()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Плагин
+# ════════════════════════════════════════════════════════════════════
+
+class ColorInspectorPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        global _PLUGIN
+        _PLUGIN = self
+        self.panel = None
+        self._drawer_item = None
+        self.engine = Engine(self)
+        self.nav = Navigator(self.engine)
+        try:
+            self.engine.load()
+        except Exception:
+            log_exc("load overrides")
+        try:
+            self.engine.load_anims()
+        except Exception:
+            log_exc("load anims")
+        self.engine.install_hook()
+        self.engine.install_pinned_hook()
+        self.engine.install_chat_theme_hook()
+        if self.engine.overrides:
+            post_ui(self._initial_apply, 250)
+        if self.engine.anims:
+            post_ui(self.engine.anim_kick, 900)
+        self._update_drawer_item()
+
+    def _initial_apply(self):
+        self.engine.refresh_theme()
+
+    def on_plugin_unload(self):
+        try:
+            if self.panel is not None:
+                self.panel.close()
+        except Exception:
+            pass
+        self.panel = None
+        try:
+            self.engine.stop_blink()
+        except Exception:
+            pass
+        try:
+            self.engine.restore_everything()
+        except Exception:
+            log_exc("restore_everything")
+        self._remove_drawer_item()
+
+    def on_app_event(self, event_type):
+        try:
+            name = str(event_type).upper()
+            if "PAUSE" in name or "STOP" in name:
+                self.engine.anim_pause(True)        # в фоне перелив не гоняем
+            elif "RESUME" in name or "START" in name:
+                self.engine.anim_pause(False)
+            if "RESUME" in name and self.engine.overrides and not self.engine.hook_ok:
+                post_ui(self.engine.refresh_theme, 200)
+        except Exception:
+            pass
+
+    # ── пункт в боковом меню ──
+    def _update_drawer_item(self, enabled=None):
+        self._remove_drawer_item()
+        if enabled is None:
+            enabled = bool(self.get_setting("drawer_item", True))
+        if enabled:
+            try:
+                self._drawer_item = self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Редактор цветов",
+                    icon="msg_palette",
+                    on_click=lambda ctx: post_ui(self.open_editor),
+                    priority=0,
+                ))
+            except Exception:
+                log_exc("add_menu_item")
+
+    def _remove_drawer_item(self):
+        if self._drawer_item is not None:
+            try:
+                self.remove_menu_item(self._drawer_item)
+            except Exception:
+                pass
+            self._drawer_item = None
+
+    # ── редактор ──
+    def open_editor(self):
+        act = get_activity()
+        if act is None:
+            toast("Не удалось открыть редактор: нет активного окна", "err")
+            return
+        try:
+            if self.panel is not None and self.panel.dialog is not None:
+                if self.panel.act is act:
+                    self.panel.expand()
+                    return
+                self.panel.close()
+            self.panel = EditorPanel(self, act)
+            self.panel.show()
+        except Exception:
+            log_exc("open_editor")
+            toast("Ошибка открытия редактора — подробности в логах", "err")
+
+    # ── недавние цвета ──
+    def recent_colors(self):
+        try:
+            data = json.loads(self.get_setting("recent", "[]") or "[]")
+            out = []
+            for x in data:
+                c = parse_color(x)
+                if c is not None:
+                    out.append(c)
+            return out[:14]
+        except Exception:
+            return []
+
+    def push_recent(self, color):
+        rec = [c for c in self.recent_colors() if c != u32(color)]
+        rec.insert(0, u32(color))
+        self.set_setting("recent", json.dumps([hex_color(c) for c in rec[:14]]))
+
+    # ── экспорт / импорт / сброс ──
+    def export_text(self):
+        lines = ["%s=%s" % (k, hex_color(v)) for k, v in sorted(self.engine.overrides.items())]
+        return "\n".join(lines)
+
+    def export_to_clipboard(self):
+        if not self.engine.overrides:
+            toast("Нет изменений для экспорта")
+            return
+        try:
+            clipboard_set(self.export_text())
+            toast("Скопировано изменений: %d (формат .attheme)" % len(self.engine.overrides), "ok")
+        except Exception:
+            log_exc("export")
+            toast("Не удалось скопировать", "err")
+
+    def import_from_clipboard(self):
+        text = clipboard_get()
+        pairs = parse_import(text)
+        eng = self.engine
+        good = 0
+        for name, c in pairs:
+            if eng.key_id(name) >= 0 and name not in NON_COLOR_KEYS:
+                eng.overrides[name] = c
+                good += 1
+        if not good:
+            toast("В буфере нет цветов (ожидается key=#AARRGGBB по строкам или JSON)", "err")
+            return
+        eng.save()
+        eng.dirty = True
+        eng.refresh_theme()
+        toast("Импортировано цветов: %d" % good, "ok")
+
+    def _stop_anims(self):
+        n = self.engine.anim_clear_all()
+        toast("Переливы остановлены: %d" % n if n else "Переливов нет", "ok" if n else "info")
+
+    def restore_backup(self):
+        raw = self.get_setting("overrides_backup", "")
+        pairs = parse_import(raw) if raw else []
+        eng = self.engine
+        n = 0
+        for name, c in pairs:
+            if eng.key_id(name) >= 0:
+                eng.overrides[name] = c
+                n += 1
+        if n:
+            eng.dirty = True
+            eng.save()
+            self.set_setting("overrides_backup", "")
+            eng.refresh_theme()
+        return n
+
+    def ask_reset_all(self, after=None):
+        n = len(self.engine.overrides)
+        if not n:
+            toast("Изменений нет")
+            return
+
+        def do():
+            self.engine.reset_all()
+            toast("Все изменения сброшены", "ok")
+            if after:
+                after()
+        if self.panel is not None and self.panel.dialog is not None:
+            self.panel.confirm("Сбросить всё?", "Будут удалены изменения цветов: %d." % n, "Сбросить", do)
+        elif AlertDialogBuilder is not None:
+            try:
+                b = AlertDialogBuilder(get_activity())
+                b.set_title("Сбросить всё?")
+                b.set_message("Будут удалены изменения цветов: %d." % n)
+                b.set_positive_button("Сбросить", lambda bb, w: post_ui(do))
+                b.set_negative_button("Отмена", None)
+                b.show()
+            except Exception:
+                do()
+        else:
+            do()
+
+    # ── настройки ──
+    def create_settings(self):
+        """Ошибка здесь прячет кнопку настроек, поэтому строим максимально бережно."""
+        try:
+            items = self._settings_items()
+            return [it for it in items if it is not None]
+        except Exception:
+            log_exc("create_settings")
+            try:
+                return [Header(text="Theme Color Editor"),
+                        Text(text="Открыть редактор цветов", on_click=lambda *a: post_ui(self.open_editor))]
+            except Exception:
+                return []
+
+    def _settings_items(self):
+        n = 0
+        try:
+            n = len(self.engine.overrides)
+        except Exception:
+            pass
+        return [
+            S_header("Редактор"),
+            S_text(text="Открыть редактор цветов", icon="msg_palette", accent=True,
+                 on_click=lambda *a: post_ui(self.open_editor)),
+            S_switch(key="drawer_item", text="Пункт в боковом меню", default=True,
+                   subtext="«Редактор цветов» в меню слева", icon="msg_list",
+                   on_change=lambda v=None, *a: post_ui(
+                       lambda: self._update_drawer_item(bool(v) if isinstance(v, bool) else None))),
+            S_switch(key="auto_highlight", text="Подсвечивать элемент при выборе", default=True,
+                   subtext="Рамка и мигание там, где используется цвет", icon="msg_location"),
+            S_switch(key="auto_navigate", text="Переходить на экран элемента", default=True,
+                   subtext="Если цвета нет на текущем экране — открыть профиль, чат, настройки и т.п.",
+                   icon="msg_arrow_forward"),
+            S_selector(key="style", text="Оформление редактора", default=0,
+                     items=["Как у темы", "Тёмное", "Светлое"], icon="msg_theme"),
+            S_header("RGB-перелив"),
+            S_selector(key="anim_fps", text="Плавность перелива", default=1,
+                     items=["Экономно (10 к/с)", "Обычно (20 к/с)", "Плавно (30 к/с)"], icon="msg_theme"),
+            S_text(text="Остановить все переливы", icon="msg_reset",
+                 on_click=lambda *a: post_ui(self._stop_anims)),
+            S_header("Изменения (%d)" % n),
+            S_text(text="Экспорт в буфер обмена", icon="msg_copy",
+                 on_click=lambda *a: post_ui(self.export_to_clipboard)),
+            S_text(text="Импорт из буфера обмена", icon="msg_download",
+                 on_click=lambda *a: post_ui(self.import_from_clipboard)),
+            S_text(text="Сбросить все изменения", icon="msg_reset", red=True,
+                 on_click=lambda *a: post_ui(self.ask_reset_all)),
+            S_divider(text="Изменения действуют поверх любой темы и сохраняются после перезапуска. "
+                         "В редакторе: ⌖ — пипетка (нажмите на элемент экрана), значок метки — показать, "
+                         "где элемент (с переходом на нужный экран); потяните за полоску сверху, "
+                         "чтобы изменить высоту окна."),
+        ]
+
+
+def _safe_setting(cls, required, **kw):
+    """Создать элемент настроек; если SDK не знает какой-то параметр —
+    повторить без необязательных, а не уронить весь экран настроек."""
+    try:
+        return cls(**kw)
+    except TypeError:
+        log("settings: %s не принял %s" % (getattr(cls, "__name__", cls), sorted(set(kw) - set(required))))
+    base = {k: v for k, v in kw.items() if k in required}
+    for opt in ("on_change", "on_click", "icon", "accent", "red", "subtext", "items"):
+        if opt in kw:
+            trial = dict(base)
+            trial[opt] = kw[opt]
+            try:
+                cls(**trial)
+                base = trial
+            except TypeError:
+                pass
+    try:
+        return cls(**base)
+    except Exception:
+        log_exc("settings item")
+        return None
+
+
+def S_header(text):
+    return _safe_setting(Header, ("text",), text=text)
+
+
+def S_text(**kw):
+    return _safe_setting(Text, ("text",), **kw)
+
+
+def S_switch(**kw):
+    return _safe_setting(Switch, ("key", "text", "default"), **kw)
+
+
+def S_selector(**kw):
+    return _safe_setting(Selector, ("key", "text", "default", "items"), **kw)
+
+
+def S_divider(**kw):
+    return _safe_setting(Divider, (), **kw)
+
+
+def parse_import(text):
+    out = []
+    if not text:
+        return out
+    t = text.strip()
+    if t.startswith("{"):
+        try:
+            data = json.loads(t)
+            for k, v in data.items():
+                c = parse_color(v) if isinstance(v, str) else (u32(v) if isinstance(v, int) else None)
+                if c is not None:
+                    out.append((str(k).strip(), c))
+            return out
+        except Exception:
+            pass
+    for line in t.replace("\r", "\n").replace(";", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") and "=" not in line:
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+        elif ":" in line:
+            k, v = line.split(":", 1)
+        else:
+            continue
+        k = k.strip().strip('"').strip("'")
+        c = parse_color(v.strip().strip(",").strip('"').strip("'"))
+        if k and c is not None:
+            out.append((k, c))
+    return out
