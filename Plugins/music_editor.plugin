@@ -1,0 +1,1200 @@
+__id__ = "music_editor"
+__name__ = "Music Editor"
+__description__ = (
+    "Редактор музыки во встроенном плеере: теги (название, исполнитель, альбом), "
+    "обложка, обрезка, скорость и тон, реверб, бас, громкость, 8D, широкое стерео, "
+    "плавные начало/конец, выравнивание громкости, эквалайзер, пресеты "
+    "(Slowed + Reverb, Nightcore…), битрейт. Результат можно сохранить в Избранное, "
+    "отправить в чат или скачать.\n"
+    "Как пользоваться: откройте плеер музыки → «⋮» → «Редактор трека».\n\n"
+    "Music editor inside the built-in player: tags, cover, trim, speed/pitch, reverb, "
+    "bass, EQ, 8D, bitrate. Open the player → ⋮ → Track editor.\n\n"
+    "Канал / channel: @goodgamenicetry"
+)
+__author__ = "@ympuxyecoc"
+__version__ = "1.0.0"
+__min_version__ = "12.10.6"
+__icon__ = "trackeditor_by_gxwai/0"
+__category__ = ["tools"]
+
+import math
+import os
+import re
+import struct
+import threading
+import warnings
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Switch, Divider
+
+try:
+    from base_plugin import MethodHook
+except ImportError:  # pragma: no cover
+    from hook_utils import MethodHook
+
+from java import dynamic_proxy, jclass, jarray, jbyte
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    BulletinHelper = None
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        import audioop
+    except Exception:
+        audioop = None
+
+TAG = "MusicEditor"
+PICK_REQ = 0x7E0E
+
+OnClick = jclass("android.view.View$OnClickListener")
+JString = jclass("java.lang.String")
+
+SPEEDS = [0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0,
+          1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.4, 1.5]
+PITCHES = list(range(-12, 13))
+PERCENTS = list(range(0, 101, 10))
+VOLUMES = [-12, -9, -6, -3, 0, 3, 6, 9, 12]
+BITRATES = [0, 64, 96, 128, 160, 192, 256]
+# (название, бас, высокие, режим)
+EQS = [
+    ("Ровно", 0, 0, None),
+    ("Басс", 0.9, 0, None),
+    ("Фонк", 1.3, 0.35, None),
+    ("Хип-хоп", 0.6, 0.2, None),
+    ("Высокие", 0, 0.7, None),
+    ("Радио", 0, 0, "radio"),
+    ("Вокал", 0, 0, "vocal"),
+    ("Рок", 0.45, 0.45, None),
+]
+DEFAULTS = {
+    "speed": 1.0, "pitch": 0, "keep_pitch": False, "reverb": 0, "bass": 0,
+    "volume": 0, "d8": False, "wide": False, "fade_in": False, "fade_out": False,
+    "normalize": False, "eq": 0, "bitrate": 0, "trim": None,
+}
+PRESETS = [
+    ("Оригинал", {}),
+    ("Slowed + Reverb", {"speed": 0.8, "reverb": 50, "bass": 20}),
+    ("Nightcore", {"speed": 1.25, "eq": 4}),
+    ("Sped Up", {"speed": 1.2}),
+    ("Bass Boost", {"bass": 70, "eq": 1}),
+    ("8D", {"d8": True, "reverb": 30}),
+]
+
+
+def _ui(fn):
+    run_on_ui_thread(fn)
+
+
+def _toast(text, ok=True):
+    def show():
+        try:
+            if BulletinHelper is None:
+                return
+            if ok:
+                BulletinHelper.show_success(text)
+            else:
+                BulletinHelper.show_error(text)
+        except Exception:
+            pass
+    _ui(show)
+
+
+def _jcls(name):
+    """java.lang.Class (find_class отдаёт обёртку Chaquopy без рефлексии)."""
+    loader = jclass("org.telegram.messenger.ApplicationLoader").applicationContext.getClassLoader()
+    return loader.loadClass(name)
+
+
+def _get_field(obj, name):
+    cls = obj.getClass()
+    while cls is not None:
+        try:
+            f = cls.getDeclaredField(name)
+            f.setAccessible(True)
+            return f.get(obj)
+        except Exception:
+            cls = cls.getSuperclass()
+    return None
+
+
+def _jbytes(arr):
+    if arr is None:
+        return None
+    try:
+        return bytes(arr)
+    except Exception:
+        return bytes(b & 0xFF for b in arr)
+
+
+def _fmt_time(sec):
+    sec = max(0, int(round(sec)))
+    return "%d:%02d" % (sec // 60, sec % 60)
+
+
+def _parse_time(text):
+    text = str(text).strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        return int(parts[0]) * 60 + float(parts[1])
+    except ValueError:
+        return None
+
+
+def _safe_name(s):
+    s = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", s).strip()
+    return s[:80] or "track"
+
+
+class Run(dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception as e:
+            log("%s run: %s" % (TAG, e))
+
+
+class Click(dynamic_proxy(OnClick)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        try:
+            self.fn()
+        except Exception as e:
+            log("%s click: %s" % (TAG, e))
+
+
+# ----------------------------------------------------------------- DSP (audioop)
+# PCM: 16 бит, стерео, interleaved; кадр = 4 байта.
+
+def _shift(x, frames):
+    n = frames * 4
+    if n <= 0:
+        return x
+    if n >= len(x):
+        return b"\0" * len(x)
+    return b"\0" * n + x[:-n]
+
+
+def _lp(x, k):
+    """ФНЧ: каскад (1 + z^-2^i)/2 = скользящее среднее на 2^k кадров, без задержки."""
+    y = x
+    for i in range(k):
+        y = audioop.add(audioop.mul(y, 2, 0.5), audioop.mul(_shift(y, 1 << i), 2, 0.5), 2)
+    d = ((1 << k) - 1) // 2
+    return y[d * 4:] + b"\0" * (d * 4) if d else y
+
+
+def _sub(a, b):
+    return audioop.add(a, audioop.mul(b, 2, -1.0), 2)
+
+
+def _mix(a, ga, b, gb):
+    return audioop.add(audioop.mul(a, 2, ga), audioop.mul(b, 2, gb), 2)
+
+
+def _eq(x, idx, bass_pct):
+    _, bass, treble, mode = EQS[idx]
+    bass += bass_pct / 100.0 * 1.6
+    if mode == "radio":
+        band = _sub(_lp(x, 2), _lp(x, 6))
+        x = audioop.mul(band, 2, 1.8)
+    elif mode == "vocal":
+        x = _mix(x, 0.85, _sub(_lp(x, 3), _lp(x, 6)), 0.8)
+    if bass > 0:
+        x = _mix(x, 1.0 / (1 + bass * 0.35), _lp(x, 7), bass / (1 + bass * 0.35))
+    if treble > 0:
+        x = _mix(x, 1.0, _sub(x, _lp(x, 4)), treble)
+    return x
+
+
+def _comb(x, frames, g, n=5):
+    y = x
+    for _ in range(n):
+        y = audioop.add(y, audioop.mul(_shift(y, frames), 2, g), 2)
+        frames *= 2
+        g *= g
+    return y
+
+
+def _reverb(x, sr, pct):
+    w = pct / 100.0
+    g = 0.55 + 0.3 * w
+    src = audioop.mul(x, 2, 0.12)
+    wet = None
+    for ms in (49.7, 56.1, 61.3, 68.9):
+        c = _comb(src, int(sr * ms / 1000.0), g)
+        wet = c if wet is None else audioop.add(wet, c, 2)
+    wet = _lp(wet, 2)
+    return _mix(x, 1.0 - 0.35 * w, wet, 1.4 * w)
+
+
+def _resample(x, sr, ratio):
+    if abs(ratio - 1.0) < 1e-4:
+        return x
+    return audioop.ratecv(x, 2, 2, int(round(sr * ratio)), sr, None)[0]
+
+
+def _stretch(x, f):
+    """OLA: длительность × f без изменения тона."""
+    if abs(f - 1.0) < 1e-3:
+        return x
+    W, S = 2048, 16
+    H = W // 2
+    hb, sb, wb = H * 4, H * 4 // S, W * 4
+    n = len(x) // 4
+    out_frames = int(n * f)
+    ha = H / f
+    parts, prev = [], None
+    for k in range(out_frames // H + 1):
+        a = int(k * ha) * 4
+        seg = x[a:a + wb]
+        if len(seg) < wb:
+            seg += b"\0" * (wb - len(seg))
+        head, tail = seg[:hb], seg[hb:]
+        if prev is None:
+            parts.append(head)
+        else:
+            for i in range(S):
+                g = (i + 0.5) / S
+                parts.append(_mix(prev[i * sb:(i + 1) * sb], 1 - g, head[i * sb:(i + 1) * sb], g))
+        prev = tail
+    parts.append(prev)
+    return b"".join(parts)[:out_frames * 4]
+
+
+def _wide(x):
+    l = audioop.tomono(x, 2, 1, 0)
+    r = audioop.tomono(x, 2, 0, 1)
+    d = audioop.mul(_sub(l, r), 2, 0.35)
+    l2 = audioop.add(l, d, 2)
+    r2 = _sub(r, d)
+    return audioop.add(audioop.tostereo(l2, 2, 1, 0), audioop.tostereo(r2, 2, 0, 1), 2)
+
+
+def _8d(x, sr, period=8.0):
+    ch = 2048 * 4
+    out = []
+    for i in range(0, len(x), ch):
+        t = i / 4.0 / sr
+        p = (math.sin(2 * math.pi * t / period) + 1) * math.pi / 4
+        m = audioop.tomono(x[i:i + ch], 2, 0.5, 0.5)
+        out.append(audioop.tostereo(m, 2, math.cos(p) * 1.25, math.sin(p) * 1.25))
+    return b"".join(out)
+
+
+def _fade(x, sr, sec, fade_in):
+    n = min(len(x) // 4, int(sec * sr)) * 4
+    if n <= 0:
+        return x
+    steps = 64
+    blk = max(4, (n // steps) // 4 * 4)
+    region = x[:n] if fade_in else x[-n:]
+    parts = []
+    for i, j in enumerate(range(0, n, blk)):
+        g = (i + 0.5) * blk / n
+        g = min(1.0, g) if fade_in else max(0.0, 1.0 - g)
+        parts.append(audioop.mul(region[j:j + blk], 2, g * g))
+    region = b"".join(parts)
+    return region + x[n:] if fade_in else x[:-n] + region
+
+
+def _process(pcm, sr, st, prog=None):
+    step = prog or (lambda f: None)
+    if st["trim"]:
+        a, b = st["trim"]
+        pcm = pcm[int(a * sr) * 4:int(b * sr) * 4]
+    speed = st["speed"]
+    p = 2 ** (st["pitch"] / 12.0)
+    ratio = (1.0 if st["keep_pitch"] else speed) * p
+    step(0.05)
+    pcm = _resample(pcm, sr, ratio)
+    pcm = _stretch(pcm, ratio / speed)
+    step(0.35)
+    if st["eq"] or st["bass"]:
+        pcm = _eq(pcm, st["eq"], st["bass"])
+    step(0.5)
+    if st["reverb"]:
+        pcm = _reverb(pcm, sr, st["reverb"])
+    step(0.8)
+    if st["wide"]:
+        pcm = _wide(pcm)
+    if st["d8"]:
+        pcm = _8d(pcm, sr)
+    if st["volume"]:
+        pcm = audioop.mul(pcm, 2, 10 ** (st["volume"] / 20.0))
+    if st["normalize"]:
+        peak = audioop.max(pcm, 2)
+        if peak > 0:
+            pcm = audioop.mul(pcm, 2, min(8.0, 32000.0 / peak))
+    if st["fade_in"]:
+        pcm = _fade(pcm, sr, 3.0, True)
+    if st["fade_out"]:
+        pcm = _fade(pcm, sr, 4.0, False)
+    return pcm
+
+
+# ------------------------------------------------------------- MediaCodec I/O
+
+def _decode(path, prog=None):
+    MediaExtractor = jclass("android.media.MediaExtractor")
+    MediaCodec = jclass("android.media.MediaCodec")
+    ex = MediaExtractor()
+    ex.setDataSource(path)
+    track, fmt = -1, None
+    for i in range(ex.getTrackCount()):
+        f = ex.getTrackFormat(i)
+        if str(f.getString("mime")).startswith("audio/"):
+            track, fmt = i, f
+            break
+    if track < 0:
+        raise RuntimeError("в файле нет аудиодорожки")
+    ex.selectTrack(track)
+    dur_us = fmt.getLong("durationUs") if fmt.containsKey("durationUs") else 0
+    sr = fmt.getInteger("sample-rate")
+    ch = fmt.getInteger("channel-count")
+    codec = MediaCodec.createDecoderByType(fmt.getString("mime"))
+    codec.configure(fmt, None, None, 0)
+    codec.start()
+    info = MediaCodec.BufferInfo()
+    chunks, eos_in, buf = [], False, None
+    try:
+        while True:
+            if not eos_in:
+                ii = codec.dequeueInputBuffer(5000)
+                if ii >= 0:
+                    n = ex.readSampleData(codec.getInputBuffer(ii), 0)
+                    if n < 0:
+                        codec.queueInputBuffer(ii, 0, 0, 0, 4)
+                        eos_in = True
+                    else:
+                        t = ex.getSampleTime()
+                        codec.queueInputBuffer(ii, 0, n, t, 0)
+                        ex.advance()
+                        if prog is not None and dur_us > 0:
+                            prog(min(1.0, t / dur_us))
+            oi = codec.dequeueOutputBuffer(info, 5000)
+            if oi == -2:
+                of = codec.getOutputFormat()
+                sr = of.getInteger("sample-rate")
+                ch = of.getInteger("channel-count")
+            elif oi >= 0:
+                size = info.size
+                if size > 0:
+                    ob = codec.getOutputBuffer(oi)
+                    ob.position(info.offset)
+                    if buf is None or len(buf) < size:
+                        buf = jarray(jbyte)(size)
+                    ob.get(buf, 0, size)
+                    chunks.append(_jbytes(buf)[:size])
+                codec.releaseOutputBuffer(oi, False)
+                if info.flags & 4:
+                    break
+    finally:
+        codec.stop()
+        codec.release()
+        ex.release()
+    pcm = b"".join(chunks)
+    if ch == 1:
+        pcm = audioop.tostereo(pcm, 2, 1, 1)
+    elif ch != 2:
+        raise RuntimeError("неподдерживаемое число каналов: %d" % ch)
+    return pcm, sr
+
+
+def _encode_aac(pcm, sr, kbps, out_path, prog=None):
+    MediaCodec = jclass("android.media.MediaCodec")
+    MediaFormat = jclass("android.media.MediaFormat")
+    MediaMuxer = jclass("android.media.MediaMuxer")
+    fmt = MediaFormat.createAudioFormat("audio/mp4a-latm", sr, 2)
+    fmt.setInteger("aac-profile", 2)
+    fmt.setInteger("bitrate", kbps * 1000)
+    fmt.setInteger("max-input-size", 16384)
+    enc = MediaCodec.createEncoderByType("audio/mp4a-latm")
+    enc.configure(fmt, None, None, 1)
+    enc.start()
+    mux = MediaMuxer(out_path, 0)
+    info = MediaCodec.BufferInfo()
+    track, pos, total, eos_in, started = -1, 0, len(pcm), False, False
+    try:
+        while True:
+            if not eos_in:
+                ii = enc.dequeueInputBuffer(5000)
+                if ii >= 0:
+                    ib = enc.getInputBuffer(ii)
+                    ib.clear()
+                    n = min(ib.remaining(), total - pos) // 4 * 4
+                    pts = (pos // 4) * 1000000 // sr
+                    if n <= 0:
+                        enc.queueInputBuffer(ii, 0, 0, pts, 4)
+                        eos_in = True
+                    else:
+                        ib.put(jarray(jbyte)(pcm[pos:pos + n]))
+                        enc.queueInputBuffer(ii, 0, n, pts, 0)
+                        pos += n
+                        if prog is not None:
+                            prog(pos / float(total))
+            oi = enc.dequeueOutputBuffer(info, 5000)
+            if oi == -2:
+                track = mux.addTrack(enc.getOutputFormat())
+                mux.start()
+                started = True
+            elif oi >= 0:
+                if info.size > 0 and started and not (info.flags & 2):
+                    ob = enc.getOutputBuffer(oi)
+                    ob.position(info.offset)
+                    ob.limit(info.offset + info.size)
+                    mux.writeSampleData(track, ob, info)
+                enc.releaseOutputBuffer(oi, False)
+                if info.flags & 4:
+                    break
+    finally:
+        enc.stop()
+        enc.release()
+        if started:
+            mux.stop()
+        mux.release()
+
+
+# --------------------------------------------------------------------- теги
+
+def _syncsafe(n):
+    return bytes([(n >> 21) & 0x7F, (n >> 14) & 0x7F, (n >> 7) & 0x7F, n & 0x7F])
+
+
+def _write_id3(data, tags):
+    if data[:3] == b"ID3":
+        s = data[6:10]
+        size = (s[0] << 21) | (s[1] << 14) | (s[2] << 7) | s[3]
+        data = data[10 + size + (10 if data[5] & 0x10 else 0):]
+    frames = b""
+    for fid, key in ((b"TIT2", "title"), (b"TPE1", "artist"), (b"TALB", "album")):
+        if tags.get(key):
+            body = b"\x01\xff\xfe" + tags[key].encode("utf-16-le")
+            frames += fid + struct.pack(">I", len(body)) + b"\0\0" + body
+    if tags.get("cover"):
+        mime = b"image/png" if tags["cover"][:4] == b"\x89PNG" else b"image/jpeg"
+        body = b"\x00" + mime + b"\x00\x03\x00" + tags["cover"]
+        frames += b"APIC" + struct.pack(">I", len(body)) + b"\0\0" + body
+    return b"ID3\x03\x00\x00" + _syncsafe(len(frames)) + frames + data
+
+
+def _atom(t, payload):
+    return struct.pack(">I", 8 + len(payload)) + t + payload
+
+
+def _atoms(data, start=0, end=None):
+    end = len(data) if end is None else end
+    i = start
+    while i + 8 <= end:
+        size, t = struct.unpack(">I4s", data[i:i + 8])
+        hdr = 8
+        if size == 1:
+            size, hdr = struct.unpack(">Q", data[i + 8:i + 16])[0], 16
+        elif size == 0:
+            size = end - i
+        if size < hdr:
+            break
+        yield t, i, hdr, size
+        i += size
+
+
+_CONTAINERS = (b"trak", b"mdia", b"minf", b"stbl", b"edts")
+
+
+def _fix_offsets(moov, delta):
+    buf = bytearray(moov)
+
+    def walk(s, e):
+        for t, i, hdr, size in _atoms(buf, s, e):
+            if t in _CONTAINERS:
+                walk(i + hdr, i + size)
+            elif t in (b"stco", b"co64"):
+                cnt = struct.unpack(">I", buf[i + 12:i + 16])[0]
+                w, f = (4, ">I") if t == b"stco" else (8, ">Q")
+                for k in range(cnt):
+                    p = i + 16 + k * w
+                    struct.pack_into(f, buf, p, struct.unpack(f, buf[p:p + w])[0] + delta)
+    walk(8, len(buf))
+    return bytes(buf)
+
+
+def _write_mp4_tags(data, tags):
+    items = b""
+    for t, key in ((b"\xa9nam", "title"), (b"\xa9ART", "artist"), (b"\xa9alb", "album")):
+        if tags.get(key):
+            items += _atom(t, _atom(b"data", struct.pack(">II", 1, 0) + tags[key].encode("utf-8")))
+    if tags.get("cover"):
+        kind = 14 if tags["cover"][:4] == b"\x89PNG" else 13
+        items += _atom(b"covr", _atom(b"data", struct.pack(">II", kind, 0) + tags["cover"]))
+    hdlr = _atom(b"hdlr", b"\0" * 8 + b"mdirappl" + b"\0" * 9)
+    udta = _atom(b"udta", _atom(b"meta", b"\0\0\0\0" + hdlr + _atom(b"ilst", items)))
+
+    moov = mdat_pos = None
+    for t, i, hdr, size in _atoms(data):
+        if t == b"moov":
+            moov = (i, hdr, size)
+        elif t == b"mdat" and mdat_pos is None:
+            mdat_pos = i
+    if moov is None:
+        raise RuntimeError("moov не найден")
+    i, hdr, size = moov
+    body = b"".join(data[ci:ci + cs] for t, ci, ch, cs in _atoms(data, i + hdr, i + size) if t != b"udta")
+    new_moov = _atom(b"moov", body + udta)
+    if mdat_pos is not None and i < mdat_pos:
+        new_moov = _fix_offsets(new_moov, len(new_moov) - size)
+    return data[:i] + new_moov + data[i + size:]
+
+
+# ------------------------------------------------------------------- хуки
+
+class _MenuOptionsHook(MethodHook):
+    """AudioPlayerAlert.showMenuOptions: запоминаем плеер, пока строится меню «⋮»."""
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._menu_alert = param.thisObject
+
+    def after_hooked_method(self, param):
+        self.plugin._menu_alert = None
+
+
+class _ItemOptionsShowHook(MethodHook):
+    """ItemOptions.show: добавляем пункт, если это меню плеера."""
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        alert = self.plugin._menu_alert
+        if alert is None:
+            return
+        self.plugin._menu_alert = None
+        try:
+            self.plugin.add_player_item(param.thisObject, alert)
+        except Exception as e:
+            log("%s add item: %s" % (TAG, e))
+
+
+class _ActivityResultHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if int(param.args[0]) == PICK_REQ:
+                param.setResult(None)
+                self.plugin.on_cover_picked(int(param.args[1]), param.args[2])
+        except Exception as e:
+            log("%s activity result: %s" % (TAG, e))
+
+
+# ------------------------------------------------------------------ плагин
+
+class MusicEditorPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._cover_cb = None
+        self._menu_alert = None
+        cls = _jcls("org.telegram.ui.Components.AudioPlayerAlert")
+        for m in cls.getDeclaredMethods():
+            if str(m.getName()) == "showMenuOptions":
+                self.hook_method(m, _MenuOptionsHook(self))
+        io = _jcls("org.telegram.ui.Components.ItemOptions")
+        for m in io.getDeclaredMethods():
+            if str(m.getName()) == "show" and m.getParameterCount() == 0:
+                self.hook_method(m, _ItemOptionsShowHook(self))
+        la = _jcls("org.telegram.ui.LaunchActivity")
+        for m in la.getDeclaredMethods():
+            if str(m.getName()) == "onActivityResult":
+                self.hook_method(m, _ActivityResultHook(self))
+
+    def create_settings(self):
+        return [
+            Header(text="Music Editor"),
+            Switch(key="player_button", text="Кнопка «Редактор трека» в плеере", default=True),
+            Divider(text="Откройте плеер музыки → «⋮» → «Редактор трека». "
+                         "Без изменений звука mp3/m4a не перекодируются — меняются только теги."),
+            Divider(text="Автор: @ympuxyecoc · Канал: @goodgamenicetry"),
+        ]
+
+    # ---------------------------------------------------------- кнопка в плеере
+    def add_player_item(self, o, alert):
+        if not self.get_setting("player_button", True):
+            return
+        ctx = alert.getContext()
+        icon = ctx.getResources().getIdentifier("msg_edit", "drawable", ctx.getPackageName())
+
+        def click():
+            o.dismiss()
+            self.open_from_player(alert)
+        o.add(icon, "Редактор трека", Run(click))
+
+    def open_from_player(self, alert):
+        mo = jclass("org.telegram.messenger.MediaController").getInstance().getPlayingMessageObject()
+        if mo is None:
+            _toast("Ничего не играет", ok=False)
+            return
+        path = self._message_path(mo)
+        if not path:
+            _toast("Сначала дождитесь загрузки трека", ok=False)
+            return
+        try:
+            alert.dismiss()
+        except Exception:
+            pass
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag is not None else alert.getContext()
+        Editor(self, act, mo, path).show()
+
+    @staticmethod
+    def _message_path(mo):
+        cands = []
+        try:
+            cands.append(str(mo.messageOwner.attachPath or ""))
+        except Exception:
+            pass
+        try:
+            fl = jclass("org.telegram.messenger.FileLoader").getInstance(mo.currentAccount)
+            cands.append(str(fl.getPathToMessage(mo.messageOwner).getAbsolutePath()))
+        except Exception:
+            pass
+        for p in cands:
+            if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+        return None
+
+    # ------------------------------------------------------------- обложка
+    def pick_cover(self, act, cb):
+        Intent = jclass("android.content.Intent")
+        it = Intent(Intent.ACTION_GET_CONTENT)
+        it.setType("image/*")
+        self._cover_cb = cb
+        act.startActivityForResult(it, PICK_REQ)
+
+    def on_cover_picked(self, result_code, intent):
+        cb, self._cover_cb = self._cover_cb, None
+        if cb is None or result_code != -1 or intent is None or intent.getData() is None:
+            return
+        try:
+            ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+            stream = ctx.getContentResolver().openInputStream(intent.getData())
+            bmp = jclass("android.graphics.BitmapFactory").decodeStream(stream)
+            stream.close()
+            Bitmap = jclass("android.graphics.Bitmap")
+            side = min(bmp.getWidth(), bmp.getHeight())
+            bmp = Bitmap.createBitmap(bmp, (bmp.getWidth() - side) // 2,
+                                      (bmp.getHeight() - side) // 2, side, side)
+            if side > 800:
+                bmp = Bitmap.createScaledBitmap(bmp, 800, 800, True)
+            bos = jclass("java.io.ByteArrayOutputStream")()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 90, bos)
+            cb(_jbytes(bos.toByteArray()))
+        except Exception as e:
+            _toast("Не удалось открыть картинку: %s" % e, ok=False)
+
+
+class Editor:
+    def __init__(self, plugin, act, mo, path):
+        self.plugin, self.act, self.mo, self.path = plugin, act, mo, path
+        self.account = mo.currentAccount
+        self.ext = os.path.splitext(path)[1].lower().lstrip(".")
+        self.st = dict(DEFAULTS)
+        self.preset = 0
+        self.cells = {}
+        self.cache = {}
+        self.dialog = None
+        self.duration = float(mo.getDuration() or 0)
+        self.src_kbps = 0
+        self.tags = {"title": "", "artist": "", "album": "", "cover": None}
+        self.tags_changed = False
+        self._read_tags()
+
+    # --------------------------------------------------------------- данные
+    def _read_tags(self):
+        r = jclass("android.media.MediaMetadataRetriever")()
+        try:
+            r.setDataSource(self.path)
+            self.tags["title"] = str(r.extractMetadata(7) or "")
+            self.tags["artist"] = str(r.extractMetadata(2) or "")
+            self.tags["album"] = str(r.extractMetadata(1) or "")
+            self.tags["cover"] = _jbytes(r.getEmbeddedPicture())
+            self.src_kbps = int(r.extractMetadata(20) or 0) // 1000
+            if not self.duration:
+                self.duration = int(r.extractMetadata(9) or 0) / 1000.0
+        except Exception as e:
+            log("%s retriever: %s" % (TAG, e))
+        finally:
+            r.release()
+        if not self.tags["title"]:
+            self.tags["title"] = str(self.mo.getMusicTitle() or "")
+        if not self.tags["artist"]:
+            self.tags["artist"] = str(self.mo.getMusicAuthor() or "")
+
+    def _audio_changed(self):
+        return any(self.st[k] != DEFAULTS[k] for k in DEFAULTS if k != "bitrate")
+
+    def _out_duration(self):
+        d = self.duration
+        if self.st["trim"]:
+            d = self.st["trim"][1] - self.st["trim"][0]
+        return d / self.st["speed"]
+
+    def _kbps(self):
+        if self.st["bitrate"]:
+            return self.st["bitrate"]
+        if not self._audio_changed() and self.ext in ("mp3", "m4a"):
+            return self.src_kbps or 0
+        return 256
+
+    def _size_text(self, kbps):
+        if not kbps:
+            return ""
+        return "≈ %.1f МБ" % (kbps * 1000 / 8.0 * self._out_duration() / 1048576)
+
+    # ------------------------------------------------------------------ UI
+    def show(self):
+        from ui.alert import AlertDialogBuilder
+        LinearLayout = jclass("android.widget.LinearLayout")
+        ScrollView = jclass("android.widget.ScrollView")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        HeaderCell = jclass("org.telegram.ui.Cells.HeaderCell")
+        TextSettingsCell = jclass("org.telegram.ui.Cells.TextSettingsCell")
+        TextCheckCell = jclass("org.telegram.ui.Cells.TextCheckCell")
+        ctx = self.act
+
+        root = LinearLayout(ctx)
+        root.setOrientation(1)
+
+        def header(text):
+            h = HeaderCell(ctx)
+            h.setText(text)
+            root.addView(h)
+
+        def row(key, fn, color=None):
+            c = TextSettingsCell(ctx)
+            c.setBackground(Theme.getSelectorDrawable(False))
+            if color is not None:
+                c.setTextColor(Theme.getColor(color))
+            c.setOnClickListener(Click(fn))
+            root.addView(c)
+            self.cells[key] = c
+
+        def check(key, text):
+            c = TextCheckCell(ctx)
+            c.setBackground(Theme.getSelectorDrawable(False))
+
+            def toggle():
+                self.st[key] = not self.st[key]
+                self.refresh()
+            c.setOnClickListener(Click(toggle))
+            root.addView(c)
+            self.cells[key] = (c, text)
+
+        header("Трек")
+        row("tags", self.edit_tags)
+        row("cover", self.edit_cover)
+        row("trim", self.edit_trim)
+        header("Пресеты")
+        row("preset", self.edit_preset)
+        header("Звук")
+        row("speed", lambda: self.pick("Скорость", "speed", SPEEDS, lambda v: "%g×" % v))
+        row("pitch", lambda: self.pick("Тон", "pitch", PITCHES, lambda v: "%+d полутон" % v if v else "0"))
+        check("keep_pitch", "Сохранять тон при смене скорости")
+        row("reverb", lambda: self.pick("Реверб", "reverb", PERCENTS, lambda v: "%d%%" % v))
+        row("bass", lambda: self.pick("Бас", "bass", PERCENTS, lambda v: "%d%%" % v))
+        row("volume", lambda: self.pick("Громкость", "volume", VOLUMES, lambda v: "%+d dB" % v if v else "0 dB"))
+        row("eq", lambda: self.pick("Эквалайзер", "eq", list(range(len(EQS))), lambda v: EQS[v][0]))
+        check("d8", "8D-эффект")
+        check("wide", "Широкое стерео")
+        check("fade_in", "Плавное начало")
+        check("fade_out", "Плавный конец")
+        check("normalize", "Выровнять громкость")
+        header("Битрейт")
+        row("bitrate", self.edit_bitrate)
+        header("Готовый трек")
+        blue = Theme.key_windowBackgroundWhiteBlueText4
+        row("save", lambda: self.run("saved"), blue)
+        row("send", lambda: self.run("chat"), blue)
+        row("download", lambda: self.run("download"), blue)
+        row("reset", self.reset, Theme.key_text_RedRegular)
+
+        sv = ScrollView(ctx)
+        sv.addView(root)
+        self.refresh()
+
+        b = AlertDialogBuilder(ctx)
+        b.set_title("Редактор трека")
+        b.set_view(sv)
+        b.set_negative_button("Закрыть")
+        self.dialog = b.show()
+
+    def refresh(self):
+        st, c = self.st, self.cells
+        t = self.tags
+        c["tags"].setTextAndValue("Теги", (t["title"] or "—") + " — " + (t["artist"] or "—"), True)
+        c["cover"].setTextAndValue("Обложка", "есть" if t["cover"] else "нет", True)
+        trim = st["trim"] or (0, self.duration)
+        c["trim"].setTextAndValue("Обрезка", "%s–%s" % (_fmt_time(trim[0]), _fmt_time(trim[1])), False)
+        c["preset"].setTextAndValue("Пресет", PRESETS[self.preset][0], False)
+        c["speed"].setTextAndValue("Скорость", "%g×" % st["speed"], True)
+        c["pitch"].setTextAndValue("Тон", "%+d полутон" % st["pitch"] if st["pitch"] else "0 полутон", True)
+        c["reverb"].setTextAndValue("Реверб", "%d%%" % st["reverb"], True)
+        c["bass"].setTextAndValue("Бас", "%d%%" % st["bass"], True)
+        c["volume"].setTextAndValue("Громкость", "%+d dB" % st["volume"] if st["volume"] else "0 dB", True)
+        c["eq"].setTextAndValue("Эквалайзер", EQS[st["eq"]][0], True)
+        for key in ("keep_pitch", "d8", "wide", "fade_in", "fade_out", "normalize"):
+            cell, text = c[key]
+            cell.setTextAndCheck(text, bool(st[key]), key != "normalize")
+        br = "%d kbps" % st["bitrate"] if st["bitrate"] else "Оригинал"
+        c["bitrate"].setTextAndValue(br, self._size_text(self._kbps()), False)
+        c["save"].setText("Сохранить в Избранное", True)
+        c["send"].setText("Отправить в этот чат", True)
+        c["download"].setText("Скачать файл", True)
+        c["reset"].setText("Сбросить всё", False)
+
+    def items(self, title, names, cb):
+        from ui.alert import AlertDialogBuilder
+        b = AlertDialogBuilder(self.act)
+        b.set_title(title)
+        b.set_items(names, lambda bld, which: cb(int(which)))
+        b.show()
+
+    def pick(self, title, key, values, fmt):
+        def on(i):
+            self.st[key] = values[i]
+            self.refresh()
+        self.items(title, [fmt(v) for v in values], on)
+
+    def edit_preset(self):
+        def on(i):
+            self.preset = i
+            trim = self.st["trim"]
+            self.st = dict(DEFAULTS)
+            self.st.update(PRESETS[i][1])
+            self.st["trim"] = trim
+            self.refresh()
+        self.items("Пресет", [p[0] for p in PRESETS], on)
+
+    def edit_bitrate(self):
+        names = []
+        for v in BITRATES:
+            if v:
+                names.append("%d kbps  %s" % (v, self._size_text(v)))
+            else:
+                names.append("Оригинал" + (" (%d kbps)" % self.src_kbps if self.src_kbps else ""))
+
+        def on(i):
+            self.st["bitrate"] = BITRATES[i]
+            self.refresh()
+        self.items("Битрейт", names, on)
+
+    def edit_cover(self):
+        def on(i):
+            if i == 0:
+                def got(data):
+                    self.tags["cover"] = data
+                    self.tags_changed = True
+                    _ui(self.refresh)
+                self.plugin.pick_cover(self.act, got)
+            elif i == 1:
+                self.tags["cover"] = None
+                self.tags_changed = True
+                self.refresh()
+        self.items("Обложка", ["Выбрать из галереи", "Убрать обложку"], on)
+
+    def _inputs(self, title, fields, on_ok):
+        from ui.alert import AlertDialogBuilder
+        LinearLayout = jclass("android.widget.LinearLayout")
+        EditText = jclass("android.widget.EditText")
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        layout = LinearLayout(self.act)
+        layout.setOrientation(1)
+        pad = int(AU.dp(20.0))
+        layout.setPadding(pad, int(AU.dp(8.0)), pad, 0)
+        edits = []
+        for hint, text in fields:
+            et = EditText(self.act)
+            et.setHint(hint)
+            et.setText(text)
+            et.setSingleLine(True)
+            et.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            et.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            layout.addView(et)
+            edits.append(et)
+        b = AlertDialogBuilder(self.act)
+        b.set_title(title)
+        b.set_view(layout)
+        b.set_positive_button("Готово", lambda bld, w: on_ok([str(e.getText()).strip() for e in edits]))
+        b.set_negative_button("Отмена")
+        b.show()
+
+    def edit_tags(self):
+        t = self.tags
+
+        def ok(vals):
+            t["title"], t["artist"], t["album"] = vals
+            self.tags_changed = True
+            self.refresh()
+        self._inputs("Теги", [("Название", t["title"]), ("Исполнитель", t["artist"]),
+                              ("Альбом", t["album"])], ok)
+
+    def edit_trim(self):
+        a, b = self.st["trim"] or (0, self.duration)
+
+        def ok(vals):
+            s, e = _parse_time(vals[0]), _parse_time(vals[1])
+            if s is None or e is None or s < 0 or e <= s or e > self.duration + 1:
+                _toast("Неверное время, формат м:сс", ok=False)
+                return
+            self.st["trim"] = None if (s == 0 and e >= self.duration - 0.5) else (s, min(e, self.duration))
+            self.refresh()
+        self._inputs("Обрезка (м:сс)", [("Начало", _fmt_time(a)), ("Конец", _fmt_time(b))], ok)
+
+    def reset(self):
+        self.st = dict(DEFAULTS)
+        self.preset = 0
+        self.refresh()
+
+    # ------------------------------------------------------------ обработка
+    def _error(self, text):
+        def show():
+            from ui.alert import AlertDialogBuilder
+            b = AlertDialogBuilder(self.act)
+            b.set_title("Music Editor: ошибка")
+            b.set_message(text)
+            b.set_positive_button("OK")
+            b.show()
+        _ui(show)
+
+    def _progress_dialog(self):
+        """Кружок, под ним полоса и текст этапа."""
+        LinearLayout = jclass("android.widget.LinearLayout")
+        TextView = jclass("android.widget.TextView")
+        Radial = jclass("org.telegram.ui.Components.RadialProgressView")
+        Line = jclass("org.telegram.ui.Components.LineProgressView")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        LP = jclass("android.widget.LinearLayout$LayoutParams")
+        dp = lambda v: int(AU.dp(float(v)))
+        ctx = self.act
+        root = LinearLayout(ctx)
+        root.setOrientation(1)
+        root.setGravity(1)
+        root.setPadding(dp(24), dp(20), dp(24), dp(16))
+        spin = Radial(ctx)
+        spin.setSize(dp(36))
+        spin.setProgressColor(Theme.getColor(Theme.key_dialogLineProgress))
+        root.addView(spin, LP(dp(48), dp(48)))
+        line = Line(ctx)
+        line.setProgressColor(Theme.getColor(Theme.key_dialogLineProgress))
+        line.setBackColor(Theme.getColor(Theme.key_dialogLineProgressBackground))
+        lp = LP(-1, dp(4))
+        lp.topMargin = dp(16)
+        root.addView(line, lp)
+        label = TextView(ctx)
+        label.setTextColor(Theme.getColor(Theme.key_dialogTextGray2))
+        label.setTextSize(1, 14.0)
+        label.setGravity(1)
+        lp2 = LP(-1, -2)
+        lp2.topMargin = dp(10)
+        root.addView(label, lp2)
+        b = jclass("org.telegram.ui.ActionBar.AlertDialog$Builder")(ctx)
+        b.setView(root)
+        dlg = b.create()
+        dlg.setCanceledOnTouchOutside(False)
+        dlg.setCancelable(False)
+        dlg.show()
+        return dlg, line, label
+
+    def run(self, target):
+        if audioop is None and self._audio_changed():
+            self._error("Нет модуля audioop в этой версии Python — доступна только правка тегов.")
+            return
+        try:
+            dlg, line, label = self._progress_dialog()
+        except Exception as e:
+            log("%s progress dialog: %r" % (TAG, e))
+            dlg = line = label = None
+        state = {"text": None, "pct": -1}
+
+        def report(text, pct):
+            pct = int(pct)
+            if text == state["text"] and pct == state["pct"]:
+                return
+            state["text"], state["pct"] = text, pct
+            if line is None:
+                return
+
+            def upd():
+                try:
+                    label.setText("%s  %d%%" % (text, pct))
+                    line.setProgress(pct / 100.0, True)
+                except Exception:
+                    pass
+            _ui(upd)
+
+        def close():
+            try:
+                if dlg is not None:
+                    dlg.dismiss()
+            except Exception:
+                pass
+
+        def work():
+            try:
+                path = self.render_music(report)
+                if target == "download":
+                    report("Сохранение…", 100)
+                    self.download(path)
+                    msg = "Сохранено в «Музыку»"
+                else:
+                    report("Отправка…", 100)
+                    self.send_music(path, target)
+                    msg = "Отправлено в Избранное" if target == "saved" else "Отправлено в чат"
+                _ui(close)
+                _toast(msg)
+            except Exception as e:
+                import traceback
+                log("%s render: %s" % (TAG, traceback.format_exc()))
+                _ui(close)
+                self._error("%s\n\n%s" % (e, traceback.format_exc()[-600:]))
+        report("Подготовка…", 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _out_dir(self):
+        d = str(jclass("org.telegram.messenger.FileLoader").getDirectory(4).getAbsolutePath())
+        d = os.path.join(d, "track_editor")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _key(self):
+        t = self.tags
+        return repr((sorted(self.st.items()), t["title"], t["artist"], t["album"],
+                     hash(t["cover"]) if t["cover"] else None))
+
+    def render_music(self, report=lambda text, pct: None):
+        key = "m" + self._key()
+        if key in self.cache and os.path.isfile(self.cache[key]):
+            return self.cache[key]
+        name = _safe_name("%s - %s" % (self.tags["artist"], self.tags["title"]))
+        tags = self.tags
+        if not self._audio_changed() and not self.st["bitrate"] and self.ext in ("mp3", "m4a"):
+            with open(self.path, "rb") as f:
+                data = f.read()
+            data = _write_id3(data, tags) if self.ext == "mp3" else _write_mp4_tags(data, tags)
+            out = os.path.join(self._out_dir(), name + "." + self.ext)
+        else:
+            report("Чтение трека…", 0)
+            pcm, sr = _decode(self.path, lambda f: report("Чтение трека…", f * 35))
+            pcm = _process(pcm, sr, self.st, lambda f: report("Обработка звука…", 35 + f * 25))
+            out = os.path.join(self._out_dir(), name + ".m4a")
+            tmp = out + ".tmp"
+            _encode_aac(pcm, sr, self._kbps(), tmp, lambda f: report("Кодирование…", 60 + f * 38))
+            del pcm
+            with open(tmp, "rb") as f:
+                data = _write_mp4_tags(f.read(), tags)
+            os.remove(tmp)
+        with open(out, "wb") as f:
+            f.write(data)
+        self.cache[key] = out
+        return out
+
+    # --------------------------------------------------------------- отправка
+    def _dialog_id(self, target):
+        if target == "saved":
+            return int(jclass("org.telegram.messenger.UserConfig").getInstance(self.account).getClientUserId())
+        return int(self.mo.getDialogId())
+
+    @staticmethod
+    def _call(method, target, by_type):
+        """Вызов перегрузки, подбирая аргументы по типам (сигнатуры меняются между версиями)."""
+        box = {
+            "boolean": lambda v: jclass("java.lang.Boolean")(bool(v)),
+            "int": lambda v: jclass("java.lang.Integer")(int(v)),
+            "long": lambda v: jclass("java.lang.Long")(int(v)),
+            "short": lambda v: jclass("java.lang.Short")(int(v)),
+            "byte": lambda v: jclass("java.lang.Byte")(int(v)),
+            "float": lambda v: jclass("java.lang.Float")(float(v)),
+            "double": lambda v: jclass("java.lang.Double")(float(v)),
+        }
+        args, seen = [], {}
+        for p in method.getParameterTypes():
+            n = str(p.getName())
+            k = seen.get(n, 0)
+            seen[n] = k + 1
+            vals = by_type.get(n)
+            v = vals[k] if vals is not None and k < len(vals) else None
+            if n in box:
+                v = box[n](v or 0)
+            args.append(v)
+        return method.invoke(target, jarray(jclass("java.lang.Object"))(args))
+
+    def send_music(self, path, target):
+        SMH = _jcls("org.telegram.messenger.SendMessagesHelper")
+        acc = jclass("org.telegram.messenger.AccountInstance").getInstance(self.account)
+        best = None
+        for m in SMH.getDeclaredMethods():
+            if str(m.getName()) == "prepareSendingDocument":
+                if best is None or m.getParameterCount() > best.getParameterCount():
+                    best = m
+        if best is None:
+            raise RuntimeError("prepareSendingDocument не найден")
+        best.setAccessible(True)
+        try:
+            args_empty = jclass("org.telegram.messenger.SendMessageChatArguments").EMPTY
+        except Exception:
+            args_empty = None
+        done = threading.Event()
+        err = []
+
+        def send():
+            try:
+                self._call(best, None, by_type)
+            except Exception as e:
+                err.append(e)
+            finally:
+                done.set()
+        by_type = {
+            "org.telegram.messenger.SendMessageChatArguments": [args_empty],
+            "org.telegram.messenger.AccountInstance": [acc],
+            "java.lang.String": [path, path],
+            "long": [self._dialog_id(target)],
+            "boolean": [True],
+        }
+        _ui(send)
+        done.wait(15)
+        if err:
+            raise err[0]
+
+    def download(self, path):
+        MC = _jcls("org.telegram.messenger.MediaController")
+        ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+        mime = "audio/mpeg" if path.endswith(".mp3") else "audio/mp4"
+        for m in MC.getDeclaredMethods():
+            pts = [str(p.getName()) for p in m.getParameterTypes()]
+            if str(m.getName()) == "saveFile" and pts[:3] == ["java.lang.String", "android.content.Context", "int"]:
+                self._call(m, None, {
+                    "java.lang.String": [path, os.path.basename(path), mime],
+                    "android.content.Context": [ctx],
+                    "int": [3],
+                })
+                return
+        raise RuntimeError("MediaController.saveFile не найден")
