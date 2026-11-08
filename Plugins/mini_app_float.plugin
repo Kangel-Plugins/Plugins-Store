@@ -1,0 +1,2373 @@
+from base_plugin import BasePlugin, MethodHook
+from android_utils import OnClickListener, run_on_ui_thread
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
+from java import dynamic_proxy
+from java.lang import Thread
+from android.view import View, Gravity, MotionEvent, WindowManager
+from android.widget import FrameLayout, LinearLayout, TextView
+from android.graphics.drawable import GradientDrawable, ColorDrawable
+from android.graphics import Color, Typeface
+from android.animation import ValueAnimator
+
+from org.telegram.messenger import AndroidUtilities
+
+__id__ = "mini_app_float"
+__name__ = "Mini App Float"
+__description__ = "Сворачивает мини-аппы и сайты из браузера в плавующее окно"
+__author__ = "@PLOXOI_RRO & @TimPlugins"
+__version__ = "1.1"
+__min_version__ = "12.10.6"
+__icon__ = "NewsEmoji/53"
+__category__ = ["tools", "appearance"]
+
+SHEET_CLASSES = [
+    "org.telegram.ui.bots.BotWebViewSheet",
+    "org.telegram.ui.bots.BotWebViewAttachedSheet",
+    "org.telegram.ui.Components.BotWebViewSheet",
+    "org.telegram.ui.web.BotWebViewSheet",
+]
+BLUE = "#2F7BFF"
+DARK = "#1C1C1E"
+START_FRAC = 0.4     # начальная ширина окна от ширины экрана
+EXPAND_FRAC = 0.60  # окно заняло такую долю площади экрана -> авто-разворот
+COLLAPSE_FRAC = 0.05  # окно заняло такую долю площади экрана -> мини-круг
+MARGIN_DP = 6
+# Сайты: плавающее окно живёт в СВОЁМ окне (под-окно Activity), а не внутри дерева видов Activity.
+# Тогда перемещение делает система (двигает готовую поверхность), и окно активности не перерисовывается
+# — «шлейф» из копий невозможен. Если на каком-то устройстве что-то не так — поставьте False
+# (вернётся прежнее поведение: окно внутри Activity).
+SITE_OWN_WINDOW = True
+# Сайты: после сворачивания окно активности могло остаться со «старой картинкой» страницы.
+# На долю секунды скрываем и снова показываем окно активности — система пересоздаёт его
+# поверхность и рисует заново. Если не нужно (или мелькает) — поставьте False.
+STALE_FIX = False
+# Сайты: чат под плавающим окном. Telegram не рисует чат, пока считает, что шторка сайта открыта
+# (ActionBarLayout.sheetFragment). Пока окно плавает, временно «отцепляем» шторку и возвращаем при закрытии.
+SITE_FIX = True
+# Стикер над названием плагина в настройках: набор и индекс стикера в нём (0 — первый)
+STICKER_SET = "NewsEmoji"
+STICKER_INDEX = 53
+
+
+# ---------------- утилиты ----------------
+def _activity():
+    try:
+        frag = get_last_fragment()
+        if frag is not None:
+            act = frag.getParentActivity()
+            if act is not None:
+                return act
+    except Exception:
+        pass
+    try:
+        return find_class("org.telegram.ui.LaunchActivity").instance
+    except Exception:
+        return None
+
+
+def _field(obj, *names):
+    for n in names:
+        try:
+            v = get_private_field(obj, n)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+        try:
+            c = obj.getClass()
+            while c is not None:
+                try:
+                    f = c.getDeclaredField(n)
+                    f.setAccessible(True)
+                    v = f.get(obj)
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+                c = c.getSuperclass()
+        except Exception:
+            pass
+    return None
+
+
+def _sheet_root(sheet):
+    try:
+        w = sheet.getWindow()
+        if w is not None:
+            return w.getDecorView()
+    except Exception:
+        pass
+    return _field(sheet, "windowView")
+
+
+def _cname(v):
+    try:
+        n = str(v.getClass().getSimpleName())
+        return n if n else str(v.getClass().getName()).split(".")[-1]
+    except Exception:
+        return "?"
+
+
+def _sheet_roots(sheet):
+    """Все корневые виды шторки, которые надо прятать/показывать (сама шторка + её Dialog, если есть)."""
+    roots = []
+    r = _sheet_root(sheet)
+    if r is not None:
+        roots.append(r)
+    try:
+        dlg = _field(sheet, "dialog")
+        if dlg is not None:
+            w = dlg.getWindow()
+            if w is not None:
+                d = w.getDecorView()
+                if d is not None:
+                    roots.append(d)
+    except Exception:
+        pass
+    return roots
+
+
+_WEBVIEW_BAD = ("Factory", "Client", "Chrome", "Provider", "Renderer", "Settings", "History")
+
+
+def _is_webview_view(v):
+    try:
+        n = str(v.getClass().getName())
+    except Exception:
+        return False
+    if any(b in n for b in _WEBVIEW_BAD):
+        return False
+    return "WebView" in n or "MyWeb" in n
+
+
+def _find_webview(v):
+    """Ищет в дереве видов первый веб-вью (WebView / контейнер вебвью)."""
+    if v is None:
+        return None
+    try:
+        if _is_webview_view(v):
+            return v
+    except Exception:
+        pass
+    try:
+        for i in range(v.getChildCount()):
+            r = _find_webview(v.getChildAt(i))
+            if r is not None:
+                return r
+    except Exception:
+        pass
+    return None
+
+
+def _find_page_view(v, depth=0):
+    """Первый вложенный вид с getUrl()+getTitle() — это WebView страницы."""
+    if v is None or depth > 14:
+        return None
+    try:
+        if hasattr(v, "getUrl") and hasattr(v, "getTitle"):
+            return v
+    except Exception:
+        pass
+    try:
+        n = int(v.getChildCount())
+    except Exception:
+        return None
+    for i in range(n):
+        try:
+            r = _find_page_view(v.getChildAt(i), depth + 1)
+        except Exception:
+            r = None
+        if r is not None:
+            return r
+    return None
+
+
+def _round_bg(color, radius_px, stroke_px=0, stroke_color=0):
+    d = GradientDrawable()
+    d.setColor(color)
+    d.setCornerRadius(float(radius_px))
+    if stroke_px:
+        d.setStroke(int(stroke_px), stroke_color)
+    return d
+
+
+class _Click(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        try:
+            self.fn()
+        except Exception:
+            pass
+
+
+class _Touch(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onTouch(self, v, e):
+        try:
+            return bool(self.fn(v, e))
+        except Exception:
+            return False
+
+
+
+class _LayoutCb(dynamic_proxy(View.OnLayoutChangeListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onLayoutChange(self, v, l, t, r, b, ol, ot, orr, ob):
+        try:
+            self.fn(l, t, r, b, ol, ot, orr, ob)
+        except Exception:
+            pass
+
+
+class _AnimUpd(dynamic_proxy(ValueAnimator.AnimatorUpdateListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onAnimationUpdate(self, anim):
+        try:
+            self.fn(float(anim.getAnimatedValue()))
+        except Exception:
+            pass
+
+
+# ---------------- плавающее окно ----------------
+class FloatingWindow:
+    """Живой мини-апп в уменьшенном окне.
+
+    Сверху и снизу — полоски-ручки (не перекрывают интерфейс мини-аппа):
+      обе полоски: перетаскивание куда угодно, тап — панель (рамка, ✕)
+      размер меняется угловыми зонами на нижней полоске (слева и справа)
+    Окно двигается свободно по всему экрану и живёт при переходах между чатами.
+    Растянули до ~60% площади экрана — авто-разворот в обычный вид.
+    Уменьшили до ~5% — авто-сворачивание в мини-круг с аватаркой бота
+    (тап по кругу возвращает окно).
+    """
+
+    def __init__(self, plugin, sheet):
+        self.plugin = plugin
+        self.sheet = sheet
+        self.container = None
+        self.orig_parent = None
+        self.orig_index = 0
+        self.orig_lp = None
+        self.root = None
+        self.content = None
+        self.icon = None
+        self.host = None
+        self.active = False
+        self.iconified = False
+        self.scale = 0.5
+        self.lw = 0
+        self.lh = 0
+        self.bar = 0
+        self.isz = 0
+        self.min_scale = 0.2
+        self.max_scale = 1.0
+        self.collapse_scale = 0.25
+        self.expand_scale = 0.9
+        self.overlay = []
+        self.overlay_on = False
+        self.token = 0
+        self.dp_ = 1.0
+        self.sw0 = 0
+        self.sh0 = 0
+        self.hstate = {}
+        self.gstate = {}
+        self.istate = {}
+        self.px = 0.0   # позиция окна на экране (храним сами: окно может быть отдельным)
+        self.py = 0.0
+        self.own_window = False
+        self.wm = None
+        self.focusable = False
+        self.ix = 0.0   # позиция мини-круга (он тоже может жить в своём окне)
+        self.iy = 0.0
+        self.icon_win = False
+        self.icon_added = False
+        self._scale_pending = False
+        self.panel = None        # скруглённая панель внутри окна-обёртки (только отдельное окно сайта)
+        self.gesture = False     # идёт жест изменения размера: окно временно «большое», двигается только панель
+        self._anim_seq = 0       # «жетон» анимации доводки: новое касание/жест отменяет идущую анимацию (см. _animate_to)
+        self._layer2 = None
+        self._saved_fields = []
+        self.is_site = False  # True: в окно переносится WebView сайта из ArticleViewer$Sheet
+
+    def dp(self, x):
+        return int(x * self.dp_ + 0.5)
+
+    # ----- размеры -----
+    def _dims(self):
+        sw = int(self.host.getWidth()) or self.sw0
+        sh = int(self.host.getHeight()) or self.sh0
+        return sw, sh
+
+    def _w(self):
+        return int(self.lw * self.scale)
+
+    def _h(self):
+        return int(self.lh * self.scale) + 2 * self.bar
+
+    def _clamp_scale(self, s):
+        return max(self.min_scale, min(self.max_scale, s))
+
+    def _apply_scale_to_content(self):
+        try:
+            self.content.setScaleX(self.scale)
+            self.content.setScaleY(self.scale)
+        except Exception:
+            pass
+
+    def _apply_scale(self, s, flush=True):
+        self.scale = s
+        nw, nh = self._w(), self._h()
+        if self.own_window and self.panel is not None:
+            # панель внутри окна: её размер меняем всегда (дёшево — только раскладка внутри приложения)
+            try:
+                plp = self.panel.getLayoutParams()
+                if plp is not None and (plp.width != nw or plp.height != nh):
+                    plp.width = nw
+                    plp.height = nh
+                    self.panel.setLayoutParams(plp)
+            except Exception:
+                pass
+            if self.gesture:
+                # во время жеста окно уже увеличено «с запасом» и размер свой не меняет —
+                # двигается только позиция (см. _set_pos). Масштаб применяем сразу,
+                # layoutParams окна не трогаем вообще.
+                self._apply_scale_to_content()
+                return
+        lp = self.root.getLayoutParams()
+        if lp is None:
+            self._apply_scale_to_content()
+            return
+        if lp.width == nw and lp.height == nh:
+            # размер не изменился ни на пиксель — раскладку и окно не трогаем вообще:
+            # лишние setLayoutParams/updateViewLayout на каждый кадр и давали «дёрганье».
+            # Масштаб содержимого обновляем всегда — это дёшево, применяется на GPU
+            self._apply_scale_to_content()
+            return
+        lp.width = nw
+        lp.height = nh
+        if self.own_window:
+            # окно меняет размер асинхронно (через WindowManager). Масштаб содержимого применяем в тот же
+            # кадр, когда окно получило новый размер (см. _LayoutCb) — иначе содержимое и окно «разъезжаются»
+            self._scale_pending = True
+            if flush:
+                self._wm_update(lp)
+        else:
+            self._apply_scale_to_content()
+            self.root.setLayoutParams(lp)
+
+    def _gesture_begin(self):
+        """Начало жеста ресайза: окно ОДИН РАЗ увеличиваем «с запасом» на весь жест, но НЕ ДВИГАЕМ его.
+        Позиция окна и так равна позиции панели (панель лежит в углу окна, без смещения), поэтому:
+          - изменение ТОЛЬКО РАЗМЕРА незаметно: старая картинка остаётся на месте,
+            вокруг неё добавляется прозрачная область;
+          - перемещение окна во время жеста (за левый угол) применяется мгновенно и точно.
+        Раньше окно разворачивалось на весь экран с переносом в (0,0), а панель внутри
+        сдвигалась «вручную» на следующий кадр: система применяет позицию мгновенно,
+        а картинку — кадром позже, поэтому окно «улетало» в угол и возвращалось.
+        Теперь позиция окна в начале/конце жеста не меняется вовсе."""
+        if not self.own_window or self.gesture or self.panel is None:
+            return
+        lp = self.root.getLayoutParams()
+        if lp is None:
+            return
+        sw, sh = self._dims()
+        self.gesture = True
+        self._anim_seq += 1  # жест перебивает любую идущую доводку — теперь управляет только палец
+        try:
+            self.panel.setLayerType(View.LAYER_TYPE_NONE, None)
+        except Exception:
+            pass
+        # lp.x/lp.y НЕ трогаем: окно остаётся на месте, панель — ровно там же на экране.
+        # Растёт только «запас» вправо-вниз (за край экрана — не страшно, есть FLAG_LAYOUT_NO_LIMITS):
+        # во время жеста панель растёт и едет внутри окна без смены размера самого окна.
+        lp.width = sw
+        lp.height = sh
+        self._wm_update(lp)
+
+    def _gesture_end(self):
+        if not self.gesture:
+            return
+        self.gesture = False
+        if not self.active:
+            # окно уже закрыли/развернули прямо во время жеста — WindowManager трогать нельзя
+            return
+        lp = self.root.getLayoutParams()
+        if lp is None or self.panel is None:
+            return
+        w, h = self._w(), self._h()
+        # снова только размер: подрезаем прозрачный «запас» до размеров панели.
+        # Позицию не трогаем — старая картинка в углу окна остаётся на своих пикселях.
+        lp.width = w
+        lp.height = h
+        self._wm_update(lp)
+        try:
+            # скруглённые углы возвращаем, когда размер перестал меняться
+            self.panel.setLayerType(View.LAYER_TYPE_HARDWARE, None)
+        except Exception:
+            pass
+
+    # ----- собственное окно сайта -----
+    def _on_root_layout(self, l=0, t=0, r=0, b=0, ol=0, ot=0, orr=0, ob=0):
+        if self._scale_pending:
+            self._scale_pending = False
+            self._apply_scale_to_content()
+
+    def _wm_update(self, lp):
+        try:
+            self.wm.updateViewLayout(self.root, lp)
+        except Exception:
+            pass
+
+    def _set_pos(self, x, y):
+        self.px = float(x)
+        self.py = float(y)
+        if self.own_window:
+            # позиция окна = позиция панели (панель лежит в углу окна, смещение 0,0).
+            # Смена позиции не пересоздаёт поверхность и применяется мгновенно — двигать окно
+            # можно на каждый кадр, это так же плавно, как обычное перемещение окна мышью/пальцем.
+            lp = self.root.getLayoutParams()
+            if lp is not None:
+                nx = int(self.px)
+                ny = int(self.py)
+                if lp.x == nx and lp.y == ny:
+                    # позиция не изменилась ни на пиксель — WindowManager не дёргаем вовсе:
+                    # лишний updateViewLayout на каждый кадр только нагружает компоновщик.
+                    # (тяга за правый угол окно вообще не двигает — раньше был холостой вызов
+                    #  на каждый кадр, и «доводка» после перетаскивания молотила 200 мс вхолостую,
+                    #  мешая плавности в момент, когда палец уже тянет угол)
+                    return
+                lp.x = nx
+                lp.y = ny
+                self._wm_update(lp)
+        else:
+            self.root.setX(self.px)
+            self.root.setY(self.py)
+
+    def _front(self):
+        if not self.own_window:
+            self.root.bringToFront()
+
+    def _set_root_visible(self, visible):
+        if self.own_window:
+            lp = self.root.getLayoutParams()
+            if lp is not None:
+                nt = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                lp.flags = (lp.flags & ~nt) if visible else (lp.flags | nt)
+                self.root.setVisibility(View.VISIBLE if visible else View.GONE)
+                self._wm_update(lp)
+                return
+        self.root.setVisibility(View.VISIBLE if visible else View.GONE)
+
+    def _set_focusable(self, on):
+        # окно не фокусируемое, чтобы не отнимать у чата клавиатуру и кнопку «назад»;
+        # фокус включаем, когда тапнули по содержимому сайта (поля ввода), и снимаем при тапе снаружи
+        if not self.own_window or self.focusable == on:
+            return
+        lp = self.root.getLayoutParams()
+        if lp is None:
+            return
+        nf = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        lp.flags = (lp.flags & ~nf) if on else (lp.flags | nf)
+        self.focusable = on
+        self._wm_update(lp)
+
+    # ----- мини-круг: тоже отдельное окно (иначе в окне активности остаётся шлейф копий) -----
+    def _icon_window_add(self, x, y):
+        if self.icon_added:
+            return True
+        try:
+            LP = WindowManager.LayoutParams
+            lp = LP()
+            lp.type = LP.TYPE_APPLICATION_PANEL
+            lp.flags = (LP.FLAG_NOT_FOCUSABLE | LP.FLAG_NOT_TOUCH_MODAL
+                        | LP.FLAG_LAYOUT_IN_SCREEN | LP.FLAG_LAYOUT_NO_LIMITS)
+            lp.format = -3
+            lp.gravity = Gravity.TOP | Gravity.START
+            lp.width = self.isz
+            lp.height = self.isz
+            lp.x = int(x)
+            lp.y = int(y)
+            self.wm.addView(self.icon, lp)
+            self.icon_added = True
+            return True
+        except Exception:
+            return False
+
+    def _icon_window_remove(self):
+        if self.icon_added:
+            try:
+                self.wm.removeViewImmediate(self.icon)
+            except Exception:
+                pass
+            self.icon_added = False
+
+    def _icon_set_pos(self, x, y):
+        self.ix = float(x)
+        self.iy = float(y)
+        if self.icon_win and self.icon_added:
+            lp = self.icon.getLayoutParams()
+            if lp is not None:
+                lp.x = int(self.ix)
+                lp.y = int(self.iy)
+                self._wm_update_view(self.icon, lp)
+        else:
+            self.icon.setX(self.ix)
+            self.icon.setY(self.iy)
+
+    def _wm_update_view(self, v, lp):
+        try:
+            self.wm.updateViewLayout(v, lp)
+        except Exception:
+            pass
+
+    def _icon_animate_x(self, tx):
+        x0 = self.ix
+        if self.icon_win:
+            def step(f):
+                if self.icon_added:
+                    self._icon_set_pos(x0 + (tx - x0) * f, self.iy)
+            va = ValueAnimator.ofFloat(0.0, 1.0)
+            va.setDuration(160)
+            va.addUpdateListener(_AnimUpd(step))
+            va.start()
+        else:
+            self.ix = float(tx)
+            self.icon.animate().x(tx).setDuration(160).start()
+
+    def _on_root_touch(self, v, e):
+        if e.getActionMasked() == MotionEvent.ACTION_OUTSIDE:
+            self._set_focusable(False)
+        return False
+
+    def _on_web_touch(self, v, e):
+        if e.getActionMasked() == MotionEvent.ACTION_DOWN:
+            self._set_focusable(True)
+        return False
+
+    def _add_own_window(self, act, x, y):
+        wrapped = False
+        try:
+            # окно-обёртка (прозрачная) + скруглённая панель внутри
+            panel = self.root
+            shell = FrameLayout(act)
+            shell.addView(panel, FrameLayout.LayoutParams(self._w(), self._h()))
+            self.panel = panel
+            self.root = shell
+            wrapped = True
+            LP = WindowManager.LayoutParams
+            lp = LP()
+            lp.type = LP.TYPE_APPLICATION_PANEL
+            lp.flags = (LP.FLAG_NOT_FOCUSABLE | LP.FLAG_NOT_TOUCH_MODAL | LP.FLAG_WATCH_OUTSIDE_TOUCH
+                        | LP.FLAG_LAYOUT_IN_SCREEN | LP.FLAG_LAYOUT_NO_LIMITS)
+            lp.format = -3  # TRANSLUCENT: скруглённые углы
+            lp.gravity = Gravity.TOP | Gravity.START
+            lp.width = self._w()
+            lp.height = self._h()
+            lp.x = int(x)
+            lp.y = int(y)
+            lp.softInputMode = 48  # SOFT_INPUT_ADJUST_NOTHING
+            self.wm = act.getWindowManager()
+            self.focusable = False
+            self.root.setOnTouchListener(_Touch(self._on_root_touch))
+            try:
+                self.root.addOnLayoutChangeListener(_LayoutCb(self._on_root_layout))
+            except Exception:
+                pass
+            # скруглённые углы: обрезаем содержимое по контуру фона и рисуем окно через аппаратный слой —
+            # иначе WebView (GL) выходит за скруглённые углы
+            try:
+                self.panel.setClipToOutline(True)
+                self.panel.setLayerType(View.LAYER_TYPE_HARDWARE, None)
+            except Exception:
+                pass
+            self.wm.addView(self.root, lp)
+            try:
+                self.container.setOnTouchListener(_Touch(self._on_web_touch))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            if wrapped:
+                try:
+                    self.root.removeView(self.panel)
+                except Exception:
+                    pass
+                self.root = self.panel
+                self.panel = None
+            return False
+
+    def _clamp_xy(self, x, y):
+        # окно живёт строго внутри экрана — перемещение свободное, без выноса за края
+        sw, sh = self._dims()
+        w = self._w()
+        h = self._h()
+        return max(0.0, min(x, float(sw - w))), max(0.0, min(y, float(sh - h)))
+
+    def _title(self):
+        try:
+            wv = self.container.getWebView()
+            t = wv.getTitle() if wv is not None else None
+            if t:
+                return str(t)
+        except Exception:
+            pass
+        try:
+            t = self.container.getTitle()
+            if t:
+                return str(t)
+        except Exception:
+            pass
+        try:
+            # сайт: вид шторки целиком — ищем вложенный WebView, берём заголовок или адрес
+            pv = _find_page_view(self.container)
+            if pv is not None:
+                t = pv.getTitle()
+                if t:
+                    return str(t)
+                u = pv.getUrl()
+                if u:
+                    host = str(u).split("//")[-1].split("/")[0]
+                    if host.startswith("www."):
+                        host = host[4:]
+                    if host:
+                        return host
+        except Exception:
+            pass
+        return "Mini App"
+
+    def _side_from_x(self):
+        sw, _ = self._dims()
+        return "left" if self.px + self._w() / 2.0 < sw / 2.0 else "right"
+
+    # ----- бот мини-аппа (для аватарки на мини-круге) -----
+    def _bot_user(self):
+        if self.container is not None:
+            # 1) публичные методы контейнера вебвью
+            for getter in ("getBotUser", "getUser"):
+                try:
+                    u = getattr(self.container, getter)()
+                    if u is not None:
+                        return u
+                except Exception:
+                    pass
+            # 2) приватное поле контейнера (в Telegram это TLRPC.User botUser)
+            u = _field(self.container, "botUser", "bot_user", "user")
+            if u is not None:
+                return u
+        # 3) поля шторки
+        u = _field(self.sheet, "botUser", "bot_user", "user")
+        if u is not None:
+            return u
+        # 4) методы шторки
+        for getter in ("getBotUser", "getUser"):
+            try:
+                u = getattr(self.sheet, getter)()
+                if u is not None:
+                    return u
+            except Exception:
+                pass
+        return None
+
+    def _make_icon(self, act):
+        """Мини-круг: аватарка бота мини-аппа; если недоступна — буква."""
+        dp = self.dp
+        icon = None
+        try:
+            user = self._bot_user()
+            if user is not None:
+                from org.telegram.ui.Components import BackupImageView, AvatarDrawable
+                from org.telegram.messenger import UserConfig
+                wrap = FrameLayout(act)
+                wrap.setBackground(_round_bg(Color.parseColor("#2C2C2E"), self.isz // 2))
+                wrap.setPadding(dp(2), dp(2), dp(2), dp(2))
+                try:
+                    wrap.setElevation(float(dp(10)))
+                except Exception:
+                    pass
+                avatar = BackupImageView(act)
+                avatar.setRoundRadius((self.isz - 2 * dp(2)) // 2)
+                placeholder = AvatarDrawable()
+                try:
+                    placeholder.setInfo(UserConfig.selectedAccount, user)
+                except Exception:
+                    placeholder.setInfo(user)
+                avatar.setForUserOrChat(user, placeholder)
+                wrap.addView(avatar, FrameLayout.LayoutParams(-1, -1))
+                icon = wrap
+        except Exception:
+            pass
+        if icon is None:
+            letter = (self._title().strip()[:1] or "M").upper()
+            icon = TextView(act)
+            icon.setText(letter)
+            icon.setTextColor(Color.WHITE)
+            icon.setTextSize(20.0)
+            icon.setGravity(Gravity.CENTER)
+            icon.setBackground(_round_bg(Color.parseColor("#2C2C2E"), self.isz // 2))
+            try:
+                icon.setElevation(float(dp(10)))
+            except Exception:
+                pass
+        icon.setOnTouchListener(_Touch(self._on_icon_touch))
+        self.icon = icon
+
+    # ----- веб-содержимое шторки -----
+    def _content_view(self):
+        """Вид, который живёт в плавающем окне.
+
+        Мини-аппы: поле webViewContainer у BotWebViewSheet.
+        Сайты (ArticleViewer$Sheet): поля webViewContainer нет — ищем
+        любое поле-View с вебвью в имени класса, затем по дереву видов окна.
+        """
+        try:
+            sname = str(self.sheet.getClass().getName())
+        except Exception:
+            sname = ""
+        if "BotWebViewSheet" not in sname:
+            # Сайт в браузере Telegram (ArticleViewer$Sheet): переносим в окно только WebView
+            # страницы, а саму шторку прячем — так же, как у мини-аппов. Перенос всего windowView
+            # давал «двойника»: шторка не исчезала, а окно оставляло шлейф при перетаскивании.
+            wv = None
+            try:
+                wv = self.sheet.getWindowView()
+            except Exception:
+                wv = None
+            if wv is None:
+                wv = _field(self.sheet, "windowView")
+            pv = _find_page_view(wv) if wv is not None else None
+            if pv is not None:
+                self.is_site = True
+                return pv
+        c = _field(self.sheet, "webViewContainer")
+        if c is not None:
+            return c
+        try:
+            cl = self.sheet.getClass()
+            while cl is not None:
+                for f in list(cl.getDeclaredFields()):
+                    try:
+                        f.setAccessible(True)
+                        v = f.get(self.sheet)
+                    except Exception:
+                        continue
+                    if v is None:
+                        continue
+                    try:
+                        if hasattr(v, "getParent") and hasattr(v, "getWidth") and _is_webview_view(v):
+                            return v
+                    except Exception:
+                        continue
+                cl = cl.getSuperclass()
+        except Exception:
+            pass
+        return _find_webview(_sheet_root(self.sheet))
+
+    # ----- свернуть -----
+    def minimize(self):
+        if id(self.sheet) in self.plugin.windows:
+            return
+        act = _activity()
+        if act is None:
+            return
+        container = self._content_view()
+        if container is None:
+            return
+        self.container = container
+        self.own_window = bool(self.is_site and SITE_OWN_WINDOW)
+        self.orig_parent = container.getParent()
+        if self.orig_parent is None:
+            return
+        self.orig_index = self.orig_parent.indexOfChild(container)
+        self.orig_lp = container.getLayoutParams()
+        if self.is_site:
+            # шторку могли тянуть жестом — сбрасываем смещение, пока она не спрятана
+            for r in _sheet_roots(self.sheet):
+                try:
+                    r.setTranslationX(0.0)
+                    r.setTranslationY(0.0)
+                    r.setAlpha(1.0)
+                except Exception:
+                    pass
+
+        dm = act.getResources().getDisplayMetrics()
+        self.dp_ = dm.density
+        dp = self.dp
+
+        self.host = act.getWindow().getDecorView().findViewById(16908290)
+        if self.host is None:
+            return
+        self.sw0 = int(dm.widthPixels)
+        self.sh0 = int(dm.heightPixels)
+        sw, sh = self._dims()
+
+        self.bar = dp(24)
+        self.isz = dp(52)
+        self.lw = int(container.getWidth() or sw)
+        self.lh = int(container.getHeight() or int(sh * 0.8))
+
+        # пороги авто-разворота (~60% площади экрана) и авто-сворачивания (~5%)
+        body = self.lw * float(self.lh)
+        screen = sw * float(sh)
+        if body > 0 and screen > 0:
+            self.collapse_scale = (COLLAPSE_FRAC * screen / body) ** 0.5
+            self.expand_scale = (EXPAND_FRAC * screen / body) ** 0.5
+        else:
+            self.collapse_scale = 0.25
+            self.expand_scale = 0.9
+        fit = min(sw / float(self.lw), (sh * 0.92 - 2 * self.bar) / float(self.lh))
+        self.min_scale = max(0.05, self.collapse_scale)
+        self.max_scale = max(self.min_scale + 0.01, min(fit, self.expand_scale))
+        self.scale = self._clamp_scale(START_FRAC * sw / float(self.lw))
+
+        root = FrameLayout(act)
+        root.setBackground(_round_bg(Color.parseColor(DARK), dp(14)))
+        if not self.is_site:
+            root.setClipToOutline(True)
+            try:
+                root.setElevation(float(dp(14)))
+            except Exception:
+                pass
+        self.root = root
+
+        # содержимое мини-аппа: полный логический размер, масштабируется
+        content = FrameLayout(act)
+        content.setPivotX(0.0)
+        content.setPivotY(0.0)
+        clp = FrameLayout.LayoutParams(self.lw, self.lh)
+        clp.topMargin = self.bar
+        root.addView(content, clp)
+        self.content = content
+
+        self.orig_parent.removeView(container)
+        content.addView(container, FrameLayout.LayoutParams(-1, -1))
+        self.old_layer = None
+        if self.is_site:
+            try:
+                self.old_layer = int(container.getLayerType())
+                container.setLayerType(View.LAYER_TYPE_NONE, None)
+            except Exception:
+                pass
+
+        # верхняя полоска: перетаскивание + ✕
+        top = FrameLayout(act)
+        top.setBackgroundColor(Color.parseColor(DARK))
+        tpill = View(act)
+        tpill.setBackground(_round_bg(Color.parseColor("#B3FFFFFF"), dp(2)))
+        top.addView(tpill, FrameLayout.LayoutParams(dp(40), dp(4), Gravity.CENTER))
+        root.addView(top, FrameLayout.LayoutParams(-1, self.bar, Gravity.TOP))
+        top.setOnTouchListener(_Touch(self._on_handle_touch))
+
+        close = TextView(act)
+        close.setText("✕")
+        close.setTextColor(Color.WHITE)
+        close.setTextSize(10.0)
+        close.setGravity(Gravity.CENTER)
+        close.setBackground(_round_bg(Color.parseColor("#55FFFFFF"), dp(9)))
+        xlp = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.END | Gravity.CENTER_VERTICAL)
+        xlp.rightMargin = dp(5)
+        top.addView(close, xlp)
+        close.setOnClickListener(_Click(self.close))
+
+        # нижняя полоска: тоже перетаскивание; размер — угловыми зонами слева/справа
+        bottom = FrameLayout(act)
+        bottom.setBackgroundColor(Color.parseColor(DARK))
+        bpill = View(act)
+        bpill.setBackground(_round_bg(Color.parseColor("#B3FFFFFF"), dp(2)))
+        bottom.addView(bpill, FrameLayout.LayoutParams(dp(40), dp(4), Gravity.CENTER))
+        root.addView(bottom, FrameLayout.LayoutParams(-1, self.bar, Gravity.BOTTOM))
+        bottom.setOnTouchListener(_Touch(self._on_handle_touch))
+
+        # невидимые зоны ресайза: потянуть за нижний левый/правый угол
+        zl = View(act)
+        bottom.addView(zl, FrameLayout.LayoutParams(dp(32), -1, Gravity.START | Gravity.CENTER_VERTICAL))
+        zl.setOnTouchListener(_Touch(self._resize_touch("left")))
+        zr = View(act)
+        bottom.addView(zr, FrameLayout.LayoutParams(dp(32), -1, Gravity.END | Gravity.CENTER_VERTICAL))
+        zr.setOnTouchListener(_Touch(self._resize_touch("right")))
+
+        # синяя рамка (видна, пока открыта панель)
+        border = View(act)
+        border.setBackground(_round_bg(0, dp(14), dp(2), Color.parseColor(BLUE)))
+        border.setClickable(False)
+        root.addView(border, FrameLayout.LayoutParams(-1, -1))
+        self.overlay = [border, close]
+
+        # мини-круг с аватаркой бота
+        self._make_icon(act)
+
+        self._apply_scale(self.scale)
+        n = len(self.plugin.windows)
+        x0 = float(max(0, sw - self._w() - dp(MARGIN_DP) - n * dp(16)))
+        y0 = float(dp(100) + n * dp(16))
+        self.px = x0
+        self.py = y0
+        if not (self.own_window and self._add_own_window(act, x0, y0)):
+            self.own_window = False
+            self.host.addView(root, FrameLayout.LayoutParams(self._w(), self._h()))
+            root.setX(x0)
+            root.setY(y0)
+        if not self.own_window:
+            self.host.addView(self.icon, FrameLayout.LayoutParams(self.isz, self.isz))
+            self.icon.setVisibility(View.GONE)
+
+        for r in _sheet_roots(self.sheet):
+            try:
+                r.setVisibility(View.GONE)
+            except Exception:
+                pass
+        if self.is_site:
+            self._hide_site_leftovers(True)
+            for d in (0, 50, 200, 600):
+                run_on_ui_thread(self._repaint, d)
+            run_on_ui_thread(self._allow_draw_content, 40)
+            if SITE_FIX:
+                # шаги «лечения» шторки (см. _exp): чат под окном начинает рисоваться
+                for d, n in ((120, 1), (350, 2), (600, 3)):
+                    run_on_ui_thread(lambda nn=n: self._exp(nn), d)
+            if STALE_FIX:
+                run_on_ui_thread(self._refresh_surface, 350)
+
+        self.active = True
+        self.plugin.windows[id(self.sheet)] = self
+        self._show_overlay(True)
+        self._schedule_hide(2500)
+
+    # ----- анимация -----
+    def _animate_to(self, x1, y1, s1, dur=200):
+        x0 = self.px
+        y0 = self.py
+        s0 = self.scale
+        self._anim_seq += 1
+        my = self._anim_seq
+
+        def step(f):
+            # анимация живёт, пока её не отменили (касание угла/полоски, жест ресайза,
+            # сворачивание). Иначе «доводка» 200 мс воюет с пальцем за позицию окна,
+            # и панель при растягивании слегка дёргается в сторону
+            if not self.active or my != self._anim_seq or self.gesture:
+                return
+            self._apply_scale(s0 + (s1 - s0) * f, False)
+            self._set_pos(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)
+
+        if self.own_window and abs(s1 - s0) > 0.001:
+            self._gesture_begin()
+
+            def gend():
+                # завершаем «временное большое окно» только если анимацию не перебил жест
+                if my == self._anim_seq:
+                    self._gesture_end()
+
+            run_on_ui_thread(gend, dur + 80)
+        va = ValueAnimator.ofFloat(0.0, 1.0)
+        va.setDuration(dur)
+        va.addUpdateListener(_AnimUpd(step))
+        va.start()
+
+    # ----- панель управления -----
+    def _show_overlay(self, show):
+        for v in self.overlay:
+            v.setVisibility(View.VISIBLE if show else View.GONE)
+        self.overlay_on = show
+
+    def _schedule_hide(self, delay):
+        self.token += 1
+        t = self.token
+
+        def hide():
+            if self.active and self.token == t:
+                self._show_overlay(False)
+
+        run_on_ui_thread(hide, delay)
+
+    def _hold_overlay(self):
+        self.token += 1
+
+    # ----- полоски: свободное перемещение -----
+    def _on_handle_touch(self, v, e):
+        a = e.getActionMasked()
+        st = self.hstate
+        if a == MotionEvent.ACTION_DOWN:
+            self._front()
+            self._anim_seq += 1  # палец взялся за полоску — отменяем идущую доводку позиции
+            st["dx"] = self.px - e.getRawX()
+            st["dy"] = self.py - e.getRawY()
+            st["rx"] = e.getRawX()
+            st["ry"] = e.getRawY()
+            st["moved"] = False
+            st["n"] = 0
+            return True
+        if a == MotionEvent.ACTION_MOVE:
+            if not st.get("moved") and abs(e.getRawX() - st["rx"]) + abs(e.getRawY() - st["ry"]) > self.dp(6):
+                st["moved"] = True
+            if st.get("moved"):
+                st["n"] = st.get("n", 0) + 1
+                # окно перемещается куда угодно — просто не даём ему вылезти за экран
+                x, y = self._clamp_xy(e.getRawX() + st["dx"], e.getRawY() + st["dy"])
+                self._set_pos(x, y)
+                if not self.own_window:
+                    if self.is_site:
+                        self._repaint()
+                    else:
+                        try:
+                            self.host.invalidate()
+                        except Exception:
+                            pass
+                self._show_overlay(True)
+                self._hold_overlay()
+            return True
+        if a in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+            if st.get("moved"):
+                self._finish_drag()
+            elif self.overlay_on:
+                self._show_overlay(False)
+            else:
+                self._show_overlay(True)
+                self._schedule_hide(3500)
+            return True
+        return False
+
+    def _finish_drag(self):
+        x, y = self._clamp_xy(self.px, self.py)
+        self._animate_to(x, y, self.scale)
+
+    # ----- мини-круг -----
+    def _iconify(self, side):
+        self._gesture_end()
+        self._anim_seq += 1  # сворачиваемся — идущая доводка позиции больше не нужна
+        sw, sh = self._dims()
+        isz = self.isz
+        y = self.py + self._h() / 2.0 - isz / 2.0
+        y = max(0.0, min(y, float(sh - isz)))
+        self.iconified = True
+        self._set_root_visible(False)
+        x = float(self.dp(4)) if side == "left" else float(sw - isz - self.dp(4))
+        if self.own_window and self.wm is not None:
+            self.icon_win = self._icon_window_add(x, y)
+        if self.icon_win:
+            self.icon.setVisibility(View.VISIBLE)
+            self._icon_set_pos(x, y)
+        else:
+            self._icon_set_pos(x, y)
+            self.icon.setVisibility(View.VISIBLE)
+            self.icon.bringToFront()
+        run_on_ui_thread(self._allow_draw_content, 60)
+
+    def _on_icon_touch(self, v, e):
+        a = e.getActionMasked()
+        st = self.istate
+        sw, sh = self._dims()
+        isz = self.isz
+        if a == MotionEvent.ACTION_DOWN:
+            if not self.icon_win:
+                self.icon.bringToFront()
+            st["dx"] = self.ix - e.getRawX()
+            st["dy"] = self.iy - e.getRawY()
+            st["rx"] = e.getRawX()
+            st["ry"] = e.getRawY()
+            st["moved"] = False
+            return True
+        if a == MotionEvent.ACTION_MOVE:
+            if not st.get("moved") and abs(e.getRawX() - st["rx"]) + abs(e.getRawY() - st["ry"]) > self.dp(6):
+                st["moved"] = True
+            if st.get("moved"):
+                self._icon_set_pos(max(0.0, min(e.getRawX() + st["dx"], float(sw - isz))),
+                                   max(0.0, min(e.getRawY() + st["dy"], float(sh - isz))))
+            return True
+        if a in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+            if st.get("moved"):
+                left = self.ix + isz / 2.0 < sw / 2.0
+                tx = float(self.dp(4)) if left else float(sw - isz - self.dp(4))
+                self._icon_animate_x(tx)
+                run_on_ui_thread(self._allow_draw_content, 60)
+            else:
+                self._expand_from_icon()
+            return True
+        return False
+
+    def _expand_from_icon(self):
+        sw, sh = self._dims()
+        isz = self.isz
+        w = self._w()
+        h = self._h()
+        margin = self.dp(MARGIN_DP)
+        left = self.ix + isz / 2.0 < sw / 2.0
+        x = float(margin) if left else float(sw - w - margin)
+        y = self.iy + isz / 2.0 - h / 2.0
+        self.iconified = False
+        self.icon.setVisibility(View.GONE)
+        self._icon_window_remove()
+        self._set_root_visible(True)
+        self._front()
+        x, y = self._clamp_xy(x, y)
+        self._set_pos(x, y)
+        self._show_overlay(True)
+        self._schedule_hide(2500)
+
+    def _invalidate_deep(self, v, state, depth=0):
+        """Инвалидируем каждый вид поддерева: простой decor.invalidate() не заставляет детей
+        перезаписать свои display list'ы, и область под скрытой шторкой может остаться со старой картинкой."""
+        if v is None or depth > 40 or state[0] > 6000:
+            return
+        state[0] += 1
+        try:
+            v.invalidate()
+        except Exception:
+            pass
+        try:
+            n = int(v.getChildCount())
+        except Exception:
+            return
+        for i in range(n):
+            try:
+                self._invalidate_deep(v.getChildAt(i), state, depth + 1)
+            except Exception:
+                pass
+
+    def _allow_draw_content(self):
+        return  # отключено: меняет приватные флаги Telegram под шторкой
+
+    def _find_field(self, obj, name):
+        c = obj.getClass()
+        while c is not None:
+            try:
+                f = c.getDeclaredField(name)
+                f.setAccessible(True)
+                return f
+            except Exception:
+                c = c.getSuperclass()
+        return None
+
+    def _find_by_class(self, root, name, depth=0):
+        if root is None or depth > 10:
+            return None
+        try:
+            if _cname(root) == name:
+                return root
+            n = int(root.getChildCount())
+        except Exception:
+            return None
+        for i in range(n):
+            try:
+                r = self._find_by_class(root.getChildAt(i), name, depth + 1)
+                if r is not None:
+                    return r
+            except Exception:
+                pass
+        return None
+
+    def _restore_saved_fields(self):
+        """Вернуть Telegram всё, что мы временно подменили (вызывается перед закрытием/разворотом)."""
+        try:
+            for obj, f, old, label in list(self._saved_fields):
+                try:
+                    if isinstance(old, bool):
+                        f.setBoolean(obj, old)
+                    else:
+                        f.set(obj, old)
+                except Exception:
+                    pass
+            self._saved_fields = []
+        except Exception:
+            pass
+        try:
+            if self._layer2 is not None:
+                self._layer2.setVisibility(View.VISIBLE)
+                self._layer2 = None
+        except Exception:
+            pass
+
+    def _exp(self, n):
+        """Шаги «лечения» после сворачивания сайта; остаются применёнными до закрытия/разворота."""
+        if not self.active:
+            return
+        try:
+            d = _activity().getWindow().getDecorView()
+            ab = self._find_by_class(d, "ActionBarLayout")
+            if ab is None:
+                return
+            chat_c = None
+            layer2 = None
+            for i in range(int(ab.getChildCount())):
+                ch = ab.getChildAt(i)
+                if _cname(ch) != "LayoutContainer":
+                    continue
+                for j in range(int(ch.getChildCount())):
+                    cn = _cname(ch.getChildAt(j))
+                    if cn == "ChatActivityFragmentView":
+                        chat_c = ch
+                    elif cn == "WindowView":
+                        layer2 = ch
+            if n == 1:
+                f = self._find_field(ab, "openingAnimation")
+                if f is not None:
+                    old = bool(f.getBoolean(ab))
+                    self._saved_fields.append((ab, f, old, "openingAnimation"))
+                    f.setBoolean(ab, False)
+                if layer2 is not None:
+                    layer2.setVisibility(View.GONE)
+                    self._layer2 = layer2
+                ab.invalidate()
+            elif n == 2:
+                f = self._find_field(ab, "sheetFragment")
+                if f is not None:
+                    old = f.get(ab)
+                    self._saved_fields.append((ab, f, old, "sheetFragment"))
+                    f.set(ab, None)
+                    ab.invalidate()
+                    if chat_c is not None:
+                        chat_c.invalidate()
+            elif n == 3:
+                ab.requestLayout()
+                if chat_c is not None:
+                    chat_c.requestLayout()
+                    chat_c.invalidate()
+            d.invalidate()
+        except Exception:
+            pass
+
+    def _refresh_surface(self):
+        """Пересоздать поверхность окна активности (лечит «застрявшую» картинку скрытой шторки)."""
+        try:
+            d = _activity().getWindow().getDecorView()
+        except Exception:
+            return
+        try:
+            d.setVisibility(View.INVISIBLE)
+        except Exception:
+            return
+
+        def back():
+            try:
+                d.setVisibility(View.VISIBLE)
+            except Exception:
+                pass
+        run_on_ui_thread(back, 90)
+        run_on_ui_thread(back, 400)
+
+    def _repaint(self, deep=False):
+        """Сайт: после скрытия шторки заставляем окно активности перерисоваться целиком."""
+        if deep:
+            self._allow_draw_content()
+        try:
+            act = _activity()
+            d = act.getWindow().getDecorView()
+            d.invalidate()
+            d.requestLayout()
+            if deep:
+                st = [0]
+                self._invalidate_deep(d, st)
+        except Exception:
+            pass
+        if deep:
+            try:
+                fr = get_last_fragment()
+                fv = fr.getFragmentView() if fr is not None else None
+                if fv is not None:
+                    fv.invalidate()
+                    fv.requestLayout()
+            except Exception:
+                pass
+        try:
+            self.host.invalidate()
+        except Exception:
+            pass
+
+    def _siblings(self):
+        out = []
+        try:
+            for r in _sheet_roots(self.sheet):
+                par = r.getParent()
+                if par is None:
+                    continue
+                for i in range(int(par.getChildCount())):
+                    c = par.getChildAt(i)
+                    if c is not r and c is not self.root:
+                        out.append(c)
+        except Exception:
+            pass
+        return out
+
+    def _hide_site_leftovers(self, hide):
+        self.hidden_sibs = []
+        self._hide_site_leftovers2(hide)
+
+    def _find_tabs_overlay(self):
+        try:
+            top = self.host.getChildAt(0)
+            for i in range(int(top.getChildCount())):
+                c = top.getChildAt(i)
+                if "BottomSheetTabsOverlay" in str(c.getClass().getName()):
+                    return c
+        except Exception:
+            pass
+        return None
+
+    def _hide_tabs_overlay(self, hide):
+        """BottomSheetTabsOverlay рисует снимок шторки при «сворачивании в таб»; мы отменяем
+        dismiss(true), и оверлей остаётся с застывшей картинкой сайта поверх чата."""
+        try:
+            if hide:
+                ov = self._find_tabs_overlay()
+                self.tabs_overlay = ov
+                if ov is None:
+                    return
+                self.tabs_overlay_vis = int(ov.getVisibility())
+                ov.setVisibility(View.INVISIBLE)
+                ov.invalidate()
+            else:
+                ov = getattr(self, "tabs_overlay", None)
+                if ov is not None:
+                    ov.setVisibility(getattr(self, "tabs_overlay_vis", 0))
+                    ov.invalidate()
+                    self.tabs_overlay = None
+        except Exception:
+            pass
+
+    def _hide_site_leftovers2(self, hide):
+        self._hide_tabs_overlay(hide)
+        """У сайта после выноса WebView остаётся PageLayout/шторка, которые рисуют «двойника»."""
+        try:
+            p = self.orig_parent
+            if p is not None:
+                p.setVisibility(View.INVISIBLE if hide else View.VISIBLE)
+        except Exception:
+            pass
+        try:
+            wv = self.sheet.getWindowView()
+            if wv is not None:
+                wv.setVisibility(View.GONE if hide else View.VISIBLE)
+                wv.setAlpha(0.0 if hide else 1.0)
+        except Exception:
+            pass
+
+    def _force_close_site(self):
+        """Шторка сайта после dismiss(false) может остаться — закрываем всеми доступными способами."""
+        try:
+            av = find_class("org.telegram.ui.ArticleViewer")
+            inst = None
+            for gn in ("getInstance", "getInstance"):
+                try:
+                    inst = av.getInstance()
+                    break
+                except Exception:
+                    inst = None
+            if inst is not None:
+                for args in ((False, True), (True, True)):
+                    try:
+                        inst.close(*args)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        for name, args in (("release", ()),):
+            try:
+                getattr(self.sheet, name)(*args)
+            except Exception:
+                continue
+        for r in _sheet_roots(self.sheet):
+            try:
+                r.setVisibility(View.GONE)
+            except Exception:
+                pass
+
+    def hide_sheet(self):
+        """Не даём шторке «всплыть» (плашка снизу) при переходах между чатами."""
+        if not self.active:
+            return
+        try:
+            for r in _sheet_roots(self.sheet):
+                r.setVisibility(View.GONE)
+        except Exception:
+            pass
+        try:
+            if self.iconified:
+                self.icon.setVisibility(View.VISIBLE)
+                if not self.icon_win:
+                    self.icon.bringToFront()
+            else:
+                self._front()
+        except Exception:
+            pass
+
+    # ----- размер: угловые зоны на нижней полоске (слева и справа) -----
+    def _resize_touch(self, side):
+        def fn(v, e):
+            a = e.getActionMasked()
+            st = self.gstate
+            if a == MotionEvent.ACTION_DOWN:
+                self._front()
+                self._anim_seq += 1  # палец взялся за угол — отменяем идущую доводку позиции
+                # окно НЕ разворачиваем сразу: раньше это делалось на каждое нажатие,
+                # и простой тап по углу «мигал» окном на весь экран. Разворачиваем лениво —
+                # только когда палец действительно поехал (первый ACTION_MOVE)
+                st["sx"] = e.getRawX()
+                st["sy"] = e.getRawY()
+                st["s0"] = self.scale
+                st["begun"] = False
+                st["n"] = 0
+                st["fm"] = False       # был ли уже первый MOVE (от него ведём отсчёт растягивания)
+                st["lx"] = e.getRawX() # точка пальца на прошлом событии — копим пройденный путь
+                st["ly"] = e.getRawY()
+                st["acc"] = 0.0       # путь, пройденный пальцем (для «разгона» жеста)
+                # фиксируем противоположный край: левый угол тянет влево, правый — вправо
+                if side == "left":
+                    st["ax"] = self.px + self._w()
+                else:
+                    st["ax"] = self.px
+                self._hold_overlay()
+                return True
+            if a == MotionEvent.ACTION_MOVE:
+                if not self.active or self.iconified:
+                    return True
+                st["n"] = st.get("n", 0) + 1
+                if not st.get("fm"):
+                    # первый MOVE часто несёт сразу весь накопленный путь от нажатия
+                    # (Android батчит события) — на нём панель прыгала бы на полпути
+                    # пальца мгновенно. Не прыгаем: ведём отсчёт растягивания от него.
+                    st["fm"] = True
+                    st["sx"] = e.getRawX()
+                    st["sy"] = e.getRawY()
+                st["acc"] += abs(e.getRawX() - st["lx"]) + abs(e.getRawY() - st["ly"])
+                st["lx"] = e.getRawX()
+                st["ly"] = e.getRawY()
+                dx = (st["sx"] - e.getRawX()) if side == "left" else (e.getRawX() - st["sx"])
+                grow = (dx + (e.getRawY() - st["sy"])) / 2.0
+                raw = (st["s0"] * self.lw + grow) / float(self.lw)
+                # «разгон» жеста: первые ~14dp пути масштаб нарастает плавно, от нуля до
+                # единицы. Панель выдвигается из места покоя без рывка, и за это же время
+                # окно успевает увеличиться «с запасом» (_gesture_begin) до первого реального
+                # роста — раньше первый кадр роста рисовался ещё в старое маленькое окно.
+                ramp = min(1.0, st["acc"] / max(1.0, float(self.dp(14))))
+                raw = st["s0"] + (raw - st["s0"]) * ramp
+                if raw >= self.expand_scale:
+                    # ~60% экрана — авто-разворот в обычный вид
+                    self.restore()
+                    return True
+                if raw <= self.collapse_scale:
+                    # ~5% экрана — авто-сворачивание в мини-круг
+                    self._iconify(self._side_from_x())
+                    return True
+                if not st.get("begun"):
+                    if st["acc"] <= self.dp(4):
+                        # палец проехал меньше 4dp — микродрожь, жест ещё не начался:
+                        # окно не разворачиваем, панель не трогаем
+                        return True
+                    # жест пошёл по-настоящему — только теперь разворачиваем окно на весь экран
+                    st["begun"] = True
+                    self._gesture_begin()
+                self._apply_scale(self._clamp_scale(raw), False)
+                if side == "left":
+                    x = st["ax"] - self._w()
+                else:
+                    x = st["ax"]
+                x, y = self._clamp_xy(x, self.py)
+                self._set_pos(x, y)
+                return True
+            if a in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                if st.get("begun"):
+                    self._gesture_end()
+                if self.active and not self.iconified:
+                    self._schedule_hide(2500)
+                return True
+            return False
+        return fn
+
+    # ----- вернуть / закрыть -----
+    def _detach(self):
+        self.token += 1
+        self._restore_saved_fields()
+        try:
+            if self.container is not None:
+                p = self.container.getParent()
+                if p is not None:
+                    p.removeView(self.container)
+        except Exception:
+            pass
+        try:
+            if self.root is not None:
+                if self.own_window:
+                    self.wm.removeViewImmediate(self.root)
+                elif self.host is not None:
+                    self.host.removeView(self.root)
+        except Exception:
+            pass
+        try:
+            if self.icon_added:
+                self._icon_window_remove()
+            elif self.host is not None and self.icon is not None:
+                self.host.removeView(self.icon)
+        except Exception:
+            pass
+        try:
+            if self.own_window and self.container is not None:
+                self.container.setOnTouchListener(None)
+        except Exception:
+            pass
+        self.plugin.windows.pop(id(self.sheet), None)
+        self.active = False
+
+    def restore(self):
+        if not self.active:
+            return
+        self._detach()
+        try:
+            if self.orig_lp is not None:
+                self.orig_parent.addView(self.container, self.orig_index, self.orig_lp)
+            else:
+                self.orig_parent.addView(self.container, self.orig_index)
+        except Exception:
+            pass
+        if self.is_site:
+            self._hide_site_leftovers(False)
+            try:
+                if getattr(self, "old_layer", None) is not None:
+                    self.container.setLayerType(self.old_layer, None)
+            except Exception:
+                pass
+        for r in _sheet_roots(self.sheet):
+            try:
+                r.setVisibility(View.VISIBLE)
+            except Exception:
+                pass
+
+    def _dismiss_sheet(self):
+        # у шторок разные сигнатуры: dismiss() / dismiss(boolean) / dismiss(boolean, Runnable)
+        for args in ((False,), (), (False, None)):
+            try:
+                self.sheet.dismiss(*args)
+                return
+            except Exception:
+                continue
+
+    def close(self):
+        if not self.active:
+            return
+        site = self.is_site
+        self.restore()
+        self._dismiss_sheet()
+        if site:
+            run_on_ui_thread(self._force_close_site, 120)
+
+
+# ---------------- хуки ----------------
+_SKIP_FRAMES = (
+    "java.lang.Thread", "dalvik.system", "PyObject", "PyMethodHook", "HookCallbackDispatcher",
+    "XposedBridge", "LSPHooker", "com.chaquo", "java.lang.reflect", "$Proxy",
+)
+
+
+def _stack_info():
+    """Возвращает (класс.метод вызывающего, есть ли в стеке ActionBarMenu)."""
+    caller = ""
+    caller_cls = ""
+    caller_m = ""
+    menu = False
+    st = Thread.currentThread().getStackTrace()
+    for i in range(len(st)):
+        e = st[i]
+        cn = str(e.getClassName())
+        mn = str(e.getMethodName())
+        if "ActionBarMenu" in cn:
+            menu = True
+        if caller:
+            continue
+        if any(s in cn for s in _SKIP_FRAMES):
+            continue
+        caller_cls, caller_m = cn, mn
+        caller = cn.split(".")[-1] + "." + mn
+    return caller, caller_cls, caller_m, menu
+
+
+class DismissHook(MethodHook):
+    """dismiss() шторки.
+
+    1) Если его вызвала нативная кнопка-стрелка «свернуть вниз» (пункт меню шапки)
+       или кнопка сворачивания сайта во встроенном браузере (dismiss(true) —
+       сворачивание в таб-пилюлю), отменяем закрытие и сворачиваем в плавающее окно.
+       Сайты в браузере Telegram открываются в той же шторке BotWebViewSheet,
+       поэтому плавающее окно для них работает точно так же.
+    2) Если окно уже плавает, ЛЮБОЙ dismiss (в т.ч. LaunchActivity.dismissAllWeb при
+       переходе в другой чат) блокируется — иначе шторка «всплывает» плашкой снизу
+       и убивает мини-апп/сайт за плавающим окном.
+    Левый крестик (onCheckDismissByUser) и свайп не трогаем, пока окно не активно.
+    """
+
+    def __init__(self, plugin, name, intercept, tabs=False):
+        super().__init__()
+        self.plugin = plugin
+        self.name = name
+        self.intercept = intercept
+        self.tabs = tabs  # dismiss(boolean) — путь «свернуть в таб» браузера
+
+    def before_hooked_method(self, param):
+        try:
+            _, ccls, cm, menu = _stack_info()
+            sheet = param.thisObject
+            win = getattr(self.plugin, "windows", {}).get(id(sheet))
+            if win is not None and win.active:
+                # окно плавает — шторке запрещено закрываться и показываться
+                first = None
+                try:
+                    a0 = param.args[0] if (param.args and len(param.args) > 0) else None
+                    if isinstance(a0, bool):
+                        first = a0
+                except Exception:
+                    first = None
+                # кнопки самого сайта внутри окна — лямбды ArticleViewer (действия пользователя)
+                user_ui = ccls == "org.telegram.ui.ArticleViewer" and cm.startswith("lambda$")
+                if cm in ("onCloseRequested", "onClose") or (user_ui and first is False):
+                    # мини-апп просит закрыться сам или нажат «закрыть» в окне — закрываем по-настоящему
+                    if win.is_site:
+                        # у сайта одного dismiss мало: шторка остаётся видимой. Блокируем этот вызов и
+                        # закрываем полным путём (вернуть WebView → dismiss → ArticleViewer.close → release)
+                        try:
+                            param.setResult(None)
+                        except Exception:
+                            win.restore()
+                            return
+                        run_on_ui_thread(win.close, 10)
+                        return
+                    win.restore()
+                    return
+                if user_ui and first is True:
+                    # кнопка «свернуть» самого сайта внутри окна — сворачиваем окно в мини-круг
+                    try:
+                        param.setResult(None)
+                    except Exception:
+                        return
+                    run_on_ui_thread(lambda w=win: w._iconify(w._side_from_x()), 30)
+                    return
+                try:
+                    param.setResult(None)
+                except Exception:
+                    return
+                run_on_ui_thread(lambda w=win: w.hide_sheet(), 60)
+                return
+            take = False
+            if (
+                self.intercept
+                and self.plugin.get_setting("enabled", True)
+                and id(sheet) not in self.plugin.windows
+            ):
+                if menu and "BotWebViewSheet$" in ccls and cm == "onItemClick":
+                    # стрелка «свернуть вниз» в шапке мини-аппа
+                    take = True
+                elif self.tabs and param.args and len(param.args) > 0:
+                    # сайт в браузере: dismiss(true) — пользователь сворачивает вкладку
+                    try:
+                        # dismiss() сам вызывает dismiss(true) — это не «свернуть», пропускаем
+                        take = bool(param.args[0]) and not (cm == "dismiss" and "Sheet" in ccls)
+                    except Exception:
+                        take = False
+            if not take:
+                return
+            try:
+                param.setResult(None)
+            except Exception:
+                return
+            run_on_ui_thread(lambda s=sheet: FloatingWindow(self.plugin, s).minimize(), 30)
+        except Exception:
+            pass
+
+
+class MiniAppFloatPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.windows = {}
+        self._hook_refs = []
+        for name in SHEET_CLASSES:
+            try:
+                cls = find_class(name)
+            except Exception:
+                cls = None
+            if cls is None:
+                continue
+            short = name.split(".")[-1]
+            try:
+                for m in list(cls.getClass().getDeclaredMethods()):
+                    mn = str(m.getName())
+                    if mn == "dismiss":
+                        tabs = False
+                        try:
+                            pt = list(m.getParameterTypes())
+                            tabs = bool(pt) and "boolean" in str(pt[0])
+                        except Exception:
+                            tabs = False
+                        self._hook_refs.append(self.hook_method(
+                            m, DismissHook(self, short + ".dismiss", True, tabs)))
+                    elif mn == "onCheckDismissByUser":
+                        self._hook_refs.append(self.hook_method(
+                            m, DismissHook(self, short + ".onCheckDismissByUser", False)))
+            except Exception:
+                pass
+        # сайты в браузере и путь «в таб-пилюлю»
+        try:
+            self._install_site_hooks()
+        except Exception:
+            pass
+        # первый запуск: предложить перезапуск, чтобы хуки точно применились
+        try:
+            if not self.get_setting("restart_sheet_first_install_done", False):
+                run_on_ui_thread(lambda: self._show_restart_sheet(), 1800)
+        except Exception:
+            pass
+
+    def _install_site_hooks(self):
+        # сайт в браузере Telegram — это ArticleViewer$Sheet, а не BotWebViewSheet
+        for cn in ("org.telegram.ui.ArticleViewer$Sheet",):
+            try:
+                cls = find_class(cn)
+            except Exception:
+                cls = None
+            if cls is None:
+                continue
+            try:
+                for m in list(cls.getClass().getDeclaredMethods()):
+                    if str(m.getName()) != "dismiss":
+                        continue
+                    tabs = False
+                    try:
+                        pt = list(m.getParameterTypes())
+                        tabs = bool(pt) and "boolean" in str(pt[0])
+                    except Exception:
+                        tabs = False
+                    self._hook_refs.append(self.hook_method(
+                        m, DismissHook(self, "ArticleViewer$Sheet.dismiss", True, tabs)))
+            except Exception:
+                pass
+
+    def on_plugin_unload(self):
+        # снимаем хуки — иначе после обновления плагина «на лету»
+        # остаются висеть старые хуки прошлой версии
+        for ref in list(getattr(self, "_hook_refs", [])):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hook_refs = []
+        for w in list(getattr(self, "windows", {}).values()):
+            try:
+                w.restore()
+            except Exception:
+                pass
+        self.windows = {}
+
+    # ---------- элементы интерфейса ----------
+
+    def _theme_col(self, name, fallback):
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            return Theme.getColor(getattr(Theme, name))
+        except Exception:
+            return fallback
+
+    def _ui_context(self):
+        try:
+            frag = get_last_fragment()
+            ctx = frag.getContext() if frag else None
+            if ctx is not None:
+                return ctx
+        except Exception:
+            pass
+        from org.telegram.messenger import ApplicationLoader
+        return ApplicationLoader.applicationContext
+
+    def _label(self, ctx, text, color, size, medium=False):
+        tv = TextView(ctx)
+        tv.setText(text)
+        tv.setTextColor(color)
+        tv.setTextSize(2, float(size))
+        if medium:
+            try:
+                tv.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            except Exception:
+                tv.setTypeface(Typeface.DEFAULT_BOLD)
+        return tv
+
+    def _header_sticker(self, ctx):
+        """Стикер из набора STICKER_SET над названием плагина."""
+        holder = FrameLayout(ctx)
+        try:
+            from org.telegram.ui.Components import BackupImageView
+            image = BackupImageView(ctx)
+            holder.addView(image, FrameLayout.LayoutParams(-1, -1))
+            self._load_header_sticker(image, holder)
+        except Exception:
+            holder.setVisibility(View.GONE)
+        return holder
+
+    def _show_header_sticker(self, image, doc):
+        try:
+            from org.telegram.messenger import ImageLocation
+            mime = str(doc.mime_type) if doc.mime_type else ""
+            flt = "100_100_pcache" if "video" in mime else "100_100"
+            image.setImage(ImageLocation.getForDocument(doc), flt, ColorDrawable(0), doc)
+            try:
+                image.getImageReceiver().setAutoRepeat(1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _load_header_sticker(self, image, holder):
+        doc = getattr(self, "_sticker_doc", None)
+        if doc is not None:
+            self._show_header_sticker(image, doc)
+            return
+        try:
+            from org.telegram.tgnet import TLRPC
+            from client_utils import send_request
+            req = TLRPC.TL_messages_getStickerSet()
+            inp = TLRPC.TL_inputStickerSetShortName()
+            inp.short_name = STICKER_SET
+            req.stickerset = inp
+            req.hash = 0
+
+            def done(response, error):
+                try:
+                    docs = response.documents if (response is not None and not error) else None
+                    if docs is None or docs.size() == 0:
+                        run_on_ui_thread(lambda: holder.setVisibility(View.GONE))
+                        return
+                    idx = max(0, min(STICKER_INDEX, docs.size() - 1))
+                    d = docs.get(idx)
+                    self._sticker_doc = d
+                    run_on_ui_thread(lambda: self._show_header_sticker(image, d))
+                except Exception:
+                    pass
+            send_request(req, done)
+        except Exception:
+            holder.setVisibility(View.GONE)
+
+    def _header_item(self):
+        try:
+            from ui.settings import Custom
+            ctx = self._ui_context()
+            layout = LinearLayout(ctx)
+            layout.setOrientation(1)
+            layout.setGravity(Gravity.CENTER)
+            layout.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(24),
+                              AndroidUtilities.dp(16), AndroidUtilities.dp(16))
+            try:
+                # стикер над названием плагина
+                layout.addView(self._header_sticker(ctx),
+                               LinearLayout.LayoutParams(AndroidUtilities.dp(100), AndroidUtilities.dp(100)))
+            except Exception:
+                pass
+            for text, key, fb, size, top, bold in (
+                    ("Mini App Float v" + __version__, "key_windowBackgroundWhiteBlackText", -16777216, 20.0, 12, True),
+                    ("Мини-аппы и сайты в плавающем окне.",
+                     "key_windowBackgroundWhiteGrayText2", -7829368, 13.5, 4, False)):
+                view = self._label(ctx, text, self._theme_col(key, fb), size, bold)
+                view.setGravity(Gravity.CENTER)
+                view.setPadding(0, AndroidUtilities.dp(top), 0, 0)
+                layout.addView(view)
+            try:
+                from org.telegram.ui.Components import UItem
+                item = UItem.asCustom(layout)
+                item.transparent = True
+                return Custom(item=item)
+            except Exception:
+                return Custom(view=layout)
+        except Exception:
+            return Header(text="Mini App Float")
+
+    # ---------- «Поддержать» (окно как в Plugin Editor) ----------
+
+    _SUPPORT_USER = "PLOXOI_RRO"
+    _SUPPORT_URL = "https://t.me/PLOXOI_RRO"
+
+    def _show_support(self):
+        def show():
+            ctx = _activity()
+            if ctx is None:
+                return
+            try:
+                from org.telegram.ui.ActionBar import BottomSheet
+                root, image, button = self._support_view(ctx)
+                builder = BottomSheet.Builder(ctx)
+                builder.setCustomView(root)
+                sheet = builder.show()
+
+                def go(view):
+                    try:
+                        sheet.dismiss()
+                    except Exception:
+                        pass
+                    self._open_support_chat(ctx)
+                button.setOnClickListener(OnClickListener(go))
+                self._load_support_avatar(image)
+            except Exception:
+                pass
+        run_on_ui_thread(show)
+
+    def _open_support_chat(self, ctx):
+        try:
+            from org.telegram.messenger.browser import Browser
+            Browser.openUrl(ctx, self._SUPPORT_URL)
+        except Exception:
+            pass
+
+    def _support_view(self, ctx):
+        from org.telegram.ui.Components import BackupImageView
+        text_color = self._theme_col("key_dialogTextBlack", -16777216)
+        hint_color = self._theme_col("key_dialogTextGray2", -7829368)
+        root = LinearLayout(ctx)
+        root.setOrientation(1)
+        root.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(20),
+                        AndroidUtilities.dp(24), AndroidUtilities.dp(20))
+
+        def add(view, top=0, width=-1, height=-2, gravity=None):
+            lp = LinearLayout.LayoutParams(width, height)
+            lp.topMargin = AndroidUtilities.dp(top)
+            if gravity is not None:
+                lp.gravity = gravity
+            root.addView(view, lp)
+
+        image = BackupImageView(ctx)
+        image.setRoundRadius(AndroidUtilities.dp(48))
+        placeholder = GradientDrawable()
+        placeholder.setShape(1)
+        placeholder.setColor(self._theme_col("key_dialogBackgroundGray", 0x14808080))
+        image.setBackground(placeholder)
+        add(image, 0, AndroidUtilities.dp(96), AndroidUtilities.dp(96), Gravity.CENTER_HORIZONTAL)
+
+        title = self._label(ctx, "Поддержать автора", text_color, 22.0, True)
+        title.setGravity(Gravity.CENTER)
+        add(title, 16)
+        subtitle = self._label(
+            ctx, "Спасибо, что пользуетесь моими плагинами. Если они вам полезны, дайте знать.",
+            hint_color, 15.0)
+        subtitle.setGravity(Gravity.CENTER)
+        subtitle.setLineSpacing(0.0, 1.15)
+        add(subtitle, 8)
+
+        points = (("msg_stats", "Ваша поддержка помогает мне делать плагины лучше и сложнее"),
+                  ("msg_gift_premium", "Любая помощь важна, от подарка до доброго слова"),
+                  ("msg_info", "Если возникли проблемы или хотите что-то улучшить — пишите в ЛС, всегда отвечу"))
+        for index, (icon, text) in enumerate(points):
+            row = LinearLayout(ctx)
+            icon_lp = LinearLayout.LayoutParams(AndroidUtilities.dp(26), AndroidUtilities.dp(26))
+            icon_lp.setMargins(AndroidUtilities.dp(9), 0, AndroidUtilities.dp(9), 0)
+            row.addView(self._icon_view(ctx, icon, text_color), icon_lp)
+            body = self._label(ctx, text, text_color, 15.5)
+            body.setLineSpacing(0.0, 1.15)
+            body.setPadding(AndroidUtilities.dp(8), 0, 0, 0)
+            row.addView(body, LinearLayout.LayoutParams(0, -2, 1.0))
+            add(row, 16 if index else 22)
+
+        color = self._theme_col("key_featuredStickers_addButton", -11037236)
+        pressed = self._theme_col("key_featuredStickers_addButtonPressed", color)
+        button = self._label(ctx, "Написать в ЛС",
+                             self._theme_col("key_featuredStickers_buttonText", -1), 16.0, True)
+        button.setGravity(Gravity.CENTER)
+        button.setClickable(True)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            button.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
+                AndroidUtilities.dp(14), color, pressed))
+        except Exception:
+            shape = GradientDrawable()
+            shape.setColor(color)
+            shape.setCornerRadius(float(AndroidUtilities.dp(14)))
+            button.setBackground(shape)
+        add(button, 28, -1, AndroidUtilities.dp(52))
+        return root, image, button
+
+    def _icon_view(self, ctx, name, color):
+        from android.graphics import PorterDuff, PorterDuffColorFilter
+        from android.widget import ImageView
+        view = ImageView(ctx)
+        try:
+            res = ctx.getResources()
+            rid = res.getIdentifier(name, "drawable", ctx.getPackageName())
+            if rid:
+                drawable = res.getDrawable(rid).mutate()
+                drawable.setColorFilter(PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN))
+                view.setImageDrawable(drawable)
+        except Exception:
+            pass
+        return view
+
+    def _load_support_avatar(self, image):
+        # Аватарка автора из Telegram; если не нашлась — серый круг.
+        try:
+            from org.telegram.messenger import MessagesController, UserConfig
+            from org.telegram.tgnet import TLRPC
+            from client_utils import send_request
+
+            account = UserConfig.selectedAccount
+            controller = MessagesController.getInstance(account)
+
+            def show(obj):
+                def display():
+                    try:
+                        from org.telegram.ui.Components import AvatarDrawable
+                        drawable = AvatarDrawable()
+                        drawable.setInfo(account, obj)
+                        image.setForUserOrChat(obj, drawable)
+                    except Exception:
+                        pass
+                run_on_ui_thread(display)
+
+            obj = controller.getUserOrChat(self._SUPPORT_USER)
+            if obj is not None:
+                show(obj)
+                return
+            request = TLRPC.TL_contacts_resolveUsername()
+            request.username = self._SUPPORT_USER
+
+            def resolved(response, error):
+                try:
+                    if error or response is None:
+                        return
+                    if response.users.size() > 0:
+                        controller.putUsers(response.users, False)
+                        show(response.users.get(0))
+                    elif response.chats.size() > 0:
+                        controller.putChats(response.chats, False)
+                        show(response.chats.get(0))
+                except Exception:
+                    pass
+            send_request(request, resolved)
+        except Exception:
+            pass
+
+    # ----- инструкция -----
+    _INSTRUCTION = "\n".join((
+        "1. Нажмите стрелку вниз (или используйте свайп вниз) в шапке мини-аппа — он свернётся в плавающее окно. Сайт во встроенном браузере сворачивается так же — кнопкой сворачивания вкладки. Крестик закрывает как обычно.",
+        "2. Верхняя или нижняя полоска — перетащите окно в любое место экрана. Тап по полоске — панель (✕ — закрыть окно).",
+        "3. Размер: потяните за нижний угол окна (слева или справа) — вниз и в сторону окно растёт, вверх и к центру — уменьшается.",
+        "4. Растянули примерно до 80% экрана — окно автоматически развернётся в обычный вид.",
+        "5. Уменьшили примерно до 5% экрана — окно автоматически свернётся в мини-круг: у мини-аппа — аватарка бота, у сайта — буква названия.",
+        "6. Тап по мини-кругу возвращает окно. Круг можно перетаскивать.",
+        "7. Если сайт не сворачивается — включите «Браузер Telegram», разрешите «Поверх приложений» и перезапустите приложение.",
+    ))
+
+    def show_instruction(self, view=None):
+        def run():
+            try:
+                act = _activity()
+                if act is None:
+                    return
+                b = AlertDialogBuilder(act)
+                b.set_title("Как пользоваться")
+                b.set_message(self._INSTRUCTION)
+                b.set_positive_button("Понятно", lambda bld, w: bld.dismiss())
+                b.show()
+            except Exception:
+                pass
+
+        run_on_ui_thread(run)
+
+    # ----- быстрые кнопки к настройкам -----
+    def _open_overlay_permission(self, view=None):
+        """Экран системы «Поверх других приложений» для Telegram."""
+        def run():
+            try:
+                from android.content import Intent
+                from android.net import Uri
+                from android.provider import Settings as AndroidSettings
+                act = _activity()
+                ctx = act if act is not None else self._ui_context()
+                i = Intent(AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                           Uri.parse("package:" + str(ctx.getPackageName())))
+                i.addFlags(0x10000000)  # FLAG_ACTIVITY_NEW_TASK
+                ctx.startActivity(i)
+            except Exception:
+                pass
+        run_on_ui_thread(run)
+
+    def _open_browser_settings(self, view=None):
+        """Строка «Браузер Telegram»: включаем открытие ссылок внутри Telegram.
+
+        Сначала пробуем открыть экран настроек браузера (в разных клиентах он свой:
+        WebBrowserSettings в свежих официальных, ChatSettings в старых).
+        Если экрана в сборке нет (например, в exteraGram 13.x оба класса отсутствуют) —
+        управляем настройкой напрямую: флаг SharedConfig.inappBrowser, по которому
+        Telegram решает, открывать ли ссылки во встроенном браузере."""
+        def run():
+            try:
+                frag = get_last_fragment()
+                page = None
+                if frag is not None:
+                    from org.telegram.messenger import UserConfig
+                    for cn in ("org.telegram.ui.web.WebBrowserSettings",
+                               "org.telegram.ui.ChatSettings"):
+                        try:
+                            cls = find_class(cn)
+                        except Exception:
+                            cls = None
+                        if cls is None:
+                            continue
+                        # у экранов разные конструкторы: пробуем все по очереди
+                        for ctor in ((None,), (), (UserConfig.selectedAccount,)):
+                            try:
+                                page = cls(*ctor)
+                                break
+                            except Exception:
+                                page = None
+                        if page is not None:
+                            break
+                    if page is not None:
+                        try:
+                            if frag.presentFragment(page):
+                                return
+                        except Exception:
+                            pass
+                # экрана настроек в этой сборке нет — включаем настройку напрямую
+                self._browser_flag_dialog()
+            except Exception:
+                self.show_instruction()
+        run_on_ui_thread(run)
+
+    def _browser_flag(self):
+        """True/False — открытие ссылок во встроенном браузере Telegram; None — флаг недоступен."""
+        try:
+            from org.telegram.messenger import SharedConfig
+            return bool(SharedConfig.inappBrowser)
+        except Exception:
+            return None
+
+    def _browser_flag_set(self, on):
+        """True — получилось изменить настройку встроенного браузера."""
+        try:
+            from org.telegram.messenger import SharedConfig
+            try:
+                # свежие сборки: у SharedConfig есть сеттер, который сам сохраняет значение
+                SharedConfig.setInappBrowser(on)
+                return True
+            except Exception:
+                pass
+            try:
+                # сборки без сеттера: пишем поле напрямую и просим сохранить конфиг
+                SharedConfig.inappBrowser = on
+                try:
+                    SharedConfig.saveConfig()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _browser_flag_dialog(self):
+        """Нет экрана настроек браузера — показываем состояние настройки и включаем одним тапом."""
+        def run():
+            try:
+                act = _activity()
+                if act is None:
+                    self.show_instruction()
+                    return
+                cur = self._browser_flag()
+                b = AlertDialogBuilder(act)
+                b.set_title("Браузер Telegram")
+                if cur is None:
+                    b.set_message("В этой сборке нет экрана настроек браузера, и плагин не может "
+                                  "включить его автоматически. Откройте настройки клиента и включите "
+                                  "открытие ссылок внутри Telegram (пункт «Браузер» или «Встроенный браузер»).")
+                    b.set_positive_button("Понятно", lambda bld, w: bld.dismiss())
+                elif cur:
+                    b.set_message("Открытие ссылок в Telegram уже включено: сайты из чата открываются "
+                                  "во встроенном браузере и сворачиваются в плавающее окно.")
+                    b.set_positive_button("Понятно", lambda bld, w: bld.dismiss())
+                else:
+                    b.set_message("Открытие ссылок в Telegram выключено — сайты из чата открываются "
+                                  "во внешнем браузере, и плагин не может их свернуть. Включить?")
+
+                    def enable(bld, w):
+                        try:
+                            bld.dismiss()
+                        except Exception:
+                            pass
+                        self._browser_flag_done(self._browser_flag_set(True))
+
+                    b.set_positive_button("Включить", enable)
+                    b.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+                b.show()
+            except Exception:
+                self.show_instruction()
+        run_on_ui_thread(run)
+
+    def _browser_flag_done(self, ok):
+        """Итог включения настройки одним тапом."""
+        def run():
+            try:
+                act = _activity()
+                if act is None:
+                    return
+                b = AlertDialogBuilder(act)
+                b.set_title("Браузер Telegram")
+                if ok:
+                    b.set_message("Готово: ссылки теперь открываются в Telegram. Если сайты всё ещё "
+                                  "открываются во внешнем браузере — перезапустите приложение.")
+                else:
+                    b.set_message("Не удалось включить настройку автоматически. Откройте настройки "
+                                  "клиента и включите открытие ссылок внутри Telegram вручную.")
+                b.set_positive_button("Понятно", lambda bld, w: bld.dismiss())
+                b.show()
+            except Exception:
+                pass
+        run_on_ui_thread(run)
+
+    # ----- перезапуск приложения (как в plugin_editor) -----
+    def _show_restart_sheet(self, attempt=0):
+        def show():
+            act = _activity()
+            if act is None:
+                if attempt < 60:
+                    run_on_ui_thread(lambda: self._show_restart_sheet(attempt + 1), 500)
+                return
+            try:
+                if act.isFinishing() or act.isDestroyed():
+                    if attempt < 60:
+                        run_on_ui_thread(lambda: self._show_restart_sheet(attempt + 1), 500)
+                    return
+            except Exception:
+                pass
+            try:
+                from org.telegram.ui.ActionBar import BottomSheet
+                root, button = self._restart_view(act)
+                builder = BottomSheet.Builder(act)
+                builder.setCustomView(root)
+                sheet = builder.show()
+                button.setOnClickListener(OnClickListener(
+                    lambda v: (sheet.dismiss(), self._restart_application())))
+                try:
+                    self.set_setting("restart_sheet_first_install_done", True)
+                except Exception:
+                    pass
+            except Exception:
+                if attempt < 60:
+                    run_on_ui_thread(lambda: self._show_restart_sheet(attempt + 1), 500)
+        run_on_ui_thread(show)
+
+    def _restart_view(self, act):
+        def color(name, fallback):
+            return self._theme_col(name, fallback)
+
+        root = LinearLayout(act)
+        root.setOrientation(1)
+        root.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(20),
+                        AndroidUtilities.dp(24), AndroidUtilities.dp(20))
+
+        def add(view, top=0, height=-2):
+            lp = LinearLayout.LayoutParams(-1, height)
+            lp.topMargin = AndroidUtilities.dp(top)
+            root.addView(view, lp)
+
+        title = self._label(act, "Перезапустить Telegram?",
+                            color("key_dialogTextBlack", -16777216), 22.0, True)
+        title.setGravity(Gravity.CENTER)
+        add(title)
+        subtitle = self._label(
+            act, "Плагин установлен. Перезапустите приложение, чтобы сворачивание мини-аппов и сайтов заработало полностью.",
+            color("key_dialogTextGray2", -7829368), 15.0)
+        subtitle.setGravity(Gravity.CENTER)
+        subtitle.setLineSpacing(0.0, 1.15)
+        add(subtitle, 8)
+
+        btn_color = color("key_featuredStickers_addButton", -11037236)
+        btn_pressed = color("key_featuredStickers_addButtonPressed", btn_color)
+        button = self._label(act, "Перезапустить",
+                             color("key_featuredStickers_buttonText", -1), 16.0, True)
+        button.setGravity(Gravity.CENTER)
+        button.setClickable(True)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            button.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
+                AndroidUtilities.dp(14), btn_color, btn_pressed))
+        except Exception:
+            shape = GradientDrawable()
+            shape.setColor(btn_color)
+            shape.setCornerRadius(float(AndroidUtilities.dp(14)))
+            button.setBackground(shape)
+        add(button, 28, AndroidUtilities.dp(52))
+        return root, button
+
+    def _restart_application(self):
+        try:
+            from android.os import Process
+            act = _activity()
+            if act is None:
+                return
+            try:
+                if act.isFinishing() or act.isDestroyed():
+                    return
+            except Exception:
+                pass
+            intent = act.getPackageManager().getLaunchIntentForPackage(act.getPackageName())
+            if intent is None:
+                return
+            intent.addFlags(0x10000000 | 0x00008000)
+            act.startActivity(intent)
+            Process.killProcess(Process.myPid())
+        except Exception:
+            pass
+
+    def _restart_prompt(self, view=None):
+        def run():
+            try:
+                act = _activity()
+                if act is None:
+                    return
+                b = AlertDialogBuilder(act)
+                b.set_title("Перезапустить Telegram?")
+                b.set_message("Плавающие окна будут закрыты, плагин загрузится заново с чистыми хуками.")
+                b.set_positive_button("Перезапустить", lambda bld, w: (bld.dismiss(), self._restart_application()))
+                b.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+                b.show()
+            except Exception:
+                pass
+        run_on_ui_thread(run)
+
+    # ----- настройки -----
+    def create_settings(self):
+        return [
+            self._header_item(),
+            Switch(
+                key="enabled",
+                text="Включить плавающий режим",
+                default=True,
+                subtext="Стрелка вниз в шапке мини-аппа и кнопка сворачивания вкладки в браузере сворачивают их в плавающее окно. Крестик работает как раньше.",
+            ),
+            Header(text="Инструкция"),
+            Text(
+                text="Как пользоваться",
+                icon="msg_info",
+                subtext="Подробная инструкция по плавающему окну",
+                on_click=self.show_instruction,
+            ),
+            Header(text="Включите функции ниже для нормальной работы плагина"),
+            Text(
+                text="Поверх приложений",
+                icon="msg_permissions",
+                subtext="Включите это разрешение для нормальной работы плагина — откроется экран системы",
+                on_click=self._open_overlay_permission,
+            ),
+            Text(
+                text="Браузер Telegram",
+                icon="msg_openin",
+                subtext="Включите открытие ссылок в Telegram для нормальной работы плагина",
+                on_click=self._open_browser_settings,
+            ),
+            Divider(text="Работает для мини-аппов и сайтов во встроенном браузере."),
+            Text(text="Поддержка", icon="msg_gift_premium", accent=True,
+                 on_click=lambda view=None: self._show_support()),
+        ]
