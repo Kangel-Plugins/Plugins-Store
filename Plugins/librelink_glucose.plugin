@@ -1,0 +1,793 @@
+import calendar
+import hashlib
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from typing import Any, List, Optional
+from java import dynamic_proxy, jint
+from java.lang import Object, Runnable
+from android.widget import EditText, FrameLayout, LinearLayout
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
+from base_plugin import BasePlugin
+from extera_utils.classes import Base, java_subclass, joverride
+from org.telegram.messenger import AndroidUtilities, LocaleController, R
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui import LaunchActivity
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import AnimatedTextView, ItemOptions, ScaleStateListAnimator
+from com.exteragram.messenger.pillstack.core import PillRegistry, PillStackConfig
+from com.exteragram.messenger.pillstack.ui import PillStackPreferencesActivity
+from com.exteragram.messenger.pillstack.ui.pills import BasePill
+from com.exteragram.messenger.pillstack.ui.pills.crypto.utils import ColoredBackground
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from org.telegram.ui.Cells import TextCell
+from ui.settings import Header, Input, Selector, Divider, Custom, Text, SimpleSettingFactory
+
+__id__ = "librelink_glucose"
+__name__ = "LibreLink Глюкоза"
+__description__ = "Показывает ваш уровень глюкозы из LibreLinkUp прямо в [Pill Stack](https://t.me/exteraSettings?s=pillStack). Подробности в [посте](https://t.me/akresmc/19)"
+__author__ = "@akresik"
+__version__ = "1.0.0"
+__icon__ = "SpottyAndPersikAnimated/37"
+__min_version__ = "13.1.1"
+__category__ = ["tools", "integrations"]
+
+PILL_ID = 91001
+MGDL_PER_MMOL = 18.0182
+STALE_MINUTES = 15
+
+COLOR_LOW = (-1238236, -3599332, -1)
+COLOR_OK = (-7288005, -8735958, -16777216)
+COLOR_HIGH = (-17407, -2055168, -16777216)
+COLOR_VERY_HIGH = (-1086464, -3646208, -1)
+COLOR_STALE = (-7829368, -9211021, -1)
+
+state = {"plugin": None, "data": None, "error": None}
+
+def cfg(key, default):
+    plugin = state["plugin"]
+    if plugin is None:
+        return default
+    try:
+        return plugin.get_setting(key, default)
+    except Exception as e:
+        log(f"[LLG] cfg error: {e}")
+        return default
+
+def parse_float(value, default):
+    try:
+        return float(str(value).strip().replace(",", "."))
+    except Exception as e:
+        log(f"[LLG] parse_float error: {e}")
+        return default
+
+def default_thresholds(unit):
+    return ("70", "180", "240") if unit == 1 else ("3.9", "10.0", "13.3")
+
+def to_mmol(value, unit):
+    try:
+        return value / MGDL_PER_MMOL if unit == 1 else value
+    except Exception as e:
+        log(f"[LLG] to_mmol error: {e}")
+        return value
+
+def fmt_threshold(mmol, unit):
+    try:
+        if unit == 1:
+            return str(int(round(mmol * MGDL_PER_MMOL)))
+        return f"{mmol:.1f}"
+    except Exception as e:
+        log(f"[LLG] fmt_threshold error: {e}")
+        return str(mmol)
+
+def thresholds():
+    try:
+        unit = cfg("unit", 0)
+        d_low, d_high, d_very = default_thresholds(unit)
+        low = to_mmol(parse_float(cfg("thr_low", d_low), float(d_low)), unit)
+        high = to_mmol(parse_float(cfg("thr_high", d_high), float(d_high)), unit)
+        very_high = to_mmol(parse_float(cfg("thr_very_high", d_very), float(d_very)), unit)
+        if not (0 < low < high < very_high):
+            return 3.9, 10.0, 13.3
+        return low, high, very_high
+    except Exception as e:
+        log(f"[LLG] thresholds error: {e}")
+        return 3.9, 10.0, 13.3
+
+def age_minutes(data):
+    try:
+        ts = None if data is None else data.get("ts")
+        if ts is None:
+            return None
+        return max(0, int((time.time() - ts) // 60))
+    except Exception as e:
+        log(f"[LLG] age_minutes error: {e}")
+        return None
+
+def is_stale(data):
+    try:
+        age = age_minutes(data)
+        return age is not None and age > STALE_MINUTES
+    except Exception as e:
+        log(f"[LLG] is_stale error: {e}")
+        return False
+
+def palette(data):
+    try:
+        if data is None:
+            return COLOR_OK
+        if is_stale(data):
+            return COLOR_STALE
+        mmol = data["mgdl"] / MGDL_PER_MMOL
+        low, high, very_high = thresholds()
+        if data.get("low") or mmol <= low:
+            return COLOR_LOW
+        if data.get("high") or mmol > very_high:
+            return COLOR_VERY_HIGH
+        if mmol > high:
+            return COLOR_HIGH
+        return COLOR_OK
+    except Exception as e:
+        log(f"[LLG] palette error: {e}")
+        return COLOR_OK
+
+def format_data(data):
+    try:
+        if data.get("high"):
+            value = "HI"
+        elif data.get("low"):
+            value = "LO"
+        elif cfg("unit", 0) == 1:
+            value = str(int(round(data["mgdl"])))
+        else:
+            value = f"{data['mgdl'] / MGDL_PER_MMOL:.1f}".replace(".", ",")
+        age = age_minutes(data)
+        if age is not None and age > STALE_MINUTES:
+            ago = f"{age}м" if age < 60 else f"{age // 60}ч"
+            return f"{value} · {ago}"
+        return f"{value} {data.get('arrow', '')}".strip()
+    except Exception as e:
+        log(f"[LLG] format_data error: {e}")
+        return ""
+
+def notify(text):
+    try:
+        BulletinHelper.show_error(text)
+    except Exception as e:
+        log(f"[LLG] notify error: {e}")
+        try:
+            BulletinHelper.show_info(text)
+        except Exception as e:
+            log(f"[LLG] notify error: {e}")
+
+def parse_timestamp(m):
+    try:
+        raw = m.get("FactoryTimestamp")
+        if not raw:
+            return None
+        dt = datetime.strptime(raw, "%m/%d/%Y %I:%M:%S %p")
+        return calendar.timegm(dt.timetuple())
+    except Exception as e:
+        log(f"[LLG] parse_timestamp error: {e}")
+        return None
+
+class RunProxy(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception as e:
+            log(f"[LLG] run error: {e}")
+
+class LluError(Exception):
+    pass
+
+class RateLimited(LluError):
+    pass
+
+@java_subclass(BasePill)
+class GlucosePill(Base):
+    def on_post_init(self, context, resources_provider):
+        try:
+            self.busy = False
+            self.is_loading = False
+            self.row = LinearLayout(context)
+            self.row.setOrientation(0)
+            self.row.setGravity(17)
+            self.row.setMinimumWidth(AndroidUtilities.dp(48.0))
+            self.row.setPadding(AndroidUtilities.dp(8.0), 0, AndroidUtilities.dp(8.0), 0)
+            frame_params = FrameLayout.LayoutParams(-2, AndroidUtilities.dp(28.0), (3 if LocaleController.isRTL else 5) | 16)
+            self.addView(self.row, frame_params)
+            self.label = AnimatedTextView(context, True, True, True)
+            self.label.setTextSize(AndroidUtilities.dp(13.0))
+            self.label.setIncludeFontPadding(False)
+            self.label.setTypeface(AndroidUtilities.bold())
+            self.label.adaptWidth = True
+            label_params = LinearLayout.LayoutParams(-2, -2)
+            label_params.gravity = 16
+            self.row.addView(self.label, label_params)
+            self.setLoadingTargetView(self.row)
+            self.updateColors()
+            ScaleStateListAnimator.apply(self.row)
+            if state["data"] is not None:
+                self.show_data(state["data"], False)
+        except Exception as e:
+            log(f"[LLG] on_post_init error: {e}")
+
+    @joverride()
+    def getPillId(self):
+        return PILL_ID
+
+    @joverride()
+    def getRefreshInterval(self):
+        return 60000
+
+    @joverride()
+    def onPillClicked(self):
+        try:
+            self.onUpdateData(True)
+        except Exception as e:
+            log(f"[LLG] onPillClicked error: {e}")
+
+    @joverride()
+    def onPillLongClicked(self):
+        try:
+            fragment = LaunchActivity.getSafeLastFragment()
+            if fragment is None:
+                return False
+            refresh = RunProxy(lambda: self.onUpdateData(True))
+            settings = RunProxy(lambda: fragment.presentFragment(PillStackPreferencesActivity()))
+            ItemOptions.makeOptions(fragment, self.java).add(R.drawable.msg_retry, LocaleController.getString(R.string.Refresh), refresh).add(R.drawable.msg_settings, LocaleController.getString(R.string.Settings), settings).setDrawScrim(False).setDimAlpha(0).setDismissOnMoveOutside(True).show()
+            return True
+        except Exception as e:
+            log(f"[LLG] onPillLongClicked error: {e}")
+            return False
+
+    @joverride()
+    def onUpdateData(self, force):
+        try:
+            cached = state["data"]
+            if not force and cached is not None and not self.isRefreshDue():
+                self.show_data(cached, False)
+                return
+            if self.busy:
+                return
+            self.busy = True
+            if force:
+                self.animateSizeChange()
+            self.is_loading = True
+            self.startLoading()
+            self.label.setVisibility(0 if cached is not None else 8)
+            threading.Thread(target=self.load_data, args=(bool(force),), daemon=True).start()
+        except Exception as e:
+            self.busy = False
+            log(f"[LLG] onUpdateData error: {e}")
+
+    @joverride()
+    def updateColors(self):
+        try:
+            row = getattr(self, "row", None)
+            if row is None:
+                return
+            top, bottom, text = palette(state["data"])
+            row.setBackground(ColoredBackground(top, bottom))
+            self.label.setTextColor(text)
+        except Exception as e:
+            log(f"[LLG] updateColors error: {e}")
+
+    @joverride()
+    def setPressed(self, pressed):
+        try:
+            value = False if getattr(self, "is_loading", False) else pressed
+            super().setPressed(value)
+            row = getattr(self, "row", None)
+            if row is not None:
+                row.setPressed(value)
+        except Exception as e:
+            log(f"[LLG] setPressed error: {e}")
+
+    def load_data(self, force):
+        data = None
+        error = None
+        try:
+            plugin = state["plugin"]
+            if plugin is None:
+                raise LluError("плагин выгружен")
+            data = plugin._fetch(force)
+            state["data"] = data
+            state["error"] = None
+        except Exception as e:
+            error = str(e) or e.__class__.__name__
+            state["error"] = error
+            log(f"[LLG] load_data error: {e}")
+        try:
+            run_on_ui_thread(lambda: self.finish_load(data, error, force))
+        except Exception as e:
+            self.busy = False
+            log(f"[LLG] load_data error: {e}")
+
+    def finish_load(self, data, error, force):
+        self.busy = False
+        try:
+            if data is not None:
+                self.show_data(data, True)
+                self.markDataUpdated()
+            elif state["data"] is not None:
+                self.show_data(state["data"], True)
+            else:
+                self.show_error()
+            if error and force:
+                notify(f"LibreLink: {error}")
+        except Exception as e:
+            log(f"[LLG] finish_load error: {e}")
+
+    def show_data(self, data, animate):
+        try:
+            self.is_loading = False
+            self.stopLoading()
+            if animate:
+                self.animateSizeChange()
+            self.label.setText(format_data(data), animate)
+            self.label.setVisibility(0)
+            self.updateColors()
+        except Exception as e:
+            log(f"[LLG] show_data error: {e}")
+
+    def show_error(self):
+        try:
+            self.is_loading = False
+            self.stopLoading()
+            self.animateSizeChange()
+            self.label.setText(LocaleController.getString(R.string.Retry), True)
+            self.label.setVisibility(0)
+            self.updateColors()
+        except Exception as e:
+            log(f"[LLG] show_error error: {e}")
+
+@java_subclass(Object, PillRegistry.PillCreator)
+class GlucoseCreator(Base):
+    @joverride()
+    def create(self, context, resources_provider):
+        try:
+            return GlucosePill.new_instance(context, resources_provider).java
+        except Exception as e:
+            log(f"[LLG] create error: {e}")
+            return None
+
+def _pw_create_view(context, list_view, current_account, class_guid, resources_provider):
+    cell = TextCell(context)
+    try:
+        cell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+    except Exception as e:
+        log(f"[LLG] _pw_create_view error: {e}")
+    return cell
+
+def _pw_bind_view(view, item, divider, adapter, list_view):
+    try:
+        plugin = state["plugin"]
+        has_password = bool(plugin.get_setting("password", "") or "") if plugin else False
+        view.setTextAndValueAndIcon("Пароль", "Указан" if has_password else "Не указан", R.drawable.msg_secret, bool(divider))
+    except Exception as e:
+        log(f"[LLG] _pw_bind_view error: {e}")
+
+def _pw_on_click(plugin, item, view):
+    try:
+        py_plugin = state["plugin"]
+        if py_plugin is None:
+            return
+        py_plugin._edit_password(view)
+    except Exception as e:
+        log(f"[LLG] _pw_on_click error: {e}")
+
+PasswordRowFactory = SimpleSettingFactory(_pw_create_view, _pw_bind_view, is_clickable=True, on_click=_pw_on_click)
+
+class LibreGlucosePlugin(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            self._token: Optional[str] = None
+            self._account_id: Optional[str] = None
+            self._base: Optional[str] = None
+            self._lock = threading.RLock()
+            self._stop = threading.Event()
+            self._registered = False
+            self._fail_count = 0
+            self._next_allowed = 0.0
+            state["plugin"] = self
+            state["data"] = None
+            state["error"] = None
+            self._creator = GlucoseCreator.new_java_instance()
+            run_on_ui_thread(self._register)
+            threading.Thread(target=self._warmup, daemon=True).start()
+        except Exception as e:
+            log(f"[LLG] on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            self._stop.set()
+            state["plugin"] = None
+            run_on_ui_thread(self._unregister)
+        except Exception as e:
+            log(f"[LLG] on_plugin_unload error: {e}")
+
+    def create_settings(self) -> List[Any]:
+        try:
+            unit = self.get_setting("unit", 0)
+            unit_name = "мг/дл" if unit == 1 else "ммоль/л"
+            d_low, d_high, d_very = default_thresholds(unit)
+            return [
+                Header(text="Аккаунт LibreLinkUp"),
+                Input(
+                    key="email",
+                    text="Почта",
+                    default="",
+                    subtext="Логин от приложения LibreLinkUp",
+                    icon="msg_mention",
+                    on_change=self._on_account_change,
+                ),
+                Custom(factory=PasswordRowFactory.instance.java),
+                Selector(
+                    key="region",
+                    text="Регион",
+                    default=0,
+                    items=["Россия", "Другие страны (авто)"],
+                    icon="msg_language",
+                    on_change=self._on_account_change,
+                ),
+                Input(
+                    key="patient",
+                    text="Пациент",
+                    default="",
+                    subtext="Часть имени или фамилии. Пусто — первый в списке",
+                    icon="msg_contact",
+                    on_change=self._on_account_change,
+                ),
+                Divider(),
+                Header(text="Отображение"),
+                Selector(
+                    key="unit",
+                    text="Единицы",
+                    default=0,
+                    items=["ммоль/л", "мг/дл"],
+                    icon="msg_stats",
+                    on_change=self._on_unit_change,
+                ),
+                Input(
+                    key="thr_low",
+                    text=f"Низкий уровень, {unit_name}",
+                    default=d_low,
+                    subtext="Ниже или равно — красный",
+                    icon="msg_arrow_down",
+                    on_change=self._on_display_change,
+                ),
+                Input(
+                    key="thr_high",
+                    text=f"Высокий уровень, {unit_name}",
+                    default=d_high,
+                    subtext="Выше — жёлтый",
+                    icon="msg_arrow_up",
+                    on_change=self._on_display_change,
+                ),
+                Input(
+                    key="thr_very_high",
+                    text=f"Очень высокий, {unit_name}",
+                    default=d_very,
+                    subtext="Выше — красный",
+                    icon="msg_arrow_up",
+                    on_change=self._on_display_change,
+                ),
+                Divider(text=f"Если данные старше {STALE_MINUTES} минут, пилюля становится серой и показывает возраст."),
+                Text(
+                    text="Инструкция",
+                    icon="msg_info",
+                    accent=True,
+                    on_click=self._open_instruction,
+                ),
+                Divider(text="Плагину нужен аккаунт LibreLinkUp (смотрителя), а не аккаунт LibreLink. В инструкции в Telegram-канале написано, как его создать, подключить к себе и какие данные ввести выше."),
+            ]
+        except Exception as e:
+            log(f"[LLG] create_settings error: {e}")
+            return []
+
+    def _open_instruction(self, view=None):
+        try:
+            activity = None
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+            except Exception as e:
+                log(f"[LLG] _open_instruction error: {e}")
+                activity = None
+            if activity is None and view is not None:
+                activity = view.getContext()
+            if activity is None:
+                return
+            Browser.openUrl(activity, "https://t.me/akresmc/19")
+        except Exception as e:
+            log(f"[LLG] _open_instruction error: {e}")
+
+    def _edit_password(self, view=None):
+        try:
+            activity = None
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+            except Exception as e:
+                log(f"[LLG] _edit_password error: {e}")
+                activity = None
+            if activity is None and view is not None:
+                activity = view.getContext()
+            if activity is None:
+                return
+            container = LinearLayout(activity)
+            container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(8), AndroidUtilities.dp(24), 0)
+            edit = EditText(activity)
+            edit.setSingleLine(True)
+            edit.setInputType(145)
+            edit.setHint("Пароль")
+            current = self.get_setting("password", "") or ""
+            if current:
+                edit.setText(current)
+                edit.setSelection(len(current))
+            try:
+                edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            except Exception as e:
+                log(f"[LLG] _edit_password error: {e}")
+            container.addView(edit, LinearLayout.LayoutParams(-1, -2))
+            def save(bld, which):
+                try:
+                    value = str(edit.getText().toString())
+                    if value != current:
+                        self._on_account_change()
+                        self.set_setting("password", value, reload_settings=True)
+                    bld.dismiss()
+                except Exception as e:
+                    log(f"[LLG] save error: {e}")
+            def cancel(bld, which):
+                try:
+                    bld.dismiss()
+                except Exception as e:
+                    log(f"[LLG] cancel error: {e}")
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Пароль LibreLinkUp")
+            builder.set_view(container)
+            builder.set_positive_button("Сохранить", save)
+            builder.set_negative_button("Отмена", cancel)
+            builder.show()
+        except Exception as e:
+            log(f"[LLG] _edit_password error: {e}")
+
+    def _on_account_change(self, _value=None):
+        try:
+            with self._lock:
+                self._token = None
+                self._account_id = None
+                self._base = None
+                self._fail_count = 0
+                self._next_allowed = 0.0
+            state["data"] = None
+            state["error"] = None
+        except Exception as e:
+            log(f"[LLG] _on_account_change error: {e}")
+
+    def _on_unit_change(self, new_unit):
+        try:
+            new_unit = 1 if new_unit == 1 else 0
+            old_unit = 1 - new_unit
+            old_defaults = default_thresholds(old_unit)
+            keys = ["thr_low", "thr_high", "thr_very_high"]
+            values = []
+            for key, d in zip(keys, old_defaults):
+                mmol = to_mmol(parse_float(self.get_setting(key, d), float(d)), old_unit)
+                values.append(fmt_threshold(mmol, new_unit))
+            for i, (key, val) in enumerate(zip(keys, values)):
+                self.set_setting(key, val, reload_settings=(i == len(keys) - 1))
+        except Exception as e:
+            log(f"[LLG] _on_unit_change error: {e}")
+
+    def _on_display_change(self, _value=None):
+        pass
+
+    def _register(self):
+        try:
+            if self._registered or state["plugin"] is not self:
+                return
+            info = PillRegistry.PillInfo(PILL_ID, "Глюкоза", R.drawable.msg_emoji_food, -7288005, -8735958, self._creator)
+            PillRegistry.register(info)
+            self._registered = True
+            if self.get_setting("pill_active", True):
+                PillRegistry.activatePill(PILL_ID)
+            threading.Thread(target=self._watch, daemon=True).start()
+        except Exception as e:
+            log(f"[LLG] _register error: {e}")
+
+    def _watch(self):
+        try:
+            while not self._stop.wait(10):
+                if state["plugin"] is not self:
+                    return
+                run_on_ui_thread(self._sync_intent)
+        except Exception as e:
+            log(f"[LLG] _watch error: {e}")
+
+    def _sync_intent(self):
+        try:
+            if state["plugin"] is not self:
+                return
+            active = bool(PillStackConfig.getActivePills().contains(jint(PILL_ID)))
+            if active != self.get_setting("pill_active", True):
+                self.set_setting("pill_active", active)
+        except Exception as e:
+            log(f"[LLG] _sync_intent error: {e}")
+
+    def _unregister(self):
+        try:
+            PillRegistry.unregister(PILL_ID)
+            self._registered = False
+        except Exception as e:
+            log(f"[LLG] _unregister error: {e}")
+
+    def _warmup(self):
+        try:
+            if not (self.get_setting("email", "") or "").strip():
+                return
+            with self._lock:
+                if not self._token:
+                    self._login()
+        except Exception as e:
+            log(f"[LLG] _warmup error: {e}")
+
+    def _request(self, host: str, method: str, path: str, body: Optional[dict] = None, auth: bool = False) -> dict:
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+                "product": "llu.android",
+                "version": "4.16.0",
+            }
+            if auth:
+                headers["Authorization"] = f"Bearer {self._token}"
+                if self._account_id:
+                    headers["Account-Id"] = self._account_id
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(f"https://{host}{path}", data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    raw = r.read().decode()
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    raise PermissionError("unauthorized")
+                if e.code == 429:
+                    raise RateLimited("слишком много запросов, повторю позже")
+                if e.code >= 500:
+                    raise LluError(f"сервер LibreLinkUp недоступен (HTTP {e.code})")
+                raise LluError(f"ошибка HTTP {e.code}")
+            except urllib.error.URLError as e:
+                raise LluError(f"нет связи с сервером: {e.reason}")
+            except Exception as e:
+                raise LluError(f"сетевая ошибка: {e}")
+            try:
+                return json.loads(raw)
+            except Exception:
+                raise LluError("сервер вернул некорректный ответ")
+        except Exception as e:
+            log(f"[LLG] _request error: {e}")
+            raise
+
+    def _login_hosts(self) -> List[str]:
+        try:
+            if self.get_setting("region", 0) == 1:
+                return [self._base or "api.libreview.io"]
+            return ["api.libreview.ru"]
+        except Exception as e:
+            log(f"[LLG] _login_hosts error: {e}")
+            return ["api.libreview.ru"]
+
+    def _login(self):
+        try:
+            email = (self.get_setting("email", "") or "").strip()
+            password = self.get_setting("password", "") or ""
+            if not email or not password:
+                raise LluError("укажи почту и пароль в настройках плагина")
+            last_error = "не удалось войти"
+            for start in self._login_hosts():
+                host = start
+                for _ in range(3):
+                    resp = self._request(host, "POST", "/llu/auth/login", {"email": email, "password": password})
+                    data = resp.get("data") or {}
+                    if data.get("redirect") and data.get("region"):
+                        region = str(data["region"]).lower()
+                        host = "api.libreview.ru" if region == "ru" else f"api-{region}.libreview.io"
+                        continue
+                    status = resp.get("status")
+                    if status == 0 and "authTicket" in data:
+                        self._token = data["authTicket"]["token"]
+                        self._account_id = hashlib.sha256(data["user"]["id"].encode()).hexdigest()
+                        self._base = host
+                        return
+                    if status == 4 or data.get("step"):
+                        raise LluError("открой LibreLinkUp и прими обновлённые условия использования")
+                    if status == 2:
+                        last_error = "неверная почта или пароль (проверь регион)"
+                    else:
+                        last_error = f"ошибка входа (status {status})"
+                    break
+            raise LluError(last_error)
+        except Exception as e:
+            log(f"[LLG] _login error: {e}")
+            raise
+
+    def _fetch(self, force: bool = False) -> dict:
+        try:
+            with self._lock:
+                now = time.time()
+                if not force and now < self._next_allowed:
+                    raise LluError("пауза после ошибки сервера")
+                try:
+                    data = self._fetch_locked()
+                    self._fail_count = 0
+                    self._next_allowed = 0.0
+                    return data
+                except RateLimited:
+                    self._fail_count += 1
+                    self._next_allowed = time.time() + min(60 * (2 ** self._fail_count), 900)
+                    raise
+        except Exception as e:
+            log(f"[LLG] _fetch error: {e}")
+            raise
+
+    def _fetch_locked(self) -> dict:
+        try:
+            if not self._token or not self._base:
+                self._login()
+            try:
+                resp = self._request(self._base, "GET", "/llu/connections", auth=True)
+            except PermissionError:
+                self._token = None
+                self._login()
+                resp = self._request(self._base, "GET", "/llu/connections", auth=True)
+            connections = resp.get("data") or []
+            if not connections:
+                raise LluError("в LibreLinkUp нет подключений")
+            conn = self._pick_connection(connections)
+            m = conn.get("glucoseMeasurement")
+            if not m:
+                raise LluError("пока нет данных о глюкозе")
+            mgdl = m.get("ValueInMgPerDl")
+            if mgdl is None:
+                raise LluError("в ответе нет значения глюкозы")
+            return {
+                "mgdl": float(mgdl),
+                "arrow": {1: "\u2193", 2: "\u2198", 3: "\u2192", 4: "\u2197", 5: "\u2191"}.get(m.get("TrendArrow"), ""),
+                "ts": parse_timestamp(m),
+                "high": bool(m.get("isHigh")),
+                "low": bool(m.get("isLow")),
+            }
+        except Exception as e:
+            log(f"[LLG] _fetch_locked error: {e}")
+            raise
+
+    def _pick_connection(self, connections: list) -> dict:
+        try:
+            query = (self.get_setting("patient", "") or "").strip().lower()
+            if not query:
+                return connections[0]
+            for c in connections:
+                name = f"{c.get('firstName', '')} {c.get('lastName', '')}".lower()
+                if query in name:
+                    return c
+            raise LluError(f"пациент «{query}» не найден среди подключений")
+        except Exception as e:
+            log(f"[LLG] _pick_connection error: {e}")
+            raise
