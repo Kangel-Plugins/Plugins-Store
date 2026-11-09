@@ -1,0 +1,685 @@
+__id__ = "quick_stickers"
+__name__ = "QuickStickers"
+__description__ = "Долгое нажатие на кнопку стикеров раскрывает веер из стикеров: проведи пальцем, у края веер листается, отпусти, чтобы отправить"
+__author__ = "@LuPlugins (@optimist_opti)"
+__version__ = "1.1"
+__icon__ = "rei_plugins/5"
+__min_version__ = "12.10.6"
+
+import math
+import time
+from bisect import bisect_left, bisect_right
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import log
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.settings import Selector
+from java import dynamic_proxy, jclass, jarray, jint, jlong
+from java.lang import Runnable
+from java.lang.ref import WeakReference
+from android.os import Handler, Looper, SystemClock
+from android.view import View, MotionEvent
+from android.view.animation import LinearInterpolator
+from android.animation import ValueAnimator
+from android.widget import FrameLayout
+
+X_STIFFNESS = 320.0
+X_DAMPING = 0.88
+Y_STIFFNESS = 500.0
+Y_DAMPING = 0.60
+BIRTH_SCALE = 0.42
+STAGGER = 0.028
+Y_OVERSHOOT_STEP = 0.06
+LONG_PRESS_MS = 280
+COUNT = 5
+MAX_TOTAL = 300
+EDGE_ZONE = 64.0
+SPEEDS = (400.0, 720.0, 1100.0, 1600.0)
+
+
+def spring(t, stiffness, zeta):
+    if t <= 0:
+        return 0.0
+    w0 = math.sqrt(stiffness)
+    if zeta < 1.0:
+        wd = w0 * math.sqrt(1.0 - zeta * zeta)
+        return 1.0 - math.exp(-zeta * w0 * t) * (math.cos(wd * t) + zeta * w0 / wd * math.sin(wd * t))
+    return 1.0 - math.exp(-w0 * t) * (1.0 + w0 * t)
+
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+class Run(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        self.fn()
+
+
+class Touch(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onTouch(self, v, e):
+        return bool(self.fn(v, e))
+
+
+class Tick(dynamic_proxy(ValueAnimator.AnimatorUpdateListener)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onAnimationUpdate(self, animation):
+        self.fn()
+
+
+class ResumeHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.attach(param.thisObject)
+        except Exception as ex:
+            log("quick_stickers attach: " + str(ex))
+
+
+class Card:
+    __slots__ = ("view", "doc", "w", "h", "dx", "dy", "cx", "cy", "sc", "al", "hl", "ha", "fx", "fy", "fs", "fa", "last")
+
+    def __init__(self, doc, left, top, w, h):
+        self.view = None
+        self.doc = doc
+        self.w = w
+        self.h = h
+        self.dx = left + w / 2.0
+        self.dy = top + h / 2.0
+        self.cx = 0.0
+        self.cy = 0.0
+        self.sc = 1.0
+        self.al = 0.0
+        self.hl = 1.0
+        self.ha = 1.0
+        self.fx = 0.0
+        self.fy = 0.0
+        self.fs = 1.0
+        self.fa = 1.0
+        self.last = None
+
+    def apply(self):
+        v = self.view
+        if v is None:
+            return
+        key = (round(self.cx, 1), round(self.cy, 1), round(self.sc, 3), round(clamp(self.al), 3))
+        if key == self.last:
+            return
+        self.last = key
+        v.setTranslationX(float(self.cx - self.w / 2.0))
+        v.setTranslationY(float(self.cy - self.h / 2.0))
+        v.setScaleX(float(self.sc))
+        v.setScaleY(float(self.sc))
+        v.setAlpha(float(key[3]))
+        v.setVisibility(0 if key[3] > 0.01 else 4)
+
+
+class Fan:
+    pass
+
+
+class QuickStickersPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.refs = []
+        self.pending = None
+        self.fan = None
+        self.send_method = None
+        self.hide_method = None
+        self.down_x = 0.0
+        self.down_y = 0.0
+        self.handler = Handler(Looper.getMainLooper())
+        self.listener = Touch(self.on_touch)
+        self.media_data = jclass("org.telegram.messenger.MediaDataController")
+        self.image_location = jclass("org.telegram.messenger.ImageLocation")
+        self.file_loader = jclass("org.telegram.messenger.FileLoader")
+        self.image_view_class = jclass("org.telegram.ui.Components.BackupImageView")
+        self.send_helper = jclass("org.telegram.messenger.SendMessagesHelper")
+        self.object_class = jclass("java.lang.Object")
+        chat_class = find_class("org.telegram.ui.ChatActivity")
+        method = chat_class.getClass().getDeclaredMethod("onResume")
+        self.hook_method(method, ResumeHook(self))
+        self.handler.post(Run(self.attach_current))
+
+    def on_plugin_unload(self):
+        self.cancel_pending()
+        self.handler.removeCallbacksAndMessages(None)
+        self.close()
+        for r in self.refs:
+            v = r.get()
+            if v is not None:
+                try:
+                    v.setOnTouchListener(None)
+                except Exception:
+                    pass
+        self.refs = []
+        self.send_method = None
+        self.hide_method = None
+
+    def create_settings(self):
+        return [
+            Selector(key="speed", text="Скорость листания веера", default=1, items=["Медленно", "Средне", "Быстро", "Очень быстро"]),
+        ]
+
+    def attach_current(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None and str(fragment.getClass().getName()).endswith("ChatActivity"):
+                self.attach(fragment)
+        except Exception as ex:
+            log("quick_stickers attach_current: " + str(ex))
+
+    def attach(self, chat):
+        self.preload(chat.getCurrentAccount())
+        enter = get_private_field(chat, "chatActivityEnterView")
+        if enter is None:
+            return
+        button = get_private_field(enter, "emojiButton")
+        if button is None:
+            return
+        try:
+            items = list(button)
+        except TypeError:
+            items = [button]
+        self.refs = [r for r in self.refs if r.get() is not None]
+        for v in items:
+            if v is None:
+                continue
+            if not any(v.equals(r.get()) for r in self.refs if r.get() is not None):
+                self.refs.append(WeakReference(v))
+            v.setOnTouchListener(self.listener)
+
+    def stickers_of(self, controller, kind):
+        try:
+            return controller.getRecentStickersNoCopy(kind)
+        except Exception:
+            return controller.getRecentStickers(kind)
+
+    def preload(self, account):
+        controller = self.media_data.getInstance(account)
+        for kind in (2, 0):
+            try:
+                lst = self.stickers_of(controller, kind)
+                if lst is None or lst.size() == 0:
+                    controller.loadRecents(kind, False, True, False)
+            except Exception as ex:
+                log("quick_stickers preload: " + str(ex))
+
+    def load_docs(self, account):
+        controller = self.media_data.getInstance(account)
+        docs = []
+        seen = set()
+        for kind in (2, 0):
+            lst = self.stickers_of(controller, kind)
+            if lst is None:
+                continue
+            for i in range(lst.size()):
+                d = lst.get(i)
+                key = d.id
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append(d)
+                if len(docs) >= MAX_TOTAL:
+                    return docs
+        return docs
+
+    def ratio(self, doc):
+        try:
+            attrs = doc.attributes
+            for i in range(attrs.size()):
+                a = attrs.get(i)
+                name = a.getClass().getSimpleName()
+                if (name == "TL_documentAttributeImageSize" or name == "TL_documentAttributeVideo") and a.w > 0 and a.h > 0:
+                    return float(a.w) / float(a.h)
+        except Exception:
+            pass
+        return 1.0
+
+    def cancel_pending(self):
+        if self.pending is not None:
+            self.handler.removeCallbacks(self.pending)
+            self.pending = None
+
+    def on_touch(self, v, e):
+        a = e.getActionMasked()
+        fan = self.fan
+        if fan is not None and fan.phase == "in" and fan.source_view is v:
+            if a == 2:
+                self.move(e)
+            elif a == 1:
+                self.finish(e, True)
+            elif a == 3:
+                self.finish(e, False)
+            return True
+        if a == 0:
+            self.cancel_pending()
+            self.down_x = e.getRawX()
+            self.down_y = e.getRawY()
+            self.pending = Run(lambda: self.begin(v))
+            self.handler.postDelayed(self.pending, LONG_PRESS_MS)
+        elif a == 2:
+            if self.pending is not None:
+                slop = 10.0 * v.getResources().getDisplayMetrics().density
+                if abs(e.getRawX() - self.down_x) + abs(e.getRawY() - self.down_y) > slop:
+                    self.cancel_pending()
+        elif a == 1 or a == 3:
+            self.cancel_pending()
+        return False
+
+    def realize(self, c):
+        fan = self.fan
+        image = self.image_view_class(fan.activity)
+        fan.overlay.addView(image, FrameLayout.LayoutParams(int(c.w), int(c.h)))
+        c.view = image
+        c.last = None
+        receiver = image.getImageReceiver()
+        receiver.setAspectFit(True)
+        location = self.image_location.getForDocument(c.doc)
+        thumb = self.file_loader.getClosestPhotoSizeWithSize(c.doc.thumbs, 90)
+        thumb_location = self.image_location.getForDocument(thumb, c.doc) if thumb is not None else None
+        receiver.setImage(location, "80_80", thumb_location, "80_80", 0, None, c.doc, 1)
+
+    def release(self, c):
+        try:
+            self.fan.overlay.removeView(c.view)
+        except Exception:
+            pass
+        c.view = None
+        c.last = None
+
+    def begin(self, v):
+        self.pending = None
+        if self.fan is not None:
+            return
+        fragment = get_last_fragment()
+        if fragment is None or not str(fragment.getClass().getName()).endswith("ChatActivity"):
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+        account = fragment.getCurrentAccount()
+        docs = self.load_docs(account)
+        if not docs:
+            self.preload(account)
+            return
+
+        density = float(activity.getResources().getDisplayMetrics().density)
+        decor = activity.getWindow().getDecorView()
+        decor_loc = jarray(jint)([0, 0])
+        view_loc = jarray(jint)([0, 0])
+        decor.getLocationOnScreen(decor_loc)
+        v.getLocationOnScreen(view_loc)
+        width = float(decor.getWidth())
+        sx = view_loc[0] - decor_loc[0] + v.getWidth() / 2.0
+        sy = view_loc[1] - decor_loc[1] + v.getHeight() / 2.0
+        source_top = view_loc[1] - decor_loc[1]
+        try:
+            top_inset = float(jclass("org.telegram.messenger.AndroidUtilities").statusBarHeight)
+        except Exception:
+            top_inset = 0.0
+
+        max_edge = 80.0 * density
+        spacing = 5.0 * density
+        sizes = []
+        for d in docs:
+            r = max(0.2, self.ratio(d))
+            sizes.append((max_edge, max_edge / r) if r >= 1 else (max_edge * r, max_edge))
+        n = len(docs)
+        visible = min(n, COUNT)
+        available = width - 16.0 * density - spacing * (visible - 1)
+        unscaled = sum(s[0] for s in sizes[:visible])
+        k = min(1.0, available / max(1.0, unscaled))
+        sizes = [(s[0] * k, s[1] * k) for s in sizes]
+        strip = sum(s[0] for s in sizes[:visible]) + spacing * (visible - 1)
+        content = sum(s[0] for s in sizes) + spacing * (n - 1)
+        max_h = max(s[1] for s in sizes)
+        last_w = sizes[visible - 1][0]
+        x = max(8.0 * density, min(sx - strip + last_w / 2.0, width - 8.0 * density - strip))
+        y = max(top_inset + 8.0 * density, source_top - 16.0 * density - max_h)
+
+        overlay = FrameLayout(activity)
+        overlay.setClipChildren(False)
+        dim = View(activity)
+        dim.setBackgroundColor(0x0A000000)
+        dim.setAlpha(0.0)
+        overlay.addView(dim, FrameLayout.LayoutParams(-1, -1))
+
+        cards = []
+        next_x = x
+        for d, size in zip(docs, sizes):
+            w, h = size
+            card = Card(d, next_x, y + (max_h - h) / 2.0, w, h)
+            next_x += w + spacing
+            card.cx = sx
+            card.cy = sy
+            card.sc = BIRTH_SCALE
+            cards.append(card)
+
+        decor.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+
+        fan = Fan()
+        fan.overlay = overlay
+        fan.dim = dim
+        fan.decor = decor
+        fan.activity = activity
+        fan.cards = cards
+        fan.dxs = [c.dx for c in cards]
+        fan.max_w = max(c.w for c in cards)
+        fan.live = set()
+        fan.source_view = v
+        fan.fragment = fragment
+        fan.density = density
+        fan.width = width
+        fan.sx = sx
+        fan.sy = sy
+        fan.ox = float(decor_loc[0])
+        fan.oy = float(decor_loc[1])
+        fan.sl = x
+        fan.sr = x + strip
+        fan.max_scroll = max(0.0, content - strip)
+        fan.scroll = 0.0
+        fan.vel = 0.0
+        fan.speed = SPEEDS[int(clamp(float(self.get_setting("speed", 1)), 0.0, float(len(SPEEDS) - 1)))]
+        fan.px = self.down_x - fan.ox
+        fan.py = self.down_y - fan.oy
+        fan.hi = None
+        fan.sel = None
+        fan.phase = "in"
+        fan.t0 = time.monotonic()
+        fan.tf = 0.0
+        fan.last = fan.t0
+        fan.tx = 0.0
+        fan.ty = 0.0
+        fan.ts = 1.0
+        self.fan = fan
+
+        for i in range(visible):
+            self.realize(cards[i])
+            fan.live.add(i)
+            cards[i].apply()
+
+        t = SystemClock.uptimeMillis()
+        cancel = MotionEvent.obtain(t, t, 3, 0.0, 0.0, 0)
+        v.onTouchEvent(cancel)
+        cancel.recycle()
+        parent = v.getParent()
+        if parent is not None:
+            parent.requestDisallowInterceptTouchEvent(True)
+        v.performHapticFeedback(0)
+
+        fan.anim = ValueAnimator.ofFloat(0.0, 1.0)
+        fan.anim.setDuration(600000)
+        fan.anim.setInterpolator(LinearInterpolator())
+        fan.tick = Tick(self.render)
+        fan.anim.addUpdateListener(fan.tick)
+        fan.anim.start()
+
+    def hit(self, x, y):
+        fan = self.fan
+        slop = 12.0 * fan.density
+        cards = fan.cards
+        n = len(cards)
+        i = bisect_left(fan.dxs, fan.scroll + fan.sl - slop)
+        limit = fan.scroll + fan.sr + slop
+        while i < n:
+            c = cards[i]
+            if c.dx > limit:
+                break
+            left = c.dx - fan.scroll - c.w / 2.0
+            top = c.dy - c.h / 2.0
+            if left - slop <= x <= left + c.w + slop and top - slop * 2 <= y <= top + c.h + slop * 2:
+                return i
+            i += 1
+        return None
+
+    def move(self, e):
+        fan = self.fan
+        fan.px = e.getRawX() - fan.ox
+        fan.py = e.getRawY() - fan.oy
+
+    def finish(self, e, ok):
+        fan = self.fan
+        self.move(e)
+        idx = self.hit(fan.px, fan.py) if ok else None
+        for i in fan.live:
+            c = fan.cards[i]
+            c.fx = c.cx
+            c.fy = c.cy
+            c.fs = c.sc
+            c.fa = c.al
+        fan.tf = time.monotonic()
+        if idx is not None and idx in fan.live:
+            fan.sel = idx
+            c = fan.cards[idx]
+            fan.ts = (150.0 * fan.density) / max(c.w, c.h)
+            fan.tx = fan.width - 16.0 * fan.density - c.w * fan.ts / 2.0
+            fan.ty = fan.sy - 28.0 * fan.density - c.h * fan.ts / 2.0
+            c.view.bringToFront()
+            fan.phase = "pick"
+            try:
+                self.send_sticker(fan.fragment, c.doc)
+            except Exception as ex:
+                log("quick_stickers send: " + str(ex))
+        else:
+            fan.phase = "fold"
+
+    def send_sticker(self, fragment, doc):
+        helper = self.send_helper.getInstance(fragment.getCurrentAccount())
+        if self.send_method is None:
+            best = None
+            for m in helper.getClass().getDeclaredMethods():
+                if m.getName() != "sendSticker":
+                    continue
+                types = m.getParameterTypes()
+                if len(types) == 0 or types[0].getSimpleName() != "Document":
+                    continue
+                if best is None or len(types) > len(best.getParameterTypes()):
+                    best = m
+            if best is None:
+                return
+            best.setAccessible(True)
+            self.send_method = best
+        types = self.send_method.getParameterTypes()
+        dialog = fragment.getDialogId()
+        reply = self.reply_message(fragment)
+        top = self.thread_message(fragment)
+        messages = [reply, top]
+        args = []
+        longs = 0
+        booleans = 0
+        for i in range(len(types)):
+            name = types[i].getName()
+            if i == 0:
+                args.append(doc)
+            elif name == "long":
+                args.append(jlong(dialog if longs == 0 else 0))
+                longs += 1
+            elif name == "boolean":
+                args.append(booleans < 2)
+                booleans += 1
+            elif name == "int":
+                args.append(jint(0))
+            elif types[i].getSimpleName() == "MessageObject":
+                args.append(messages.pop(0) if messages else None)
+            else:
+                args.append(None)
+        self.send_method.invoke(helper, jarray(self.object_class)(args))
+        if reply is not None:
+            self.clear_reply(fragment)
+
+    def reply_message(self, fragment):
+        enter = get_private_field(fragment, "chatActivityEnterView")
+        if enter is None:
+            return None
+        try:
+            return enter.getReplyingMessageObject()
+        except Exception:
+            return get_private_field(enter, "replyingMessageObject")
+
+    def thread_message(self, fragment):
+        try:
+            return fragment.getThreadMessage()
+        except Exception:
+            return get_private_field(fragment, "threadMessage")
+
+    def clear_reply(self, fragment):
+        try:
+            if self.hide_method is None:
+                best = None
+                for m in fragment.getClass().getDeclaredMethods():
+                    if m.getName() == "hideFieldPanel" and (best is None or len(m.getParameterTypes()) < len(best.getParameterTypes())):
+                        best = m
+                if best is None:
+                    return
+                best.setAccessible(True)
+                self.hide_method = best
+            types = self.hide_method.getParameterTypes()
+            args = [True if types[i].getName() == "boolean" else jint(0) for i in range(len(types))]
+            self.hide_method.invoke(fragment, jarray(self.object_class)(args))
+        except Exception as ex:
+            log("quick_stickers clear_reply: " + str(ex))
+
+    def close(self):
+        fan = self.fan
+        self.fan = None
+        if fan is None:
+            return
+        try:
+            fan.anim.cancel()
+            fan.anim.removeAllUpdateListeners()
+        except Exception:
+            pass
+        try:
+            fan.overlay.removeAllViews()
+            fan.decor.removeView(fan.overlay)
+        except Exception:
+            pass
+        fan.cards = []
+        fan.live = set()
+
+    def update_scroll(self, dt):
+        fan = self.fan
+        zone = EDGE_ZONE * fan.density
+        x = fan.px
+        if x > fan.sr - zone:
+            k = clamp((x - (fan.sr - zone)) / zone, 0.0, 1.5)
+        elif x < fan.sl + zone:
+            k = -clamp(((fan.sl + zone) - x) / zone, 0.0, 1.5)
+        else:
+            k = 0.0
+        fan.vel += (k * fan.speed * fan.density - fan.vel) * min(1.0, dt * 10.0)
+        fan.scroll = clamp(fan.scroll + fan.vel * dt, 0.0, fan.max_scroll)
+
+    def edge(self, c):
+        fan = self.fan
+        if c.cx < fan.sl:
+            return clamp(1.0 - (fan.sl - c.cx) / (c.w * 0.8))
+        if c.cx > fan.sr:
+            return clamp(1.0 - (c.cx - fan.sr) / (c.w * 0.8))
+        return 1.0
+
+    def render(self):
+        try:
+            self.step()
+        except Exception as ex:
+            log("quick_stickers render: " + str(ex))
+            self.close()
+
+    def step(self):
+        fan = self.fan
+        if fan is None:
+            return
+        now = time.monotonic()
+        dt = min(0.05, now - fan.last)
+        fan.last = now
+        cards = fan.cards
+
+        if fan.phase == "in":
+            t = now - fan.t0
+            fan.dim.setAlpha(float(clamp(t / 0.12)))
+            self.update_scroll(dt)
+            idx = self.hit(fan.px, fan.py)
+            if idx != fan.hi:
+                if idx is not None:
+                    fan.source_view.performHapticFeedback(4)
+                fan.hi = idx
+            reach = 2.5 * fan.max_w
+            lo = bisect_left(fan.dxs, fan.scroll + fan.sl - reach)
+            hi = bisect_right(fan.dxs, fan.scroll + fan.sr + reach)
+            for i in [j for j in fan.live if j >= COUNT and not lo <= j < hi]:
+                self.release(cards[i])
+                fan.live.discard(i)
+            for i in range(lo, hi):
+                if i not in fan.live:
+                    self.realize(cards[i])
+                    fan.live.add(i)
+            for i in fan.live:
+                c = cards[i]
+                target_x = c.dx - fan.scroll
+                if i < COUNT:
+                    ti = t - i * STAGGER
+                    ps = spring(ti, X_STIFFNESS, X_DAMPING)
+                    py = spring(ti, Y_STIFFNESS, max(0.2, Y_DAMPING - i * Y_OVERSHOOT_STEP))
+                    c.cx = fan.sx + (target_x - fan.sx) * ps
+                    c.cy = fan.sy + (c.dy - fan.sy) * py
+                else:
+                    ti = t
+                    ps = 1.0
+                    c.cx = target_x
+                    c.cy = c.dy
+                c.hl += ((1.18 if fan.hi == i else 1.0) - c.hl) * min(1.0, dt * 16.0)
+                c.sc = (BIRTH_SCALE + (1.0 - BIRTH_SCALE) * ps) * c.hl
+                c.ha += ((1.0 if (fan.hi is None or fan.hi == i) else 0.8) - c.ha) * min(1.0, dt * 16.0)
+                c.al = clamp(ti / 0.15) * c.ha * self.edge(c)
+                c.apply()
+            return
+
+        t = now - fan.tf
+        fan.dim.setAlpha(float(1.0 - clamp(t / 0.18)))
+
+        if fan.phase == "fold":
+            for i in fan.live:
+                c = cards[i]
+                j = min(i, COUNT - 1)
+                ti = t - (COUNT - 1 - j) * STAGGER
+                px = spring(ti, Y_STIFFNESS, max(0.2, Y_DAMPING - j * Y_OVERSHOOT_STEP))
+                py = spring(ti, X_STIFFNESS, X_DAMPING)
+                c.cx = c.fx + (fan.sx - c.fx) * px
+                c.cy = c.fy + (fan.sy - c.fy) * py
+                c.sc = c.fs + (BIRTH_SCALE - c.fs) * py
+                c.al = c.fa * (1.0 - clamp(ti / 0.10))
+                c.apply()
+            if t > 0.55:
+                self.close()
+            return
+
+        q = clamp(t / 0.12)
+        for i in fan.live:
+            c = cards[i]
+            if i == fan.sel:
+                p = spring(t, 500.0, 0.82)
+                c.cx = c.fx + (fan.tx - c.fx) * p
+                c.cy = c.fy + (fan.ty - c.fy) * p
+                c.sc = c.fs + (fan.ts - c.fs) * p
+                c.al = c.fa * (1.0 - clamp((t - 0.30) / 0.12))
+            else:
+                c.sc = c.fs * (1.0 - 0.2 * q)
+                c.al = c.fa * (1.0 - q)
+            c.apply()
+        if t > 0.46:
+            self.close()
