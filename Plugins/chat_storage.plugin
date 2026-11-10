@@ -1,0 +1,706 @@
+import os
+import re
+import json
+import shutil
+import threading
+
+from java import jclass, jarray, jint, dynamic_proxy
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from client_utils import get_last_fragment
+from ui.settings import Header, Selector, Text, Divider
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread, log
+
+__id__ = "chat_storage"
+__name__ = "Chat Storage"
+__description__ = "Своя папка для файлов выбранных чатов: файлы скачиваются и читаются только оттуда, кеш Telegram не используется."
+__author__ = "@Kcharter"
+__version__ = "1.0.20"
+__icon__ = "Tagsforsaved_by_TgEmodziBot/1"
+__app_version__ = ">=13.1.1"
+__category__ = ["chats", "tools"]
+
+KEY_CHATS = "enabled_chats"
+KEY_KIND = "storage_kind"
+KEY_CUSTOM = "custom_dir"
+
+JFile = jclass("java.io.File")
+JThread = jclass("java.lang.Thread")
+JString = jclass("java.lang.String")
+FileLoader = jclass("org.telegram.messenger.FileLoader")
+MessageObject = jclass("org.telegram.messenger.MessageObject")
+MessagesStorage = jclass("org.telegram.messenger.MessagesStorage")
+UserConfig = jclass("org.telegram.messenger.UserConfig")
+ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+TLRPC = jclass("org.telegram.tgnet.TLRPC")
+AlertBuilder = jclass("android.app.AlertDialog$Builder")
+Intent = jclass("android.content.Intent")
+DocumentsContract = jclass("android.provider.DocumentsContract")
+Environment = jclass("android.os.Environment")
+PICK_CODE = 0x4353
+RED = 0xFFE53935 - (1 << 32)
+
+
+class _Run(dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        self.fn()
+
+
+class _Click(dynamic_proxy(jclass("android.content.DialogInterface$OnClickListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, dialog, which):
+        self.fn(which)
+
+
+def _tid():
+    return JThread.currentThread().getId()
+
+
+def _dialog_of(obj):
+    try:
+        if obj is None:
+            return None
+        if isinstance(obj, MessageObject):
+            return str(obj.getDialogId())
+        cname = str(obj.getClass().getName())
+        if "TLRPC$Message" in cname:
+            return str(MessageObject.getDialogId(obj))
+    except Exception as e:
+        log(f"[ChatStorage] dialog_of error: {e}")
+    return None
+
+
+class ContextHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin.migrating:
+                return
+            dirs = self.plugin._dirs()
+            if not dirs:
+                return
+            for a in param.args:
+                d = _dialog_of(a)
+                if d and d in dirs:
+                    self.plugin.ctx[_tid()] = dirs[d]
+                    return
+        except Exception as e:
+            log(f"[ChatStorage] ctx before error: {e}")
+
+    def after_hooked_method(self, param):
+        self.plugin.ctx.pop(_tid(), None)
+
+
+class DirectoryHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if self.plugin.migrating:
+                return
+            path = self.plugin.ctx.get(_tid())
+            if path:
+                os.makedirs(path, exist_ok=True)
+                param.setResult(JFile(path))
+        except Exception as e:
+            log(f"[ChatStorage] getDirectory error: {e}")
+
+
+class PathToAttachHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if self.plugin.migrating:
+                return
+            dirs = self.plugin._dirs()
+            if not dirs or not param.args:
+                return
+            attach = param.args[0]
+            if attach is None:
+                return
+            name = FileLoader.getAttachFileName(attach)
+            if not name:
+                return
+            name = str(name)
+            for path in set(dirs.values()):
+                candidate = os.path.join(path, name)
+                if os.path.exists(candidate):
+                    param.setResult(JFile(candidate))
+                    return
+        except Exception:
+            pass
+
+
+class ActivityResultHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if int(param.args[0]) != PICK_CODE:
+                return
+            intent = param.args[2]
+            if int(param.args[1]) == -1 and intent is not None:
+                self.plugin.on_tree_picked(intent.getData())
+            try:
+                param.setResult(None)
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"[ChatStorage] activity result error: {e}")
+
+
+class ChatStoragePlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.ctx = {}
+        self.migrating = False
+        self.result_hooked = False
+        self.root = None
+        self.cs_chats = self._load_enabled()
+        self._refresh_root()
+
+        ctx_hook = ContextHook(self)
+        dir_hook = DirectoryHook(self)
+        attach_hook = PathToAttachHook(self)
+
+        try:
+            fl_class = FileLoader.getInstance(UserConfig.selectedAccount).getClass()
+        except Exception:
+            fl_class = jclass("java.lang.Class").forName("org.telegram.messenger.FileLoader")
+
+        for m in fl_class.getDeclaredMethods():
+            name = str(m.getName())
+            try:
+                if name in ("loadFileInternal", "getPathToMessage"):
+                    self.hook_method(m, ctx_hook)
+                elif name == "getDirectory":
+                    self.hook_method(m, dir_hook)
+                elif name == "getPathToAttach":
+                    self.hook_method(m, attach_hook)
+            except Exception as e:
+                log(f"[ChatStorage] cannot hook {name}: {e}")
+
+        self._menu_ids = []
+        item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Storage",
+                subtext="Хранение файлов этого чата",
+                icon="msg_download",
+                priority=90,
+                on_click=self._guard("Storage", self.open_storage_menu),
+            )
+        )
+        self._menu_ids.append(item_id)
+
+    def on_plugin_unload(self):
+        for item_id in getattr(self, "_menu_ids", []):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+
+    def create_settings(self):
+        root = self.root
+        return [
+            Header(text="Место хранения файлов чатов"),
+            Selector(
+                key=KEY_KIND,
+                text="Где хранить",
+                default=0,
+                items=[
+                    "Папка приложения (память телефона)",
+                    "Папка приложения на SD-карте",
+                    "Своя папка (системный выбор)",
+                ],
+                on_change=lambda idx: self._refresh_root(int(idx)),
+            ),
+            Text(text="Выбрать свою папку…", icon="msg_folder", on_click=lambda view: self.pick_system()),
+            Divider(text=f"Сейчас: {root}" if root else "Сейчас: папка не определена (SD-карта не найдена или своя папка не выбрана)"),
+            Text(
+                text="Очистить все данные",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda view: self._guard("Очистка", self.clear_all)(),
+            ),
+        ]
+
+    def _load_enabled(self):
+        try:
+            return set(str(x) for x in json.loads(self.get_setting(KEY_CHATS, "[]")))
+        except Exception:
+            return set()
+
+    def _save_enabled(self):
+        self.set_setting(KEY_CHATS, json.dumps(sorted(self.cs_chats)))
+
+    def _dirs(self):
+        root = self.root
+        if not root or not self.cs_chats:
+            return {}
+        return {cid: os.path.join(root, cid) for cid in self.cs_chats}
+
+    def _root_for(self, kind):
+        ctx = ApplicationLoader.applicationContext
+        if kind == 2:
+            custom = self.get_setting(KEY_CUSTOM, "")
+            return str(custom) if custom else None
+        if kind == 1:
+            for d in ctx.getExternalFilesDirs(None):
+                if d is not None and Environment.isExternalStorageRemovable(d):
+                    return os.path.join(str(d.getAbsolutePath()), "ChatStorage")
+            return None
+        base = ctx.getExternalFilesDir(None)
+        if base is None:
+            base = ctx.getFilesDir()
+        return os.path.join(str(base.getAbsolutePath()), "ChatStorage")
+
+    def _all_roots(self):
+        roots = []
+        for kind in (0, 1, 2):
+            try:
+                root = self._root_for(kind)
+            except Exception:
+                root = None
+            if root and root not in roots and os.path.isdir(root):
+                roots.append(root)
+        return roots
+
+    def _refresh_root(self, kind=None):
+        try:
+            if kind is None:
+                kind = int(self.get_setting(KEY_KIND, 0))
+            self.root = self._root_for(kind)
+        except Exception as e:
+            log(f"[ChatStorage] refresh_root error: {e}")
+            self.root = None
+
+    def _toast(self, kind, text):
+
+        def f():
+            try:
+                getattr(BulletinHelper, kind)(text)
+            except Exception as e:
+                log(f"[ChatStorage] bulletin failed: {e}")
+                try:
+                    jclass("android.widget.Toast").makeText(ApplicationLoader.applicationContext, text, 1).show()
+                except Exception as e2:
+                    log(f"[ChatStorage] toast failed: {e2}")
+
+        run_on_ui_thread(f)
+
+    def _guard(self, name, fn):
+
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                log(f"[ChatStorage] {name} error: {e}")
+                self._toast("show_error", f"{name}: ошибка — {e}")
+
+        return wrapper
+
+    def _activity(self):
+        return get_last_fragment().getParentActivity()
+
+    @staticmethod
+    def _writable(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+            test = os.path.join(path, ".write_test")
+            with open(test, "w") as f:
+                f.write("1")
+            os.remove(test)
+            return True
+        except Exception as e:
+            log(f"[ChatStorage] not writable {path}: {e}")
+            return False
+
+    @staticmethod
+    def _dir_stats(paths):
+        files, size = 0, 0
+        for path in paths:
+            for base, _, names in os.walk(path):
+                for n in names:
+                    try:
+                        size += os.path.getsize(os.path.join(base, n))
+                        files += 1
+                    except OSError:
+                        pass
+        return files, size
+
+    @staticmethod
+    def _wipe(path):
+        removed = 0
+        for entry in os.listdir(path):
+            full = os.path.join(path, entry)
+            try:
+                if os.path.isdir(full) and not os.path.islink(full):
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                removed += 1
+            except Exception as e:
+                log(f"[ChatStorage] wipe error {full}: {e}")
+        return removed
+
+    def _chat_dirs(self, dialog_id):
+        return [p for p in (os.path.join(r, dialog_id) for r in self._all_roots()) if os.path.isdir(p)]
+
+    def _all_chat_dirs(self):
+        dirs = []
+        for root in self._all_roots():
+            try:
+                for name in os.listdir(root):
+                    full = os.path.join(root, name)
+                    if re.fullmatch(r"-?\d+", name) and os.path.isdir(full):
+                        dirs.append(full)
+            except Exception as e:
+                log(f"[ChatStorage] list error {root}: {e}")
+        return dirs
+
+    def _confirm_delete(self, message, paths, drop_empty):
+        def delete():
+            def work():
+                removed = 0
+                for p in paths:
+                    removed += self._wipe(p)
+                    if drop_empty and os.path.basename(p) not in self.cs_chats:
+                        try:
+                            os.rmdir(p)
+                        except OSError:
+                            pass
+                self._toast("show_success", f"Удалено элементов: {removed}")
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def show():
+            b = AlertBuilder(self._activity())
+            b.setTitle("Очистить данные")
+            b.setMessage(message)
+            b.setPositiveButton("Удалить", _Click(lambda _: delete()))
+            b.setNegativeButton("Отмена", None)
+            b.show()
+
+        run_on_ui_thread(show)
+
+    def clear_chat(self, context):
+        dialog_id = str(context.get("dialog_id"))
+        paths = self._chat_dirs(dialog_id)
+        files, size = self._dir_stats(paths)
+        if not files:
+            self._toast("show_info", "Для этого чата нет сохранённых данных")
+            return
+        self._confirm_delete(
+            f"Удалить сохранённые файлы этого чата: {files} шт., {size / 1048576:.1f} МБ?\n\nДействие необратимо.",
+            paths,
+            False,
+        )
+
+    def clear_all(self):
+        paths = self._all_chat_dirs()
+        files, size = self._dir_stats(paths)
+        if not files:
+            self._toast("show_info", "Сохранённых данных нет")
+            return
+        self._confirm_delete(
+            f"Удалить сохранённые файлы всех чатов: {files} шт., {size / 1048576:.1f} МБ?\n\nДействие необратимо.",
+            paths,
+            True,
+        )
+
+    def open_storage_menu(self, context):
+        dialog_id = str(context.get("dialog_id"))
+        on = dialog_id in self.cs_chats and bool(self.root)
+        title = "Storage · включено" if on else "Storage · выключено"
+        items, icon_names, actions = [], [], []
+        if on:
+            items.append("Отключить для чата")
+            icon_names.append("msg_cancel")
+            actions.append(("Отключить", self.disable_chat))
+        else:
+            items.append("Включить для чата")
+            icon_names.append("msg_download")
+            actions.append(("Включить", self.enable_chat))
+        items.append("Перенести из кеша")
+        icon_names.append("msg_forward")
+        actions.append(("Перенос", self.migrate_chat))
+        items.append("Очистить данные чата")
+        icon_names.append("msg_delete")
+        actions.append(("Очистка", self.clear_chat))
+
+        def on_pick(which):
+            name, fn = actions[int(which)]
+            self._guard(name, fn)(context)
+
+        def show():
+            try:
+                Drawable = jclass("org.telegram.messenger.R$drawable")
+                icons = [int(getattr(Drawable, n, 0)) for n in icon_names]
+                b = jclass("org.telegram.ui.ActionBar.BottomSheet$Builder")(self._activity())
+                b.setTitle(title)
+                b.setItems(jarray(JString)(items), jarray(jint)(icons), _Click(on_pick))
+                sheet = b.show()
+                try:
+                    sheet.setItemColor(len(items) - 1, RED, RED)
+                except Exception as e:
+                    log(f"[ChatStorage] item color failed: {e}")
+            except Exception as e:
+                log(f"[ChatStorage] bottom sheet failed: {e}")
+                b = AlertBuilder(self._activity())
+                b.setTitle(title)
+                b.setItems(jarray(JString)(items), _Click(on_pick))
+                b.setNegativeButton("Отмена", None)
+                b.show()
+
+        run_on_ui_thread(show)
+
+    def enable_chat(self, context):
+        dialog_id = str(context.get("dialog_id"))
+        self._refresh_root()
+        if not self.root:
+            self._toast("show_error", "Сначала выберите место хранения в настройках плагина")
+            return
+        path = os.path.join(self.root, dialog_id)
+        if not self._writable(path):
+            self._toast("show_error", "Нет прав записи в выбранную папку. Выберите другое место в настройках плагина")
+            return
+        self.cs_chats.add(dialog_id)
+        self._save_enabled()
+        self._toast("show_success", f"Сохранение включено: {path}")
+        run_on_ui_thread(lambda: self._ask_migrate(dialog_id, path))
+
+    def disable_chat(self, context):
+        dialog_id = str(context.get("dialog_id"))
+        self.cs_chats.discard(dialog_id)
+        self._save_enabled()
+        self._toast("show_info", "Для чата снова используется кеш Telegram")
+
+    def _ask_migrate(self, dialog_id, path):
+        b = AlertBuilder(self._activity())
+        b.setTitle("Сохранение включено")
+        b.setMessage(f"Файлы чата теперь хранятся в:\n{path}\n\nПеренести уже скачанные файлы из кеша?")
+        b.setPositiveButton("Перенести", _Click(lambda _: self.migrate_chat({"dialog_id": dialog_id})))
+        b.setNegativeButton("Не нужно", None)
+        b.show()
+
+    def _ensure_result_hook(self, activity):
+        if self.result_hooked:
+            return
+        cls = activity.getClass()
+        while cls is not None:
+            found = False
+            for m in cls.getDeclaredMethods():
+                if str(m.getName()) == "onActivityResult" and m.getParameterCount() == 3:
+                    self.hook_method(m, ActivityResultHook(self))
+                    found = True
+            if found:
+                self.result_hooked = True
+                return
+            cls = cls.getSuperclass()
+        raise RuntimeError("onActivityResult не найден")
+
+    def pick_system(self):
+        def go():
+            self._toast("show_info", "Открываю выбор папки…")
+            try:
+                activity = self._activity()
+                self._ensure_result_hook(activity)
+                activity.startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_CODE)
+            except Exception as e:
+                log(f"[ChatStorage] pick error: {e}")
+                self._toast("show_error", f"Системный выбор недоступен: {e}")
+
+        run_on_ui_thread(go)
+
+    @staticmethod
+    def _uri_to_path(uri):
+        try:
+            if str(uri.getAuthority()) != "com.android.externalstorage.documents":
+                return None
+            doc = str(DocumentsContract.getTreeDocumentId(uri))
+            vol, _, rel = doc.partition(":")
+            base = "/storage/emulated/0" if vol == "primary" else f"/storage/{vol}"
+            return os.path.join(base, rel) if rel else base
+        except Exception as e:
+            log(f"[ChatStorage] uri_to_path error: {e}")
+            return None
+
+    def on_tree_picked(self, uri):
+        if uri is None:
+            return
+        path = self._uri_to_path(uri)
+        if not path:
+            self._toast("show_error", "Выберите папку во внутренней памяти или на SD-карте")
+            return
+        if not self._writable(path):
+            self._toast("show_error", "Нет прав записи в эту папку. Выберите папку приложения или другую папку")
+            return
+        self.set_setting(KEY_CUSTOM, path)
+        self.set_setting(KEY_KIND, 2)
+        self._refresh_root(2)
+        self._toast("show_success", f"Своя папка: {path}. Откройте настройки плагина заново, чтобы обновить экран")
+
+    def migrate_chat(self, context):
+        dialog_id = str(context.get("dialog_id"))
+        target = self._dirs().get(dialog_id)
+        if not target:
+            self._toast("show_error", "Сначала включите сохранение для этого чата")
+            return
+        if self.migrating:
+            self._toast("show_info", "Перенос уже идёт")
+            return
+
+        self._toast("show_info", "Ищу скачанные файлы чата…")
+        self.migrating = True
+
+        def collect():
+            messages = []
+            try:
+                acc = UserConfig.selectedAccount
+                storage = MessagesStorage.getInstance(acc)
+                db = storage.getDatabase()
+                client_id = UserConfig.getInstance(acc).clientUserId
+                cursor = None
+                for table in ("messages_v2", "messages"):
+                    try:
+                        cursor = db.queryFinalized(f"SELECT data FROM {table} WHERE uid = {int(dialog_id)}")
+                        break
+                    except Exception:
+                        cursor = None
+                if cursor is None:
+                    raise RuntimeError("не удалось открыть таблицу сообщений")
+                while cursor.next():
+                    data = cursor.byteBufferValue(0)
+                    if data is None:
+                        continue
+                    try:
+                        msg = TLRPC.Message.TLdeserialize(data, data.readInt32(False), False)
+                        if msg is not None:
+                            msg.readAttachPath(data, client_id)
+                            messages.append(msg)
+                    finally:
+                        data.reuse()
+                cursor.dispose()
+            except Exception as e:
+                log(f"[ChatStorage] collect error: {e}")
+                self.migrating = False
+                self._toast("show_error", f"Ошибка чтения чата: {e}")
+                return
+            threading.Thread(target=move_files, args=(messages,), daemon=True).start()
+
+        def attach_names(msg):
+            names = []
+            try:
+                media = msg.media
+                if media is None:
+                    return names
+                objs = []
+                for attr in ("document", "photo"):
+                    o = getattr(media, attr, None)
+                    if o is not None:
+                        objs.append(o)
+                wp = getattr(media, "webpage", None)
+                if wp is not None:
+                    for attr in ("document", "photo"):
+                        o = getattr(wp, attr, None)
+                        if o is not None:
+                            objs.append(o)
+                for o in objs:
+                    sizes = getattr(o, "sizes", None)
+                    if sizes is not None:
+                        for sz in sizes:
+                            n = FileLoader.getAttachFileName(sz)
+                            if n:
+                                names.append(str(n))
+                    else:
+                        n = FileLoader.getAttachFileName(o)
+                        if n:
+                            names.append(str(n))
+            except Exception as e:
+                log(f"[ChatStorage] attach_names error: {e}")
+            return names
+
+        def move_files(messages):
+            moved = 0
+            size = 0
+            with_media = 0
+            errors = 0
+            last_err = ""
+            seen = set()
+            try:
+                os.makedirs(target, exist_ok=True)
+                cache_dirs = []
+                for i in range(0, 8):
+                    try:
+                        d = FileLoader.getDirectory(i)
+                        if d is not None:
+                            p = str(d.getAbsolutePath())
+                            if p not in cache_dirs and p != os.path.abspath(target):
+                                cache_dirs.append(p)
+                    except Exception:
+                        pass
+                log(f"[ChatStorage] migrate: messages={len(messages)} dirs={cache_dirs}")
+
+                for msg in messages:
+                    try:
+                        sources = []
+                        try:
+                            f = FileLoader.getPathToMessage(msg)
+                            if f is not None:
+                                sources.append(str(f.getAbsolutePath()))
+                        except Exception:
+                            pass
+                        names = attach_names(msg)
+                        if names or sources:
+                            with_media += 1
+                        for n in names:
+                            for d in cache_dirs:
+                                sources.append(os.path.join(d, n))
+                        for src in sources:
+                            if src in seen or not os.path.isfile(src):
+                                continue
+                            seen.add(src)
+                            if os.path.dirname(src) == os.path.abspath(target):
+                                continue
+                            dst = os.path.join(target, os.path.basename(src))
+                            s = os.path.getsize(src)
+                            if os.path.exists(dst):
+                                os.remove(src)
+                            else:
+                                shutil.move(src, dst)
+                            moved += 1
+                            size += s
+                    except Exception as e:
+                        errors += 1
+                        last_err = str(e)
+                        log(f"[ChatStorage] move error: {e}")
+            finally:
+                self.migrating = False
+            report = f"сообщений: {len(messages)}, с вложениями: {with_media}, ошибок: {errors}"
+            if moved:
+                self._toast("show_success", f"Перенесено: {moved} ({size / 1048576:.1f} МБ). {report}. Переоткройте чат.")
+            elif errors:
+                self._toast("show_error", f"Не удалось перенести ({report}): {last_err}")
+            elif not messages:
+                self._toast("show_info", f"В базе нет сообщений этого чата (id {dialog_id}). Откройте чат и прокрутите историю")
+            else:
+                self._toast("show_info", f"Файлов в кеше не найдено ({report})")
+
+        try:
+            MessagesStorage.getInstance(UserConfig.selectedAccount).getStorageQueue().postRunnable(_Run(collect))
+        except Exception as e:
+            self.migrating = False
+            self._toast("show_error", f"Не удалось запустить перенос: {e}")
