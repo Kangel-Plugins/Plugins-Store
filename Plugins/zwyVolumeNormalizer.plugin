@@ -37,7 +37,8 @@ from java import jclass, jarray, jfloat
 from java.io import File
 from java.lang import String
 from java.nio import ByteOrder
-from android.media import MediaCodec, MediaExtractor, MediaFormat
+from java.lang.reflect import Modifier
+from android.media import AudioTrack, MediaCodec, MediaExtractor, MediaFormat
 from android.media.audiofx import LoudnessEnhancer
 from org.telegram.messenger import MediaController, MessageObject, FileLoader, SharedConfig
 from org.telegram.ui.Components import UItem
@@ -49,9 +50,10 @@ __description__ = (
 )
 __icon__ = "zwyPluginsIcons/10"
 __id__ = "zwyVolumeNormalizer"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "@zwylair"
-__min_version__ = "12.5.1"
+__app_version__ = ">=12.10.6"
+__category__ = ["media"]
 
 REQUIRED_ZWYLIB_VERSION = "2.0.6"
 
@@ -205,13 +207,16 @@ GAIN_SLEW_DB_PER_TICK = 2.0
 PUSH_EPSILON_DB = 0.05
 NEXT_TRACK_RETRY_SEC = 2.0
 LOG_GAIN_STEP_DB = 3.0
+SESSION_RETRY_SEC = 2.0
+SESSION_SEARCH_DEPTH = 5
+AUDIO_SEARCH_TYPES = ("AudioSink", "AudioOutput")
 
 MAX_STORED_TRACKS = 200
 MAX_LOADED_TRACKS = 32
 MAX_TRACKED_PLAYERS = 8
 
 _AU_CHANNEL_ID = 2521243181
-_AU_MSG_ID = 139
+_AU_MSG_ID = 138
 
 
 class S:
@@ -628,10 +633,75 @@ def get_next_message(controller: MediaController) -> Optional[MessageObject]:
     return message if message is not None and message.isMusic() else None
 
 
+_audio_fields: Dict[str, List[Tuple[Any, bool]]] = {}
+
+
+def get_audio_fields(cls) -> List[Tuple[Any, bool]]:
+    key = str(cls.getName())
+    fields = _audio_fields.get(key)
+    if fields is not None:
+        return fields
+
+    fields = []
+    current = cls
+    while current is not None and not str(current.getName()).startswith(("java.", "android.")):
+        for field in current.getDeclaredFields():
+            if Modifier.isStatic(field.getModifiers()):
+                continue
+
+            kind = field.getType()
+            is_track = AudioTrack.getClass().isAssignableFrom(kind)
+            if is_track or any(i in str(kind.getName()) for i in AUDIO_SEARCH_TYPES):
+                field.setAccessible(True)
+                fields.append((field, is_track))
+        current = current.getSuperclass()
+
+    _audio_fields[key] = fields
+    return fields
+
+
+def find_audio_track(obj, depth: int) -> Optional[AudioTrack]:
+    if obj is None or depth < 0:
+        return None
+
+    if obj.getClass().isArray():
+        for item in obj:
+            track = find_audio_track(item, depth - 1)
+            if track is not None:
+                return track
+        return None
+
+    for field, is_track in get_audio_fields(obj.getClass()):
+        value = field.get(obj)
+        if is_track:
+            if value is not None:
+                return value
+            continue
+
+        track = find_audio_track(value, depth - 1)
+        if track is not None:
+            return track
+    return None
+
+
+def get_audio_session_id(exo_player) -> int:
+    if exo_player is None:
+        return 0
+
+    try:
+        return int(exo_player.getAudioSessionId())
+    except AttributeError:
+        pass
+
+    track = find_audio_track(HookUtils.get_private_field(exo_player, "renderers"), SESSION_SEARCH_DEPTH)
+    return int(track.getAudioSessionId()) if track is not None else 0
+
+
 class Booster:
     def __init__(self):
         self.player = None
         self.enhancer = None
+        self.next_search = 0.0
 
     def release(self):
         if self.enhancer is not None:
@@ -641,6 +711,7 @@ class Booster:
                 logger.debug("Failed to release the loudness enhancer:", exc_info=True)
         self.enhancer = None
         self.player = None
+        self.next_search = 0.0
 
     def apply(self, player, boost_db: float):
         if self.player is not None and not self.player.equals(player):
@@ -649,20 +720,27 @@ class Booster:
         if self.enhancer is None and boost_db <= BOOST_EPSILON_DB:
             return
 
-        exo_player = player.player
-        session_id = exo_player.getAudioSessionId() if exo_player is not None else 0
-        if session_id == 0:
-            return
-
         try:
             if self.enhancer is None:
+                now = time.monotonic()
+                if now < self.next_search:
+                    return
+
+                self.next_search = now + SESSION_RETRY_SEC
+                session_id = get_audio_session_id(player.player)
+                if session_id == 0:
+                    logger.debug("No audio session yet, the boost is postponed.")
+                    return
+
                 self.enhancer = LoudnessEnhancer(session_id)
                 self.enhancer.setEnabled(True)
                 self.player = player
+                logger.debug(f"Loudness enhancer attached to the session {session_id}.")
             self.enhancer.setTargetGain(int(round(boost_db * 100)))
         except Exception:
             logger.error("Failed to apply the boost:", exc_info=True)
             self.release()
+            self.next_search = time.monotonic() + SESSION_RETRY_SEC
 
 
 class Normalizer:
@@ -856,8 +934,13 @@ class Normalizer:
 
     def _push(self, player):
         self.pushed_db = self.applied_db
-        self.booster.apply(player, max(self.applied_db, 0.0))
-        MC.refresh_player_volume()
+        try:
+            self.booster.apply(player, max(self.applied_db, 0.0))
+        finally:
+            MC.refresh_player_volume()
+
+        if self.applied_db > BOOST_EPSILON_DB and self.booster.enhancer is None:
+            self.pushed_db = None
 
     def _preanalyze_next(self, controller: MediaController):
         now = time.monotonic()
