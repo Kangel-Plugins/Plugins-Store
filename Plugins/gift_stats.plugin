@@ -1,27 +1,33 @@
+import os
+import queue
+import sys
+import threading
 import time
+import traceback
 
-from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
-from client_utils import get_last_fragment, get_selected_account, send_request, send_document, send_photo, run_on_queue
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, send_request, send_document, send_photo
 from android_utils import run_on_ui_thread, OnClickListener
 from hook_utils import find_class
-from extera_utils.classes import Base, java_subclass, joverride
+from extera_utils.classes import Base, java_subclass, joverride, joverload
 from java import jclass, dynamic_proxy
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Switch, Input
 from file_utils import get_cache_dir
-from org.telegram.messenger import MessagesController, UserObject, ImageLocation, DocumentObject, ImageLoader, FileLoader, R as R_tg
+from org.telegram.messenger import MessagesController, UserObject, ImageLocation, FileLoader, R as R_tg
 from org.telegram.tgnet import TLRPC
 from org.telegram.tgnet.tl import TL_stars
 from org.telegram.ui.ActionBar import Theme
-from android.graphics import Bitmap, BitmapFactory
+from android.graphics import BitmapFactory
 
 __id__ = "gift_stats"
 __name__ = "Gift Stats"
 __description__ = "Статистика подарков: топ дарителей в профиле/чате, анонимные отдельно, разбивка по подаркам"
 __author__ = "@alexeykasp"
-__version__ = "1.6.16"
-__app_version__ = ">=12.8.1"
+__version__ = "1.8.13"
+__app_version__ = ">=12.10.6"
+__category__ = ["tools"]
 __sdk_version__ = ">=1.4.5.0"
 
 PAGE_LIMIT = 30
@@ -31,6 +37,69 @@ EXPORT_WIDTH_DP = 320
 EXPORT_TIMEOUT_SEC = 60
 EXPORT_IDLE_SEC = 6
 PRELOAD_TIMEOUT_SEC = 12
+ACTION_IDLE_SEC = 90
+ACTION_WATCH_TICK_SEC = 5
+ROW_FIRST = 12
+ROW_BATCH = 120
+
+
+class _ActionState:
+    """Одно действие плагина (сбор статистики, экспорт): свой поток, очередь задач, отмена и сторож.
+
+    Всё содержимое действия исполняется в этом потоке, а из сетевых колбэков и UI-постов
+    задачи только перекладываются в его очередь. Зависшее действие не держит UI-поток
+    клиента: сторож снимает его, освобождает состояние плагина, а сам поток после этого
+    игнорируется — его результаты уже не смогут ничего изменить (см. GiftStatsPlugin._stale).
+    """
+
+    def __init__(self, plugin, name, idle_limit=ACTION_IDLE_SEC):
+        self.plugin = plugin
+        self.name = name
+        self.idle_limit = idle_limit
+        self.cancel = False
+        self.done = False
+        self.abandoned = False
+        self.user_cancelled = False
+        self.started = time.time()
+        self.beat = self.started
+        self._tasks = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, name=f"gift_stats_{name}", daemon=True)
+        self._watcher = threading.Thread(target=self._watch, name=f"gift_stats_{name}_watch", daemon=True)
+        self._thread.start()
+        self._watcher.start()
+
+    def alive(self):
+        return not (self.done or self.cancel)
+
+    def touch(self):
+        self.beat = time.time()
+
+    def submit(self, fn):
+        self._tasks.put(fn)
+
+    def stop(self):
+        self.done = True
+        self._tasks.put(None)
+
+    def _loop(self):
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            if not self.alive() or self.plugin._act is not self:
+                continue
+            self.touch()
+            self.plugin._run_task(self, task)
+
+    def _watch(self):
+        while self.alive():
+            time.sleep(ACTION_WATCH_TICK_SEC)
+            if self.done or self.cancel or self.abandoned:
+                return
+            idle = time.time() - self.beat
+            if idle > self.idle_limit:
+                self.plugin._abandon(self, f"нет прогресса {int(idle)} с")
+                return
 
 
 class _JavaRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
@@ -42,10 +111,59 @@ class _JavaRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
         self.fn()
 
 
+@java_subclass(find_class("java.lang.Object"),
+               find_class("org.telegram.ui.DialogsActivity$DialogsActivityDelegate"))
+class _ChatPickerDelegate(Base):
+    """Ответ нативного выбора чата: выбранный чат становится получателем картинки."""
+
+    def __init__(self, *args):
+        self._plugin = None
+        self._intent = None
+
+    @joverload("didSelectDialogs", [
+        "org.telegram.ui.DialogsActivity", "java.util.ArrayList", "java.lang.CharSequence",
+        "boolean", "boolean", "int", "int", "org.telegram.ui.TopicsFragment"])
+    def didSelectDialogs(self, fragment, dids, message, param, notify, schedule_date,
+                         schedule_repeat_period, topics_fragment):
+        try:
+            try:
+                fragment.finishFragment()
+            except Exception:
+                pass
+            plugin = self._plugin
+            intent = self._intent
+            if plugin is None or not intent:
+                return True
+            dialog_id = None
+            try:
+                if dids is not None and dids.size() > 0:
+                    dialog_id = int(dids.get(0).dialogId)
+            except Exception as e:
+                plugin.log(f"GiftStats picker parse error: {e}")
+            if dialog_id:
+                target = dict(intent)
+                target["peer"] = dialog_id
+                target["reply"] = None
+                target["reply_id"] = None
+                target["reply_obj"] = None
+                plugin.log(f"GiftStats export target picked: {dialog_id}")
+                plugin._run_export(**target)
+            return True
+        except Exception as e:
+            try:
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats picker delegate error: {e}")
+            except Exception:
+                pass
+            return False
+
+
 class GiftStatsPlugin(BasePlugin):
 
     def on_plugin_load(self):
-        self.log("GiftStats v1.6.16 loaded")
+        self.log("GiftStats v1.8.13 loaded")
+        self._tls = threading.local()
+        self._act = None
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.PROFILE_ACTION_MENU,
             text="Gift Stats",
@@ -55,24 +173,195 @@ class GiftStatsPlugin(BasePlugin):
             priority=100,
         ))
         self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Отправить в этот чат",
+            icon="msg_share",
+            subtext="Картинка со статистикой в чат с этим пользователем",
+            condition="chat == null || !org.telegram.messenger.ChatObject.isChannelAndNotMegaGroup(chat)",
+            item_id="gift_stats_profile_here",
+            on_click=self._on_profile_send_here,
+            priority=101,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Отправить другому…",
+            icon="msg_forward",
+            subtext="Выбрать получателя, как при пересылке",
+            item_id="gift_stats_profile_pick",
+            on_click=self._on_profile_send_pick,
+            priority=102,
+        ))
+        self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
             text="Gift Stats",
             icon="gift",
             subtext="Статистика подарков автора сообщения",
+            condition="message == null || message.getSenderId() > 0",
             on_click=self._on_message_click,
             priority=100,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Отправить другому…",
+            icon="msg_forward",
+            subtext="Выбрать получателя, как при пересылке",
+            condition="message == null || message.getSenderId() > 0",
+            item_id="gift_stats_message_pick",
+            on_click=self._on_message_send_pick,
+            priority=101,
         ))
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.CHAT_ACTION_MENU,
             text="Gift Stats",
             icon="gift",
             subtext="Статистика подарков в чате",
+            condition="chat == null || !org.telegram.messenger.ChatObject.isChannelAndNotMegaGroup(chat)",
             on_click=self._on_chat_click,
             priority=100,
         ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Отправить другому…",
+            icon="msg_forward",
+            subtext="Выбрать получателя, как при пересылке",
+            item_id="gift_stats_chat_pick",
+            on_click=self._on_chat_send_pick,
+            priority=101,
+        ))
 
     def on_plugin_unload(self):
-        pass
+        st = getattr(self, "_act", None)
+        if st is not None:
+            st.cancel = True
+            self._finish(st)
+        run_on_ui_thread(self._export_dismiss_loading)
+
+    # ---------------------------------------------------------------- потоки
+
+    def _st(self):
+        """Действие, код которого исполняется в текущем потоке (None — вне действия)."""
+        tls = getattr(self, "_tls", None)
+        return None if tls is None else getattr(tls, "st", None)
+
+    def _stale(self, st=None):
+        """True — продолжение относится к отменённому, брошенному или уже снятому действию."""
+        if st is None:
+            st = self._st()
+            if st is None:
+                self._warn_no_context()
+                return True
+        if st.cancel or st.done or st.abandoned:
+            return True
+        return st is not getattr(self, "_act", None)
+
+    def _warn_no_context(self):
+        n = getattr(self, "_ctx_warns", 0)
+        if n < 5:
+            self._ctx_warns = n + 1
+            self.log("GiftStats work outside action context ignored")
+
+    def _beat(self):
+        """Отметка «действие живо» для сторожа (в долгих циклах ожидания)."""
+        st = self._st()
+        if st is not None:
+            st.touch()
+
+    def _run_task(self, st, fn):
+        """Исполняет шаг действия с привязкой состояния к текущему потоку."""
+        tls = getattr(self, "_tls", None)
+        if tls is None:
+            return
+        prev = getattr(tls, "st", None)
+        tls.st = st
+        try:
+            fn()
+        except Exception as e:
+            self.log(f"GiftStats action '{st.name}' step error: {e}")
+            self.log(traceback.format_exc())
+            try:
+                self._export_error(st, f"Внутренняя ошибка: {e}")
+            except Exception as inner:
+                self.log(f"GiftStats action error report failed: {inner}")
+        finally:
+            tls.st = prev
+
+    def _ui(self, st, fn):
+        """UI-часть действия: выполняется в UI-потоке, снятое действие свой UI уже не трогает."""
+        def post():
+            if self._stale(st):
+                return
+            self._run_task(st, fn)
+
+        try:
+            run_on_ui_thread(post)
+        except Exception as e:
+            self.log(f"GiftStats ui post error: {e}")
+
+    def _work(self, st, fn):
+        """Продолжение действия: ставится в очередь его собственного потока."""
+        st.submit(fn)
+
+    def _ask(self, st, request, cb, account=None):
+        """TL-запрос действия: сетевой колбэк лишь перекладывает ответ в поток действия."""
+        def on_response(response, error):
+            if self._stale(st):
+                return
+            self._work(st, lambda: cb(response, error))
+
+        return send_request(request, on_response, account=account)
+
+    def _start_action(self, name):
+        """Запускает действие в отдельном потоке; None — предыдущее ещё не завершено."""
+        cur = getattr(self, "_act", None)
+        if cur is not None:
+            if cur.alive():
+                self.log(f"GiftStats action '{name}' skipped: '{cur.name}' is still running")
+                return None
+            self._finish(cur)
+        st = _ActionState(self, name)
+        self._act = st
+        self.log(f"GiftStats action '{name}' started (idle limit {int(st.idle_limit)} с)")
+        return st
+
+    def _finish(self, st):
+        """Штатное завершение/отмена: плагин свободен, остатки очереди действия игнорируются."""
+        if st is None:
+            return
+        if getattr(self, "_act", None) is st:
+            self._act = None
+        st.stop()
+
+    def _abandon(self, st, reason):
+        """Сторож: действие зависло — освобождаем клиент и состояние плагина."""
+        if st.done or st.abandoned:
+            return
+        st.abandoned = True
+        st.cancel = True
+        if getattr(self, "_act", None) is st:
+            self._act = None
+        self.log(f"GiftStats action '{st.name}' abandoned: {reason}")
+        self.log(f"GiftStats abandoned thread trace:\n{self._thread_trace(st)}")
+        def ui():
+            self._export_dismiss_loading()
+            try:
+                BulletinHelper.show_error(f"Gift Stats: действие прервано ({reason})")
+            except Exception:
+                pass
+
+        try:
+            run_on_ui_thread(ui)
+        except Exception:
+            pass
+        st.stop()
+
+    def _thread_trace(self, st):
+        try:
+            frame = sys._current_frames().get(st._thread.ident)
+            if frame is None:
+                return "  (поток уже завершился)"
+            return "".join(traceback.format_stack(frame))
+        except Exception as e:
+            return f"  (traceback недоступен: {e})"
 
     def create_settings(self):
         return [
@@ -124,14 +413,38 @@ class GiftStatsPlugin(BasePlugin):
         except Exception:
             return EXPORT_TOP_LIMIT
 
+    def _pick_chat(self, intent):
+        """Нативный экран выбора чата TG (как при пересылке): выбранный чат — получатель."""
+        try:
+            if self._get_activity() is None:
+                return
+            frag = get_last_fragment()
+            layout = frag.getParentLayout() if frag is not None else None
+            if layout is None:
+                return
+            Bundle = jclass("android.os.Bundle")
+            DialogsActivity = jclass("org.telegram.ui.DialogsActivity")
+            args = Bundle()
+            args.putBoolean("onlySelect", True)
+            # DIALOGS_TYPE_DEFAULT = 0 (DialogsActivity), литералом: у jclass в этом SDK нет статических полей
+            args.putInt("dialogsType", 0)
+            picker = DialogsActivity(args)
+            delegate = _ChatPickerDelegate.new_instance()
+            delegate._plugin = self
+            delegate._intent = intent
+            picker.setDelegate(delegate.java)
+            layout.presentFragment(picker, False)
+            self.log("GiftStats chat picker opened")
+        except Exception as e:
+            self.log(f"GiftStats picker error: {e}")
+
     def _run_export(self, account, peer, reply, target_arg, donor_arg, is_donor, reply_id=None, reply_obj=None):
-        if getattr(self, "_xexport_running", False):
+        st = self._start_action("export")
+        if st is None:
             return
-        self._xexport_running = True
-        self._x_cancel = False
         if self.get_setting("show_loading", True):
-            run_on_ui_thread(self._export_show_loading)
-        run_on_queue(lambda: self._export_resolve_target(account, peer, reply, target_arg, donor_arg, is_donor, reply_id, reply_obj))
+            self._ui(st, self._export_show_loading)
+        self._work(st, lambda: self._export_resolve_target(st, account, peer, reply, target_arg, donor_arg, is_donor, reply_id, reply_obj))
 
     def _export_show_loading(self):
         activity = self._export_context()
@@ -159,21 +472,23 @@ class GiftStatsPlugin(BasePlugin):
         except Exception:
             self._xloading = None
 
-    def _export_is_cancelled(self):
-        return bool(getattr(self, "_x_cancel", False))
-
     def _cancel_export(self):
-        self._x_cancel = True
-        self._xexport_running = False
+        st = getattr(self, "_act", None)
+        if st is not None:
+            st.cancel = True
+            st.user_cancelled = True
         self._export_dismiss_loading()
-        self.log("GiftStats export cancelled")
+        self.log("GiftStats action cancelled by user")
+        self._finish(st)
 
-    def _export_resolve_target(self, account, peer, reply, target_arg, donor_arg, is_donor, reply_id=None, reply_obj=None):
+    def _export_resolve_target(self, st, account, peer, reply, target_arg, donor_arg, is_donor, reply_id=None, reply_obj=None):
+        if self._stale(st):
+            return
         if reply is not None:
             try:
                 sid = int(reply.getSenderId())
                 if sid > 0:
-                    self._export_on_target(account, peer, donor_arg, is_donor, sid, reply_id, reply_obj)
+                    self._export_on_target(st, account, peer, donor_arg, is_donor, sid, reply_id, reply_obj)
                     return
             except Exception:
                 pass
@@ -182,22 +497,22 @@ class GiftStatsPlugin(BasePlugin):
             try:
                 uid = int(a)
                 if uid > 0:
-                    self._export_on_target(account, peer, donor_arg, is_donor, uid, reply_id, reply_obj)
+                    self._export_on_target(st, account, peer, donor_arg, is_donor, uid, reply_id, reply_obj)
                     return
             except Exception:
                 pass
             if a.startswith("@"):
-                self._export_resolve_user(account, a[1:], lambda uid: self._export_on_target(account, peer, donor_arg, is_donor, uid, reply_id, reply_obj))
+                self._export_resolve_user(st, account, a[1:], lambda uid: self._export_on_target(st, account, peer, donor_arg, is_donor, uid, reply_id, reply_obj))
                 return
         if peer and peer > 0:
-            self._export_on_target(account, peer, donor_arg, is_donor, int(peer), reply_id, reply_obj)
+            self._export_on_target(st, account, peer, donor_arg, is_donor, int(peer), reply_id, reply_obj)
             return
         if is_donor:
-            self._export_error("Команда работает в личном чате или укажи пользователя аргументом")
+            self._export_error(st, "Команда работает в личном чате или укажи пользователя аргументом")
             return
-        self._export_error("Пользователь не найден или недоступен")
+        self._export_error(st, "Пользователь не найден или недоступен")
 
-    def _export_resolve_user(self, account, username, cb):
+    def _export_resolve_user(self, st, account, username, cb):
         try:
             u = MessagesController.getInstance(account).getUser(username)
             if u is not None:
@@ -219,24 +534,27 @@ class GiftStatsPlugin(BasePlugin):
                         pass
                 cb(None)
 
-            send_request(req, rcb, account=account)
+            self._ask(st, req, rcb, account=account)
         except Exception as e:
             self.log(f"GiftStats resolve username error: {e}")
             cb(None)
 
-    def _export_on_target(self, account, peer, donor_arg, is_donor, target_id, reply_id=None, reply_obj=None):
+    def _export_on_target(self, st, account, peer, donor_arg, is_donor, target_id, reply_id=None, reply_obj=None):
+        if self._stale(st):
+            return
         if not target_id:
-            self._export_error("Пользователь не найден или недоступен")
+            self._export_error(st, "Пользователь не найден или недоступен")
             return
         self._collect(
+            st,
             account,
             int(target_id),
-            on_done=lambda gifts, names: self._export_on_collected(account, peer, donor_arg, is_donor, gifts, names, reply_id, reply_obj, target_id),
-            on_error=lambda err: self._export_error(f"Не удалось собрать подарки: {err}"),
+            on_done=lambda gifts, names: self._export_on_collected(st, account, peer, donor_arg, is_donor, gifts, names, reply_id, reply_obj, target_id),
+            on_error=lambda err: self._export_error(st, f"Не удалось собрать подарки: {err}"),
         )
 
-    def _export_on_collected(self, account, peer, donor_arg, is_donor, gifts, names, reply_id=None, reply_obj=None, target_id=None):
-        if self._export_is_cancelled():
+    def _export_on_collected(self, st, account, peer, donor_arg, is_donor, gifts, names, reply_id=None, reply_obj=None, target_id=None):
+        if self._stale(st):
             return
         donors, anonymous, nft = self._build_stats(gifts, names, account)
         self._disambiguate_names(donors)
@@ -244,29 +562,39 @@ class GiftStatsPlugin(BasePlugin):
         limit = self._export_limit()
         if limit and len(named) > limit:
             named = named[:limit]
+        self.log(f"GiftStats export donors={len(named)} (limit {limit if limit else 'нет'})")
         donor_list = list(named)
         if nft is not None:
             donor_list.append(nft)
         if anonymous is not None:
             donor_list.append(anonymous)
         if not donor_list:
-            self._export_error("Подарков не найдено")
+            self._export_error(st, "Подарков не найдено")
             return
-        donor = None
-        if donor_arg:
-            donor = self._find_donor(account, donor_arg, donors, anonymous, nft)
-            if donor is None:
-                self._export_error("Даритель не найден в списке подарков")
-                return
-        run_on_queue(lambda: self._export_render(account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id, reply_obj, target_id))
 
-    def _find_donor(self, account, arg, donors, anonymous, nft):
-        a = arg.strip()
+        def start(donor):
+            if self._stale(st):
+                return
+            if donor_arg and donor is None:
+                self._export_error(st, "Даритель не найден в списке подарков")
+                return
+            self._export_render(st, account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id, reply_obj, target_id)
+
+        if donor_arg:
+            self._export_find_donor(st, account, donor_arg, donors, anonymous, nft, start)
+        else:
+            start(None)
+
+    def _export_find_donor(self, st, account, arg, donors, anonymous, nft, cb):
+        """Ищет дарителя из аргумента без блокирующего ожидания: результат приходит в cb."""
+        a = (arg or "").strip()
         low = a.lower()
         if low in ("nft", "нфт") and nft is not None:
-            return nft
+            cb(nft)
+            return
         if low in ("anon", "анон", "анонимы", "анонимные") and anonymous is not None:
-            return anonymous
+            cb(anonymous)
+            return
 
         def match(uid):
             if uid is None:
@@ -276,46 +604,44 @@ class GiftStatsPlugin(BasePlugin):
         try:
             uid = int(a)
             if uid > 0:
-                return match(uid)
+                cb(match(uid))
+                return
         except Exception:
             pass
         if a.startswith("@"):
             try:
                 u = MessagesController.getInstance(account).getUser(a[1:])
                 if u is not None:
-                    return match(int(u.id))
+                    cb(match(int(u.id)))
+                    return
             except Exception:
                 pass
             try:
                 req = TLRPC.TL_contacts_resolveUsername()
                 req.username = a[1:]
-                found = [None]
 
                 def rcb(response, error):
+                    found = None
                     if error is None and response is not None:
                         try:
                             for u in self._list_items(getattr(response, "users", None)):
-                                found[0] = match(int(u.id))
-                                return
+                                found = match(int(u.id))
+                                break
                         except Exception:
-                            pass
-                    found[0] = found[0] or None
+                            found = None
+                    cb(found)
 
-                send_request(req, rcb, account=account)
-                for _ in range(50):
-                    if found[0] is not None:
-                        return found[0]
-                    time.sleep(0.1)
-                return None
+                self._ask(st, req, rcb, account=account)
+                return
             except Exception:
-                return None
-        return None
+                cb(None)
+                return
+        cb(None)
 
-    def _export_error(self, msg):
-        if self._export_is_cancelled():
-            self._xexport_running = False
+    def _export_error(self, st, msg):
+        if self._stale(st):
             return
-        self._xexport_running = False
+        self.log(f"GiftStats error: {msg}")
 
         def ui():
             self._export_dismiss_loading()
@@ -323,8 +649,9 @@ class GiftStatsPlugin(BasePlugin):
                 BulletinHelper.show_error(msg)
             except Exception as e:
                 self.log(f"GiftStats bulletin error: {e}")
+            self._finish(st)
 
-        run_on_ui_thread(ui)
+        self._ui(st, ui)
 
     def _export_context(self):
         try:
@@ -491,14 +818,15 @@ class GiftStatsPlugin(BasePlugin):
         s.addView(ic)
         return s
 
-    def _export_wait_images(self, pending):
+    def _export_wait_images(self, st, pending):
         total = len(pending)
         last_loaded = 0
         idle_since = time.time()
         deadline = time.time() + EXPORT_TIMEOUT_SEC
         while pending and time.time() < deadline:
-            if self._export_is_cancelled():
+            if self._stale(st):
                 break
+            self._beat()
             ready = True
             for entry in list(pending):
                 iv = entry[0]
@@ -527,7 +855,9 @@ class GiftStatsPlugin(BasePlugin):
                                             opts.inSampleSize *= 2
                                     bmp2 = BitmapFactory.decodeFile(path.toString(), opts)
                                     if bmp2 is not None:
-                                        run_on_ui_thread(lambda b=bmp2, v=iv: v.setImageBitmap(b))
+                                        # дерево собрано в этом же потоке и не в окне: ставим битмап напрямую,
+                                        # ImageLoader сам выставляет битмапы из своих потоков
+                                        iv.setImageBitmap(bmp2)
                             except Exception:
                                 pass
                             pending.remove(entry)
@@ -541,9 +871,9 @@ class GiftStatsPlugin(BasePlugin):
             if ready or (loaded > 0 and now - idle_since >= EXPORT_IDLE_SEC):
                 break
             time.sleep(0.1)
-        if not self._export_is_cancelled():
+        if not self._stale(st):
             try:
-                self._export_finish()
+                self._export_finish(st)
             except Exception as e:
                 self.log(f"GiftStats export finish call error: {e}")
 
@@ -596,35 +926,52 @@ class GiftStatsPlugin(BasePlugin):
                 except Exception:
                     pass
 
-    def _export_save(self, ui, root, w_px, h_px, pending=None, target_id=None):
-        bmp = ui["Bitmap"].createBitmap(w_px, h_px, ui["Bitmap"].Config.ARGB_8888)
-        canvas = ui["Canvas"](bmp)
+    def _export_draw(self, ui, root, canvas, pending=None):
+        """Рисование дерева в готовый Canvas: только UI-поток (draw отрисовываемых View)."""
         root.draw(canvas)
         if pending:
             self._export_draw_pending(ui, root, pending, canvas)
-        path = None
-        try:
-            import os
-            name = f"{int(target_id) if target_id else 'unknown'}_stats.png"
-            path = os.path.join(get_cache_dir(), name)
-            fos = ui["FOS"](path)
-            try:
-                bmp.compress(ui["Bitmap"].CompressFormat.PNG, 100, fos)
-            finally:
-                fos.close()
-        except Exception:
-            path = None
-        try:
-            bmp.recycle()
-        except Exception:
-            pass
-        return path
 
-    def _export_render_top(self, account, donor_list):
-        ctx = self._export_context()
-        if ctx is None:
-            return None
-        ui = self._export_ui(ctx)
+    def _export_encode(self, st, job):
+        """PNG-кодирование и запись файла — в потоке действия, чтобы не держать UI-поток."""
+        try:
+            if self._stale(st):
+                return
+            ui = job["ui"]
+            bmp = job.get("bmp")
+            started = time.time()
+            self._beat()
+            path = None
+            try:
+                name = f"{int(job.get('target_id')) if job.get('target_id') else 'unknown'}_stats.png"
+                path = os.path.join(get_cache_dir(), name)
+                fos = ui["FOS"](path)
+                try:
+                    bmp.compress(ui["Bitmap"].CompressFormat.PNG, 100, fos)
+                finally:
+                    fos.close()
+            except Exception as e:
+                self.log(f"GiftStats export save error: {e}")
+                path = None
+            finally:
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+                job["bmp"] = None
+                job["canvas"] = None
+            self._beat()
+            self.log(f"GiftStats export encoded in {int((time.time() - started) * 1000)} ms: {path}")
+            if path is None:
+                self._export_error(st, "Не удалось отрисовать картинку")
+                return
+            job["path"] = path
+            self._export_send(st, job)
+        except Exception as e:
+            self.log(f"GiftStats export encode error: {e}")
+            self._export_error(st, f"Ошибка экспорта: {e}")
+
+    def _export_render_top(self, ui, account, donor_list):
         root = ui["LL"](ui["ctx"])
         root.setOrientation(ui["LL"].VERTICAL)
         root.setBackgroundColor(self._xcolor(ui, ui["K_APP_BG"]))
@@ -684,6 +1031,7 @@ class GiftStatsPlugin(BasePlugin):
             top_card.setBackgroundColor(self._xcolor(ui, ui["K_BG"]))
 
         for i, donor in enumerate(donor_list):
+            self._beat()
             if i > 0:
                 top_card.addView(self._xdivider(ui, 0))
             row = ui["LL"](ui["ctx"])
@@ -733,11 +1081,7 @@ class GiftStatsPlugin(BasePlugin):
 
         return ui, root, pending
 
-    def _export_render_details(self, account, donor):
-        ctx = self._export_context()
-        if ctx is None:
-            return None
-        ui = self._export_ui(ctx)
+    def _export_render_details(self, ui, account, donor):
         root = ui["LL"](ui["ctx"])
         root.setOrientation(ui["LL"].VERTICAL)
         root.setBackgroundColor(self._xcolor(ui, ui["K_APP_BG"]))
@@ -777,6 +1121,7 @@ class GiftStatsPlugin(BasePlugin):
             list_card.setBackgroundColor(self._xcolor(ui, ui["K_BG"]))
         shown = 0
         for title, entry in gift_items:
+            self._beat()
             if shown > 0:
                 list_card.addView(self._xdivider(ui, 0))
             cnt = entry[0]
@@ -829,44 +1174,76 @@ class GiftStatsPlugin(BasePlugin):
         ic.setLayoutParams(lp)
         return ic
 
-    def _export_render(self, account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id=None, reply_obj=None, target_id=None):
-        def build():
+    def _export_render(self, st, account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id=None, reply_obj=None, target_id=None):
+        def prepare():
+            """Поток действия: подготовить картинки и контекст, собрать дерево и разложить его."""
             try:
-                if is_donor or donor is not None:
-                    res = self._export_render_details(account, donor)
-                else:
-                    res = self._export_render_top(account, donor_list)
-                if not res:
-                    self._export_error("Не удалось отрисовать картинку")
+                if self._stale(st):
                     return
-                self._xjob = {"ui": res[0], "root": res[1], "pending": res[2], "peer": peer, "account": account, "reply_id": reply_id, "reply_obj": reply_obj, "target_id": target_id}
-                run_on_queue(lambda: self._export_wait_images(self._xjob.get("pending", [])))
-            except Exception as e:
-                self.log(f"GiftStats export build error: {e}")
-                self._export_error(f"Ошибка экспорта: {e}")
-
-        def preload():
-            try:
-                ctx = self._export_context()
-                ui = self._export_ui(ctx) if ctx is not None else None
                 preload_list = [donor] if (is_donor or donor is not None) else donor_list
-                ivs = self._export_preload_avatars(ui, account, preload_list)
+                ivs = self._export_preload_avatars(account, preload_list)
                 if ivs:
-                    run_on_queue(lambda: self._export_preload_wait(ivs, build))
+                    self._export_preload_wait(st, ivs, lambda: self._ui(st, capture))
                 else:
-                    run_on_ui_thread(build)
+                    self._ui(st, capture)
             except Exception as e:
                 self.log(f"GiftStats preload error: {e}")
-                run_on_ui_thread(build)
+                self._ui(st, capture)
 
-        run_on_ui_thread(preload)
+        def capture():
+            """UI-поток: только взять activity и кэш классов — тяжёлого здесь нет."""
+            try:
+                if self._stale(st):
+                    return
+                ctx = self._export_context()
+                if ctx is None:
+                    self._export_error(st, "Не удалось отрисовать картинку")
+                    return
+                xui = self._export_ui(ctx)
+                self._work(st, lambda: build(xui))
+            except Exception as e:
+                self.log(f"GiftStats export context error: {e}")
+                self._export_error(st, f"Ошибка экспорта: {e}")
 
-    def _export_preload_avatars(self, ui, account, donor_list):
-        if ui is None:
-            return []
+        def build(xui):
+            """Поток действия: конструкция View, measure/layout, выделение bitmap (дерево не в окне)."""
+            try:
+                if self._stale(st):
+                    return
+                if is_donor or donor is not None:
+                    res = self._export_render_details(xui, account, donor)
+                else:
+                    res = self._export_render_top(xui, account, donor_list)
+                if not res:
+                    self._export_error(st, "Не удалось отрисовать картинку")
+                    return
+                xui, root, pending = res[0], res[1], res[2]
+                started = time.time()
+                w = self._xdp(xui, EXPORT_WIDTH_DP)
+                self._beat()
+                root.measure(xui["MS"].makeMeasureSpec(w, xui["MS"].EXACTLY),
+                             xui["MS"].makeMeasureSpec(0, xui["MS"].UNSPECIFIED))
+                h = root.getMeasuredHeight()
+                root.layout(0, 0, w, h)
+                bmp = xui["Bitmap"].createBitmap(w, h, xui["Bitmap"].Config.ARGB_8888)
+                self.log(f"GiftStats export built and laid out in {int((time.time() - started) * 1000)} ms, {w}x{h} px")
+                self._xjob = {
+                    "ui": xui, "root": root, "pending": pending, "bmp": bmp,
+                    "canvas": xui["Canvas"](bmp), "peer": peer, "account": account,
+                    "reply_id": reply_id, "reply_obj": reply_obj, "target_id": target_id,
+                }
+                self._work(st, lambda: self._export_wait_images(st, pending))
+            except Exception as e:
+                self.log(f"GiftStats export build error: {e}")
+                self._export_error(st, f"Ошибка экспорта: {e}")
+
+        self._work(st, prepare)
+
+    def _export_preload_avatars(self, account, donor_list):
         fl = FileLoader.getInstance(int(account))
         jobs = []
         for donor in donor_list:
+            self._beat()
             obj = donor.get("obj")
             if obj is None:
                 continue
@@ -883,10 +1260,13 @@ class GiftStatsPlugin(BasePlugin):
                 self.log(f"GiftStats preload avatar err: {e}")
         return jobs
 
-    def _export_preload_wait(self, jobs, build):
+    def _export_preload_wait(self, st, jobs, then):
         try:
+            self._beat()
             deadline = time.time() + PRELOAD_TIMEOUT_SEC
             while jobs and time.time() < deadline:
+                if self._stale(st):
+                    return
                 for f in list(jobs):
                     try:
                         if f.exists():
@@ -898,41 +1278,56 @@ class GiftStatsPlugin(BasePlugin):
                 time.sleep(0.3)
         except Exception as e:
             self.log(f"GiftStats preload wait error: {e}")
-        run_on_ui_thread(build)
+        then()
 
-    def _export_finish(self):
+    def _export_finish(self, st):
         def ui():
             try:
-                if self._export_is_cancelled():
+                if self._stale(st):
                     self._export_dismiss_loading()
                     return
                 job = getattr(self, "_xjob", None)
                 if not job:
                     self.log("GiftStats export finish: no job")
+                    self._export_error(st, "Не удалось отрисовать картинку")
                     return
-                ui = job["ui"]
-                root = job["root"]
-                w = self._xdp(ui, EXPORT_WIDTH_DP)
-                root.measure(ui["MS"].makeMeasureSpec(w, ui["MS"].EXACTLY),
-                             ui["MS"].makeMeasureSpec(0, ui["MS"].UNSPECIFIED))
-                root.layout(0, 0, w, root.getMeasuredHeight())
-                job["path"] = self._export_save(ui, root, w, root.getMeasuredHeight(), job.get("pending", []), job.get("target_id"))
+                if job.get("bmp") is None or job.get("canvas") is None:
+                    self.log("GiftStats export finish: no bitmap")
+                    self._export_error(st, "Не удалось отрисовать картинку")
+                    return
+                started = time.time()
+                self._beat()
+                self._export_draw(job["ui"], job["root"], job["canvas"], job.get("pending", []))
+                self.log(f"GiftStats export drawn in {int((time.time() - started) * 1000)} ms")
                 self._export_dismiss_loading()
-                run_on_queue(lambda: self._export_send(job))
+                self._work(st, lambda: self._export_encode(st, job))
             except Exception as e:
                 self.log(f"GiftStats export finish error: {e}")
-                self._export_error(f"Ошибка экспорта: {e}")
+                self._export_error(st, f"Ошибка экспорта: {e}")
 
-        run_on_ui_thread(ui)
+        self._ui(st, ui)
 
-    def _export_send(self, job):
+    def _export_send(self, st, job):
         try:
-            if self._export_is_cancelled():
+            # картинка уже готова, поэтому результат не выбрасываем: уважаем только отмену
+            # пользователем и ситуацию, когда уже работает другое действие
+            if getattr(st, "user_cancelled", False):
+                self.log("GiftStats export send skipped (отменено пользователем)")
                 return
+            cur = getattr(self, "_act", None)
+            if cur is not None and cur is not st:
+                self.log("GiftStats export send skipped (активно другое действие)")
+                return
+            if job.get("sent"):
+                self.log("GiftStats export send skipped (уже отправлено)")
+                return
+            if st.abandoned:
+                self.log("GiftStats export: отправляю готовый результат, хотя сторож снял действие")
             path = job.get("path")
             if not path:
-                self._export_error("Не удалось отрисовать картинку")
+                self._export_error(st, "Не удалось отрисовать картинку")
                 return
+            job["sent"] = True
             self.log(f"GiftStats export sending to peer={job['peer']} reply_id={job.get('reply_id')} reply_obj={type(job.get('reply_obj')).__name__ if job.get('reply_obj') is not None else None}")
             kwargs = {}
             ro = job.get("reply_obj")
@@ -952,13 +1347,13 @@ class GiftStatsPlugin(BasePlugin):
             else:
                 send_document(job["peer"], path, account=job["account"], **kwargs)
             self.log(f"GiftStats export sent to peer={job['peer']} as={'photo' if send_as_photo else 'file'}: {path}")
+            self._finish(st)
         except Exception as e:
             self.log(f"GiftStats export send error: {e}")
-            self._export_error(f"Ошибка отправки: {e}")
-        finally:
-            self._xexport_running = False
+            self._export_error(st, f"Ошибка отправки: {e}")
 
-    def _on_profile_click(self, context):
+    def _parse_profile_target(self, context):
+        """(account, user_id) из контекста меню профиля."""
         account = context.get("account") if context else None
         user_id = None
         if context:
@@ -980,12 +1375,38 @@ class GiftStatsPlugin(BasePlugin):
                     user_id = getattr(user, "id", None)
             if not user_id:
                 user_id = context.get("userId")
+        return account, user_id
+
+    def _on_profile_click(self, context):
+        """Основной пункт профиля: экран статистики."""
+        account, user_id = self._parse_profile_target(context)
         if not user_id:
             self._show_message("Gift Stats", "Не удалось определить пользователя из контекста")
             return
         self.collect_and_show(int(account), int(user_id))
 
-    def _on_message_click(self, context):
+    def _on_profile_send_here(self, context):
+        """Пункт профиля: отправить картинку в чат с этим пользователем."""
+        account, user_id = self._parse_profile_target(context)
+        if not user_id:
+            self._show_message("Gift Stats", "Не удалось определить пользователя из контекста")
+            return
+        self._run_export(int(account), int(user_id), None, str(int(user_id)), None, False)
+
+    def _on_profile_send_pick(self, context):
+        """Пункт профиля: выбрать получателя нативным экраном."""
+        account, user_id = self._parse_profile_target(context)
+        if not user_id:
+            self._show_message("Gift Stats", "Не удалось определить пользователя из контекста")
+            return
+        self._pick_chat({
+            "account": int(account), "peer": int(user_id), "reply": None,
+            "target_arg": str(int(user_id)), "donor_arg": None, "is_donor": False,
+            "reply_id": None, "reply_obj": None,
+        })
+
+    def _parse_message_target(self, context):
+        """(account, peer, user_id, reply_id, reply_obj) из меню сообщения."""
         account = context.get("account") if context else None
         user_id = None
         dialog_id = None
@@ -1018,7 +1439,7 @@ class GiftStatsPlugin(BasePlugin):
                 user_id = None
         if not user_id or user_id <= 0:
             self._show_message("Gift Stats", "Не удалось определить автора сообщения")
-            return
+            return None
         peer = dialog_id
         if not peer and msg is not None:
             try:
@@ -1027,15 +1448,36 @@ class GiftStatsPlugin(BasePlugin):
                 peer = None
         if not peer:
             self._show_message("Gift Stats", "Не удалось определить чат для отправки")
-            return
+            return None
         reply_obj = msg
         try:
             rid = int(msg.getId()) if msg is not None else None
         except Exception:
             rid = None
+        return account, peer, user_id, rid, reply_obj
+
+    def _on_message_click(self, context):
+        """Основной пункт сообщения: отправка в текущий чат (с реплаем на сообщение)."""
+        target = self._parse_message_target(context)
+        if target is None:
+            return
+        account, peer, user_id, rid, reply_obj = target
         self._run_export(int(account), int(peer), None, str(user_id), None, False, rid, reply_obj)
 
-    def _on_chat_click(self, context):
+    def _on_message_send_pick(self, context):
+        """Пункт сообщения: выбрать получателя (без реплая)."""
+        target = self._parse_message_target(context)
+        if target is None:
+            return
+        account, peer, user_id, _rid, _reply = target
+        self._pick_chat({
+            "account": int(account), "peer": int(peer), "reply": None,
+            "target_arg": str(user_id), "donor_arg": None, "is_donor": False,
+            "reply_id": None, "reply_obj": None,
+        })
+
+    def _parse_chat_target(self, context):
+        """(account, dialog_id, target) из меню чата."""
         account = context.get("account") if context else None
         dialog_id = None
         if context:
@@ -1047,52 +1489,79 @@ class GiftStatsPlugin(BasePlugin):
                 dialog_id = None
         if dialog_id is None:
             self._show_message("Gift Stats", "Не удалось определить чат из контекста")
-            return
+            return None
         target = abs(int(dialog_id))
         if target <= 0:
             self._show_message("Gift Stats", "Подарки можно собирать только у пользователей")
+            return None
+        return account, dialog_id, target
+
+    def _on_chat_click(self, context):
+        """Основной пункт чата: отправка в текущий чат."""
+        t = self._parse_chat_target(context)
+        if t is None:
             return
+        account, dialog_id, target = t
         self._run_export(int(account), int(dialog_id), None, str(target), None, False)
 
+    def _on_chat_send_pick(self, context):
+        """Пункт чата: выбрать получателя нативным экраном."""
+        t = self._parse_chat_target(context)
+        if t is None:
+            return
+        account, dialog_id, target = t
+        self._pick_chat({
+            "account": int(account), "peer": int(dialog_id), "reply": None,
+            "target_arg": str(target), "donor_arg": None, "is_donor": False,
+            "reply_id": None, "reply_obj": None,
+        })
+
     def collect_and_show(self, account, user_id):
-        self._x_cancel = False
-        loading = self._show_loading()
-        self._collect(
+        st = self._start_action("collect")
+        if st is None:
+            return
+        if self.get_setting("show_loading", True):
+            self._ui(st, self._show_loading)
+        self._work(st, lambda: self._collect(
+            st,
             account,
             user_id,
-            on_done=lambda gifts, names: self._on_collected(account, gifts, names, loading),
-            on_error=lambda err: self._on_collect_error(err, loading),
-            progress=loading,
-        )
+            on_done=lambda gifts, names: self._on_collected(st, account, gifts, names),
+            on_error=lambda err: self._on_collect_error(st, err),
+            progress=True,
+        ))
 
-    def _on_collected(self, account, gifts, names, loading):
-        if self._export_is_cancelled():
+    def _on_collected(self, st, account, gifts, names):
+        if self._stale(st):
             return
         donors, anonymous, nft = self._build_stats(gifts, names, account)
         self._disambiguate_names(donors)
+        data = self._donor_view_data(donors, anonymous, nft)
 
         def ui():
-            if loading is not None:
-                try:
-                    loading.dismiss()
-                except Exception:
-                    pass
-            self._show_donors(donors, anonymous, nft, account)
-        run_on_ui_thread(ui)
+            if self._stale(st):
+                return
+            self._export_dismiss_loading()
+            try:
+                self._show_donors(data, account)
+            except Exception as e:
+                self.log(f"GiftStats show donors error: {e}")
+                BulletinHelper.show_error(f"Ошибка отображения: {e}")
+            self._finish(st)
 
-    def _on_collect_error(self, err, loading):
-        if self._export_is_cancelled():
+        self._ui(st, ui)
+
+    def _on_collect_error(self, st, err):
+        if self._stale(st):
             return
         self.log(f"GiftStats error: {err}")
 
         def ui():
-            if loading is not None:
-                try:
-                    loading.dismiss()
-                except Exception:
-                    pass
+            self._export_dismiss_loading()
             self._show_message("Gift Stats", f"Ошибка: {err}")
-        run_on_ui_thread(ui)
+            self._finish(st)
+
+        self._ui(st, ui)
 
     def _show_loading(self):
         if not self.get_setting("show_loading", True):
@@ -1122,8 +1591,9 @@ class GiftStatsPlugin(BasePlugin):
         except Exception:
             return None
 
-    def _collect(self, account, user_id, on_done, on_error, progress=None):
-        self._resolve_peer(account, user_id, lambda peer: self._fetch_gifts(account, peer, on_done, on_error, progress))
+    def _collect(self, st, account, user_id, on_done, on_error, progress=None):
+        """progress=True — обновлять текст диалога загрузки по страницам подарков."""
+        self._resolve_peer(st, account, user_id, lambda peer: self._fetch_gifts(st, account, peer, on_done, on_error, progress))
 
     def _list_items(self, java_list):
         items = []
@@ -1137,7 +1607,7 @@ class GiftStatsPlugin(BasePlugin):
             pass
         return items
 
-    def _resolve_peer(self, account, user_id, on_result):
+    def _resolve_peer(self, st, account, user_id, on_result):
         mc = MessagesController.getInstance(account)
         user = None
         try:
@@ -1190,12 +1660,12 @@ class GiftStatsPlugin(BasePlugin):
                 else:
                     on_result(None)
 
-            send_request(req, cb, account=account)
+            self._ask(st, req, cb, account=account)
         except Exception as e:
             self.log(f"GiftStats resolve send error: {e}")
             on_result(None)
 
-    def _fetch_gifts(self, account, peer, on_done, on_error, progress=None):
+    def _fetch_gifts(self, st, account, peer, on_done, on_error, progress=None):
         if peer is None:
             on_error("Не удалось получить peer пользователя (пользователь не загружен)")
             return
@@ -1203,7 +1673,7 @@ class GiftStatsPlugin(BasePlugin):
         name_map = {}
 
         def fetch(offset):
-            if self._export_is_cancelled():
+            if self._stale(st):
                 return
             req = TL_stars.getSavedStarGifts()
             req.limit = PAGE_LIMIT
@@ -1212,7 +1682,7 @@ class GiftStatsPlugin(BasePlugin):
 
             def cb(response, error):
                 try:
-                    if self._export_is_cancelled():
+                    if self._stale(st):
                         return
                     if error is not None:
                         self.log(f"GiftStats request error: {getattr(error, 'text', error)}")
@@ -1236,21 +1706,14 @@ class GiftStatsPlugin(BasePlugin):
                         cid = getattr(c, "id", None)
                         if cid is not None:
                             name_map[-cid] = c
-                    if progress is not None:
+                    if progress:
                         try:
                             total = getattr(response, "count", 0)
                             if total:
                                 msg = f"Загружаю подарки: {len(all_gifts)} / {total}"
                             else:
                                 msg = f"Загружаю подарки: {len(all_gifts)}"
-
-                            def upd(msg=msg):
-                                try:
-                                    progress.set_message(msg)
-                                except Exception:
-                                    pass
-
-                            run_on_ui_thread(upd)
+                            self._ui(st, lambda m=msg: self._export_progress(m))
                         except Exception:
                             pass
                     if rnext:
@@ -1262,7 +1725,7 @@ class GiftStatsPlugin(BasePlugin):
                     on_error(f"Внутренняя ошибка: {e}")
 
             try:
-                send_request(req, cb, account=account)
+                self._ask(st, req, cb, account=account)
             except Exception as e:
                 on_error(f"Ошибка отправки запроса: {e}")
 
@@ -1273,7 +1736,9 @@ class GiftStatsPlugin(BasePlugin):
         anonymous = None
         nft = None
 
-        for g in gifts:
+        for i, g in enumerate(gifts):
+            if (i & 255) == 0:
+                self._beat()
             is_anon = bool(getattr(g, "name_hidden", False))
             from_id = getattr(g, "from_id", None)
             gift_obj = getattr(g, "gift", None)
@@ -1484,7 +1949,8 @@ class GiftStatsPlugin(BasePlugin):
             pass
         return None
 
-    def _show_donors(self, donors, anonymous, nft, account):
+    def _donor_view_data(self, donors, anonymous, nft):
+        """Данные экрана топа (сортировка/лимит/итоги) — считаются в потоке действия, не в UI."""
         named = sorted(donors.values(), key=lambda d: -d["stars"])
         limit = self._top_limit()
         if limit and len(named) > limit:
@@ -1495,8 +1961,7 @@ class GiftStatsPlugin(BasePlugin):
         if anonymous is not None:
             donor_list.append(anonymous)
         if not donor_list:
-            self._show_message("Gift Stats", "Подарков не найдено")
-            return
+            return None
         total = sum(d["count"] for d in donor_list)
         total_stars = sum(d["stars"] for d in donor_list)
         unique_docs = []
@@ -1508,6 +1973,14 @@ class GiftStatsPlugin(BasePlugin):
                     continue
                 seen.add(did)
                 unique_docs.append(doc)
+        return donor_list, total, total_stars, unique_docs
+
+    def _show_donors(self, data, account):
+        """UI-часть: только показать уже подготовленный экран топа."""
+        if data is None:
+            self._show_message("Gift Stats", "Подарков не найдено")
+            return
+        donor_list, total, total_stars, unique_docs = data
         try:
             frag = get_last_fragment()
             if frag is None:
@@ -1567,6 +2040,9 @@ class _GiftStatsFragment(Base):
         self._visible = True
         self._title_view = None
         self._preloaded_aeds = []
+        self._density = None
+        self._colors = {}
+        self._built_root = None
 
     def setup_top(self, account, plugin, donor_list, total, unique_docs=None, total_stars=0):
         self._account = account
@@ -1626,6 +2102,16 @@ class _GiftStatsFragment(Base):
         return self
 
     def dp(self, v):
+        """dp → px. Плотность считается один раз: это вызывается десятки раз на строку."""
+        d = self._density
+        if d is None:
+            try:
+                d = float(self._ctx.getResources().getDisplayMetrics().density)
+            except Exception:
+                d = -1.0
+            self._density = d
+        if d > 0:
+            return int(float(v) * d)
         try:
             return int(self.TypedValue.applyDimension(
                 self.TypedValue.COMPLEX_UNIT_DIP, float(v), self._ctx.getResources().getDisplayMetrics()))
@@ -1636,13 +2122,19 @@ class _GiftStatsFragment(Base):
         return self.ColorClass.parseColor(value)
 
     def theme(self, key):
+        """Цвет темы с кэшем на время жизни фрагмента (Theme.getColor — JNI на каждый вызов)."""
+        cached = self._colors.get(key)
+        if cached is not None:
+            return cached
         try:
-            return int(self.Theme.getColor(key))
+            value = int(self.Theme.getColor(key))
         except Exception:
             try:
-                return self.color(key)
+                value = self.color(key)
             except Exception:
-                return self.color("#FFFFFF")
+                value = self.color("#FFFFFF")
+        self._colors[key] = value
+        return value
 
     def text(self, txt, size, colr, bold=False):
         tv = self.TextView(self._ctx)
@@ -1723,6 +2215,7 @@ class _GiftStatsFragment(Base):
         self._title_sad = None
         self._title_docs = []
         self._title_view = None
+        self._built_root = None
         try:
             if self.fragmentView is not None:
                 parent = self.fragmentView.getParent()
@@ -1741,36 +2234,57 @@ class _GiftStatsFragment(Base):
         if self._plugin is not None:
             self._plugin.log(f"GiftStats frag VIEW mode={self._mode}")
         self._ui()
-        ab = self.getActionBar()
-        if ab is not None:
+        self._setup_action_bar()
+        # возврат из подробностей: TG пересоздаёт view, но строки уже собраны — переиспользуем их
+        built = self._built_root
+        if built is not None:
             try:
-                ab.setBackButtonImage(int(self.R_drawable.ic_ab_back))
-            except Exception:
-                pass
-            try:
-                ab.setAllowOverlayTitle(True)
-            except Exception:
-                pass
-            if self._mode == "details":
-                ab.setTitle(str(self._donor["name"]))
-            else:
-                self._apply_title(ab)
-            try:
-                mc = _ABMenuClick.new_instance()
-                mc._frag = self
-                ab.setActionBarMenuOnItemClick(mc.java)
+                parent = built.getParent()
+                if parent is not None:
+                    parent.removeView(built)
+                self._cached_view = built
+                self.fragmentView = built
+                if self._plugin is not None:
+                    self._plugin.log("GiftStats frag view reused (без пересборки строк)")
+                return built
             except Exception as e:
                 if self._plugin is not None:
-                    self._plugin.log(f"GiftStats menu click error: {e}")
+                    self._plugin.log(f"GiftStats reuse view error: {e}")
+                self._built_root = None
         fl = self.FrameLayout(context)
         fl.setBackgroundColor(self.theme(self.K_APP_BG))
         if self._mode == "details":
             self._build_details(fl)
         else:
             self._build_top(fl)
+        self._built_root = fl
         self._cached_view = fl
         self.fragmentView = fl
         return fl
+
+    def _setup_action_bar(self):
+        ab = self.getActionBar()
+        if ab is None:
+            return
+        try:
+            ab.setBackButtonImage(int(self.R_drawable.ic_ab_back))
+        except Exception:
+            pass
+        try:
+            ab.setAllowOverlayTitle(True)
+        except Exception:
+            pass
+        if self._mode == "details":
+            ab.setTitle(str(self._donor["name"]))
+        else:
+            self._apply_title(ab)
+        try:
+            mc = _ABMenuClick.new_instance()
+            mc._frag = self
+            ab.setActionBarMenuOnItemClick(mc.java)
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats menu click error: {e}")
 
     def _apply_title(self, ab):
         title_text = f"Топ дарителей · {self._total}"
@@ -1896,17 +2410,15 @@ class _GiftStatsFragment(Base):
             if self._plugin is not None:
                 self._plugin.log(f"GiftStats summary card error: {e}")
 
-        for i, donor in enumerate(self._donor_list):
-            if i > 0:
-                list_box.addView(self._divider(0))
-            list_box.addView(self._donor_row(donor, self._total))
-
         scroll = self.ScrollView(self._ctx)
         scroll.setVerticalScrollBarEnabled(True)
         scroll.addView(list_box, self.FrameLayout.LayoutParams(
             self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
         fl.addView(scroll, self.FrameLayout.LayoutParams(
             self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+
+        # строки строятся вне UI-потока: их много, и каждый JNI-вызов на строку вешает отрисовку
+        self._fill_rows(list_box, [(d, self._total) for d in self._donor_list], "top")
 
     def _summary_card(self):
         total_stars = sum((d.get("stars") or 0) for d in self._donor_list)
@@ -1925,19 +2437,11 @@ class _GiftStatsFragment(Base):
         row1.addView(lbl)
         st_tv = self.text(str(total_stars), 14, self.theme(self.K_TEXT_DIM))
         row1.addView(st_tv)
-        star_icon = self.ImageView(self._ctx)
-        try:
-            star_icon.setImageResource(int(self.R_drawable.star_small_inner))
-        except Exception:
-            pass
-        star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
-        star_lp.setMargins(self.dp(4), 0, 0, 0)
-        star_icon.setLayoutParams(star_lp)
-        row1.addView(star_icon)
+        row1.addView(*self._star_icon(14))
         card.addView(row1)
         return card
 
-    def _donor_row(self, donor, total):
+    def _donor_row(self, donor, total, cycles=None):
         row = self.LinearLayout(self._ctx)
         row.setOrientation(self.LinearLayout.HORIZONTAL)
         row.setGravity(self.Gravity.CENTER_VERTICAL)
@@ -1999,48 +2503,29 @@ class _GiftStatsFragment(Base):
         col.addView(sub)
         row.addView(col)
 
-        stars = self.LinearLayout(self._ctx)
-        stars.setOrientation(self.LinearLayout.HORIZONTAL)
-        stars.setGravity(self.Gravity.CENTER_VERTICAL)
+        # звёзды добавляем прямо в строку: вложенный контейнер давал лишние View и JNI-вызовы на строку
         if donor.get("nft"):
             usd_txt = self._plugin._fmt_usd(donor.get("usd") or 0)
             if usd_txt:
-                sc = self.text(usd_txt, 15, self.theme(self.K_TEXT))
-                stars.addView(sc)
+                row.addView(self.text(usd_txt, 15, self.theme(self.K_TEXT)))
             else:
-                sc = self.text("0", 15, self.theme(self.K_TEXT))
-                stars.addView(sc)
-                icon = self.ImageView(self._ctx)
-                try:
-                    icon.setImageResource(int(self.R_drawable.star_small_inner))
-                except Exception:
-                    pass
-                star_lp = self.LinearLayout.LayoutParams(self.dp(16), self.dp(16))
-                star_lp.setMargins(self.dp(4), 0, 0, 0)
-                icon.setLayoutParams(star_lp)
-                stars.addView(icon)
+                row.addView(self.text("0", 15, self.theme(self.K_TEXT)))
+                row.addView(*self._star_icon())
         else:
-            sc = self.text(str(donor["stars"]), 15, self.theme(self.K_TEXT))
-            stars.addView(sc)
-            icon = self.ImageView(self._ctx)
-            try:
-                icon.setImageResource(int(self.R_drawable.star_small_inner))
-            except Exception:
-                pass
-            star_lp = self.LinearLayout.LayoutParams(self.dp(16), self.dp(16))
-            star_lp.setMargins(self.dp(4), 0, 0, 0)
-            icon.setLayoutParams(star_lp)
-            stars.addView(icon)
-        row.addView(stars)
+            row.addView(self.text(str(donor["stars"]), 15, self.theme(self.K_TEXT)))
+            row.addView(*self._star_icon())
 
         docs = donor.get("docs") or []
         if docs:
             icon = self._animated_icon(docs[0], "")
             icon.setPadding(self.dp(8), 0, 0, 0)
-            icon.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(24), self.dp(24)))
-            row.addView(icon)
+            row.addView(icon, self.LinearLayout.LayoutParams(self.dp(24), self.dp(24)))
             if len(docs) > 1:
-                self._cycle_icon(icon, docs)
+                # анимацию иконки запускаем после добавления строки в дерево (см. _post_rows)
+                if cycles is None:
+                    self._cycle_icon(icon, docs)
+                else:
+                    cycles.append((icon, docs))
 
         arrow = self.text("›", 20, self.theme(self.K_TEXT_DIM), True)
         arrow.setPadding(self.dp(8), 0, 0, 0)
@@ -2048,6 +2533,17 @@ class _GiftStatsFragment(Base):
 
         row.setOnClickListener(OnClickListener(lambda v: self._open_details(donor)))
         return row
+
+    def _star_icon(self, size_dp=16):
+        """Звёздочка строки: (view, layoutParams) — чтобы добавлять одним вызовом addView."""
+        icon = self.ImageView(self._ctx)
+        try:
+            icon.setImageResource(int(self.R_drawable.star_small_inner))
+        except Exception:
+            pass
+        lp = self.LinearLayout.LayoutParams(self.dp(size_dp), self.dp(size_dp))
+        lp.setMargins(self.dp(4), 0, 0, 0)
+        return icon, lp
 
     def _make_avatar(self, donor):
         ad = self.AvatarDrawable()
@@ -2085,29 +2581,8 @@ class _GiftStatsFragment(Base):
         total_row.addView(lbl)
         st_tv = self.text(str(self._donor["stars"]), 14, self.theme(self.K_TEXT_DIM))
         total_row.addView(st_tv)
-        star_icon = self.ImageView(self._ctx)
-        try:
-            star_icon.setImageResource(int(self.R_drawable.star_small_inner))
-        except Exception:
-            pass
-        star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
-        star_lp.setMargins(self.dp(4), 0, 0, 0)
-        star_icon.setLayoutParams(star_lp)
-        total_row.addView(star_icon)
+        total_row.addView(*self._star_icon(14))
         list_box.addView(total_row)
-
-        gift_items = sorted(self._donor["gifts"].items(), key=lambda kv: -kv[1][0])
-        for i, (title, entry) in enumerate(gift_items):
-            if i > 0:
-                list_box.addView(self._divider(0))
-            cnt = entry[0]
-            st = entry[1]
-            emoji = entry[2] if len(entry) > 2 else ""
-            doc = entry[3] if len(entry) > 3 else None
-            t = entry[4] if len(entry) > 4 else title
-            if t and t == emoji:
-                t = ""
-            list_box.addView(self._gift_row(t, cnt, st, emoji, doc, entry[5] if len(entry) > 5 else 0))
 
         scroll = self.ScrollView(self._ctx)
         scroll.setVerticalScrollBarEnabled(True)
@@ -2115,6 +2590,88 @@ class _GiftStatsFragment(Base):
             self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
         fl.addView(scroll, self.FrameLayout.LayoutParams(
             self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+
+        gift_items = sorted(self._donor["gifts"].items(), key=lambda kv: -kv[1][0])
+        self._fill_rows(list_box, [(entry, title) for title, entry in gift_items], "gift")
+
+    def _row_view(self, kind, payload, cycles):
+        """Строка списка; собирается в том же (не UI) потоке, что и весь список."""
+        if kind == "top":
+            donor, total = payload
+            return self._donor_row(donor, total, cycles)
+        entry, title = payload
+        cnt = entry[0]
+        st = entry[1]
+        emoji = entry[2] if len(entry) > 2 else ""
+        doc = entry[3] if len(entry) > 3 else None
+        t = entry[4] if len(entry) > 4 else title
+        if t and t == emoji:
+            t = ""
+        return self._gift_row(t, cnt, st, emoji, doc, entry[5] if len(entry) > 5 else 0)
+
+    def _fill_rows(self, list_box, items, kind):
+        """Строит строки вне UI-потока и добавляет их порциями в UI-потоке.
+
+        Строки — не привязанные к окну View, поэтому их сборка не обязана идти в UI-потоке;
+        на UI-поток остаются короткие addView порциями (по ROW_CHUNK штук).
+        """
+        if not items:
+            return
+        started = time.time()
+        # партий должно быть немного: каждый addView-пост заставляет пересчитывать раскладку
+        # всего списка, поэтому для длинных списков партии крупнее (но не мельче ROW_BATCH)
+        batch = max(ROW_BATCH, len(items) // 8)
+
+        def worker():
+            views = []
+            cycles = []
+            total_rows = 0
+            batches = 0
+            try:
+                first = True
+                for payload in items:
+                    if not self._alive:
+                        return
+                    if not first:
+                        views.append(self._divider(0))
+                    first = False
+                    views.append(self._row_view(kind, payload, cycles))
+                    total_rows += 1
+                    # первая порция уходит сразу (экран не пустует), дальше — крупными партиями:
+                    # каждый addView-пост заставляет пересчитывать раскладку всего списка, поэтому их мало
+                    if total_rows == ROW_FIRST or len(views) >= batch:
+                        batches += 1
+                        self._post_rows(list_box, views, cycles, started, last=False)
+                        views, cycles = [], []
+                if views:
+                    batches += 1
+                    self._post_rows(list_box, views, cycles, started, last=True)
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats frag rows built={total_rows} batches={batches} "
+                                     f"in {int((time.time() - started) * 1000)} ms (off UI)")
+            except Exception as e:
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats row build error: {e}")
+
+        threading.Thread(target=worker, daemon=True, name=f"gift_stats_rows_{kind}").start()
+
+    def _post_rows(self, list_box, views, cycles, started=None, last=False):
+        def ui():
+            if not self._alive:
+                return
+            try:
+                for v in views:
+                    list_box.addView(v)
+                for img, docs in cycles:
+                    self._cycle_icon(img, docs)
+                if last and started is not None and self._plugin is not None:
+                    self._plugin.log(f"GiftStats frag rows attached (UI) in "
+                                     f"{int((time.time() - started) * 1000)} ms")
+            except Exception as e:
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats row attach error: {e}")
+
+        run_on_ui_thread(ui)
 
     def _gift_row(self, title, cnt, st, emoji, doc=None, usd=0):
         row = self.LinearLayout(self._ctx)
@@ -2125,20 +2682,18 @@ class _GiftStatsFragment(Base):
             self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
 
         if doc is not None:
-            icon = self._animated_icon(doc, emoji)
+            row.addView(self._animated_icon(doc, emoji))
         else:
-            icon = self.text(emoji if emoji else "🎁", 20, self.theme(self.K_TEXT))
-            icon.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(34), self.ViewGroup.LayoutParams.WRAP_CONTENT))
-        row.addView(icon)
+            row.addView(self.text(emoji if emoji else "🎁", 20, self.theme(self.K_TEXT)),
+                        self.LinearLayout.LayoutParams(self.dp(34), self.ViewGroup.LayoutParams.WRAP_CONTENT))
 
         show_title = bool(title) and title != emoji
         if show_title:
             title_tv = self.text(title, 14, self.theme(self.K_TEXT))
             title_tv.setSingleLine(True)
             title_tv.setPadding(self.dp(10), 0, self.dp(10), 0)
-            title_tv.setLayoutParams(self.LinearLayout.LayoutParams(
+            row.addView(title_tv, self.LinearLayout.LayoutParams(
                 0, self.ViewGroup.LayoutParams.WRAP_CONTENT, 1.0))
-            row.addView(title_tv)
 
         if usd:
             usd_txt = self._plugin._fmt_usd(usd)
@@ -2150,15 +2705,7 @@ class _GiftStatsFragment(Base):
             row.addView(cnt_tv)
 
             if st:
-                star_icon = self.ImageView(self._ctx)
-                try:
-                    star_icon.setImageResource(int(self.R_drawable.star_small_inner))
-                except Exception:
-                    pass
-                star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
-                star_lp.setMargins(self.dp(4), 0, 0, 0)
-                star_icon.setLayoutParams(star_lp)
-                row.addView(star_icon)
+                row.addView(*self._star_icon(14))
 
         return row
 
@@ -2188,16 +2735,18 @@ class _GiftStatsFragment(Base):
                     return
             except Exception:
                 return
+            attached = False
             try:
-                if not img.isAttachedToWindow():
-                    return
+                attached = bool(img.isAttachedToWindow())
             except Exception:
-                return
-            try:
-                state["i"] = (state["i"] + 1) % len(docs)
-                self._swap_icon(img, docs[state["i"]])
-            except Exception:
-                pass
+                attached = False
+            if attached:
+                try:
+                    state["i"] = (state["i"] + 1) % len(docs)
+                    self._swap_icon(img, docs[state["i"]])
+                except Exception:
+                    pass
+            # таймер не останавливаем: строки могут снова появиться (возврат из подробностей)
             try:
                 self._handler.postDelayed(_JavaRunnable(tick), 3000)
             except Exception:
@@ -2213,25 +2762,24 @@ class _GiftStatsFragment(Base):
 
         def tick():
             try:
-                if not self._alive or not self._visible or self._mode != "top":
+                if not self._alive:
                     return
-            except Exception:
-                return
-            try:
-                state["i"] = (state["i"] + 1) % len(docs)
-                sad.set(docs[state["i"]], True)
-                try:
-                    sad.attach()
-                except Exception:
-                    pass
-                try:
-                    ab = self.getActionBar()
-                    if ab is not None and self._mode == "top":
-                        ab.setTitle(f"Топ дарителей · {self._total}", sad)
-                except Exception:
-                    pass
+                if self._visible and self._mode == "top":
+                    state["i"] = (state["i"] + 1) % len(docs)
+                    sad.set(docs[state["i"]], True)
+                    try:
+                        sad.attach()
+                    except Exception:
+                        pass
+                    try:
+                        ab = self.getActionBar()
+                        if ab is not None and self._mode == "top":
+                            ab.setTitle(f"Топ дарителей · {self._total}", sad)
+                    except Exception:
+                        pass
             except Exception:
                 pass
+            # таймер не останавливаем: заголовок может снова понадобиться (возврат из подробностей)
             try:
                 self._handler.postDelayed(_JavaRunnable(tick), 3000)
             except Exception:

@@ -1,0 +1,2250 @@
+import time
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, get_selected_account, send_request, send_document, send_photo, run_on_queue
+from android_utils import run_on_ui_thread, OnClickListener
+from hook_utils import find_class
+from extera_utils.classes import Base, java_subclass, joverride
+from java import jclass, dynamic_proxy
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Input
+from file_utils import get_cache_dir
+from org.telegram.messenger import MessagesController, UserObject, ImageLocation, DocumentObject, ImageLoader, FileLoader, R as R_tg
+from org.telegram.tgnet import TLRPC
+from org.telegram.tgnet.tl import TL_stars
+from org.telegram.ui.ActionBar import Theme
+from android.graphics import Bitmap, BitmapFactory
+
+__id__ = "gift_stats"
+__name__ = "Gift Stats"
+__description__ = "Статистика подарков: топ дарителей в профиле/чате, анонимные отдельно, разбивка по подаркам"
+__author__ = "@alexeykasp"
+__version__ = "1.6.16"
+__app_version__ = ">=12.8.1"
+__sdk_version__ = ">=1.4.5.0"
+
+PAGE_LIMIT = 30
+TOP_LIMIT = 100
+EXPORT_TOP_LIMIT = 10
+EXPORT_WIDTH_DP = 320
+EXPORT_TIMEOUT_SEC = 60
+EXPORT_IDLE_SEC = 6
+PRELOAD_TIMEOUT_SEC = 12
+
+
+class _JavaRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        self.fn()
+
+
+class GiftStatsPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.log("GiftStats v1.6.16 loaded")
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Gift Stats",
+            icon="gift",
+            subtext="Топ дарителей и статистика подарков",
+            on_click=self._on_profile_click,
+            priority=100,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Gift Stats",
+            icon="gift",
+            subtext="Статистика подарков автора сообщения",
+            on_click=self._on_message_click,
+            priority=100,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Gift Stats",
+            icon="gift",
+            subtext="Статистика подарков в чате",
+            on_click=self._on_chat_click,
+            priority=100,
+        ))
+
+    def on_plugin_unload(self):
+        pass
+
+    def create_settings(self):
+        return [
+            Header(text="Топ дарителей"),
+            Input(
+                key="top_limit",
+                text="Лимит топа дарителей",
+                default="100",
+                subtext="0 — без лимита (может вызывать лаги при большом количестве дарителей или подарков)",
+            ),
+            Header(text="Экспорт"),
+            Input(
+                key="export_limit",
+                text="Лимит топа в экспорте",
+                default="10",
+                subtext="0 — без лимита",
+            ),
+            Switch(
+                key="send_as_photo",
+                text="Отправлять как фото",
+                default=True,
+                subtext="Выключено — отправка как файл",
+            ),
+            Switch(
+                key="show_loading",
+                text="Показывать загрузку",
+                default=True,
+                subtext="Выключено — сбор и экспорт работают в фоне, не блокируя экран",
+            ),
+        ]
+
+    def _top_limit(self):
+        try:
+            v = self.get_setting("top_limit", "100")
+            n = int(str(v).strip())
+            if n <= 0:
+                return None
+            return n
+        except Exception:
+            return TOP_LIMIT
+
+    def _export_limit(self):
+        try:
+            v = self.get_setting("export_limit", "10")
+            n = int(str(v).strip())
+            if n <= 0:
+                return None
+            return n
+        except Exception:
+            return EXPORT_TOP_LIMIT
+
+    def _run_export(self, account, peer, reply, target_arg, donor_arg, is_donor, reply_id=None, reply_obj=None):
+        if getattr(self, "_xexport_running", False):
+            return
+        self._xexport_running = True
+        self._x_cancel = False
+        if self.get_setting("show_loading", True):
+            run_on_ui_thread(self._export_show_loading)
+        run_on_queue(lambda: self._export_resolve_target(account, peer, reply, target_arg, donor_arg, is_donor, reply_id, reply_obj))
+
+    def _export_show_loading(self):
+        activity = self._export_context()
+        if activity is None:
+            return
+        try:
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            builder.set_title("Gift Stats")
+            builder.set_message("Экспортирую Gift Stats...")
+            builder.set_negative_button("Отмена", lambda b, w: self._cancel_export())
+            builder.set_on_cancel_listener(lambda b: self._cancel_export())
+            builder.set_cancelable(True)
+            builder.show()
+            self._xloading = builder
+        except Exception as e:
+            self.log(f"GiftStats export loading error: {e}")
+            self._xloading = None
+
+    def _export_dismiss_loading(self):
+        try:
+            builder = getattr(self, "_xloading", None)
+            if builder is not None:
+                builder.dismiss()
+                self._xloading = None
+        except Exception:
+            self._xloading = None
+
+    def _export_is_cancelled(self):
+        return bool(getattr(self, "_x_cancel", False))
+
+    def _cancel_export(self):
+        self._x_cancel = True
+        self._xexport_running = False
+        self._export_dismiss_loading()
+        self.log("GiftStats export cancelled")
+
+    def _export_resolve_target(self, account, peer, reply, target_arg, donor_arg, is_donor, reply_id=None, reply_obj=None):
+        if reply is not None:
+            try:
+                sid = int(reply.getSenderId())
+                if sid > 0:
+                    self._export_on_target(account, peer, donor_arg, is_donor, sid, reply_id, reply_obj)
+                    return
+            except Exception:
+                pass
+        if target_arg:
+            a = target_arg.strip()
+            try:
+                uid = int(a)
+                if uid > 0:
+                    self._export_on_target(account, peer, donor_arg, is_donor, uid, reply_id, reply_obj)
+                    return
+            except Exception:
+                pass
+            if a.startswith("@"):
+                self._export_resolve_user(account, a[1:], lambda uid: self._export_on_target(account, peer, donor_arg, is_donor, uid, reply_id, reply_obj))
+                return
+        if peer and peer > 0:
+            self._export_on_target(account, peer, donor_arg, is_donor, int(peer), reply_id, reply_obj)
+            return
+        if is_donor:
+            self._export_error("Команда работает в личном чате или укажи пользователя аргументом")
+            return
+        self._export_error("Пользователь не найден или недоступен")
+
+    def _export_resolve_user(self, account, username, cb):
+        try:
+            u = MessagesController.getInstance(account).getUser(username)
+            if u is not None:
+                cb(int(u.id))
+                return
+        except Exception:
+            pass
+        try:
+            req = TLRPC.TL_contacts_resolveUsername()
+            req.username = username
+
+            def rcb(response, error):
+                if error is None and response is not None:
+                    try:
+                        for u in self._list_items(getattr(response, "users", None)):
+                            cb(int(u.id))
+                            return
+                    except Exception:
+                        pass
+                cb(None)
+
+            send_request(req, rcb, account=account)
+        except Exception as e:
+            self.log(f"GiftStats resolve username error: {e}")
+            cb(None)
+
+    def _export_on_target(self, account, peer, donor_arg, is_donor, target_id, reply_id=None, reply_obj=None):
+        if not target_id:
+            self._export_error("Пользователь не найден или недоступен")
+            return
+        self._collect(
+            account,
+            int(target_id),
+            on_done=lambda gifts, names: self._export_on_collected(account, peer, donor_arg, is_donor, gifts, names, reply_id, reply_obj, target_id),
+            on_error=lambda err: self._export_error(f"Не удалось собрать подарки: {err}"),
+        )
+
+    def _export_on_collected(self, account, peer, donor_arg, is_donor, gifts, names, reply_id=None, reply_obj=None, target_id=None):
+        if self._export_is_cancelled():
+            return
+        donors, anonymous, nft = self._build_stats(gifts, names, account)
+        self._disambiguate_names(donors)
+        named = sorted(donors.values(), key=lambda d: -d["stars"])
+        limit = self._export_limit()
+        if limit and len(named) > limit:
+            named = named[:limit]
+        donor_list = list(named)
+        if nft is not None:
+            donor_list.append(nft)
+        if anonymous is not None:
+            donor_list.append(anonymous)
+        if not donor_list:
+            self._export_error("Подарков не найдено")
+            return
+        donor = None
+        if donor_arg:
+            donor = self._find_donor(account, donor_arg, donors, anonymous, nft)
+            if donor is None:
+                self._export_error("Даритель не найден в списке подарков")
+                return
+        run_on_queue(lambda: self._export_render(account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id, reply_obj, target_id))
+
+    def _find_donor(self, account, arg, donors, anonymous, nft):
+        a = arg.strip()
+        low = a.lower()
+        if low in ("nft", "нфт") and nft is not None:
+            return nft
+        if low in ("anon", "анон", "анонимы", "анонимные") and anonymous is not None:
+            return anonymous
+
+        def match(uid):
+            if uid is None:
+                return None
+            return donors.get(int(uid))
+
+        try:
+            uid = int(a)
+            if uid > 0:
+                return match(uid)
+        except Exception:
+            pass
+        if a.startswith("@"):
+            try:
+                u = MessagesController.getInstance(account).getUser(a[1:])
+                if u is not None:
+                    return match(int(u.id))
+            except Exception:
+                pass
+            try:
+                req = TLRPC.TL_contacts_resolveUsername()
+                req.username = a[1:]
+                found = [None]
+
+                def rcb(response, error):
+                    if error is None and response is not None:
+                        try:
+                            for u in self._list_items(getattr(response, "users", None)):
+                                found[0] = match(int(u.id))
+                                return
+                        except Exception:
+                            pass
+                    found[0] = found[0] or None
+
+                send_request(req, rcb, account=account)
+                for _ in range(50):
+                    if found[0] is not None:
+                        return found[0]
+                    time.sleep(0.1)
+                return None
+            except Exception:
+                return None
+        return None
+
+    def _export_error(self, msg):
+        if self._export_is_cancelled():
+            self._xexport_running = False
+            return
+        self._xexport_running = False
+
+        def ui():
+            self._export_dismiss_loading()
+            try:
+                BulletinHelper.show_error(msg)
+            except Exception as e:
+                self.log(f"GiftStats bulletin error: {e}")
+
+        run_on_ui_thread(ui)
+
+    def _export_context(self):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return None
+            return frag.getParentActivity()
+        except Exception:
+            return None
+
+    def _export_ui(self, ctx):
+        xui = getattr(self, "_xui", None)
+        if xui is not None and xui.get("ctx") is ctx:
+            return xui
+        LL = jclass("android.widget.LinearLayout")
+        TV = jclass("android.widget.TextView")
+        IV = jclass("android.widget.ImageView")
+        BIV = jclass("org.telegram.ui.Components.BackupImageView")
+        AD = jclass("org.telegram.ui.Components.AvatarDrawable")
+        GD = jclass("android.graphics.drawable.GradientDrawable")
+        Gravity = jclass("android.view.Gravity")
+        TruncateAt = jclass("android.text.TextUtils$TruncateAt")
+        Typeface = jclass("android.graphics.Typeface")
+        TypedValue = jclass("android.util.TypedValue")
+        Bitmap = jclass("android.graphics.Bitmap")
+        Canvas = jclass("android.graphics.Canvas")
+        Path = jclass("android.graphics.Path")
+        RectF = jclass("android.graphics.RectF")
+        FileOutputStream = jclass("java.io.FileOutputStream")
+        ViewGroup = jclass("android.view.ViewGroup")
+        MS = jclass("android.view.View$MeasureSpec")
+        xui = {
+            "ctx": ctx,
+            "LL": LL,
+            "TV": TV,
+            "IV": IV,
+            "BIV": BIV,
+            "AD": AD,
+            "GD": GD,
+            "Gravity": Gravity,
+            "TruncateAt": TruncateAt,
+            "Typeface": Typeface,
+            "TypedValue": TypedValue,
+            "Bitmap": Bitmap,
+            "Canvas": Canvas,
+            "Path": Path,
+            "RectF": RectF,
+            "FOS": FileOutputStream,
+            "VG": ViewGroup,
+            "MS": MS,
+            "LPM": LL.LayoutParams,
+            "K_BG": Theme.key_windowBackgroundWhite,
+            "K_TEXT": Theme.key_dialogTextBlack,
+            "K_TEXT_DIM": Theme.key_dialogTextGray2,
+            "K_DIVIDER": Theme.key_divider,
+            "K_APP_BG": Theme.key_windowBackgroundGray,
+        }
+        self._xui = xui
+        return xui
+
+    def _xdp(self, ui, v):
+        try:
+            return int(ui["TypedValue"].applyDimension(
+                ui["TypedValue"].COMPLEX_UNIT_DIP, float(v), ui["ctx"].getResources().getDisplayMetrics()))
+        except Exception:
+            return int(v)
+
+    def _xcolor(self, ui, key):
+        try:
+            return int(Theme.getColor(key))
+        except Exception:
+            return int(ui["Bitmap"].TRANSPARENT)
+
+    def _xtext(self, ui, txt, size_sp, color, bold=False):
+        tv = ui["TV"](ui["ctx"])
+        tv.setText(str(txt))
+        tv.setTextColor(color)
+        tv.setTextSize(ui["TypedValue"].COMPLEX_UNIT_SP, float(size_sp))
+        if bold:
+            tv.setTypeface(ui["Typeface"].DEFAULT_BOLD)
+        return tv
+
+    def _xdivider(self, ui, inset_dp):
+        c = ui["LL"](ui["ctx"])
+        c.setOrientation(ui["LL"].VERTICAL)
+        c.setPadding(self._xdp(ui, inset_dp), 0, 0, 0)
+        v = ui["TV"](ui["ctx"])
+        v.setBackgroundColor(self._xcolor(ui, ui["K_DIVIDER"]))
+        c.addView(v, ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, self._xdp(ui, 1)))
+        return c
+
+    def _xsticker(self, ui, doc, size_dp, pending):
+        iv = ui["BIV"](ui["ctx"])
+        try:
+            loc = ImageLocation.getForDocument(doc)
+            mime = getattr(doc, "mime_type", "")
+            size = int(getattr(doc, "size", 0) or 0)
+            iv.getImageReceiver().setAllowLoadingOnAttachedOnly(False)
+            if mime == "application/x-tgsticker":
+                iv.setImage(loc, "50_50_firstframe", None, None, None, None, None, size, doc)
+            else:
+                iv.setImage(loc, "50_50", None, None, None, None, None, size, doc)
+            pending.append([iv, None, "sticker"])
+        except Exception as e:
+            self.log(f"GiftStats xsticker error: {e}")
+            iv.setImageResource(int(R_tg.drawable.gift))
+        iv.setLayoutParams(ui["LL"].LayoutParams(self._xdp(ui, size_dp), self._xdp(ui, size_dp)))
+        return iv
+
+    def _xavatar(self, ui, donor, pending, account=0):
+        docs = donor.get("docs") or []
+        if donor.get("nft") and docs:
+            iv = self._xsticker(ui, docs[0], 44, pending)
+            try:
+                iv.setRoundRadius(self._xdp(ui, 22))
+            except Exception:
+                pass
+            return iv
+        iv = ui["BIV"](ui["ctx"])
+        ad = None
+        try:
+            iv.setRoundRadius(self._xdp(ui, 22))
+            ad = ui["AD"]()
+            iv.getImageReceiver().setAllowLoadingOnAttachedOnly(False)
+            obj = donor.get("obj")
+            if obj is not None:
+                ad.setInfo(obj)
+                wait = False
+                try:
+                    loc = ImageLocation.getForUserOrChat(int(account), obj, 1)
+                    if loc is not None and loc.location is not None:
+                        iv.setImage(loc, "56_56", None, None, ad, obj, 0)
+                        wait = True
+                except Exception:
+                    wait = True
+                if wait:
+                    pending.append([iv, ad, "avatar", loc, account, time.time()])
+                else:
+                    iv.setImageDrawable(ad)
+            elif donor.get("nft"):
+                ad.setAvatarType(0)
+                iv.setImageDrawable(ad)
+            else:
+                ad.setAvatarType(21)
+                iv.setImageDrawable(ad)
+        except Exception as e:
+            self.log(f"GiftStats xavatar error: {e}")
+        iv.setLayoutParams(ui["LL"].LayoutParams(self._xdp(ui, 44), self._xdp(ui, 44)))
+        return iv
+
+    def _xstars(self, ui, txt, icon_dp, text_size=15):
+        s = ui["LL"](ui["ctx"])
+        s.setOrientation(ui["LL"].HORIZONTAL)
+        s.setGravity(ui["Gravity"].CENTER_VERTICAL)
+        s.addView(self._xtext(ui, str(txt), text_size, self._xcolor(ui, ui["K_TEXT"])))
+        ic = ui["IV"](ui["ctx"])
+        try:
+            ic.setImageResource(int(R_tg.drawable.star_small_inner))
+        except Exception:
+            pass
+        lp = ui["LL"].LayoutParams(self._xdp(ui, icon_dp), self._xdp(ui, icon_dp))
+        lp.setMargins(self._xdp(ui, 4), 0, 0, 0)
+        ic.setLayoutParams(lp)
+        s.addView(ic)
+        return s
+
+    def _export_wait_images(self, pending):
+        total = len(pending)
+        last_loaded = 0
+        idle_since = time.time()
+        deadline = time.time() + EXPORT_TIMEOUT_SEC
+        while pending and time.time() < deadline:
+            if self._export_is_cancelled():
+                break
+            ready = True
+            for entry in list(pending):
+                iv = entry[0]
+                kind = entry[2]
+                loc = entry[3] if len(entry) > 3 else None
+                account = entry[4] if len(entry) > 4 else 0
+                entered = entry[5] if len(entry) > 5 else 0.0
+                try:
+                    bmp = iv.getImageReceiver().getBitmap()
+                    if bmp is not None:
+                        pending.remove(entry)
+                    else:
+                        ready = False
+                        if kind == "avatar" and loc is not None and loc.location is not None and time.time() - entered >= 0.5:
+                            try:
+                                fl4 = FileLoader.getInstance(int(account))
+                                path = fl4.getPathToAttach(loc.location, "jpg", True, False)
+                                if path is not None and path.exists():
+                                    opts = BitmapFactory.Options()
+                                    opts.inJustDecodeBounds = True
+                                    BitmapFactory.decodeFile(path.toString(), opts)
+                                    opts.inJustDecodeBounds = False
+                                    opts.inSampleSize = 1
+                                    if opts.outWidth > 0 or opts.outHeight > 0:
+                                        while (opts.outWidth / (opts.inSampleSize * 2)) > 128 and (opts.outHeight / (opts.inSampleSize * 2)) > 128:
+                                            opts.inSampleSize *= 2
+                                    bmp2 = BitmapFactory.decodeFile(path.toString(), opts)
+                                    if bmp2 is not None:
+                                        run_on_ui_thread(lambda b=bmp2, v=iv: v.setImageBitmap(b))
+                            except Exception:
+                                pass
+                            pending.remove(entry)
+                except Exception:
+                    pending.remove(entry)
+            now = time.time()
+            loaded = total - len(pending)
+            if loaded != last_loaded:
+                last_loaded = loaded
+                idle_since = now
+            if ready or (loaded > 0 and now - idle_since >= EXPORT_IDLE_SEC):
+                break
+            time.sleep(0.1)
+        if not self._export_is_cancelled():
+            try:
+                self._export_finish()
+            except Exception as e:
+                self.log(f"GiftStats export finish call error: {e}")
+
+    def _export_progress(self, msg):
+        try:
+            builder = getattr(self, "_xloading", None)
+            if builder is not None:
+                builder.set_message(msg)
+        except Exception:
+            pass
+
+    def _export_draw_pending(self, ui, root, pending, canvas):
+        for entry in pending:
+            iv = entry[0]
+            kind = entry[2]
+            x = iv.getLeft()
+            y = iv.getTop()
+            parent = iv.getParent()
+            while parent is not None and parent != root:
+                try:
+                    x += parent.getLeft()
+                    y += parent.getTop()
+                    parent = parent.getParent()
+                except Exception:
+                    break
+            w = iv.getWidth()
+            h = iv.getHeight()
+            if w <= 0 or h <= 0:
+                continue
+            bmp = None
+            try:
+                bmp = iv.getImageReceiver().getBitmap()
+            except Exception:
+                bmp = None
+            if bmp is not None:
+                canvas.save()
+                if kind == "avatar":
+                    try:
+                        path = ui["Path"]()
+                        path.addCircle(x + w / 2.0, y + h / 2.0, w / 2.0, ui["Path"].Direction.CW)
+                        canvas.clipPath(path)
+                    except Exception:
+                        pass
+                canvas.drawBitmap(bmp, None, ui["RectF"](float(x), float(y), float(x + w), float(y + h)), None)
+                canvas.restore()
+            elif entry[1] is not None:
+                try:
+                    entry[1].setBounds(x, y, x + w, y + h)
+                    entry[1].draw(canvas)
+                except Exception:
+                    pass
+
+    def _export_save(self, ui, root, w_px, h_px, pending=None, target_id=None):
+        bmp = ui["Bitmap"].createBitmap(w_px, h_px, ui["Bitmap"].Config.ARGB_8888)
+        canvas = ui["Canvas"](bmp)
+        root.draw(canvas)
+        if pending:
+            self._export_draw_pending(ui, root, pending, canvas)
+        path = None
+        try:
+            import os
+            name = f"{int(target_id) if target_id else 'unknown'}_stats.png"
+            path = os.path.join(get_cache_dir(), name)
+            fos = ui["FOS"](path)
+            try:
+                bmp.compress(ui["Bitmap"].CompressFormat.PNG, 100, fos)
+            finally:
+                fos.close()
+        except Exception:
+            path = None
+        try:
+            bmp.recycle()
+        except Exception:
+            pass
+        return path
+
+    def _export_render_top(self, account, donor_list):
+        ctx = self._export_context()
+        if ctx is None:
+            return None
+        ui = self._export_ui(ctx)
+        root = ui["LL"](ui["ctx"])
+        root.setOrientation(ui["LL"].VERTICAL)
+        root.setBackgroundColor(self._xcolor(ui, ui["K_APP_BG"]))
+        pad = self._xdp(ui, 16)
+        root.setPadding(pad, pad, pad, pad)
+        pending = []
+
+        total = sum((d.get("count") or 0) for d in donor_list)
+        total_stars = sum((d.get("stars") or 0) for d in donor_list)
+        unique_docs = []
+        seen = set()
+        for d in donor_list:
+            for doc in d.get("docs") or []:
+                did = getattr(doc, "id", None)
+                if did is None or did in seen:
+                    continue
+                seen.add(did)
+                unique_docs.append(doc)
+
+        header = ui["LL"](ui["ctx"])
+        header.setOrientation(ui["LL"].HORIZONTAL)
+        header.setGravity(ui["Gravity"].CENTER_VERTICAL)
+        if unique_docs:
+            header.addView(self._xsticker(ui, unique_docs[0], 48, pending))
+        ttl = ui["LL"](ui["ctx"])
+        ttl.setOrientation(ui["LL"].VERTICAL)
+        ttl.setPadding(self._xdp(ui, 12), 0, 0, 0)
+        ttl.addView(self._xtext(ui, "Gift Stats", 11, self._xcolor(ui, ui["K_TEXT_DIM"])))
+        ttl.addView(self._xtext(ui, f"Топ дарителей · {total}", 18, self._xcolor(ui, ui["K_TEXT"]), True))
+        header.addView(ttl)
+        root.addView(header, ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, ui["VG"].LayoutParams.WRAP_CONTENT))
+
+        card = ui["LL"](ui["ctx"])
+        card.setOrientation(ui["LL"].VERTICAL)
+        card.setPadding(self._xdp(ui, 14), self._xdp(ui, 12), self._xdp(ui, 14), self._xdp(ui, 12))
+        try:
+            bg = Theme.createRoundRectDrawable(self._xdp(ui, 12), self._xcolor(ui, ui["K_BG"]))
+            card.setBackground(bg)
+        except Exception:
+            card.setBackgroundColor(self._xcolor(ui, ui["K_BG"]))
+        row1 = ui["LL"](ui["ctx"])
+        row1.setOrientation(ui["LL"].HORIZONTAL)
+        row1.setGravity(ui["Gravity"].CENTER_VERTICAL)
+        row1.addView(self._xtext(ui, f"{total} подарков · ", 14, self._xcolor(ui, ui["K_TEXT_DIM"])))
+        row1.addView(self._xstars(ui, total_stars, 14, 14))
+        card.addView(row1)
+        c_lp = ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, ui["VG"].LayoutParams.WRAP_CONTENT)
+        c_lp.setMargins(0, self._xdp(ui, 10), 0, self._xdp(ui, 12))
+        root.addView(card, c_lp)
+
+        top_card = ui["LL"](ui["ctx"])
+        top_card.setOrientation(ui["LL"].VERTICAL)
+        try:
+            bg = Theme.createRoundRectDrawable(self._xdp(ui, 12), self._xcolor(ui, ui["K_BG"]))
+            top_card.setBackground(bg)
+        except Exception:
+            top_card.setBackgroundColor(self._xcolor(ui, ui["K_BG"]))
+
+        for i, donor in enumerate(donor_list):
+            if i > 0:
+                top_card.addView(self._xdivider(ui, 0))
+            row = ui["LL"](ui["ctx"])
+            row.setOrientation(ui["LL"].HORIZONTAL)
+            row.setGravity(ui["Gravity"].CENTER_VERTICAL)
+            row.setPadding(self._xdp(ui, 6), self._xdp(ui, 10), self._xdp(ui, 6), self._xdp(ui, 10))
+            row.addView(self._xavatar(ui, donor, pending, account))
+            col = ui["LL"](ui["ctx"])
+            col.setOrientation(ui["LL"].VERTICAL)
+            col.setGravity(ui["Gravity"].CENTER_VERTICAL)
+            col.setPadding(self._xdp(ui, 14), 0, 0, 0)
+            col.setLayoutParams(ui["LL"].LayoutParams(0, ui["VG"].LayoutParams.WRAP_CONTENT, 1.0))
+            pct = int(round((donor.get("stars") or 0) * 100.0 / total_stars)) if total_stars else 0
+            if total < 5:
+                sub = str(donor["count"])
+            elif donor["count"] == 1:
+                sub = "1 подарок"
+            else:
+                sub = f"{pct}% · {donor['count']}"
+            nick = self._xtext(ui, donor["name"], 15, self._xcolor(ui, ui["K_TEXT"]), True)
+            nick.setSingleLine(True)
+            try:
+                nick.setEllipsize(ui["TruncateAt"].END)
+            except Exception:
+                pass
+            col.addView(nick)
+            sub_tv = self._xtext(ui, sub, 12, self._xcolor(ui, ui["K_TEXT_DIM"]))
+            sub_tv.setPadding(0, self._xdp(ui, 1), 0, 0)
+            col.addView(sub_tv)
+            row.addView(col)
+            if donor.get("nft"):
+                usd_txt = self._fmt_usd(donor.get("usd") or 0)
+                if usd_txt:
+                    row.addView(self._xtext(ui, usd_txt, 15, self._xcolor(ui, ui["K_TEXT"])))
+                else:
+                    row.addView(self._xstars(ui, donor["stars"], 16, 15))
+            else:
+                row.addView(self._xstars(ui, donor["stars"], 16, 15))
+            docs = donor.get("docs") or []
+            if docs:
+                st = self._xsticker(ui, docs[0], 24, pending)
+                st.setPadding(self._xdp(ui, 8), 0, 0, 0)
+                row.addView(st)
+            top_card.addView(row)
+
+        root.addView(top_card, ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, ui["VG"].LayoutParams.WRAP_CONTENT))
+
+        return ui, root, pending
+
+    def _export_render_details(self, account, donor):
+        ctx = self._export_context()
+        if ctx is None:
+            return None
+        ui = self._export_ui(ctx)
+        root = ui["LL"](ui["ctx"])
+        root.setOrientation(ui["LL"].VERTICAL)
+        root.setBackgroundColor(self._xcolor(ui, ui["K_APP_BG"]))
+        pad = self._xdp(ui, 16)
+        root.setPadding(pad, pad, pad, pad)
+        pending = []
+
+        gift_items = sorted(donor["gifts"].items(), key=lambda kv: -kv[1][0])
+
+        header = ui["LL"](ui["ctx"])
+        header.setOrientation(ui["LL"].HORIZONTAL)
+        header.setGravity(ui["Gravity"].CENTER_VERTICAL)
+        header.addView(self._xavatar(ui, donor, pending, account))
+        ttl = ui["LL"](ui["ctx"])
+        ttl.setOrientation(ui["LL"].VERTICAL)
+        ttl.setPadding(self._xdp(ui, 12), 0, 0, 0)
+        ttl.addView(self._xtext(ui, "Gift Stats", 11, self._xcolor(ui, ui["K_TEXT_DIM"])))
+        ttl.addView(self._xtext(ui, donor["name"], 18, self._xcolor(ui, ui["K_TEXT"]), True))
+        header.addView(ttl)
+        root.addView(header, ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, ui["VG"].LayoutParams.WRAP_CONTENT))
+
+        total_row = ui["LL"](ui["ctx"])
+        total_row.setOrientation(ui["LL"].HORIZONTAL)
+        total_row.setGravity(ui["Gravity"].CENTER_VERTICAL)
+        total_row.setPadding(0, self._xdp(ui, 12), 0, self._xdp(ui, 12))
+        total_row.addView(self._xtext(ui, f"Всего: {donor['count']} 🎁 · ", 14, self._xcolor(ui, ui["K_TEXT_DIM"])))
+        total_row.addView(self._xstars(ui, donor["stars"], 14, 14))
+        root.addView(total_row)
+
+        gift_items = sorted(donor["gifts"].items(), key=lambda kv: -kv[1][0])
+        list_card = ui["LL"](ui["ctx"])
+        list_card.setOrientation(ui["LL"].VERTICAL)
+        try:
+            bg = Theme.createRoundRectDrawable(self._xdp(ui, 12), self._xcolor(ui, ui["K_BG"]))
+            list_card.setBackground(bg)
+        except Exception:
+            list_card.setBackgroundColor(self._xcolor(ui, ui["K_BG"]))
+        shown = 0
+        for title, entry in gift_items:
+            if shown > 0:
+                list_card.addView(self._xdivider(ui, 0))
+            cnt = entry[0]
+            st = entry[1]
+            emoji = entry[2] if len(entry) > 2 else ""
+            doc = entry[3] if len(entry) > 3 else None
+            t = entry[4] if len(entry) > 4 else title
+            if t and t == emoji:
+                t = ""
+            row = ui["LL"](ui["ctx"])
+            row.setOrientation(ui["LL"].HORIZONTAL)
+            row.setGravity(ui["Gravity"].CENTER_VERTICAL)
+            row.setPadding(self._xdp(ui, 6), self._xdp(ui, 9), self._xdp(ui, 6), self._xdp(ui, 9))
+            if doc is not None:
+                row.addView(self._xsticker(ui, doc, 34, pending))
+            else:
+                row.addView(self._xtext(ui, emoji if emoji else "🎁", 20, self._xcolor(ui, ui["K_TEXT"])))
+            if t:
+                t_tv = self._xtext(ui, t, 14, self._xcolor(ui, ui["K_TEXT"]))
+                t_tv.setSingleLine(True)
+                t_tv.setPadding(self._xdp(ui, 10), 0, self._xdp(ui, 10), 0)
+                t_tv.setLayoutParams(ui["LL"].LayoutParams(0, ui["VG"].LayoutParams.WRAP_CONTENT, 1.0))
+                row.addView(t_tv)
+            if donor.get("nft"):
+                u = entry[5] if len(entry) > 5 else 0
+                usd_txt = self._fmt_usd(u)
+                row.addView(self._xtext(ui, f"{cnt} × {usd_txt if usd_txt else '0$'}", 14, self._xcolor(ui, ui["K_TEXT_DIM"])))
+            else:
+                price = int(round(st / cnt)) if st and cnt else 0
+                row.addView(self._xtext(ui, f"{cnt} × {price}", 14, self._xcolor(ui, ui["K_TEXT_DIM"])))
+                if st:
+                    row.addView(self._xstar_icon(ui, 14))
+            list_card.addView(row)
+            shown += 1
+        if shown < len(gift_items):
+            list_card.addView(self._xdivider(ui, 0))
+            list_card.addView(self._xtext(ui, f"и ещё {len(gift_items) - shown} подарков", 13, self._xcolor(ui, ui["K_TEXT_DIM"])))
+        root.addView(list_card, ui["LL"].LayoutParams(ui["VG"].LayoutParams.MATCH_PARENT, ui["VG"].LayoutParams.WRAP_CONTENT))
+
+        return ui, root, pending
+
+    def _xstar_icon(self, ui, icon_dp):
+        ic = ui["IV"](ui["ctx"])
+        try:
+            ic.setImageResource(int(R_tg.drawable.star_small_inner))
+        except Exception:
+            pass
+        lp = ui["LL"].LayoutParams(self._xdp(ui, icon_dp), self._xdp(ui, icon_dp))
+        lp.setMargins(self._xdp(ui, 4), 0, 0, 0)
+        ic.setLayoutParams(lp)
+        return ic
+
+    def _export_render(self, account, peer, is_donor, donor_list, donor, anonymous, nft, donors, reply_id=None, reply_obj=None, target_id=None):
+        def build():
+            try:
+                if is_donor or donor is not None:
+                    res = self._export_render_details(account, donor)
+                else:
+                    res = self._export_render_top(account, donor_list)
+                if not res:
+                    self._export_error("Не удалось отрисовать картинку")
+                    return
+                self._xjob = {"ui": res[0], "root": res[1], "pending": res[2], "peer": peer, "account": account, "reply_id": reply_id, "reply_obj": reply_obj, "target_id": target_id}
+                run_on_queue(lambda: self._export_wait_images(self._xjob.get("pending", [])))
+            except Exception as e:
+                self.log(f"GiftStats export build error: {e}")
+                self._export_error(f"Ошибка экспорта: {e}")
+
+        def preload():
+            try:
+                ctx = self._export_context()
+                ui = self._export_ui(ctx) if ctx is not None else None
+                preload_list = [donor] if (is_donor or donor is not None) else donor_list
+                ivs = self._export_preload_avatars(ui, account, preload_list)
+                if ivs:
+                    run_on_queue(lambda: self._export_preload_wait(ivs, build))
+                else:
+                    run_on_ui_thread(build)
+            except Exception as e:
+                self.log(f"GiftStats preload error: {e}")
+                run_on_ui_thread(build)
+
+        run_on_ui_thread(preload)
+
+    def _export_preload_avatars(self, ui, account, donor_list):
+        if ui is None:
+            return []
+        fl = FileLoader.getInstance(int(account))
+        jobs = []
+        for donor in donor_list:
+            obj = donor.get("obj")
+            if obj is None:
+                continue
+            try:
+                loc = ImageLocation.getForUserOrChat(int(account), obj, 1)
+                if loc is None or loc.location is None:
+                    continue
+                f = fl.getPathToAttach(loc.location, "jpg", True, False)
+                if f is not None and f.exists():
+                    continue
+                fl.loadFile(loc, obj, "jpg", 0, 1)
+                jobs.append(f)
+            except Exception as e:
+                self.log(f"GiftStats preload avatar err: {e}")
+        return jobs
+
+    def _export_preload_wait(self, jobs, build):
+        try:
+            deadline = time.time() + PRELOAD_TIMEOUT_SEC
+            while jobs and time.time() < deadline:
+                for f in list(jobs):
+                    try:
+                        if f.exists():
+                            jobs.remove(f)
+                    except Exception:
+                        jobs.remove(f)
+                if not jobs:
+                    break
+                time.sleep(0.3)
+        except Exception as e:
+            self.log(f"GiftStats preload wait error: {e}")
+        run_on_ui_thread(build)
+
+    def _export_finish(self):
+        def ui():
+            try:
+                if self._export_is_cancelled():
+                    self._export_dismiss_loading()
+                    return
+                job = getattr(self, "_xjob", None)
+                if not job:
+                    self.log("GiftStats export finish: no job")
+                    return
+                ui = job["ui"]
+                root = job["root"]
+                w = self._xdp(ui, EXPORT_WIDTH_DP)
+                root.measure(ui["MS"].makeMeasureSpec(w, ui["MS"].EXACTLY),
+                             ui["MS"].makeMeasureSpec(0, ui["MS"].UNSPECIFIED))
+                root.layout(0, 0, w, root.getMeasuredHeight())
+                job["path"] = self._export_save(ui, root, w, root.getMeasuredHeight(), job.get("pending", []), job.get("target_id"))
+                self._export_dismiss_loading()
+                run_on_queue(lambda: self._export_send(job))
+            except Exception as e:
+                self.log(f"GiftStats export finish error: {e}")
+                self._export_error(f"Ошибка экспорта: {e}")
+
+        run_on_ui_thread(ui)
+
+    def _export_send(self, job):
+        try:
+            if self._export_is_cancelled():
+                return
+            path = job.get("path")
+            if not path:
+                self._export_error("Не удалось отрисовать картинку")
+                return
+            self.log(f"GiftStats export sending to peer={job['peer']} reply_id={job.get('reply_id')} reply_obj={type(job.get('reply_obj')).__name__ if job.get('reply_obj') is not None else None}")
+            kwargs = {}
+            ro = job.get("reply_obj")
+            if ro is not None:
+                kwargs["replyToMsg"] = ro
+            else:
+                rid = job.get("reply_id")
+                if rid:
+                    kwargs["replyToMsg"] = rid
+            send_as_photo = False
+            try:
+                send_as_photo = bool(self.get_setting("send_as_photo", False))
+            except Exception:
+                send_as_photo = False
+            if send_as_photo:
+                send_photo(job["peer"], path, high_quality=True, account=job["account"], **kwargs)
+            else:
+                send_document(job["peer"], path, account=job["account"], **kwargs)
+            self.log(f"GiftStats export sent to peer={job['peer']} as={'photo' if send_as_photo else 'file'}: {path}")
+        except Exception as e:
+            self.log(f"GiftStats export send error: {e}")
+            self._export_error(f"Ошибка отправки: {e}")
+        finally:
+            self._xexport_running = False
+
+    def _on_profile_click(self, context):
+        account = context.get("account") if context else None
+        user_id = None
+        if context:
+            try:
+                user_id = context.get("dialog_id")
+                if user_id is not None:
+                    user_id = abs(int(user_id))
+            except Exception:
+                user_id = None
+            if not user_id:
+                chat = context.get("chat")
+                if chat is not None:
+                    user_id = getattr(chat, "id", None)
+            if not user_id:
+                user_id = context.get("chatId")
+            if not user_id:
+                user = context.get("user")
+                if user is not None:
+                    user_id = getattr(user, "id", None)
+            if not user_id:
+                user_id = context.get("userId")
+        if not user_id:
+            self._show_message("Gift Stats", "Не удалось определить пользователя из контекста")
+            return
+        self.collect_and_show(int(account), int(user_id))
+
+    def _on_message_click(self, context):
+        account = context.get("account") if context else None
+        user_id = None
+        dialog_id = None
+        msg = None
+        if context:
+            try:
+                dialog_id = context.get("dialog_id")
+                if dialog_id is not None:
+                    dialog_id = int(dialog_id)
+            except Exception:
+                dialog_id = None
+            try:
+                msg = context.get("message")
+                if msg is not None:
+                    # if forwarded with hidden author → error
+                    try:
+                        mo = msg.messageOwner
+                        fwd = getattr(mo, "fwd_from", None)
+                        if fwd is not None and getattr(fwd, "from_id", None) is None:
+                            user_id = -1
+                        else:
+                            sid = int(msg.getSenderId())
+                            if sid > 0:
+                                user_id = sid
+                    except Exception:
+                        sid = int(msg.getSenderId())
+                        if sid > 0:
+                            user_id = sid
+            except Exception:
+                user_id = None
+        if not user_id or user_id <= 0:
+            self._show_message("Gift Stats", "Не удалось определить автора сообщения")
+            return
+        peer = dialog_id
+        if not peer and msg is not None:
+            try:
+                peer = int(msg.getDialogId())
+            except Exception:
+                peer = None
+        if not peer:
+            self._show_message("Gift Stats", "Не удалось определить чат для отправки")
+            return
+        reply_obj = msg
+        try:
+            rid = int(msg.getId()) if msg is not None else None
+        except Exception:
+            rid = None
+        self._run_export(int(account), int(peer), None, str(user_id), None, False, rid, reply_obj)
+
+    def _on_chat_click(self, context):
+        account = context.get("account") if context else None
+        dialog_id = None
+        if context:
+            try:
+                dialog_id = context.get("dialog_id")
+                if dialog_id is not None:
+                    dialog_id = int(dialog_id)
+            except Exception:
+                dialog_id = None
+        if dialog_id is None:
+            self._show_message("Gift Stats", "Не удалось определить чат из контекста")
+            return
+        target = abs(int(dialog_id))
+        if target <= 0:
+            self._show_message("Gift Stats", "Подарки можно собирать только у пользователей")
+            return
+        self._run_export(int(account), int(dialog_id), None, str(target), None, False)
+
+    def collect_and_show(self, account, user_id):
+        self._x_cancel = False
+        loading = self._show_loading()
+        self._collect(
+            account,
+            user_id,
+            on_done=lambda gifts, names: self._on_collected(account, gifts, names, loading),
+            on_error=lambda err: self._on_collect_error(err, loading),
+            progress=loading,
+        )
+
+    def _on_collected(self, account, gifts, names, loading):
+        if self._export_is_cancelled():
+            return
+        donors, anonymous, nft = self._build_stats(gifts, names, account)
+        self._disambiguate_names(donors)
+
+        def ui():
+            if loading is not None:
+                try:
+                    loading.dismiss()
+                except Exception:
+                    pass
+            self._show_donors(donors, anonymous, nft, account)
+        run_on_ui_thread(ui)
+
+    def _on_collect_error(self, err, loading):
+        if self._export_is_cancelled():
+            return
+        self.log(f"GiftStats error: {err}")
+
+        def ui():
+            if loading is not None:
+                try:
+                    loading.dismiss()
+                except Exception:
+                    pass
+            self._show_message("Gift Stats", f"Ошибка: {err}")
+        run_on_ui_thread(ui)
+
+    def _show_loading(self):
+        if not self.get_setting("show_loading", True):
+            return None
+        activity = self._get_activity()
+        if activity is None:
+            return None
+        try:
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            builder.set_title("Gift Stats")
+            builder.set_message("Сбор статистики подарков...")
+            builder.set_negative_button("Отмена", lambda b, w: self._cancel_export())
+            builder.set_on_cancel_listener(lambda b: self._cancel_export())
+            builder.set_cancelable(True)
+            builder.show()
+            self._xloading = builder
+            return builder
+        except Exception:
+            return None
+
+    def _get_activity(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return None
+            return fragment.getParentActivity()
+        except Exception:
+            return None
+
+    def _collect(self, account, user_id, on_done, on_error, progress=None):
+        self._resolve_peer(account, user_id, lambda peer: self._fetch_gifts(account, peer, on_done, on_error, progress))
+
+    def _list_items(self, java_list):
+        items = []
+        try:
+            if java_list is None:
+                return items
+            size = java_list.size()
+            for i in range(size):
+                items.append(java_list.get(i))
+        except Exception:
+            pass
+        return items
+
+    def _resolve_peer(self, account, user_id, on_result):
+        mc = MessagesController.getInstance(account)
+        user = None
+        try:
+            user = mc.getUser(user_id)
+        except Exception:
+            user = None
+        if user is not None and getattr(user, "access_hash", 0):
+            try:
+                on_result(MessagesController.getInputPeer(user))
+                return
+            except Exception:
+                pass
+        chat = None
+        try:
+            chat = mc.getChat(user_id)
+        except Exception:
+            chat = None
+        if chat is not None and getattr(chat, "access_hash", 0):
+            try:
+                on_result(MessagesController.getInputPeer(chat))
+                return
+            except Exception:
+                pass
+        try:
+            req = TLRPC.TL_users_getUsers()
+            iu = TLRPC.TL_inputUser()
+            iu.user_id = user_id
+            iu.access_hash = 0
+            req.id.add(iu)
+
+            def cb(response, error):
+                if error is not None:
+                    self.log(f"GiftStats resolve error: {getattr(error, 'text', error)}")
+                    on_result(None)
+                    return
+                resolved = None
+                try:
+                    if response is not None:
+                        for u in self._list_items(response):
+                            if getattr(u, "id", None) == user_id:
+                                resolved = u
+                                break
+                except Exception:
+                    resolved = None
+                if resolved is not None:
+                    try:
+                        on_result(MessagesController.getInputPeer(resolved))
+                    except Exception:
+                        on_result(None)
+                else:
+                    on_result(None)
+
+            send_request(req, cb, account=account)
+        except Exception as e:
+            self.log(f"GiftStats resolve send error: {e}")
+            on_result(None)
+
+    def _fetch_gifts(self, account, peer, on_done, on_error, progress=None):
+        if peer is None:
+            on_error("Не удалось получить peer пользователя (пользователь не загружен)")
+            return
+        all_gifts = []
+        name_map = {}
+
+        def fetch(offset):
+            if self._export_is_cancelled():
+                return
+            req = TL_stars.getSavedStarGifts()
+            req.limit = PAGE_LIMIT
+            req.offset = offset if offset else ""
+            req.peer = peer
+
+            def cb(response, error):
+                try:
+                    if self._export_is_cancelled():
+                        return
+                    if error is not None:
+                        self.log(f"GiftStats request error: {getattr(error, 'text', error)}")
+                        on_error(str(getattr(error, "text", error)))
+                        return
+                    if response is None:
+                        on_done(all_gifts, name_map)
+                        return
+                    rnext = getattr(response, "next_offset", None)
+                    rgifts = getattr(response, "gifts", None)
+                    gift_items = self._list_items(rgifts)
+                    for g in gift_items:
+                        all_gifts.append(g)
+                    users = getattr(response, "users", None)
+                    for u in self._list_items(users):
+                        uid = getattr(u, "id", None)
+                        if uid is not None:
+                            name_map[uid] = u
+                    chats = getattr(response, "chats", None)
+                    for c in self._list_items(chats):
+                        cid = getattr(c, "id", None)
+                        if cid is not None:
+                            name_map[-cid] = c
+                    if progress is not None:
+                        try:
+                            total = getattr(response, "count", 0)
+                            if total:
+                                msg = f"Загружаю подарки: {len(all_gifts)} / {total}"
+                            else:
+                                msg = f"Загружаю подарки: {len(all_gifts)}"
+
+                            def upd(msg=msg):
+                                try:
+                                    progress.set_message(msg)
+                                except Exception:
+                                    pass
+
+                            run_on_ui_thread(upd)
+                        except Exception:
+                            pass
+                    if rnext:
+                        fetch(rnext)
+                    else:
+                        on_done(all_gifts, name_map)
+                except Exception as e:
+                    self.log(f"GiftStats cb exception: {e}")
+                    on_error(f"Внутренняя ошибка: {e}")
+
+            try:
+                send_request(req, cb, account=account)
+            except Exception as e:
+                on_error(f"Ошибка отправки запроса: {e}")
+
+        fetch(None)
+
+    def _build_stats(self, gifts, name_map, account):
+        donors = {}
+        anonymous = None
+        nft = None
+
+        for g in gifts:
+            is_anon = bool(getattr(g, "name_hidden", False))
+            from_id = getattr(g, "from_id", None)
+            gift_obj = getattr(g, "gift", None)
+            is_nft = False
+            if gift_obj is not None:
+                try:
+                    is_nft = "TL_starGiftUnique" in gift_obj.getClass().getName()
+                except Exception:
+                    is_nft = False
+            title = self._gift_title(g)
+            stars = self._gift_stars(g)
+
+            if is_nft:
+                if nft is None:
+                    nft = self._new_donor(None, "NFT", nft=True)
+                try:
+                    nft["usd"] += int(getattr(gift_obj, "value_usd_amount", 0) or 0)
+                except Exception:
+                    pass
+                d = nft
+            elif is_anon or from_id is None:
+                if anonymous is None:
+                    anonymous = self._new_donor(None, "Анонимные", anon=True)
+                d = anonymous
+            else:
+                sender_id = self._peer_id(from_id)
+                if sender_id is None:
+                    if anonymous is None:
+                        anonymous = self._new_donor(None, "Анонимные", anon=True)
+                    d = anonymous
+                else:
+                    d = donors.get(sender_id)
+                    if d is None:
+                        d = self._new_donor(sender_id, self._name_for(sender_id, name_map, account))
+                        d["obj"] = name_map.get(sender_id)
+                        donors[sender_id] = d
+
+            d["count"] += 1
+            d["stars"] += stars
+            gg = d["gifts"]
+            doc = self._gift_document(g)
+            key = None
+            if doc is not None:
+                did = getattr(doc, "id", None)
+                if did is not None:
+                    key = ("doc", did)
+            if key is None:
+                key = ("title", title)
+            entry = gg.get(key)
+            if entry is None:
+                entry = [0, 0, self._gift_emoji(g), doc, title]
+                if is_nft:
+                    try:
+                        entry.append(int(getattr(gift_obj, "value_usd_amount", 0) or 0))
+                    except Exception:
+                        entry.append(0)
+                gg[key] = entry
+            entry[0] += 1
+            entry[1] += stars
+
+            if doc is not None:
+                did = getattr(doc, "id", None)
+                if did is not None:
+                    seen = d.setdefault("_seen_docs", set())
+                    if did not in seen:
+                        seen.add(did)
+                        d["docs"].append(doc)
+
+        return donors, anonymous, nft
+
+    def _disambiguate_names(self, donors):
+        seen = {}
+        for sid, d in donors.items():
+            seen.setdefault(d["name"], []).append(sid)
+        for sid, d in donors.items():
+            if len(seen[d["name"]]) > 1:
+                d["name"] = f"{d['name']} ({sid})"
+
+    def _new_donor(self, key, name, anon=False, nft=False):
+        return {"key": key, "name": name, "count": 0, "stars": 0, "gifts": {}, "obj": None, "docs": [], "anon": anon, "nft": nft, "usd": 0}
+
+    def _peer_id(self, peer):
+        try:
+            if peer is None:
+                return None
+            uid = getattr(peer, "user_id", None)
+            if uid is not None:
+                return uid
+            cid = getattr(peer, "chat_id", None)
+            if cid is not None:
+                return -cid
+            cid2 = getattr(peer, "channel_id", None)
+            if cid2 is not None:
+                return -cid2
+        except Exception:
+            pass
+        return None
+
+    def _name_for(self, sender_id, name_map, account):
+        obj = name_map.get(sender_id)
+        if obj is None and sender_id > 0:
+            try:
+                obj = MessagesController.getInstance(account).getUser(sender_id)
+            except Exception:
+                obj = None
+        if obj is None:
+            return f"ID {sender_id}" if sender_id > 0 else f"Канал {abs(sender_id)}"
+        title = getattr(obj, "title", None)
+        if title:
+            return str(title)
+        if getattr(obj, "deleted", False):
+            return "Удалённый аккаунт"
+        try:
+            name = UserObject.getUserName(obj)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        first = getattr(obj, "first_name", None)
+        last = getattr(obj, "last_name", None)
+        if first:
+            return str(first) + (f" {last}" if last else "")
+        return str(sender_id)
+
+    def _gift_title(self, g):
+        try:
+            gift = getattr(g, "gift", None)
+            if gift is not None:
+                title = getattr(gift, "title", None)
+                if title:
+                    return str(title)
+                slug = getattr(gift, "slug", None)
+                if slug:
+                    return str(slug)
+                emoji = self._sticker_emoji(gift)
+                if emoji:
+                    return emoji
+            return "Подарок"
+        except Exception:
+            return "Подарок"
+
+    def _java_name(self, obj):
+        try:
+            return obj.getClass().getName()
+        except Exception:
+            return str(type(obj))
+
+    def _sticker_emoji(self, gift):
+        try:
+            sticker = getattr(gift, "sticker", None)
+            if sticker is None:
+                return None
+            for attr in self._list_items(getattr(sticker, "attributes", None)):
+                name = self._java_name(attr)
+                if name and ("Sticker" in name or "CustomEmoji" in name):
+                    alt = getattr(attr, "alt", None)
+                    if alt:
+                        return str(alt)
+        except Exception:
+            pass
+        return None
+
+    def _fmt_usd(self, raw):
+        try:
+            v = float(raw or 0) / 100.0
+        except Exception:
+            v = 0.0
+        if v <= 0:
+            return None
+        s = f"{v:.2f}".rstrip("0").rstrip(".")
+        return f"~{s}$"
+
+    def _gift_stars(self, g):
+        try:
+            gift = getattr(g, "gift", None)
+            if gift is None:
+                return 0
+            v = getattr(gift, "stars", None)
+            if v is None:
+                v = getattr(gift, "convert_stars", None)
+            return int(v) if v is not None else 0
+        except Exception:
+            return 0
+
+    def _gift_emoji(self, g):
+        try:
+            gift = getattr(g, "gift", None)
+            if gift is not None:
+                e = self._sticker_emoji(gift)
+                if e:
+                    return str(e)
+        except Exception:
+            pass
+        return ""
+
+    def _gift_document(self, g):
+        try:
+            gift = getattr(g, "gift", None)
+            if gift is None:
+                return None
+            doc = getattr(gift, "sticker", None)
+            if doc is not None:
+                return doc
+            for attr in self._list_items(getattr(gift, "attributes", None)):
+                if "Model" in self._java_name(attr):
+                    return getattr(attr, "document", None)
+        except Exception:
+            pass
+        return None
+
+    def _show_donors(self, donors, anonymous, nft, account):
+        named = sorted(donors.values(), key=lambda d: -d["stars"])
+        limit = self._top_limit()
+        if limit and len(named) > limit:
+            named = named[:limit]
+        donor_list = list(named)
+        if nft is not None:
+            donor_list.append(nft)
+        if anonymous is not None:
+            donor_list.append(anonymous)
+        if not donor_list:
+            self._show_message("Gift Stats", "Подарков не найдено")
+            return
+        total = sum(d["count"] for d in donor_list)
+        total_stars = sum(d["stars"] for d in donor_list)
+        unique_docs = []
+        seen = set()
+        for d in donor_list:
+            for doc in d.get("docs") or []:
+                did = getattr(doc, "id", None)
+                if did is None or did in seen:
+                    continue
+                seen.add(did)
+                unique_docs.append(doc)
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return
+            layout = frag.getParentLayout()
+            if layout is None:
+                return
+            gf = _GiftStatsFragment.new_instance()
+            gf.setup_top(account, self, donor_list, total, unique_docs, total_stars)
+            layout.presentFragment(gf.java, False)
+        except Exception as e:
+            self.log(f"GiftStats panel error: {e}")
+            self._show_message("Gift Stats", f"Ошибка отображения: {e}")
+
+    def _show_message(self, title, message):
+        activity = self._get_activity()
+        if activity is None:
+            return
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(title)
+        builder.set_message(message)
+        builder.set_positive_button("OK", lambda b, w: b.dismiss())
+        builder.show()
+
+
+@java_subclass(find_class("org.telegram.ui.ActionBar.ActionBar$ActionBarMenuOnItemClick"))
+class _ABMenuClick(Base):
+
+    def __init__(self, *args):
+        self._frag = None
+
+    @joverride()
+    def onItemClick(self, id):
+        try:
+            if int(id) == -1 and self._frag is not None:
+                self._frag.finishFragment()
+        except Exception:
+            pass
+
+
+@java_subclass(find_class("org.telegram.ui.ActionBar.BaseFragment"))
+class _GiftStatsFragment(Base):
+
+    def __init__(self, *args):
+        self._mode = "top"
+        self._donor_list = None
+        self._total = 0
+        self._donor = None
+        self._account = 0
+        self._plugin = None
+        self._ctx = None
+        self._ready = False
+        self._cached_view = None
+        self._unique_docs = []
+        self._title_sad = None
+        self._alive = True
+        self._visible = True
+        self._title_view = None
+        self._preloaded_aeds = []
+
+    def setup_top(self, account, plugin, donor_list, total, unique_docs=None, total_stars=0):
+        self._account = account
+        self._plugin = plugin
+        self._mode = "top"
+        self._donor_list = donor_list
+        self._total = total
+        self._total_stars = total_stars
+        self._unique_docs = unique_docs or []
+
+    def setup_details(self, account, plugin, donor):
+        self._account = account
+        self._plugin = plugin
+        self._mode = "details"
+        self._donor = donor
+
+    def _ui(self):
+        if not self._ready:
+            self._ready = True
+            self.LinearLayout = jclass("android.widget.LinearLayout")
+            self.FrameLayout = jclass("android.widget.FrameLayout")
+            self.TextView = jclass("android.widget.TextView")
+            self.TruncateAt = jclass("android.text.TextUtils$TruncateAt")
+            self.ImageView = jclass("android.widget.ImageView")
+            self.ScrollView = jclass("android.widget.ScrollView")
+            self.ViewGroup = jclass("android.view.ViewGroup")
+            self.View = jclass("android.view.View")
+            self.Gravity = jclass("android.view.Gravity")
+            self.TypedValue = jclass("android.util.TypedValue")
+            self.Typeface = jclass("android.graphics.Typeface")
+            self.ColorClass = jclass("android.graphics.Color")
+            self.Handler = jclass("android.os.Handler")
+            self.Looper = jclass("android.os.Looper")
+            self._handler = self.Handler(self.Looper.getMainLooper())
+            self.SwapAED = jclass("org.telegram.ui.Components.AnimatedEmojiDrawable$SwapAnimatedEmojiDrawable")
+            self.AnimatedEmojiDrawable = jclass("org.telegram.ui.Components.AnimatedEmojiDrawable")
+            self.BackupImageView = jclass("org.telegram.ui.Components.BackupImageView")
+            self.AvatarDrawable = jclass("org.telegram.ui.Components.AvatarDrawable")
+            self.GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+            self.ObjectAnimator = jclass("android.animation.ObjectAnimator")
+        self.R_drawable = R_tg.drawable
+        self.Theme = Theme
+        try:
+            self.K_BG = self.Theme.key_windowBackgroundWhite
+            self.K_TEXT = self.Theme.key_dialogTextBlack
+            self.K_TEXT_DIM = self.Theme.key_dialogTextGray2
+            self.K_DIVIDER = self.Theme.key_divider
+            self.K_APP_BG = self.Theme.key_windowBackgroundGray
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats theme init fallback: {e!r}")
+            self.K_BG = "#FFFFFF"
+            self.K_TEXT = "#000000"
+            self.K_TEXT_DIM = "#808080"
+            self.K_DIVIDER = "#E3E3E3"
+            self.K_APP_BG = "#F0F0F0"
+        return self
+
+    def dp(self, v):
+        try:
+            return int(self.TypedValue.applyDimension(
+                self.TypedValue.COMPLEX_UNIT_DIP, float(v), self._ctx.getResources().getDisplayMetrics()))
+        except Exception:
+            return int(v)
+
+    def color(self, value):
+        return self.ColorClass.parseColor(value)
+
+    def theme(self, key):
+        try:
+            return int(self.Theme.getColor(key))
+        except Exception:
+            try:
+                return self.color(key)
+            except Exception:
+                return self.color("#FFFFFF")
+
+    def text(self, txt, size, colr, bold=False):
+        tv = self.TextView(self._ctx)
+        tv.setText(str(txt))
+        tv.setTextColor(colr)
+        tv.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, float(size))
+        if bold:
+            tv.setTypeface(self.Typeface.DEFAULT_BOLD)
+        return tv
+
+    def _divider(self, inset=0):
+        container = self.LinearLayout(self._ctx)
+        container.setOrientation(self.LinearLayout.VERTICAL)
+        container.setPadding(inset, 0, 0, 0)
+        v = self.View(self._ctx)
+        v.setBackgroundColor(self.theme(self.K_DIVIDER))
+        container.addView(v, self.LinearLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, 1))
+        return container
+
+    @joverride()
+    def onFragmentCreate(self):
+        try:
+            super().onFragmentCreate()
+        except Exception:
+            pass
+        if self._plugin is not None:
+            self._plugin.log(f"GiftStats frag CREATE mode={self._mode}")
+        return True
+
+    @joverride()
+    def onPause(self):
+        self._visible = False
+        try:
+            if self._title_sad is not None:
+                self._title_sad.detach()
+        except Exception:
+            pass
+        try:
+            super().onPause()
+        except Exception:
+            pass
+
+    @joverride()
+    def onResume(self):
+        try:
+            super().onResume()
+        except Exception:
+            pass
+        self._visible = True
+        try:
+            if self._mode == "top" and self._title_sad is not None:
+                self._title_sad.attach()
+                if self._title_docs and len(self._title_docs) > 1:
+                    self._cycle_title(self._title_sad, self._title_docs)
+        except Exception:
+            pass
+
+    @joverride()
+    def onFragmentDestroy(self):
+        if self._plugin is not None:
+            self._plugin.log(f"GiftStats frag DESTROY mode={self._mode}")
+        self._alive = False
+        try:
+            if self._title_sad is not None:
+                self._title_sad.detach()
+        except Exception:
+            pass
+        try:
+            for aed in self._preloaded_aeds:
+                try:
+                    aed.removeView(self._title_view)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._preloaded_aeds = []
+        self._title_sad = None
+        self._title_docs = []
+        self._title_view = None
+        try:
+            if self.fragmentView is not None:
+                parent = self.fragmentView.getParent()
+                if parent is not None:
+                    parent.removeView(self.fragmentView)
+        except Exception:
+            pass
+        try:
+            super().onFragmentDestroy()
+        except Exception:
+            pass
+
+    @joverride("createView", ["android.content.Context"])
+    def create_view(self, context):
+        self._ctx = context
+        if self._plugin is not None:
+            self._plugin.log(f"GiftStats frag VIEW mode={self._mode}")
+        self._ui()
+        ab = self.getActionBar()
+        if ab is not None:
+            try:
+                ab.setBackButtonImage(int(self.R_drawable.ic_ab_back))
+            except Exception:
+                pass
+            try:
+                ab.setAllowOverlayTitle(True)
+            except Exception:
+                pass
+            if self._mode == "details":
+                ab.setTitle(str(self._donor["name"]))
+            else:
+                self._apply_title(ab)
+            try:
+                mc = _ABMenuClick.new_instance()
+                mc._frag = self
+                ab.setActionBarMenuOnItemClick(mc.java)
+            except Exception as e:
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats menu click error: {e}")
+        fl = self.FrameLayout(context)
+        fl.setBackgroundColor(self.theme(self.K_APP_BG))
+        if self._mode == "details":
+            self._build_details(fl)
+        else:
+            self._build_top(fl)
+        self._cached_view = fl
+        self.fragmentView = fl
+        return fl
+
+    def _apply_title(self, ab):
+        title_text = f"Топ дарителей · {self._total}"
+        if self._unique_docs:
+            try:
+                if self._title_sad is None:
+                    title_view = None
+                    try:
+                        title_view = ab.getTitleTextView()
+                    except Exception:
+                        title_view = None
+                    sad = self.SwapAED(None, self.dp(26))
+                    sad.setCurrentAccount(self._account)
+                    docs = [d for d in self._unique_docs if getattr(d, "mime_type", "") == "application/x-tgsticker"]
+                    if not docs:
+                        docs = self._unique_docs
+                    if self._plugin is not None:
+                        self._plugin.log(f"GiftStats title docs: {len(self._unique_docs)} total, {len(docs)} animated")
+                    sad.set(docs[0], True)
+                    try:
+                        sad.attach()
+                    except Exception:
+                        pass
+                    self._title_sad = sad
+                    self._title_docs = docs
+                    self._title_view = title_view
+                    if len(docs) > 1:
+                        self._cycle_title(sad, docs)
+                    try:
+                        self._handler.postDelayed(_JavaRunnable(self._attach_title), 250)
+                    except Exception:
+                        pass
+                    try:
+                        self._handler.postDelayed(_JavaRunnable(self._restore_title), 600)
+                    except Exception:
+                        pass
+                ab.setTitle(title_text, self._title_sad)
+                return
+            except Exception as e:
+                if self._plugin is not None:
+                    self._plugin.log(f"GiftStats title drawable error: {e}")
+        ab.setTitle(title_text)
+
+    def _attach_title(self):
+        try:
+            if self._title_sad is None or self._mode != "top":
+                return
+            self._title_sad.attach()
+            ab = self.getActionBar()
+            if ab is not None:
+                ab.setTitle(f"Топ дарителей · {self._total}", self._title_sad)
+                self._preload_title_docs(ab)
+        except Exception:
+            pass
+
+    def _preload_title_docs(self, ab):
+        try:
+            if not self._title_docs or len(self._title_docs) < 2:
+                return
+            title_view = None
+            try:
+                title_view = ab.getTitleTextView()
+            except Exception:
+                title_view = None
+            if title_view is None:
+                return
+            for d in self._title_docs[1:]:
+                try:
+                    aed = self.AnimatedEmojiDrawable.make(self._account, self.AnimatedEmojiDrawable.CACHE_TYPE_EMOJI_STATUS, d)
+                    aed.addView(title_view)
+                    self._preloaded_aeds.append(aed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _restore_title(self):
+        try:
+            if self._mode != "top" or self._title_sad is None:
+                return
+            ab = self.getActionBar()
+            if ab is not None:
+                try:
+                    self._title_sad.attach()
+                except Exception:
+                    pass
+                ab.setTitle(f"Топ дарителей · {self._total}", self._title_sad)
+                if self._plugin is not None:
+                    self._plugin.log("GiftStats title restored")
+        except Exception:
+            pass
+
+    def _build_top(self, fl):
+        if self._plugin is not None:
+            try:
+                self._plugin.log(f"GiftStats colors bg={self.theme(self.K_BG):#08x} appbg={self.theme(self.K_APP_BG):#08x} text={self.theme(self.K_TEXT):#08x} dim={self.theme(self.K_TEXT_DIM):#08x}")
+            except Exception:
+                pass
+        if not self._donor_list:
+            empty = self.LinearLayout(self._ctx)
+            empty.setOrientation(self.LinearLayout.VERTICAL)
+            empty.setGravity(self.Gravity.CENTER_HORIZONTAL)
+            emoji = self.text("🎁", 48, self.theme(self.K_TEXT))
+            emoji.setGravity(self.Gravity.CENTER)
+            empty.addView(emoji)
+            txt = self.text("Подарков пока нет", 15, self.theme(self.K_TEXT_DIM))
+            txt.setGravity(self.Gravity.CENTER)
+            lp = self.LinearLayout.LayoutParams(self.ViewGroup.LayoutParams.WRAP_CONTENT, self.ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.setMargins(0, self.dp(12), 0, 0)
+            empty.addView(txt, lp)
+            fl.addView(empty, self.FrameLayout.LayoutParams(
+                self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT, self.Gravity.CENTER))
+            return
+
+        list_box = self.LinearLayout(self._ctx)
+        list_box.setOrientation(self.LinearLayout.VERTICAL)
+
+        try:
+            card_lp = self.LinearLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT)
+            card_lp.setMargins(self.dp(16), self.dp(12), self.dp(16), self.dp(12))
+            list_box.addView(self._summary_card(), card_lp)
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats summary card error: {e}")
+
+        for i, donor in enumerate(self._donor_list):
+            if i > 0:
+                list_box.addView(self._divider(0))
+            list_box.addView(self._donor_row(donor, self._total))
+
+        scroll = self.ScrollView(self._ctx)
+        scroll.setVerticalScrollBarEnabled(True)
+        scroll.addView(list_box, self.FrameLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
+        fl.addView(scroll, self.FrameLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+
+    def _summary_card(self):
+        total_stars = sum((d.get("stars") or 0) for d in self._donor_list)
+        card = self.LinearLayout(self._ctx)
+        card.setOrientation(self.LinearLayout.VERTICAL)
+        card.setPadding(self.dp(14), self.dp(12), self.dp(14), self.dp(12))
+        try:
+            bg = self.Theme.createRoundRectDrawable(self.dp(12), self.Theme.getColor(self.Theme.key_windowBackgroundWhite))
+            card.setBackground(bg)
+        except Exception:
+            card.setBackgroundColor(self.theme(self.K_BG))
+        row1 = self.LinearLayout(self._ctx)
+        row1.setOrientation(self.LinearLayout.HORIZONTAL)
+        row1.setGravity(self.Gravity.CENTER_VERTICAL)
+        lbl = self.text(f"{self._total} подарков · ", 14, self.theme(self.K_TEXT_DIM))
+        row1.addView(lbl)
+        st_tv = self.text(str(total_stars), 14, self.theme(self.K_TEXT_DIM))
+        row1.addView(st_tv)
+        star_icon = self.ImageView(self._ctx)
+        try:
+            star_icon.setImageResource(int(self.R_drawable.star_small_inner))
+        except Exception:
+            pass
+        star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
+        star_lp.setMargins(self.dp(4), 0, 0, 0)
+        star_icon.setLayoutParams(star_lp)
+        row1.addView(star_icon)
+        card.addView(row1)
+        return card
+
+    def _donor_row(self, donor, total):
+        row = self.LinearLayout(self._ctx)
+        row.setOrientation(self.LinearLayout.HORIZONTAL)
+        row.setGravity(self.Gravity.CENTER_VERTICAL)
+        row.setPadding(self.dp(16), self.dp(10), self.dp(16), self.dp(10))
+        row.setBackgroundColor(self.theme(self.K_BG))
+        row.setLayoutParams(self.LinearLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        avatar = self.BackupImageView(self._ctx)
+        avatar.setRoundRadius(self.dp(22))
+        nft_docs = donor.get("docs") or []
+        if donor.get("nft") and nft_docs:
+            try:
+                self._apply_image(avatar, nft_docs[0])
+            except Exception:
+                try:
+                    avatar.setImageDrawable(self._make_avatar(donor))
+                except Exception:
+                    pass
+        else:
+            ad = self._make_avatar(donor)
+            try:
+                obj = donor.get("obj")
+                if obj is not None:
+                    avatar.setForUserOrChat(obj, ad)
+                else:
+                    avatar.setImageDrawable(ad)
+            except Exception:
+                try:
+                    avatar.setImageDrawable(ad)
+                except Exception:
+                    pass
+        avatar.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(44), self.dp(44)))
+        row.addView(avatar)
+
+        col = self.LinearLayout(self._ctx)
+        col.setOrientation(self.LinearLayout.VERTICAL)
+        col.setGravity(self.Gravity.CENTER_VERTICAL)
+        col.setPadding(self.dp(14), 0, 0, 0)
+        col.setLayoutParams(self.LinearLayout.LayoutParams(0, self.ViewGroup.LayoutParams.WRAP_CONTENT, 1.0))
+
+        total_stars = getattr(self, "_total_stars", 0) or 0
+        pct = int(round((donor.get("stars") or 0) * 100.0 / total_stars)) if total_stars else 0
+        if total < 5:
+            sub_text = str(donor["count"])
+        elif donor["count"] == 1:
+            sub_text = "1 подарок"
+        else:
+            sub_text = f"{pct}% · {donor['count']}"
+        nick = self.text(donor["name"], 15, self.theme(self.K_TEXT), True)
+        nick.setSingleLine(True)
+        try:
+            nick.setEllipsize(self.TruncateAt.END)
+        except Exception:
+            pass
+        col.addView(nick)
+        sub = self.text(sub_text, 12, self.theme(self.K_TEXT_DIM))
+        sub.setPadding(0, self.dp(1), 0, 0)
+        col.addView(sub)
+        row.addView(col)
+
+        stars = self.LinearLayout(self._ctx)
+        stars.setOrientation(self.LinearLayout.HORIZONTAL)
+        stars.setGravity(self.Gravity.CENTER_VERTICAL)
+        if donor.get("nft"):
+            usd_txt = self._plugin._fmt_usd(donor.get("usd") or 0)
+            if usd_txt:
+                sc = self.text(usd_txt, 15, self.theme(self.K_TEXT))
+                stars.addView(sc)
+            else:
+                sc = self.text("0", 15, self.theme(self.K_TEXT))
+                stars.addView(sc)
+                icon = self.ImageView(self._ctx)
+                try:
+                    icon.setImageResource(int(self.R_drawable.star_small_inner))
+                except Exception:
+                    pass
+                star_lp = self.LinearLayout.LayoutParams(self.dp(16), self.dp(16))
+                star_lp.setMargins(self.dp(4), 0, 0, 0)
+                icon.setLayoutParams(star_lp)
+                stars.addView(icon)
+        else:
+            sc = self.text(str(donor["stars"]), 15, self.theme(self.K_TEXT))
+            stars.addView(sc)
+            icon = self.ImageView(self._ctx)
+            try:
+                icon.setImageResource(int(self.R_drawable.star_small_inner))
+            except Exception:
+                pass
+            star_lp = self.LinearLayout.LayoutParams(self.dp(16), self.dp(16))
+            star_lp.setMargins(self.dp(4), 0, 0, 0)
+            icon.setLayoutParams(star_lp)
+            stars.addView(icon)
+        row.addView(stars)
+
+        docs = donor.get("docs") or []
+        if docs:
+            icon = self._animated_icon(docs[0], "")
+            icon.setPadding(self.dp(8), 0, 0, 0)
+            icon.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(24), self.dp(24)))
+            row.addView(icon)
+            if len(docs) > 1:
+                self._cycle_icon(icon, docs)
+
+        arrow = self.text("›", 20, self.theme(self.K_TEXT_DIM), True)
+        arrow.setPadding(self.dp(8), 0, 0, 0)
+        row.addView(arrow)
+
+        row.setOnClickListener(OnClickListener(lambda v: self._open_details(donor)))
+        return row
+
+    def _make_avatar(self, donor):
+        ad = self.AvatarDrawable()
+        try:
+            obj = donor.get("obj")
+            if obj is not None:
+                ad.setInfo(obj)
+            else:
+                ad.setAvatarType(21)
+        except Exception:
+            pass
+        return ad
+
+    def _open_details(self, donor):
+        try:
+            layout = self.getParentLayout()
+            if layout is None:
+                return
+            d = _GiftStatsFragment.new_instance()
+            d.setup_details(self._account, self._plugin, donor)
+            layout.presentFragment(d.java, False)
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats details error: {e}")
+
+    def _build_details(self, fl):
+        list_box = self.LinearLayout(self._ctx)
+        list_box.setOrientation(self.LinearLayout.VERTICAL)
+
+        total_row = self.LinearLayout(self._ctx)
+        total_row.setOrientation(self.LinearLayout.HORIZONTAL)
+        total_row.setGravity(self.Gravity.CENTER_VERTICAL)
+        total_row.setPadding(self.dp(16), self.dp(12), self.dp(16), self.dp(8))
+        lbl = self.text(f"Всего: {self._donor['count']} 🎁 · ", 14, self.theme(self.K_TEXT_DIM))
+        total_row.addView(lbl)
+        st_tv = self.text(str(self._donor["stars"]), 14, self.theme(self.K_TEXT_DIM))
+        total_row.addView(st_tv)
+        star_icon = self.ImageView(self._ctx)
+        try:
+            star_icon.setImageResource(int(self.R_drawable.star_small_inner))
+        except Exception:
+            pass
+        star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
+        star_lp.setMargins(self.dp(4), 0, 0, 0)
+        star_icon.setLayoutParams(star_lp)
+        total_row.addView(star_icon)
+        list_box.addView(total_row)
+
+        gift_items = sorted(self._donor["gifts"].items(), key=lambda kv: -kv[1][0])
+        for i, (title, entry) in enumerate(gift_items):
+            if i > 0:
+                list_box.addView(self._divider(0))
+            cnt = entry[0]
+            st = entry[1]
+            emoji = entry[2] if len(entry) > 2 else ""
+            doc = entry[3] if len(entry) > 3 else None
+            t = entry[4] if len(entry) > 4 else title
+            if t and t == emoji:
+                t = ""
+            list_box.addView(self._gift_row(t, cnt, st, emoji, doc, entry[5] if len(entry) > 5 else 0))
+
+        scroll = self.ScrollView(self._ctx)
+        scroll.setVerticalScrollBarEnabled(True)
+        scroll.addView(list_box, self.FrameLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
+        fl.addView(scroll, self.FrameLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+
+    def _gift_row(self, title, cnt, st, emoji, doc=None, usd=0):
+        row = self.LinearLayout(self._ctx)
+        row.setOrientation(self.LinearLayout.HORIZONTAL)
+        row.setGravity(self.Gravity.CENTER_VERTICAL)
+        row.setPadding(self.dp(16), self.dp(9), self.dp(16), self.dp(9))
+        row.setLayoutParams(self.LinearLayout.LayoutParams(
+            self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        if doc is not None:
+            icon = self._animated_icon(doc, emoji)
+        else:
+            icon = self.text(emoji if emoji else "🎁", 20, self.theme(self.K_TEXT))
+            icon.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(34), self.ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(icon)
+
+        show_title = bool(title) and title != emoji
+        if show_title:
+            title_tv = self.text(title, 14, self.theme(self.K_TEXT))
+            title_tv.setSingleLine(True)
+            title_tv.setPadding(self.dp(10), 0, self.dp(10), 0)
+            title_tv.setLayoutParams(self.LinearLayout.LayoutParams(
+                0, self.ViewGroup.LayoutParams.WRAP_CONTENT, 1.0))
+            row.addView(title_tv)
+
+        if usd:
+            usd_txt = self._plugin._fmt_usd(usd)
+            cnt_tv = self.text(f"{cnt} × {usd_txt if usd_txt else '0$'}", 14, self.theme(self.K_TEXT_DIM))
+            row.addView(cnt_tv)
+        else:
+            price = int(round(st / cnt)) if st and cnt else 0
+            cnt_tv = self.text(f"{cnt} × {price}", 14, self.theme(self.K_TEXT_DIM))
+            row.addView(cnt_tv)
+
+            if st:
+                star_icon = self.ImageView(self._ctx)
+                try:
+                    star_icon.setImageResource(int(self.R_drawable.star_small_inner))
+                except Exception:
+                    pass
+                star_lp = self.LinearLayout.LayoutParams(self.dp(14), self.dp(14))
+                star_lp.setMargins(self.dp(4), 0, 0, 0)
+                star_icon.setLayoutParams(star_lp)
+                row.addView(star_icon)
+
+        return row
+
+    def _animated_icon(self, doc, emoji):
+        try:
+            img = self.BackupImageView(self._ctx)
+            self._apply_image(img, doc)
+            img.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(34), self.dp(34)))
+            return img
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats animated icon error: {e}")
+            icon = self.text(emoji if emoji else "🎁", 20, self.theme(self.K_TEXT))
+            icon.setLayoutParams(self.LinearLayout.LayoutParams(self.dp(34), self.ViewGroup.LayoutParams.WRAP_CONTENT))
+            return icon
+
+    def _apply_image(self, img, doc):
+        loc = ImageLocation.getForDocument(doc)
+        img.setImage(loc, "50_50", None, 0, None)
+
+    def _cycle_icon(self, img, docs):
+        state = {"i": 0}
+
+        def tick():
+            try:
+                if not self._alive:
+                    return
+            except Exception:
+                return
+            try:
+                if not img.isAttachedToWindow():
+                    return
+            except Exception:
+                return
+            try:
+                state["i"] = (state["i"] + 1) % len(docs)
+                self._swap_icon(img, docs[state["i"]])
+            except Exception:
+                pass
+            try:
+                self._handler.postDelayed(_JavaRunnable(tick), 3000)
+            except Exception:
+                pass
+
+        try:
+            self._handler.postDelayed(_JavaRunnable(tick), 3000)
+        except Exception:
+            pass
+
+    def _cycle_title(self, sad, docs):
+        state = {"i": 0}
+
+        def tick():
+            try:
+                if not self._alive or not self._visible or self._mode != "top":
+                    return
+            except Exception:
+                return
+            try:
+                state["i"] = (state["i"] + 1) % len(docs)
+                sad.set(docs[state["i"]], True)
+                try:
+                    sad.attach()
+                except Exception:
+                    pass
+                try:
+                    ab = self.getActionBar()
+                    if ab is not None and self._mode == "top":
+                        ab.setTitle(f"Топ дарителей · {self._total}", sad)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                self._handler.postDelayed(_JavaRunnable(tick), 3000)
+            except Exception:
+                pass
+
+        try:
+            self._handler.postDelayed(_JavaRunnable(tick), 3000)
+        except Exception:
+            pass
+
+    def _swap_icon(self, img, doc):
+        try:
+            self._apply_image(img, doc)
+        except Exception as e:
+            if self._plugin is not None:
+                self._plugin.log(f"GiftStats swap icon error: {e}")
