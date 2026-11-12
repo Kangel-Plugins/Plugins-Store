@@ -1,0 +1,681 @@
+import time
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.lang import Integer
+from java.lang import System as JSystem
+from java.lang import Thread as JThread
+from java.util import ArrayList, Locale
+
+__id__ = "voice_video_split"
+__name__ = "Voice & Video Split"
+__description__ = "Разделяет голосовые сообщения и кружки по разным вкладкам"
+__author__ = "@kirasinplugins"
+__version__ = "1.0.3"
+__min_version__ = "12.10.6"
+__sdk_version__ = ">=1.4.3.6"
+__category__ = ["media", "chats"]
+
+VOICE_TAB_ID = 2       # Telegram's own id of the Voice tab (also its media type)
+ROUND_TAB_ID = 100     # our extra tab; never allowed to reach Telegram's internals
+TEMP_PAGE_TYPE = 4     # harmless type (Music, same adapter class) shown for a moment
+SWIPE_TIMEOUT = 4.0    # seconds a remembered swipe target stays valid
+POST_SWIPE_GRACE = 1.5  # after a swipe ends, late "select tab" calls are still corrected
+
+
+def _get_field(obj, cls, name):
+    f = cls.getDeclaredField(name)
+    f.setAccessible(True)
+    return f.get(obj)
+
+
+def _set_int_field(obj, cls, name, value):
+    f = cls.getDeclaredField(name)
+    f.setAccessible(True)
+    f.setInt(obj, value)
+
+
+# ======================= hooks ==========================================
+
+
+class UpdateTabsHook(MethodHook):
+    """SharedMediaLayout.updateTabs: rebuilds the tab strip."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        p.in_update += 1
+        try:
+            p.last_layout = param.thisObject
+            p.track_layout(param.thisObject)
+            p.ensure_delegate_hooks(param.thisObject)
+        except Exception as e:
+            p.log_error("updateTabs", e)
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        p.in_update = max(0, p.in_update - 1)
+        try:
+            p.normalize_pages(param.thisObject)
+        except Exception as e:
+            p.log_error("updateTabs (after)", e)
+
+
+class AddTabHook(MethodHook):
+    """ScrollSlidingTextTabStrip.addTextTab: add our tab right after Voice."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        try:
+            if p.adding or p.in_update <= 0:
+                return
+            args = list(param.args or [])
+            if int(args[0]) != VOICE_TAB_ID:
+                return
+            strip = param.thisObject
+            if strip.hasTab(ROUND_TAB_ID):
+                return
+            p.adding = True
+            try:
+                title = p.tab_title()
+                if len(args) >= 3:
+                    strip.addTextTab(ROUND_TAB_ID, title, args[2])
+                else:
+                    strip.addTextTab(ROUND_TAB_ID, title)
+            finally:
+                p.adding = False
+        except Exception as e:
+            p.adding = False
+            p.log_error("addTextTab", e)
+
+
+class DelegateHook(MethodHook):
+    """Tab strip delegate onPageSelected(id, forward): our tab is an alias of Voice.
+
+    Telegram ignores a tab change to the page that is already shown, so the list would
+    never be redrawn. For Voice <-> Video messages we therefore make it perform a real
+    page switch: the hidden page gets a fresh adapter attach, and the visible page briefly
+    reports another type so the "already selected" early return does not fire.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        if p.alias_call:
+            return  # our own nested call, let it through untouched
+        try:
+            args = param.args
+            tab_id = int(args[0])
+            if tab_id not in (VOICE_TAB_ID, ROUND_TAB_ID):
+                return
+            p.swipe = None
+            obj = param.thisObject
+            layout = _get_field(obj, obj.getClass(), "this$0")
+            p.last_layout = layout
+            same_page = p.current_page_type(layout) == VOICE_TAB_ID
+
+            mode = "round" if tab_id == ROUND_TAB_ID else "voice"
+            try:
+                p.set_mode(layout, mode)
+            except Exception as e:
+                p.log_error("set_mode", e)
+
+            if tab_id == VOICE_TAB_ID and not same_page:
+                return  # ordinary switch from another page: Telegram handles it
+
+            forward = bool(args[1])
+            p.alias_call = True
+            try:
+                if same_page:
+                    p.prepare_real_switch(layout)
+                obj.onPageSelected(VOICE_TAB_ID, forward)
+            finally:
+                if same_page:
+                    p.finish_real_switch()
+                p.alias_call = False
+            param.setResult(None)
+        except Exception as e:
+            p.alias_call = False
+            try:
+                p.finish_real_switch()
+            except Exception:
+                pass
+            p.log_error("onPageSelected", e)
+
+
+class ReorderGuardHook(MethodHook):
+    """Our tab must not be reordered / get an options menu (it is not a server tab)."""
+
+    def before_hooked_method(self, param):
+        try:
+            if int(param.args[0]) == ROUND_TAB_ID:
+                param.setResult(False)
+        except Exception:
+            pass
+
+
+class RemapTabHook(MethodHook):
+    """getSelectedTab/getClosestTab: report Voice instead of our alias id."""
+
+    def after_hooked_method(self, param):
+        try:
+            if param.getResult() == ROUND_TAB_ID:
+                param.setResult(Integer(VOICE_TAB_ID))  # a real java.lang.Integer
+        except Exception:
+            pass
+
+
+class SwitchModeHook(MethodHook):
+    """switchToCurrentSelectedMode: make sure no page carries our alias id."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin.normalize_pages(param.thisObject)
+        except Exception as e:
+            self.plugin.log_error("switchToCurrentSelectedMode", e)
+
+
+class LoadMediaHook(MethodHook):
+    """MediaDataController.loadMedia: a fresh first-page load of voice data resets our store."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = list(param.args or [])
+            if int(args[4]) == 2 and int(args[2]) == 0 and int(args[3]) == 0:
+                self.plugin.master.pop(int(args[0]), None)
+        except Exception as e:
+            self.plugin.log_error("loadMedia", e)
+
+
+class AddMessageHook(MethodHook):
+    """SharedMediaData.addMessage: records voice/round messages and filters by current mode."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        try:
+            args = list(param.args or [])
+            msg = args[0]
+            try:
+                is_round = bool(msg.isRoundVideo())
+            except Exception:
+                is_round = False
+            try:
+                is_voice = bool(msg.isVoice())
+            except Exception:
+                is_voice = False
+            if not (is_round or is_voice):
+                return
+
+            # Keep every voice/round message we ever see (duplicates included).
+            p.master.setdefault(int(msg.getDialogId()), {})[int(msg.getId())] = msg
+
+            if not param.getResult():
+                return  # duplicate, nothing was added
+
+            data = param.thisObject
+            key_hash = JSystem.identityHashCode(data)
+            mode = p.data_mode.get(key_hash, "voice")
+            keep = is_round if mode == "round" else (not is_round)
+
+            if not keep:
+                # Remove from the lists the adapter displays; paging state stays intact.
+                key = msg.monthKey
+                section = data.sectionArrays.get(key)
+                if section is not None:
+                    section.remove(msg)
+                    if section.isEmpty():
+                        data.sectionArrays.remove(key)
+                        data.sections.remove(key)
+                data.messages.remove(msg)
+
+            if key_hash in p.data_mode:
+                p.sync_total(data)
+        except Exception as e:
+            p.log_error("addMessage", e)
+
+
+class SetTotalHook(MethodHook):
+    """SharedMediaData.setTotalCount: keep the total equal to what we actually show."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            p = self.plugin
+            data = param.thisObject
+            if JSystem.identityHashCode(data) in p.data_mode:
+                p.sync_total(data)
+        except Exception:
+            pass
+
+
+class DeleteMessageHook(MethodHook):
+    """SharedMediaData.deleteMessage: forget deleted messages in our store."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            res = param.getResult()
+            if res is not None:
+                self.plugin.master.get(int(res.getDialogId()), {}).pop(int(res.getId()), None)
+        except Exception:
+            pass
+
+
+class PluralHook(MethodHook):
+    """LocaleController.formatPluralString("Voice", n) for the profile header counter.
+
+    The header normally counts voice messages and video messages together. We show the
+    separate count for the tab that is currently open.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        try:
+            if str(param.args[0]) != "Voice":
+                return
+            if p.last_layout is None:
+                return
+            if not p.called_from("updateSelectedMediaTabText"):
+                return
+            text = p.counter_text(p.last_layout)
+            if text is not None:
+                param.setResult(text)
+        except Exception as e:
+            p.log_error("formatPluralString", e)
+
+
+class NextPageHook(MethodHook):
+    """ScrollSlidingTextTabStrip.getNextPageId: Telegram asks it when a swipe starts.
+
+    Our tab has no page of its own, so for the layout the neighbouring page is always the
+    Voice page (id 2). The real target is remembered and applied while the swipe runs:
+    the list content is switched right now (like a tap would), and the tab indicator is
+    redirected to the right tab by SelectTabHook.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        try:
+            layout = p.layout_of_main_strip(param.thisObject)
+            if layout is None:
+                return
+            result = int(param.getResult())
+            if result not in (VOICE_TAB_ID, ROUND_TAB_ID):
+                p.swipe = None
+                return
+            if result == ROUND_TAB_ID:
+                param.setResult(Integer(VOICE_TAB_ID))  # a real page type for the layout
+            p.last_layout = layout
+
+            now = time.time()
+            sw = p.swipe
+            if sw is None or sw["target"] != result or sw.get("done") is not None:
+                p.swipe = {"target": result, "t": now, "max": 0.0, "done": None}
+            else:
+                sw["t"] = now
+
+            mode = "round" if result == ROUND_TAB_ID else "voice"
+            if p.get_mode(layout) != mode:
+                p.detach_hidden_page(layout)
+                p.set_mode(layout, mode)
+        except Exception as e:
+            p.log_error("getNextPageId", e)
+
+
+class SelectTabHook(MethodHook):
+    """ScrollSlidingTextTabStrip.selectTabWithId: moves the tab indicator during a swipe.
+
+    Both of our tabs are the Voice page for Telegram, so it always asks for tab 2. While a
+    swipe towards the Video messages tab is running we point the indicator at that tab, and
+    when the swipe ends (completed or cancelled) the indicator stays on the tab whose
+    content is on screen.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        if p.alias_select:
+            return
+        sw = p.swipe
+        if sw is None:
+            return
+        try:
+            now = time.time()
+            done_at = sw.get("done")
+            if done_at is not None:
+                if now - done_at > POST_SWIPE_GRACE:
+                    p.swipe = None
+                    return
+            elif now - sw["t"] > SWIPE_TIMEOUT:
+                p.swipe = None
+                return
+            strip = param.thisObject
+            if p.layout_of_main_strip(strip) is None:
+                return
+            tab_id = int(param.args[0])
+            if tab_id != VOICE_TAB_ID:
+                return
+            progress = float(param.args[1])
+
+            if done_at is not None:
+                # Telegram makes one more "select tab" call after the swipe animation
+                # ended; keep the final state instead of letting it jump back to Voice.
+                finished, cancelled = True, False
+            else:
+                sw["t"] = now
+                sw["max"] = max(sw["max"], progress)
+                finished = progress >= 0.999
+                cancelled = progress <= 0.001 and sw["max"] >= 0.1
+                if finished or cancelled:
+                    sw["done"] = now
+
+            new_id = ROUND_TAB_ID if sw["target"] == ROUND_TAB_ID else VOICE_TAB_ID
+            new_progress = 1.0 if (finished or cancelled) else progress
+
+            if new_id != tab_id or new_progress != progress:
+                p.alias_select = True
+                try:
+                    strip.selectTabWithId(new_id, new_progress)
+                finally:
+                    p.alias_select = False
+                param.setResult(None)
+        except Exception as e:
+            p.alias_select = False
+            p.log_error("selectTabWithId", e)
+
+
+# ======================= plugin =========================================
+
+
+class VoiceVideoSplitPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.master = {}          # dialog_id -> {message_id: MessageObject} (voice + round)
+        self.data_mode = {}       # identityHashCode(SharedMediaData) -> "voice" | "round"
+        self.in_update = 0
+        self.adding = False
+        self.alias_call = False
+        self.last_layout = None
+        self._tmp_page0 = None
+        self.swipe = None         # {'target': 2|100, 't': time, 'max': progress} while swiping
+        self.alias_select = False
+        self.hooked_delegates = set()
+
+        layout_cls = "org.telegram.ui.Components.SharedMediaLayout"
+        strip_cls = "org.telegram.ui.Components.ScrollSlidingTextTabStrip"
+        data_cls = "org.telegram.ui.Components.SharedMediaLayout$SharedMediaData"
+
+        self._hook(layout_cls, "updateTabs", UpdateTabsHook(self))
+        self._hook(strip_cls, "addTextTab", AddTabHook(self))
+        self._hook(layout_cls, "switchToCurrentSelectedMode", SwitchModeHook(self))
+        self._hook(strip_cls, "getNextPageId", NextPageHook(self))
+        self._hook(strip_cls, "selectTabWithId", SelectTabHook(self))
+        self._hook(layout_cls, "getSelectedTab", RemapTabHook())
+        self._hook(layout_cls, "getClosestTab", RemapTabHook())
+        self._hook("org.telegram.messenger.MediaDataController", "loadMedia", LoadMediaHook(self))
+        self._hook(data_cls, "addMessage", AddMessageHook(self))
+        self._hook(data_cls, "deleteMessage", DeleteMessageHook(self))
+        self._hook(data_cls, "setTotalCount", SetTotalHook(self))
+        self._hook("org.telegram.messenger.LocaleController", "formatPluralString", PluralHook(self))
+
+    # ---- helpers ----------------------------------------------------
+
+    def log_error(self, where, error):
+        try:
+            self.logger.info(f"{where}: {error}")
+        except Exception:
+            pass
+
+    def tab_title(self):
+        try:
+            if str(Locale.getDefault().getLanguage()) == "ru":
+                return "Видеосообщения"
+        except Exception:
+            pass
+        return "Video messages"
+
+    def base_class(self, obj, simple_name):
+        # The app creates anonymous subclasses; walk up to the real class.
+        c = obj.getClass()
+        while c is not None:
+            if c.getSimpleName() == simple_name:
+                return c
+            c = c.getSuperclass()
+        return obj.getClass()
+
+    def normalize_pages(self, layout):
+        """No media page may keep our alias id: Telegram indexes arrays with it."""
+        base = self.base_class(layout, "SharedMediaLayout")
+        pages = _get_field(layout, base, "mediaPages")
+        for page in pages:
+            if page is None:
+                continue
+            pbase = self.base_class(page, "MediaPage")
+            if int(_get_field(page, pbase, "selectedType")) == ROUND_TAB_ID:
+                _set_int_field(page, pbase, "selectedType", VOICE_TAB_ID)
+
+    def ensure_delegate_hooks(self, layout):
+        """Hook the tab strip's delegate class once (its name is anonymous, so find it live)."""
+        base = self.base_class(layout, "SharedMediaLayout")
+        strip = _get_field(layout, base, "scrollSlidingTextTabStrip")
+        if strip is None:
+            return
+        sbase = self.base_class(strip, "ScrollSlidingTextTabStrip")
+        delegate = _get_field(strip, sbase, "delegate")
+        if delegate is None:
+            return
+        name = str(delegate.getClass().getName())
+        if name in self.hooked_delegates:
+            return
+        self.hooked_delegates.add(name)
+        self._hook(name, "onPageSelected", DelegateHook(self))
+        self._hook(name, "canReorder", ReorderGuardHook())
+        self._hook(name, "showOptions", ReorderGuardHook())
+
+    def track_layout(self, layout):
+        """Remember the layout's voice data object so total/filter logic applies to it."""
+        base = self.base_class(layout, "SharedMediaLayout")
+        data = _get_field(layout, base, "sharedMediaData")[VOICE_TAB_ID]
+        self.data_mode.setdefault(JSystem.identityHashCode(data), "voice")
+
+    def current_page_type(self, layout):
+        base = self.base_class(layout, "SharedMediaLayout")
+        page = _get_field(layout, base, "mediaPages")[0]
+        pbase = self.base_class(page, "MediaPage")
+        return int(_get_field(page, pbase, "selectedType"))
+
+    def set_mode(self, layout, mode):
+        """Switch the Voice list between voice-only and video-messages-only.
+
+        The new content is fully prepared first; the live lists are only touched once
+        that succeeded, and the adapter is always notified afterwards.
+        """
+        base = self.base_class(layout, "SharedMediaLayout")
+        data = _get_field(layout, base, "sharedMediaData")[VOICE_TAB_ID]
+        key = JSystem.identityHashCode(data)
+        if self.data_mode.get(key, "voice") == mode:
+            return
+
+        dialog_id = int(_get_field(layout, base, "dialog_id"))
+        msgs = list(self.master.get(dialog_id, {}).values())
+        msgs.sort(key=lambda m: int(m.getId()), reverse=True)
+
+        # Step 1: prepare (may raise; nothing has been changed yet).
+        plan = []
+        for m in msgs:
+            if (mode == "round") != bool(m.isRoundVideo()):
+                continue
+            plan.append((m.monthKey, m))
+
+        # Step 2: swap the live lists.
+        self.data_mode[key] = mode
+        try:
+            data.messages.clear()
+            data.sections.clear()
+            data.sectionArrays.clear()
+            for section_key, m in plan:
+                arr = data.sectionArrays.get(section_key)
+                if arr is None:
+                    arr = ArrayList()
+                    data.sectionArrays.put(section_key, arr)
+                    data.sections.add(section_key)
+                arr.add(m)
+                data.messages.add(m)
+            self.sync_total(data)
+        finally:
+            # Step 3: always tell the RecyclerView, even after a failure above.
+            try:
+                adapter = _get_field(layout, base, "voiceAdapter")
+                adapter.notifyDataSetChanged()
+            except Exception as e:
+                self.log_error("adapter refresh", e)
+
+    def get_total(self, data):
+        base = self.base_class(data, "SharedMediaData")
+        f = base.getDeclaredField("totalCount")
+        f.setAccessible(True)
+        value = f.get(data)
+        try:
+            return int(value[0])      # int[] field
+        except TypeError:
+            return int(value)         # plain int field
+
+    def set_total(self, data, number):
+        base = self.base_class(data, "SharedMediaData")
+        f = base.getDeclaredField("totalCount")
+        f.setAccessible(True)
+        value = f.get(data)
+        try:
+            value[0] = number         # int[] field
+        except TypeError:
+            f.setInt(data, number)    # plain int field
+
+    def sync_total(self, data):
+        """Make Telegram's item count match what is shown (no trailing loading stubs)."""
+        try:
+            size = int(data.messages.size())
+            if size > 0:
+                self.set_total(data, size)
+        except Exception as e:
+            self.log_error("sync_total", e)
+
+    def prepare_real_switch(self, layout):
+        base = self.base_class(layout, "SharedMediaLayout")
+        pages = _get_field(layout, base, "mediaPages")
+        page0, page1 = pages[0], pages[1]
+        # Hidden page: detach its adapter so Telegram attaches it from scratch.
+        list1 = _get_field(page1, self.base_class(page1, "MediaPage"), "listView")
+        list1.setAdapter(None)
+        # Visible page: pretend to show another type so onPageSelected does not return early.
+        _set_int_field(page0, self.base_class(page0, "MediaPage"), "selectedType", TEMP_PAGE_TYPE)
+        self._tmp_page0 = page0
+
+    def finish_real_switch(self):
+        page0 = self._tmp_page0
+        self._tmp_page0 = None
+        if page0 is not None:
+            _set_int_field(page0, self.base_class(page0, "MediaPage"), "selectedType", VOICE_TAB_ID)
+
+    def layout_of_main_strip(self, strip):
+        """The SharedMediaLayout that owns this strip, or None if it is some other strip."""
+        try:
+            layout = _get_field(strip, strip.getClass(), "this$0")
+            base = self.base_class(layout, "SharedMediaLayout")
+            if str(base.getSimpleName()) != "SharedMediaLayout":
+                return None
+            main = _get_field(layout, base, "scrollSlidingTextTabStrip")
+            if main is None or JSystem.identityHashCode(main) != JSystem.identityHashCode(strip):
+                return None
+            return layout
+        except Exception:
+            return None
+
+    def get_mode(self, layout):
+        base = self.base_class(layout, "SharedMediaLayout")
+        data = _get_field(layout, base, "sharedMediaData")[VOICE_TAB_ID]
+        return self.data_mode.get(JSystem.identityHashCode(data), "voice")
+
+    def detach_hidden_page(self, layout):
+        """Before a swipe: make Telegram attach the adapter to the hidden page from scratch."""
+        base = self.base_class(layout, "SharedMediaLayout")
+        page1 = _get_field(layout, base, "mediaPages")[1]
+        if int(page1.getVisibility()) == 0:   # already visible (mid-swipe): do not blank it
+            return
+        list1 = _get_field(page1, self.base_class(page1, "MediaPage"), "listView")
+        list1.setAdapter(None)
+
+    def called_from(self, method_fragment):
+        for el in JThread.currentThread().getStackTrace():
+            if method_fragment in str(el.getMethodName()):
+                return True
+        return False
+
+    def counter_text(self, layout):
+        """Separate count of voice messages / video messages for the header."""
+        base = self.base_class(layout, "SharedMediaLayout")
+        data = _get_field(layout, base, "sharedMediaData")[VOICE_TAB_ID]
+        mode = self.data_mode.get(JSystem.identityHashCode(data), "voice")
+        dialog_id = int(_get_field(layout, base, "dialog_id"))
+        msgs = list(self.master.get(dialog_id, {}).values())
+        rounds = sum(1 for m in msgs if bool(m.isRoundVideo()))
+        n = rounds if mode == "round" else len(msgs) - rounds
+        complete = bool(data.endReached[0])
+
+        ru = str(Locale.getDefault().getLanguage()) == "ru"
+        if mode == "round":
+            forms = ("видеосообщение", "видеосообщения", "видеосообщений") if ru else ("video message", "video messages")
+        else:
+            forms = ("голосовое сообщение", "голосовых сообщения", "голосовых сообщений") if ru else ("voice message", "voice messages")
+
+        if not complete:
+            return f"{n}+ {forms[-1]}"
+        if ru:
+            n10, n100 = n % 10, n % 100
+            if n10 == 1 and n100 != 11:
+                word = forms[0]
+            elif 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+                word = forms[1]
+            else:
+                word = forms[2]
+        else:
+            word = forms[0] if n == 1 else forms[1]
+        return f"{n} {word}"
+
+    # ---- hooking ----------------------------------------------------
+
+    def _hook(self, class_name, method_name, handler):
+        try:
+            cls = find_class(class_name)
+            if not cls:
+                self.log_error("hook", f"class not found: {class_name}")
+                return
+            self.hook_all_methods(cls, method_name, handler)
+        except Exception as e:
+            self.log_error(f"hook {method_name}", e)
