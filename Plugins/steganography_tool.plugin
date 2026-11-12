@@ -1,0 +1,1281 @@
+import os
+import re
+import threading
+import time
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook, HookResult, HookStrategy
+from ui.settings import Header, Switch, Divider
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import run_on_ui_thread, OnClickListener
+from client_utils import get_last_fragment, get_client
+from file_utils import ensure_dir_exists, get_cache_dir
+from hook_utils import find_class
+from java import dynamic_proxy, jclass
+from java.lang import Runnable as JRunnable
+from java.lang import Class as JClass
+from java.lang import String as JString, Integer as JInteger, Boolean as JBoolean, System as JSystem
+from java.lang.reflect import Array as JArray
+from android.view import View
+from android.widget import LinearLayout, TextView, ScrollView, EditText
+from android.graphics.drawable import BitmapDrawable
+from android.util import TypedValue
+from android.text import InputType
+from org.telegram.messenger import AndroidUtilities, SvgHelper, ApplicationLoader
+from org.telegram.ui.ActionBar import Theme, ActionBarMenuSubItem
+from org.telegram.ui.Components import LayoutHelper
+
+__id__ = "steganography_tool"
+__name__ = "Steganography Tool"
+__description__ = (
+    "LSB-стеганография: прячет текст в младших битах RGB-каналов изображения и достаёт его обратно.\n\n"
+    "• При выборе фото/файла для отправки: долгое нажатие на кнопку «Отправить» -> «Скрыть текст в фото».\n"
+    "• В чате нажать на > фото > плагины >: «Скрыть текст в этом фото» и «Расшифровать фото».\n\n"
+    "Картинка уходит PNG-документом, иначе Telegram сожмёт её в JPEG и текст пропадёт."
+)
+__author__ = "@the_kubick"
+__version__ = "1.0.0"
+__icon__ = "formyetgplugins_by_fStikBot/0"
+__min_version__ = "12.10.6"
+
+
+# ============================ PURE HELPERS BEGIN ============================
+
+MARKER = b"####"
+IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "bmp")
+
+
+class StegError(Exception):
+    pass
+
+
+def capacity_bytes(width, height):
+    return (int(width) * int(height) * 3) // 8
+
+
+def camera_filename(idx=0):
+    """Имя в духе обычного фото с камеры, чтобы не выделяться среди файлов."""
+    t = time.localtime()
+    name = time.strftime("IMG_%Y%m%d_%H%M%S", t)
+    if idx:
+        name += "_%d" % idx
+    return name + ".png"
+
+
+def embed_text(rgb, text):
+    """Пишет text + '####' в младшие биты плоского буфера R,G,B,R,G,B... (старший бит байта первым)."""
+    if "####" in text:
+        raise StegError("Текст не должен содержать «####»: это маркер конца")
+    payload = text.encode("utf-8") + MARKER
+    if len(payload) * 8 > len(rgb):
+        raise StegError("Текст не влезает: нужно %d байт, в фото помещается %d" % (len(payload), len(rgb) // 8))
+    for i, byte in enumerate(payload):
+        base = i * 8
+        for k in range(8):
+            rgb[base + k] = (rgb[base + k] & 0xFE) | ((byte >> (7 - k)) & 1)
+
+
+def extract_text(rgb):
+    """Текст до маркера '####' или None."""
+    total = len(rgb) // 8
+    out = bytearray()
+    pos = 0
+    chunk = 4096
+    while pos < total:
+        cnt = min(chunk, total - pos)
+        seg = rgb[pos * 8:(pos + cnt) * 8]
+        before = len(out)
+        for i in range(cnt):
+            b = 0
+            o = i * 8
+            for k in range(8):
+                b = (b << 1) | (seg[o + k] & 1)
+            out.append(b)
+        idx = out.find(MARKER, max(0, before - 3))
+        if idx >= 0:
+            try:
+                return bytes(out[:idx]).decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+        if pos == 0 and len(out) >= 32:
+            try:
+                bytes(out[:32]).decode("utf-8")
+            except UnicodeDecodeError as e:
+                if e.start < 29:
+                    return None
+        pos += cnt
+    return None
+
+
+# ============================= PURE HELPERS END =============================
+
+
+# ========================= REFLECTION HELPERS BEGIN ==========================
+# Такой же подход, как в Circlet: кэшированный find_class/find_method/get_field,
+# чтобы не зависеть от единственного "официального" API выбора фото, а читать
+# состояние ChatAttachAlert / ItemOptions / MessageSendPreview напрямую.
+
+_CLASS_CACHE = {}
+_METHOD_CACHE = {}
+_FIELD_CACHE = {}
+_FIELDS_CACHE = {}
+_INJECTED = set()
+INJECT_TAG = "steg_item"
+
+
+def resolve_class(name):
+    if name in _CLASS_CACHE:
+        return _CLASS_CACHE[name]
+    cls = None
+    try:
+        cls = JClass.forName(name)
+    except Exception:
+        try:
+            raw = find_class(name)
+            if raw is not None:
+                cls = raw if hasattr(raw, "getDeclaredMethods") else raw.getClass()
+        except Exception:
+            cls = None
+    _CLASS_CACHE[name] = cls
+    return cls
+
+
+def array_items(arr):
+    if arr is None:
+        return []
+    try:
+        n = JArray.getLength(arr)
+        return [JArray.get(arr, i) for i in range(n)]
+    except Exception:
+        return []
+
+
+def find_method(cls, name, param_count=None):
+    if cls is None:
+        return None
+    key = (getattr(cls, "getName", lambda: str(cls))(), name, param_count)
+    if key in _METHOD_CACHE:
+        return _METHOD_CACHE[key]
+    by_count = None
+    by_name = None
+    methods = []
+    walker = cls
+    while walker is not None:
+        methods.extend(array_items(walker.getDeclaredMethods()))
+        try:
+            walker = walker.getSuperclass()
+        except Exception:
+            walker = None
+    for m in methods:
+        try:
+            if m.getName() != name:
+                continue
+            if by_name is None:
+                by_name = m
+            count = JArray.getLength(m.getParameterTypes())
+            if param_count is not None and count == param_count and by_count is None:
+                by_count = m
+        except Exception:
+            continue
+    chosen = by_name if param_count is None else by_count
+    if chosen is not None:
+        try:
+            chosen.setAccessible(True)
+        except Exception:
+            pass
+    _METHOD_CACHE[key] = chosen
+    return chosen
+
+
+def _cached_field(cls, name):
+    key = (cls.getName(), name)
+    if key in _FIELD_CACHE:
+        return _FIELD_CACHE[key]
+    walker = cls
+    found = None
+    while walker is not None:
+        try:
+            f = walker.getDeclaredField(name)
+            f.setAccessible(True)
+            found = f
+            break
+        except Exception:
+            try:
+                walker = walker.getSuperclass()
+            except Exception:
+                break
+    _FIELD_CACHE[key] = found
+    return found
+
+
+def _cached_fields(cls):
+    key = cls.getName()
+    if key in _FIELDS_CACHE:
+        return _FIELDS_CACHE[key]
+    try:
+        result = array_items(cls.getDeclaredFields())
+    except Exception:
+        result = []
+    _FIELDS_CACHE[key] = result
+    return result
+
+
+def get_field(obj, name, default=None):
+    if obj is None:
+        return default
+    try:
+        f = _cached_field(obj.getClass(), name)
+        if f is not None:
+            return f.get(obj)
+    except Exception:
+        pass
+    return default
+
+
+class ClickRunnable(dynamic_proxy(JRunnable)):
+    def __init__(self, handler):
+        super().__init__()
+        self.handler = handler
+
+    def run(self):
+        try:
+            self.handler()
+        except Exception:
+            pass
+
+
+# ========================= REFLECTION HELPERS END ============================
+
+
+# ===================== ATTACH-SEND SELECTION RESOLUTION =======================
+
+def is_image_path(path):
+    if not path:
+        return False
+    try:
+        return str(path).lower().rsplit(".", 1)[-1] in IMAGE_EXTS
+    except Exception:
+        return False
+
+
+def attach_alert_from_fragment():
+    frag = get_last_fragment()
+    if frag is None:
+        return None
+    for name in ("chatAttachAlert", "chatActivityAttachAlert", "attachAlert"):
+        alert = get_field(frag, name)
+        if alert is not None:
+            return alert
+    return None
+
+
+def alert_showing(alert):
+    if alert is None:
+        return False
+    m = find_method(alert.getClass(), "isShowing", 0)
+    if m is None:
+        return False
+    try:
+        return bool(m.invoke(alert, None))
+    except Exception:
+        return False
+
+
+def _document_path(doc):
+    try:
+        from org.telegram.messenger import FileLoader, UserConfig
+        fl = FileLoader.getInstance(int(UserConfig.selectedAccount))
+        f = fl.getPathToAttach(doc, True)
+        if f is not None and f.exists() and int(f.length()) > 0:
+            return str(f.getAbsolutePath())
+    except Exception:
+        pass
+    return None
+
+
+def path_from_entry(entry):
+    if entry is None:
+        return None
+    try:
+        if isinstance(entry, str) and is_image_path(entry):
+            return entry
+    except Exception:
+        pass
+    try:
+        s = str(entry)
+        if is_image_path(s) and os.path.isfile(s):
+            return s
+    except Exception:
+        pass
+    raw = get_field(entry, "path")
+    if raw and is_image_path(str(raw)) and os.path.isfile(str(raw)):
+        return str(raw)
+    owner = get_field(entry, "messageOwner")
+    if owner is not None:
+        raw = get_field(owner, "attachPath")
+        if raw and is_image_path(str(raw)) and os.path.isfile(str(raw)):
+            return str(raw)
+        media = get_field(owner, "media")
+        doc = get_field(media, "document") if media is not None else None
+        if doc is not None:
+            fp = _document_path(doc)
+            if fp and is_image_path(fp):
+                return fp
+    try:
+        for f in _cached_fields(entry.getClass()):
+            try:
+                v = f.get(entry)
+            except Exception:
+                continue
+            if v is None:
+                continue
+            try:
+                sv = str(v)
+            except Exception:
+                continue
+            if is_image_path(sv) and os.path.isfile(sv):
+                return sv
+    except Exception:
+        pass
+    return None
+
+
+def _collection_single(sel):
+    """Один выбранный элемент из Map (getSelectedPhotos) или List (getSelectedFiles/getSelected)."""
+    if sel is None:
+        return None
+    try:
+        if int(sel.size()) != 1:
+            return None
+    except Exception:
+        return None
+    try:
+        values = sel.values()
+        arr = array_items(values.toArray())
+        if arr:
+            return arr[0]
+    except Exception:
+        pass
+    try:
+        return sel.get(0)
+    except Exception:
+        return None
+
+
+def selected_image_path(alert):
+    if alert is None:
+        return None
+    for layout_name, mname in (("photoLayout", "getSelectedPhotos"), ("documentLayout", "getSelectedFiles")):
+        try:
+            layout = get_field(alert, layout_name)
+            if layout is None:
+                continue
+            m = find_method(layout.getClass(), mname, 0)
+            if m is None:
+                continue
+            sel = m.invoke(layout, None)
+            item = _collection_single(sel)
+            if item is None:
+                continue
+            path = path_from_entry(item)
+            if path and is_image_path(path):
+                return path
+        except Exception:
+            continue
+    for name in ("selectedPhotos", "selectedFiles", "selectedDocuments"):
+        try:
+            sel = get_field(alert, name)
+            item = _collection_single(sel)
+            if item is None:
+                continue
+            path = path_from_entry(item)
+            if path and is_image_path(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def dismiss_window(window):
+    for name in ("dismiss", "dismissInternal"):
+        m = find_method(window.getClass(), name, 0)
+        if m is None:
+            continue
+        try:
+            m.invoke(window, None)
+            return
+        except Exception:
+            continue
+
+
+def clear_attach_selection(alert):
+    """Полная очистка выбора фото/файла, иначе ChatAttachAlert может сам отправить
+    оригинал при закрытии, если где-то осталась непустая коллекция выбора (дубликат отправки)."""
+    if alert is None:
+        return False
+    cleared = False
+    layout = get_field(alert, "photoLayout")
+    if layout is not None:
+        m = find_method(layout.getClass(), "clearSelectedPhotos", 2)
+        if m is not None:
+            for flag in ((True, True), (True, False), (False, True)):
+                try:
+                    m.invoke(layout, [JBoolean(flag[0]), JBoolean(flag[1])])
+                    cleared = True
+                    break
+                except Exception:
+                    continue
+        getter = find_method(layout.getClass(), "getSelectedPhotos", 0)
+        if getter is not None:
+            try:
+                selected = getter.invoke(layout, None)
+                if selected is not None and not selected.isEmpty():
+                    selected.clear()
+                    cleared = True
+            except Exception:
+                pass
+        order_getter = find_method(layout.getClass(), "getSelectedPhotosOrder", 0)
+        if order_getter is not None:
+            try:
+                order = order_getter.invoke(layout, None)
+                if order is not None and not order.isEmpty():
+                    order.clear()
+                    cleared = True
+            except Exception:
+                pass
+        for name in ("selectedPhotos", "selectedPhotosOrder", "photos"):
+            container = get_field(layout, name)
+            if container is not None:
+                try:
+                    container.clear()
+                    cleared = True
+                except Exception:
+                    pass
+        updater = find_method(layout.getClass(), "updatePhotosButton", 2)
+        if updater is not None:
+            try:
+                updater.invoke(layout, [JBoolean(False), JBoolean(False)])
+            except Exception:
+                pass
+    doc_layout = get_field(alert, "documentLayout")
+    if doc_layout is not None:
+        getter = find_method(doc_layout.getClass(), "getSelectedFiles", 0)
+        if getter is not None:
+            try:
+                selected = getter.invoke(doc_layout, None)
+                if selected is not None and not selected.isEmpty():
+                    selected.clear()
+                    cleared = True
+            except Exception:
+                pass
+    for name in ("selectedPhotos", "selectedPhotosOrder", "photos", "selectedFiles", "selectedDocuments"):
+        container = get_field(alert, name)
+        if container is not None:
+            try:
+                container.clear()
+                cleared = True
+            except Exception:
+                pass
+    return cleared
+
+
+def close_attach_alert_now():
+    """Чистит выбор И ТОЛЬКО ПОТОМ закрывает панель — порядок важен, иначе дубль отправки."""
+    try:
+        alert = attach_alert_from_fragment()
+        if alert is not None:
+            clear_attach_selection(alert)
+            for name in ("dismissInternal", "dismiss", "hide"):
+                m = find_method(alert.getClass(), name, 0)
+                if m is None:
+                    continue
+                try:
+                    m.invoke(alert, None)
+                    break
+                except Exception:
+                    continue
+        frag = get_last_fragment()
+        if frag is not None:
+            for name in ("dismissCurrentDialog", "closeChatAttachAlert"):
+                m = find_method(frag.getClass(), name, 0)
+                if m is None:
+                    continue
+                try:
+                    m.invoke(frag, None)
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
+def style_item(item):
+    try:
+        color = int(Theme.getColor(Theme.key_actionBarDefaultSubmenuItem))
+    except Exception:
+        try:
+            color = int(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            return
+    m = find_method(item.getClass(), "setColors", 2)
+    if m is not None:
+        try:
+            m.invoke(item, [JInteger(color), JInteger(color)])
+        except Exception:
+            pass
+
+
+_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M12 17a2 2 0 0 0 2-2 2 2 0 0 0-2-2 2 2 0 0 0-2 2 2 2 0 0 0 2 2z'
+    'm6-9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h1V6'
+    'a5 5 0 0 1 10 0v2h1zM12 3a3 3 0 0 0-3 3v2h6V6a3 3 0 0 0-3-3z"/></svg>'
+)
+_ICON_CACHE = [None, False]
+
+
+def steg_icon(size=56):
+    """Растровая SVG-иконка (замок) для пункта меню, через встроенный SvgHelper, как у штатных пунктов."""
+    if _ICON_CACHE[1]:
+        return _ICON_CACHE[0]
+    _ICON_CACHE[1] = True
+    try:
+        bmp = SvgHelper.getBitmap(JString(_ICON_SVG), int(size), int(size), False)
+        if bmp is not None:
+            _ICON_CACHE[0] = BitmapDrawable(ApplicationLoader.applicationContext.getResources(), bmp)
+    except Exception:
+        _ICON_CACHE[0] = None
+    return _ICON_CACHE[0]
+
+
+def apply_icon_to_view(view, icon):
+    if view is None or icon is None:
+        return
+    try:
+        iv = get_field(view, "imageView")
+        if iv is None:
+            return
+        iv.setImageDrawable(icon)
+        iv.setVisibility(View.VISIBLE)
+    except Exception:
+        pass
+
+
+def apply_icon_to_container_last(container, icon):
+    if icon is None:
+        return
+    try:
+        items = get_field(container, "items")
+        if items is None:
+            return
+        arr = array_items(items.toArray())
+        if not arr:
+            return
+        apply_icon_to_view(arr[-1], icon)
+    except Exception:
+        pass
+
+
+# ===================== ATTACH-SEND SELECTION RESOLUTION END ===================
+
+
+# ========================== ATTACH-SEND MENU HOOKS ============================
+# Разные версии exteraGram/Telegram показывают долгое нажатие на кнопку
+# «Отправить» через разные механизмы, поэтому цепляем все три точки сразу
+# (как это сделано в Circlet): "сырое" всплывающее окно, ItemOptions
+# и экран предпросмотра перед отправкой.
+
+POPUP_WINDOW = "org.telegram.ui.ActionBar.ActionBarPopupWindow"
+ITEM_OPTIONS = "org.telegram.ui.ActionBar.ItemOptions"
+SEND_PREVIEW = "org.telegram.ui.MessageSendPreview"
+
+CAPTION = "Скрыть текст в фото"
+
+
+class PopupShowHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.get_setting("show_attach_menu", True):
+                return
+            alert = attach_alert_from_fragment()
+            if not alert_showing(alert):
+                return
+            path = selected_image_path(alert)
+            if not path:
+                return
+            window = param.thisObject
+            content = None
+            for name in ("contentView", "mContentView"):
+                content = get_field(window, name)
+                if content is not None:
+                    break
+            if content is None:
+                return
+            tag = None
+            try:
+                tag = content.getTag()
+            except Exception:
+                pass
+            if tag is not None and str(tag) == INJECT_TAG:
+                return
+            ctx = content.getContext()
+            item = ActionBarMenuSubItem(ctx, False, False)
+            item.setTextAndIcon(JString(CAPTION), 0)
+            style_item(item)
+            apply_icon_to_view(item, steg_icon())
+            dialog_id = self.plugin._current_dialog_id()
+            account = self.plugin._current_account()
+            src = {"paths": [path], "account": account, "dialog_id": dialog_id, "after": None}
+
+            def on_click(v, s=src, w=window):
+                dismiss_window(w)
+                close_attach_alert_now()
+                run_on_ui_thread(lambda: self.plugin.show_hide_dialog(s))
+
+            listener = OnClickListener(on_click)
+            self.plugin.keep(listener)
+            item.setOnClickListener(listener)
+            content.addView(item)
+            try:
+                content.setTag(JString(INJECT_TAG))
+            except Exception:
+                pass
+        except Exception as e:
+            self.plugin.log("[steg] popup inject: %s" % e)
+
+
+class ItemOptionsHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.get_setting("show_attach_menu", True):
+                return
+            opts = param.thisObject
+            if opts is None:
+                return
+            key = JSystem.identityHashCode(opts)
+            if key in _INJECTED:
+                return
+            alert = attach_alert_from_fragment()
+            path = selected_image_path(alert) if alert_showing(alert) else None
+            if not path:
+                return
+            add = None
+            for count in (3, 4, 5):
+                cand = find_method(opts.getClass(), "add", count)
+                if cand is None:
+                    continue
+                types = [p.getName() for p in array_items(cand.getParameterTypes())]
+                if count == 3 and types[0] == "int" and types[1] in ("java.lang.CharSequence", "java.lang.String") and types[2] == "java.lang.Runnable":
+                    add = cand
+                    break
+            if add is None:
+                return
+            _INJECTED.add(key)
+            if len(_INJECTED) > 64:
+                _INJECTED.clear()
+            dialog_id = self.plugin._current_dialog_id()
+            account = self.plugin._current_account()
+            src = {"paths": [path], "account": account, "dialog_id": dialog_id, "after": None}
+
+            def _act(s=src):
+                close_attach_alert_now()
+                run_on_ui_thread(lambda: self.plugin.show_hide_dialog(s))
+
+            runnable = ClickRunnable(_act)
+            self.plugin.keep(runnable)
+            add.invoke(opts, [JInteger(0), JString(CAPTION), runnable])
+            apply_icon_to_container_last(opts, steg_icon())
+        except Exception as e:
+            self.plugin.log("[steg] iopts inject: %s" % e)
+
+
+class SendPreviewHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.plugin.get_setting("show_attach_menu", True):
+                return
+            args = param.args
+            if not args or args[0] is None:
+                return
+            options = args[0]
+            path = None
+            try:
+                mos = get_field(param.thisObject, "messageObjects")
+                if mos is not None and int(mos.size()) >= 1:
+                    mo = mos.get(int(mos.size()) - 1)
+                    path = path_from_entry(mo)
+            except Exception:
+                path = None
+            if not path:
+                alert = attach_alert_from_fragment()
+                path = selected_image_path(alert)
+            if not path or not is_image_path(path):
+                return
+            add = None
+            for count in (3, 4):
+                add = find_method(options.getClass(), "add", count)
+                if add is not None:
+                    break
+            if add is None:
+                return
+            dialog_id = self.plugin._current_dialog_id()
+            account = self.plugin._current_account()
+            src = {"paths": [path], "account": account, "dialog_id": dialog_id, "after": None}
+
+            def _act(s=src):
+                close_attach_alert_now()
+                run_on_ui_thread(lambda: self.plugin.show_hide_dialog(s))
+
+            runnable = ClickRunnable(_act)
+            self.plugin.keep(runnable)
+            params = array_items(add.getParameterTypes())
+            call = []
+            for spec in params:
+                kind = spec.getName()
+                if kind == "int":
+                    call.append(JInteger(0))
+                elif kind == "java.lang.Runnable":
+                    call.append(runnable)
+                elif kind == "boolean":
+                    call.append(JBoolean(False))
+                else:
+                    call.append(JString(CAPTION))
+            add.invoke(options, call)
+            apply_icon_to_container_last(options, steg_icon())
+        except Exception as e:
+            self.plugin.log("[steg] preview inject: %s" % e)
+
+
+# ======================== ATTACH-SEND MENU HOOKS END ===========================
+
+
+class SteganographyToolPlugin(BasePlugin):
+
+    # ------------------------------------------------------------ жизнь
+    def on_plugin_load(self):
+        self._hooks = []
+        self._keep = []
+        self._update_menu()
+        try:
+            self.add_on_send_message_hook()
+        except Exception as e:
+            self.log("[steg] хук отправки: %s" % e)
+        self._hook_attach_menu()
+
+    def on_plugin_unload(self):
+        for item_id in ("steg_hide_msg", "steg_extract_msg"):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+        for ref in list(getattr(self, "_hooks", [])):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hooks = []
+        self._keep = []
+
+    def keep(self, obj):
+        self._keep.append(obj)
+
+    def _current_dialog_id(self):
+        frag = get_last_fragment()
+        if frag is None:
+            return 0
+        for name in ("dialog_id", "dialogId"):
+            v = get_field(frag, name)
+            if v:
+                try:
+                    return int(v)
+                except Exception:
+                    continue
+        m = find_method(frag.getClass(), "getDialogId", 0)
+        if m is not None:
+            try:
+                return int(m.invoke(frag, None))
+            except Exception:
+                pass
+        return 0
+
+    def _current_account(self):
+        try:
+            from org.telegram.messenger import UserConfig
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            return 0
+
+    # ------------------------------------------------- меню кнопки «Отправить»
+    def _hook_attach_menu(self):
+        popup_cls = resolve_class(POPUP_WINDOW)
+        if popup_cls is not None:
+            method = find_method(popup_cls, "showAtLocation", 4)
+            if method is not None:
+                try:
+                    ref = self.hook_method(method, PopupShowHook(self))
+                    if ref is not None:
+                        self._hooks.append(ref)
+                except Exception as e:
+                    self.log("[steg] hook popup: %s" % e)
+
+        iopts_cls = resolve_class(ITEM_OPTIONS)
+        if iopts_cls is not None:
+            for m in iopts_cls.getDeclaredMethods():
+                try:
+                    if m.getName() != "show" or len(m.getParameterTypes()) != 0:
+                        continue
+                    m.setAccessible(True)
+                    ref = self.hook_method(m, ItemOptionsHook(self))
+                    if ref is not None:
+                        self._hooks.append(ref)
+                except Exception as e:
+                    self.log("[steg] hook iopts: %s" % e)
+
+        preview_cls = resolve_class(SEND_PREVIEW)
+        if preview_cls is not None:
+            method = find_method(preview_cls, "setItemOptions", 1)
+            if method is not None:
+                try:
+                    ref = self.hook_method(method, SendPreviewHook(self))
+                    if ref is not None:
+                        self._hooks.append(ref)
+                except Exception as e:
+                    self.log("[steg] hook preview: %s" % e)
+
+    # ------------------------------------------------------------ меню
+    def _add_item(self, text, icon, item_id, handler):
+        for ic in (icon, "msg_edit", "msg_download"):
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU, text=text, icon=ic,
+                    item_id=item_id, condition="message != null", on_click=handler))
+                return
+            except Exception as e:
+                self.log("[steg] пункт %s (%s): %s" % (item_id, ic, e))
+
+    def _update_menu(self):
+        for item_id in ("steg_hide_msg", "steg_extract_msg"):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+        if self.get_setting("show_message_menu", True):
+            self._add_item("Скрыть текст в этом фото", "msg_edit", "steg_hide_msg", self._on_hide_click)
+            self._add_item("Расшифровать фото", "msg_openin", "steg_extract_msg", self._on_extract_click)
+
+    # ------------------------------------------- команда .steg текст
+    def on_send_message_hook(self, account, params):
+        try:
+            if not self.get_setting("enable_command", True):
+                return HookResult()
+            caption = None
+            for fld in ("caption", "message"):
+                v = getattr(params, fld, None)
+                if isinstance(v, str) and v.strip():
+                    caption = v
+                    break
+            if not caption:
+                return HookResult()
+            m = re.match(r"^\.steg\s+([\s\S]+)$", caption.strip())
+            if not m:
+                return HookResult()
+            text = m.group(1)
+            path = self._hook_media_path(params)
+            if not path:
+                tried = ", ".join("%s=%r" % (f, getattr(params, f, "<нет>")) for f in
+                                   ("path", "photoPath", "imagePath", "filePath", "photo", "document"))
+                self.log("[steg] не нашёл путь к фото в params: %s" % tried)
+                self._toast("Не нашёл файл фото для шифрования, см. лог плагина", "error")
+                return HookResult()
+            peer = getattr(params, "peer", None)
+            dialog_id = _as_int(peer, 0)
+            src = {"paths": [path], "account": _as_int(account, 0), "dialog_id": dialog_id, "after": None}
+            self.process_hide(src, text)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self.log("[steg] команда: %s" % e)
+            return HookResult()
+
+    def _hook_media_path(self, params):
+        for fld in ("photoPath", "path", "imagePath", "filePath"):
+            v = getattr(params, fld, None)
+            if v and os.path.isfile(str(v)):
+                return str(v)
+        media = getattr(params, "photo", None) or getattr(params, "media", None)
+        if media is not None:
+            for fld in ("path", "imagePath"):
+                v = _g(media, fld)
+                if v and os.path.isfile(str(v)):
+                    return str(v)
+        return None
+
+    # ----------------------------------------------- пункты сообщения
+    def _message_image(self, context):
+        mo = context.get("message")
+        if mo is None:
+            return None, None, 0, 0
+        account = _as_int(context.get("account"), 0) or _as_int(getattr(mo, "currentAccount", 0), 0)
+        dialog_id = _as_int(context.get("dialog_id"), 0)
+        if not dialog_id:
+            try:
+                dialog_id = _as_int(mo.getDialogId(), 0)
+            except Exception:
+                dialog_id = 0
+        path = self._media_path(mo, account)
+        if not path:
+            self._toast("Сначала откройте или скачайте фото", "error")
+            return None, mo, account, dialog_id
+        ext = path.lower().rsplit(".", 1)[-1]
+        if ext not in IMAGE_EXTS and not self._looks_like_image(path):
+            self._toast("Это не изображение", "error")
+            return None, mo, account, dialog_id
+        return path, mo, account, dialog_id
+
+    def _looks_like_image(self, path):
+        try:
+            with open(path, "rb") as f:
+                h = f.read(12)
+            return h[:3] == b"\xff\xd8\xff" or h[:8] == b"\x89PNG\r\n\x1a\n" or (h[:4] == b"RIFF" and h[8:12] == b"WEBP")
+        except Exception:
+            return False
+
+    def _on_hide_click(self, context):
+        try:
+            path, mo, account, dialog_id = self._message_image(context)
+            if path:
+                src = {"paths": [path], "account": account, "dialog_id": dialog_id, "after": None}
+                run_on_ui_thread(lambda: self.show_hide_dialog(src))
+        except Exception as e:
+            self.log("[steg] скрыть: %s" % e)
+            self._toast("Не удалось открыть диалог", "error")
+
+    def _on_extract_click(self, context):
+        try:
+            path, mo, account, dialog_id = self._message_image(context)
+            if path:
+                self.show_extract_dialog(path)
+        except Exception as e:
+            self.log("[steg] расшифровка: %s" % e)
+            self._toast("Не удалось расшифровать", "error")
+
+    def _media_path(self, mo, account):
+        fl = jclass("org.telegram.messenger.FileLoader").getInstance(account)
+        candidates = []
+        try:
+            candidates.append(fl.getPathToMessage(mo.messageOwner))
+        except Exception:
+            pass
+        try:
+            doc = mo.getDocument()
+            if doc is not None:
+                candidates.append(fl.getPathToAttach(doc, True))
+        except Exception:
+            pass
+        for f in candidates:
+            try:
+                if f is not None and f.exists() and int(f.length()) > 0:
+                    return str(f.getAbsolutePath())
+            except Exception:
+                pass
+        return None
+
+    # ------------------------------------------------------------ UI
+    def _ctx(self):
+        try:
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if act is not None:
+                return act
+        except Exception:
+            pass
+        from org.telegram.ui import LaunchActivity
+        return LaunchActivity.instance
+
+    def _toast(self, text, kind="info"):
+        def _show():
+            try:
+                if kind == "error":
+                    BulletinHelper.show_error(text)
+                elif kind == "success":
+                    BulletinHelper.show_success(text)
+                else:
+                    BulletinHelper.show_info(text)
+            except Exception:
+                pass
+        run_on_ui_thread(_show)
+
+    def _ui_call(self, fn, timeout=60):
+        done = threading.Event()
+        box = []
+
+        def go():
+            try:
+                box.append(fn())
+            except Exception as e:
+                self.log("[steg] отправка: %s" % e)
+            finally:
+                done.set()
+
+        run_on_ui_thread(go)
+        done.wait(timeout)
+        return bool(box)
+
+    def _out_dir(self):
+        d = os.path.join(str(get_cache_dir()), "kubick_steg")
+        ensure_dir_exists(d)
+        try:
+            now = time.time()
+            for n in os.listdir(d):
+                p = os.path.join(d, n)
+                if os.path.isfile(p) and now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+        except Exception:
+            pass
+        return d
+
+    def show_hide_dialog(self, src):
+        try:
+            context = self._ctx()
+            dp = AndroidUtilities.dp
+            builder = AlertDialogBuilder(context)
+            builder.set_title("Скрыть текст в фото")
+            box = LinearLayout(context)
+            box.setOrientation(LinearLayout.VERTICAL)
+            box.setPadding(dp(24), 0, dp(24), dp(8))
+            info = TextView(context)
+            n = len(src["paths"])
+            info.setText("Фото: %d. Уйдёт PNG-документом, текст не должен содержать «####»" % n)
+            info.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+            info.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+            box.addView(info, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 6))
+            edit = EditText(context)
+            edit.setHint("Секретный текст")
+            edit.setSingleLine(False)
+            edit.setMinLines(3)
+            edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+            edit.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+            box.addView(edit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+
+            def ok(b, w):
+                text = str(edit.getText())
+                if not text.strip():
+                    self._toast("Введите текст", "error")
+                    return
+                b.dismiss()
+                self.process_hide(src, text)
+
+            builder.set_view(box)
+            builder.set_positive_button("Скрыть и отправить", ok)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log("[steg] диалог: %s" % e)
+            self._toast("Не удалось открыть диалог", "error")
+
+    def show_extract_dialog(self, path):
+        self._toast("Читаю скрытые биты…")
+        self.process_extract(path)
+
+    def show_result(self, text):
+        try:
+            context = self._ctx()
+            dp = AndroidUtilities.dp
+            builder = AlertDialogBuilder(context)
+            builder.set_title("Скрытый текст")
+            box = LinearLayout(context)
+            box.setOrientation(LinearLayout.VERTICAL)
+            box.setPadding(dp(24), 0, dp(24), dp(8))
+            body = TextView(context)
+            body.setText(text)
+            body.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            body.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            try:
+                body.setTextIsSelectable(True)
+            except Exception:
+                pass
+            scroll = ScrollView(context)
+            scroll.addView(body)
+            box.addView(scroll, LayoutHelper.createLinear(-1, 260, 0, 0, 0, 0, 0))
+
+            def copy(b, w):
+                try:
+                    AndroidUtilities.addToClipboard(text)
+                    self._toast("Скопировано", "success")
+                except Exception as e:
+                    self.log("[steg] буфер: %s" % e)
+                b.dismiss()
+
+            builder.set_view(box)
+            builder.set_positive_button("Копировать", copy)
+            builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log("[steg] результат: %s" % e)
+            self._toast("Не удалось показать текст", "error")
+
+    # ------------------------------------------------------- изображения
+    def _load_rgb(self, path):
+        """-> (w, h, bytearray RGB)"""
+        try:
+            from PIL import Image, ImageOps
+            im = Image.open(path)
+            im.load()
+            try:
+                im = ImageOps.exif_transpose(im)
+            except Exception:
+                pass
+            im = im.convert("RGB")
+            return im.width, im.height, bytearray(im.tobytes())
+        except ImportError:
+            pass
+        BitmapFactory = jclass("android.graphics.BitmapFactory")
+        from java import jarray, jint
+        bmp = BitmapFactory.decodeFile(path)
+        if bmp is None:
+            raise StegError("Не удалось прочитать изображение")
+        w, h = int(bmp.getWidth()), int(bmp.getHeight())
+        arr = jarray(jint)(w * h)
+        bmp.getPixels(arr, 0, w, 0, 0, w, h)
+        rgb = bytearray(w * h * 3)
+        for i in range(w * h):
+            p = arr[i]
+            rgb[3 * i] = (p >> 16) & 255
+            rgb[3 * i + 1] = (p >> 8) & 255
+            rgb[3 * i + 2] = p & 255
+        return w, h, rgb
+
+    def _save_png(self, w, h, rgb, out):
+        try:
+            from PIL import Image
+            Image.frombytes("RGB", (w, h), bytes(rgb)).save(out, "PNG")
+            return
+        except ImportError:
+            pass
+        from java import jarray, jint
+        Bitmap = jclass("android.graphics.Bitmap")
+        Config = jclass("android.graphics.Bitmap$Config")
+        CF = jclass("android.graphics.Bitmap$CompressFormat")
+        FileOutputStream = jclass("java.io.FileOutputStream")
+        arr = jarray(jint)(w * h)
+        for i in range(w * h):
+            v = (0xFF << 24) | (rgb[3 * i] << 16) | (rgb[3 * i + 1] << 8) | rgb[3 * i + 2]
+            arr[i] = v - (1 << 32) if v >= (1 << 31) else v
+        bmp = Bitmap.createBitmap(w, h, Config.ARGB_8888)
+        bmp.setPixels(arr, 0, w, 0, 0, w, h)
+        fos = FileOutputStream(out)
+        try:
+            bmp.compress(CF.PNG, 100, fos)
+        finally:
+            fos.close()
+
+    def process_hide(self, src, text):
+        self._toast("Прячу текст…")
+
+        def work():
+            out_dir = self._out_dir()
+            files, errors = [], []
+            for path in src["paths"]:
+                try:
+                    w, h, rgb = self._load_rgb(path)
+                    embed_text(rgb, text)
+                    out = os.path.join(out_dir, camera_filename(len(files)))
+                    self._save_png(w, h, rgb, out)
+                    files.append(out)
+                except StegError as e:
+                    errors.append(str(e))
+                except Exception as e:
+                    self.log("[steg] %s: %s" % (path, e))
+                    errors.append("%s" % e)
+            sent = 0
+            for f in files:
+                if self.send_steg_image(src, f):
+                    sent += 1
+                time.sleep(0.7)
+            if sent:
+                self._toast("Отправлено: %d" % sent, "success")
+                if src.get("after"):
+                    run_on_ui_thread(src["after"])
+            else:
+                self._toast(errors[0] if errors else "Не удалось отправить", "error")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def process_extract(self, path):
+        def work():
+            try:
+                w, h, rgb = self._load_rgb(path)
+                text = extract_text(rgb)
+                if text is None:
+                    self._toast("Скрытый текст не найден", "error")
+                    return
+                run_on_ui_thread(lambda: self.show_result(text))
+            except Exception as e:
+                self.log("[steg] извлечение: %s" % e)
+                self._toast("Не удалось прочитать изображение: %s" % e, "error")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def send_steg_image(self, src, path):
+        def go():
+            client = get_client(src["account"])
+            client.send_document(_as_int(src["dialog_id"], 0), path, "")
+            return True
+        return self._ui_call(go)
+
+    # ---------------------------------------------------------- настройки
+    def create_settings(self):
+        return [
+            Header(text="Steganography Tool"),
+            Switch(
+                key="show_attach_menu", text="Кнопка в меню отправки", default=True,
+                subtext="«Скрыть текст в фото» при долгом нажатии на кнопку «Отправить», когда выбрано одно фото/файл-изображение",
+                icon="msg_edit",
+            ),
+            Switch(
+                key="enable_command", text="Команда .steg", default=True,
+                subtext="Прикрепите фото и отправьте с подписью «.steg текст» — фото уйдёт PNG-документом со скрытым текстом",
+                icon="msg_edit",
+            ),
+            Switch(
+                key="show_message_menu", text="Кнопки в меню сообщения", default=True,
+                subtext="«Скрыть текст в этом фото» и «Расшифровать фото» у фото и изображений-файлов",
+                icon="msg_edit",
+                on_change=lambda value: (
+                    self.set_setting("show_message_menu", value),
+                    run_on_ui_thread(self._update_menu),
+                ),
+            ),
+            Divider(text="Steganography Tool v%s // %s" % (__version__, __author__)),
+        ]
+
+
+def _g(o, n, d=None):
+    try:
+        v = getattr(o, n)
+        return d if v is None else v
+    except Exception:
+        return d
+
+
+def _as_int(v, d=0):
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(str(v))
+        except Exception:
+            return d
