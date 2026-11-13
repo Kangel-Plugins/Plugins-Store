@@ -1,592 +1,2422 @@
-import gc
 import re
+import threading
 import time
 
 from java import dynamic_proxy, jclass, jint, jlong
-from java.lang import Class as JClass, Integer as JInteger, Long as JLong, Runnable
+from java.lang import Integer as JInteger, Runnable
 from java.util import ArrayList
 
-from org.telegram.messenger import ApplicationLoader, ChatObject, DialogObject, LocaleController, MessagesStorage, UserObject
+from org.telegram.messenger import (
+    ApplicationLoader, ChatObject, DialogObject, LocaleController,
+    MessagesStorage, UserObject,
+)
 from org.telegram.tgnet import TLRPC
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import AvatarDrawable, BackupImageView
 
-from android_utils import log, run_on_ui_thread
+from android_utils import OnClickListener, log, run_on_ui_thread
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from client_utils import PLUGINS_QUEUE, RequestCallback, get_last_fragment, run_on_queue
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector, Text
 
 __id__ = "message_cleaner"
 __name__ = "Message Cleaner"
-__description__ = "Удаляет ваши сообщения в чате, группе или теме, а там, где есть права, — все сообщения. Сначала удаляет на сервере и только потом в приложении, поэтому сообщения не возвращаются.\n\nDeletes your messages in a chat, group or topic, or all messages where you have the rights. Deletes on the server first, so messages do not come back."
 __author__ = "@zxplugins"
-__version__ = "1.0"
+__version__ = "1.1"
 __icon__ = "UtyaDuckFull/60"
 __min_version__ = "12.10.6"
+__description__ = "Удаляет ваши сообщения в чатах. Откройте настройки плагина — там список всех чатов, разделённых на «есть сообщения» и «нет», с выбором одного или нескольких.\n\nDeletes your messages in chats. Open the plugin settings — there you will find all chats split into 'has messages' and 'none', with single or multi-select."
 __category__ = ["chats", "tools"]
 
-BLOCKED_CLIENTS = {}
 
+BLOCKED_CLIENTS = {}
 PAGE = 100
 LIST_DELAY_MS = 350
 DELETE_DELAY_MS = 300
-MAX_EXTRA_DELAY_MS = 3000
+MAX_EXTRA_DELAY = 3000
 MAX_FLOOD_S = 900
 VERIFY_ROUNDS = 2
 RETRIES = 3
 SPLIT_BUDGET = 300
 SLOW_HINT_S = 6
+DRAIN_DELAY_MS = 200
+PICKER_DIALOGS = 300
+PREFETCH_WORKERS = 3
+PREFETCH_STEP_MS = 55
+PREFETCH_SLOW_MS = 105
+UI_BATCH_LIMIT = 20
+
 FORBIDDEN = ("MESSAGE_DELETE_FORBIDDEN", "MESSAGE_ID_INVALID", "MESSAGE_IDS_EMPTY")
-FATAL = ("CHAT_ADMIN_REQUIRED", "CHANNEL_PRIVATE", "CHANNEL_INVALID", "CHAT_ID_INVALID", "PEER_ID_INVALID", "USER_BANNED_IN_CHANNEL", "CHAT_FORBIDDEN", "AUTH_KEY_UNREGISTERED", "SESSION_REVOKED")
+FATAL = (
+    "CHAT_ADMIN_REQUIRED", "CHANNEL_PRIVATE", "CHANNEL_INVALID",
+    "CHAT_ID_INVALID", "PEER_ID_INVALID", "USER_BANNED_IN_CHANNEL",
+    "CHAT_FORBIDDEN", "AUTH_KEY_UNREGISTERED", "SESSION_REVOKED",
+)
 TAG = "[MessageCleaner]"
 REX_ID = "re_extera_loader"
 REX_UTILS = "ni.shikatu.re_extera.utils.InternalUtils"
 REX_QUEUE = "ni.shikatu.re_extera.hooks.chatactivity.ProcessDeletedMessages"
 REX_FIELDS = ("markMessagesAsDeleted", "updateDialogs")
 REX_LIST_TYPES = ("java.util.List", "java.util.ArrayList", "java.util.Collection")
-DRAIN_DELAY_MS = 3000
+
+COUNT_LOADING = -2
+COUNT_ERROR = -1
+
+_LANG = [0]
 
 
 def _log(text):
-    try:
-        log(f"{TAG} {text}")
-    except Exception:
-        pass
+    log(f"{TAG} {text}")
 
 
-def _ru():
+def _ru(lang_idx=None):
+    if lang_idx is None:
+        lang_idx = 0
+    if lang_idx == 1:
+        return True
+    if lang_idx == 2:
+        return False
     try:
-        return str(LocaleController.getInstance().getCurrentLocale().getLanguage()).lower().startswith("ru")
-    except Exception:
+        code = str(LocaleController.getInstance().getCurrentLocaleInfo().pluralLangCode or "")
+        return code[:2] in ("ru", "uk", "be")
+    except:
         return False
 
 
 def _t(ru, en):
-    return ru if _ru() else en
+    return ru if _ru(_LANG[0]) else en
 
 
 def _num(n):
-    return f"{int(n):,}".replace(",", "\u00a0")
+    return f"{n:,}".replace(",", "\u202f")
 
 
 def _msgs(n):
-    n = int(n)
-    if _ru():
-        a, b = n % 10, n % 100
-        if a == 1 and b != 11:
-            word = "сообщение"
-        elif 2 <= a <= 4 and not 12 <= b <= 14:
-            word = "сообщения"
-        else:
-            word = "сообщений"
-        return f"{_num(n)} {word}"
-    return f"{_num(n)} message" + ("" if n == 1 else "s")
+    if not _ru(_LANG[0]):
+        return f"{_num(n)} message{'s' if n != 1 else ''}"
+    r10, r100 = n % 10, n % 100
+    if r10 == 1 and r100 != 11:
+        return f"{_num(n)} сообщение"
+    if 2 <= r10 <= 4 and not 12 <= r100 <= 14:
+        return f"{_num(n)} сообщения"
+    return f"{_num(n)} сообщений"
+
+
+def _chats_word(n):
+    if not _ru(_LANG[0]):
+        return f"{_num(n)} chat{'s' if n != 1 else ''}"
+    r10, r100 = n % 10, n % 100
+    if r10 == 1 and r100 != 11:
+        return f"{_num(n)} чате"
+    return f"{_num(n)} чатах"
+
+
+def _chats_gen(n):
+    if not _ru(_LANG[0]):
+        return f"{_num(n)} chat{'s' if n != 1 else ''}"
+    r10, r100 = n % 10, n % 100
+    if r10 == 1 and r100 != 11:
+        return f"{_num(n)} чата"
+    return f"{_num(n)} чатов"
+
+
+def _chats_acc(n):
+    if not _ru(_LANG[0]):
+        return f"{_num(n)} chat{'s' if n != 1 else ''}"
+    r10, r100 = n % 10, n % 100
+    if r10 == 1 and r100 != 11:
+        return f"{_num(n)} чат"
+    if 2 <= r10 <= 4 and not 12 <= r100 <= 14:
+        return f"{_num(n)} чата"
+    return f"{_num(n)} чатов"
+
+
+def _bots_gen(n):
+    if not _ru(_LANG[0]):
+        return f"{_num(n)} bot{'s' if n != 1 else ''}"
+    r10, r100 = n % 10, n % 100
+    if r10 == 1 and r100 != 11:
+        return f"{_num(n)} бота"
+    return f"{_num(n)} ботов"
+
+
+def _kind_label(scope):
+    kind = scope["kind"]
+    if kind == "private":
+        if scope.get("is_bot"):
+            return _t("Бот", "Bot")
+        if scope.get("is_deleted"):
+            return _t("Удалённый аккаунт", "Deleted account")
+        return _t("Личный чат", "Private chat")
+    if kind == "channel":
+        return _t("Канал", "Channel")
+    return _t("Группа", "Group")
 
 
 def _version_tuple(text):
-    m = re.match(r"\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(text or ""))
-    if not m:
-        return None
-    return tuple(int(x or 0) for x in m.groups())
+    try:
+        return tuple(int(x) for x in re.split(r"[.\-]", str(text))[:3])
+    except:
+        return (0, 0, 0)
 
 
 def _client_version():
-    pkg = ""
-    ver = ""
     try:
-        ctx = ApplicationLoader.applicationContext
-        pkg = str(ctx.getPackageName())
-        ver = str(ctx.getPackageManager().getPackageInfo(pkg, 0).versionName or "")
-    except Exception:
-        pass
-    if not ver:
-        try:
-            ver = str(jclass("org.telegram.messenger.BuildVars").BUILD_VERSION_STRING or "")
-        except Exception:
-            ver = ""
-    return pkg, ver
+        from org.telegram.messenger import BuildVars
+        return _version_tuple(str(BuildVars.BUILD_VERSION_STRING))
+    except:
+        return (0, 0, 0)
 
 
 def _client_problem():
-    pkg, ver = _client_version()
-    if pkg in BLOCKED_CLIENTS:
+    ver = _client_version()
+    if ver < (12, 10, 6):
         return _t(
-            f"{__name__} не поддерживает {BLOCKED_CLIENTS[pkg]}. Нужен exteraGram {__min_version__} или новее.",
-            f"{__name__} does not support {BLOCKED_CLIENTS[pkg]}. exteraGram {__min_version__} or newer is required.",
+            f"Плагин требует exteraGram 12.10.6+. Установлена {'.'.join(str(x) for x in ver)}.",
+            f"Plugin requires exteraGram 12.10.6+. Installed: {'.'.join(str(x) for x in ver)}.",
         )
-    have = _version_tuple(ver)
-    need = _version_tuple(__min_version__)
-    if have is None or need is None or have >= need:
-        return None
-    return _t(
-        f"{__name__} {__version__} работает с версии {__min_version__}, а у вас {ver}. Обновите приложение, пока плагин не активен.",
-        f"{__name__} {__version__} needs version {__min_version__} or newer, you have {ver}. The plugin stays inactive until you update.",
-    )
+    blocked = BLOCKED_CLIENTS.get(ver[:2])
+    if blocked:
+        return _t(
+            f"Версия {'.'.join(str(x) for x in ver)} несовместима: {blocked}",
+            f"Version {'.'.join(str(x) for x in ver)} incompatible: {blocked}",
+        )
+    return None
 
 
 def _show_blocked(text):
     def show():
         try:
-            if get_last_fragment() is not None:
+            if _activity():
                 BulletinHelper.show_error(text)
                 return
-        except Exception:
+        except:
             pass
         try:
             jclass("android.widget.Toast").makeText(ApplicationLoader.applicationContext, text, 1).show()
-        except Exception:
+        except:
             pass
-
     run_on_queue(lambda: run_on_ui_thread(show), PLUGINS_QUEUE, 4000)
 
 
 def _int_list(ids):
     lst = ArrayList()
     for i in ids:
-        lst.add(jint(int(i)))
+        lst.add(JInteger(int(i)))
     return lst
 
 
 def _err_code(err):
     try:
         return str(err.text or "")
-    except Exception:
+    except:
         return str(err)
 
 
 def _flood_seconds(err):
-    text = _err_code(err)
-    code = 0
     try:
-        code = int(err.code)
-    except Exception:
+        code = _err_code(err)
+        if "FLOOD_WAIT_" in code:
+            return int(code.split("FLOOD_WAIT_")[1].split()[0])
+        m = re.search(r"flood.{0,15}?(\d+)", str(err).lower())
+        if m:
+            return int(m.group(1))
+    except:
         pass
-    if "FLOOD" in text or "SLOWMODE" in text or code == 420:
-        m = re.search(r"(\d+)\s*$", text)
-        return int(m.group(1)) if m else 5
     return None
 
 
 def _error_text(code):
-    if code in ("CHAT_ADMIN_REQUIRED", "MESSAGE_DELETE_FORBIDDEN"):
-        return _t("Нет прав администратора на удаление сообщений.", "No admin right to delete messages.")
-    if code in ("CHANNEL_PRIVATE", "CHAT_FORBIDDEN", "USER_BANNED_IN_CHANNEL", "CHANNEL_INVALID", "CHAT_ID_INVALID", "PEER_ID_INVALID"):
-        return _t("Нет доступа к этому чату.", "No access to this chat.")
+    if code == "CHAT_ADMIN_REQUIRED":
+        return _t("Нет прав администратора.", "No admin right.")
     if code in ("AUTH_KEY_UNREGISTERED", "SESSION_REVOKED"):
-        return _t("Аккаунт вышел из сессии.", "The account session has ended.")
-    return _t(f"Telegram ответил ошибкой {code}.", f"Telegram returned error {code}.")
+        return _t("Аккаунт вышел из сессии.", "Session ended.")
+    return _t(f"Telegram: {code}", f"Telegram: {code}")
 
 
 def _is_service(msg):
     try:
-        return isinstance(msg, TLRPC.TL_messageService)
-    except Exception:
-        try:
-            return "MessageService" in str(msg.getClass().getName())
-        except Exception:
-            return False
+        return not isinstance(msg, TLRPC.TL_message)
+    except:
+        return False
 
 
 def _activity():
     try:
         frag = get_last_fragment()
-        if frag is not None:
-            return frag.getParentActivity()
-    except Exception:
+        if frag:
+            act = frag.getParentActivity()
+            if act and not act.isFinishing() and not act.isDestroyed():
+                return act
+    except:
+        pass
+    try:
+        from org.telegram.ui import LaunchActivity
+        act = LaunchActivity.instance
+        if act and not act.isFinishing() and not act.isDestroyed():
+            return act
+    except:
         pass
     return None
 
 
+def _open_chat(scope):
+    did = int(scope["dialog_id"])
+
+    def run():
+        try:
+            Bundle = jclass("android.os.Bundle")
+            ChatActivity = jclass("org.telegram.ui.ChatActivity")
+            args = Bundle()
+            if did > 0:
+                args.putLong("user_id", jlong(did))
+            else:
+                args.putLong("chat_id", jlong(-did))
+            frag = get_last_fragment()
+            if frag:
+                frag.presentFragment(ChatActivity(args))
+                return
+            from org.telegram.ui import LaunchActivity
+            if LaunchActivity.instance:
+                LaunchActivity.instance.presentFragment(ChatActivity(args))
+        except Exception as e:
+            _log(f"open_chat: {e}")
+            try:
+                BulletinHelper.show_error(_t("Не удалось открыть чат.", "Could not open chat."))
+            except:
+                pass
+
+    run_on_ui_thread(run)
+
+
 def _channel_pts(mc, pts, count, channel_id):
-    cls = JClass.forName("org.telegram.messenger.MessagesController")
-    m = cls.getDeclaredMethod("processNewChannelDifferenceParams", JInteger.TYPE, JInteger.TYPE, JLong.TYPE)
-    m.setAccessible(True)
-    m.invoke(mc, jint(pts), jint(count), jlong(channel_id))
+    try:
+        m = mc.getClass().getMethod(
+            "processNewChannelDifferenceParams",
+            jclass("java.lang.Integer").TYPE,
+            jclass("java.lang.Integer").TYPE,
+            jclass("java.lang.Long").TYPE,
+        )
+        m.invoke(mc, jint(pts), jint(count), jlong(channel_id))
+    except:
+        pass
+
+
+def _jcolor(c):
+    c = int(c) & 0xFFFFFFFF
+    return c - 0x100000000 if c >= 0x80000000 else c
+
+
+def _with_alpha(c, alpha_byte):
+    return _jcolor((int(c) & 0x00FFFFFF) | ((int(alpha_byte) & 0xFF) << 24))
+
+
+def _theme_color(key_name, fallback):
+    try:
+        return _jcolor(int(Theme.getColor(getattr(Theme, key_name))))
+    except:
+        return _jcolor(fallback)
+
+
+def _round_drawable(color, radius_px, stroke_px=0, stroke_color=0):
+    GD = jclass("android.graphics.drawable.GradientDrawable")
+    d = GD()
+    d.setColor(_jcolor(color))
+    d.setCornerRadius(float(radius_px))
+    if stroke_px > 0:
+        d.setStroke(int(stroke_px), _jcolor(stroke_color))
+    return d
+
+
+def _selector_round(color, radius_dp):
+    try:
+        return Theme.createSimpleSelectorRoundRectDrawable(
+            _dp_global(radius_dp),
+            _jcolor(color),
+            _with_alpha(color, 0xCC),
+        )
+    except:
+        return _round_drawable(color, _dp_global(radius_dp))
+
+
+def _row_selector():
+    try:
+        return Theme.getSelectorDrawable(False)
+    except:
+        try:
+            return Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 2)
+        except:
+            return None
+
+
+def _tg_icon(*names):
+    try:
+        R_d = jclass("org.telegram.messenger.R$drawable")
+        for n in names:
+            try:
+                val = int(getattr(R_d, n))
+                if val:
+                    return val
+            except:
+                pass
+    except:
+        pass
+    return 0
+
+
+def _vector_fallback_bitmap(kind, size_px, color):
+    Bitmap = jclass("android.graphics.Bitmap")
+    Config = jclass("android.graphics.Bitmap$Config")
+    Canvas = jclass("android.graphics.Canvas")
+    Paint = jclass("android.graphics.Paint")
+    Style = jclass("android.graphics.Paint$Style")
+    Cap = jclass("android.graphics.Paint$Cap")
+    Join = jclass("android.graphics.Paint$Join")
+    Path = jclass("android.graphics.Path")
+
+    bmp = Bitmap.createBitmap(int(size_px), int(size_px), Config.ARGB_8888)
+    canvas = Canvas(bmp)
+    paint = Paint(1)
+    paint.setColor(_jcolor(color))
+    paint.setStyle(Style.STROKE)
+    paint.setStrokeWidth(max(2.0, float(size_px) * 0.11))
+    paint.setStrokeCap(Cap.ROUND)
+    paint.setStrokeJoin(Join.ROUND)
+
+    s = float(size_px)
+    path = Path()
+    if kind == "open":
+        path.moveTo(s * 0.36, s * 0.22)
+        path.lineTo(s * 0.66, s * 0.50)
+        path.lineTo(s * 0.36, s * 0.78)
+    elif kind == "close":
+        path.moveTo(s * 0.25, s * 0.25)
+        path.lineTo(s * 0.75, s * 0.75)
+        path.moveTo(s * 0.75, s * 0.25)
+        path.lineTo(s * 0.25, s * 0.75)
+    elif kind == "check":
+        path.moveTo(s * 0.22, s * 0.52)
+        path.lineTo(s * 0.43, s * 0.73)
+        path.lineTo(s * 0.78, s * 0.30)
+    else:
+        path.moveTo(s * 0.24, s * 0.62)
+        path.lineTo(s * 0.50, s * 0.34)
+        path.lineTo(s * 0.76, s * 0.62)
+    canvas.drawPath(path, paint)
+    return bmp
+
+
+def _make_icon_view(ctx, res_names, fallback_kind, size_dp, color):
+    IV = jclass("android.widget.ImageView")
+    ScaleType = jclass("android.widget.ImageView$ScaleType")
+    PorterDuffColorFilter = jclass("android.graphics.PorterDuffColorFilter")
+    PorterDuffMode = jclass("android.graphics.PorterDuff$Mode")
+
+    iv = IV(ctx)
+    iv.setScaleType(ScaleType.FIT_CENTER)
+    res_id = _tg_icon(*res_names) if res_names else 0
+    if res_id:
+        try:
+            iv.setImageResource(int(res_id))
+            iv.setColorFilter(PorterDuffColorFilter(_jcolor(color), PorterDuffMode.SRC_IN))
+            return iv
+        except:
+            pass
+    try:
+        iv.setImageBitmap(_vector_fallback_bitmap(fallback_kind, _dp(ctx, size_dp), color))
+    except:
+        pass
+    return iv
+
+
+def _dp(ctx, n):
+    try:
+        return int(ctx.getResources().getDisplayMetrics().density * n + 0.5)
+    except:
+        return n * 3
+
+
+def _dp_global(n):
+    try:
+        return int(ApplicationLoader.applicationContext.getResources().getDisplayMetrics().density * n + 0.5)
+    except:
+        return n * 3
 
 
 class _Task(dynamic_proxy(Runnable)):
     def __init__(self, fn):
         super().__init__()
-        self.fn = fn
+        self._fn = fn
 
     def run(self):
         try:
-            self.fn()
+            self._fn()
         except Exception as e:
-            _log(f"background step failed: {e}")
+            _log(f"task: {e}")
+
+
+class _TextWatcher(dynamic_proxy(jclass("android.text.TextWatcher"))):
+    def __init__(self, on_change):
+        super().__init__()
+        self._fn = on_change
+
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+
+    def onTextChanged(self, s, start, before, count):
+        pass
+
+    def afterTextChanged(self, s):
+        try:
+            self._fn(str(s) if s is not None else "")
+        except:
+            pass
+
+
+class _DismissListener(dynamic_proxy(jclass("android.content.DialogInterface$OnDismissListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onDismiss(self, dialog):
+        try:
+            self._fn()
+        except:
+            pass
+
+
+class _LongClickListener(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def onLongClick(self, v):
+        try:
+            self._fn()
+        except Exception as e:
+            _log(f"long_click: {e}")
+        return True
+
+
+class _DragTapListener(dynamic_proxy(jclass("android.view.View$OnTouchListener"))):
+    def __init__(self, view, ctx, on_tap):
+        super().__init__()
+        self._v = view
+        self._slop = float(_dp(ctx, 8))
+        self._on_tap = on_tap
+        self._sx = 0.0
+        self._sy = 0.0
+        self._tx = 0.0
+        self._ty = 0.0
+        self._moved = False
+
+    def onTouch(self, v, ev):
+        try:
+            act = int(ev.getActionMasked())
+            if act == 0:
+                self._sx = float(ev.getRawX())
+                self._sy = float(ev.getRawY())
+                self._tx = float(self._v.getTranslationX())
+                self._ty = float(self._v.getTranslationY())
+                self._moved = False
+                return True
+            if act == 2:
+                dx = float(ev.getRawX()) - self._sx
+                dy = float(ev.getRawY()) - self._sy
+                if not self._moved and (abs(dx) > self._slop or abs(dy) > self._slop):
+                    self._moved = True
+                if self._moved:
+                    p = self._v.getParent()
+                    nx = self._tx + dx
+                    ny = self._ty + dy
+                    if p is not None:
+                        pw = float(p.getWidth())
+                        ph = float(p.getHeight())
+                        vw = float(self._v.getWidth())
+                        vh = float(self._v.getHeight())
+                        left = float(self._v.getLeft())
+                        top = float(self._v.getTop())
+                        nx = max(-left + 8.0, min(pw - left - vw - 8.0, nx))
+                        ny = max(-top + 48.0, min(ph - top - vh - 16.0, ny))
+                    self._v.setTranslationX(nx)
+                    self._v.setTranslationY(ny)
+                return True
+            if act == 1:
+                if not self._moved:
+                    self._on_tap()
+                return True
+        except Exception as e:
+            _log(f"pill touch: {e}")
+        return False
 
 
 def _rex_plugins():
     found = []
-    for cls in BasePlugin.__subclasses__():
-        g = None
-        for v in vars(cls).values():
-            if hasattr(v, "__globals__"):
-                g = v.__globals__
-                break
-        if g is None or g.get("__id__") != REX_ID:
-            continue
-        for r in gc.get_referrers(cls):
-            if isinstance(r, cls):
-                found.append((r, str(g.get("__version__") or "?")))
+    try:
+        from base_plugin import BasePlugin as _BP
+        for r in list(getattr(_BP, "_registry", {}).values()):
+            try:
+                g = vars(__import__(type(r).__module__, fromlist=["_"]))
+                if str(g.get("__id__") or "") == REX_ID:
+                    found.append((r, str(g.get("__version__") or "?")))
+            except:
+                pass
+    except:
+        pass
     return found
 
 
-def _rex_loader(plugin):
-    loader = getattr(plugin, "loader", None)
-    if loader is None:
-        return None
+def _rex_loader(p):
     try:
-        main = getattr(loader, "dex_main_class", None)
-        if main is not None:
-            cl = main.getClassLoader()
-            if cl is not None:
-                return cl
-    except Exception:
+        return p.get_loader()
+    except:
         pass
-    return getattr(loader, "dex_loader", None)
+    try:
+        return p._loader
+    except:
+        return None
 
 
 def _rex_ready(utils):
-    known = {}
-    others = []
-    for f in utils.getDeclaredFields():
+    for f in REX_FIELDS:
         try:
-            if str(f.getType().getName()) != "java.lang.reflect.Method":
-                continue
-            name = str(f.getName())
-            f.setAccessible(True)
-            ok = f.get(None) is not None
-        except Exception:
-            continue
-        if name in REX_FIELDS:
-            known[name] = ok
-        elif "secret" not in name.lower():
-            others.append(ok)
-    if known:
-        return all(known.values())
-    return all(others)
+            ff = utils.getClass().getDeclaredField(f)
+            ff.setAccessible(True)
+            if ff.get(utils) is None:
+                return False
+        except:
+            pass
+    return True
 
 
 def _rex_method(utils):
-    best = None
-    for m in utils.getMethods():
-        try:
-            if str(m.getName()) != "deleteMessages":
-                continue
-            names = [str(t.getName()) for t in m.getParameterTypes()]
-        except Exception:
+    for m in utils.getClass().getDeclaredMethods():
+        if m.getName() != "deleteMessages":
             continue
-        if len(names) < 4 or names[0] != "int" or names[1] != "long" or names[2] not in REX_LIST_TYPES or names[-1] != "boolean":
-            continue
-        if len(names) == 5 and names[3] == "java.lang.Long":
-            return m, 5
-        if len(names) == 4 and best is None:
-            best = (m, 4)
-    return best
+        params = [p.getName() for p in m.getParameterTypes()]
+        if len(params) >= 4 and any(t in REX_LIST_TYPES for t in params):
+            m.setAccessible(True)
+            return m, len(params)
+    return None, 0
 
 
 def _rex_api():
-    try:
-        plugins = _rex_plugins()
-    except Exception as e:
-        _log(f"re:extera lookup failed: {e}")
-        return None
-    if not plugins:
-        return None
-    for plugin, ver in plugins:
-        cl = _rex_loader(plugin)
-        if cl is None:
-            continue
+    for plugin, _ in _rex_plugins():
         try:
-            utils = JClass.forName(REX_UTILS, True, cl)
-        except Exception as e:
-            _log(f"re:extera {ver}: delete helper not found: {e}")
-            continue
-        try:
-            if not _rex_ready(utils):
-                _log(f"re:extera {ver}: delete helper is not ready")
-                return False
-            picked = _rex_method(utils)
-        except Exception as e:
-            _log(f"re:extera {ver}: delete helper check failed: {e}")
-            return False
-        if picked is None:
-            _log(f"re:extera {ver}: deleteMessages not found")
-            return False
-        queue = None
-        try:
-            queue = JClass.forName(REX_QUEUE, True, cl).getField("onRequestToDelete").get(None)
-        except Exception as e:
-            _log(f"re:extera {ver}: delete queue not found: {e}")
-        _log(f"local removal via re:extera {ver}")
-        return picked[0], picked[1], queue
-    return False
+            loader = _rex_loader(plugin)
+            if not loader:
+                continue
+            uc = loader.loadClass(REX_UTILS)
+            uf = uc.getDeclaredField("INSTANCE")
+            uf.setAccessible(True)
+            utils = uf.get(None)
+            if not utils or not _rex_ready(utils):
+                continue
+            method, size = _rex_method(utils)
+            if not method:
+                continue
+            queue = None
+            try:
+                qc = loader.loadClass(REX_QUEUE)
+                qf = qc.getDeclaredField("INSTANCE")
+                qf.setAccessible(True)
+                queue = qf.get(None)
+            except:
+                pass
+            return method, size, queue
+        except:
+            pass
+    return None
 
 
 def _rex_drain(queue, lst):
     try:
-        queue.removeAll(lst)
+        for m in queue.getClass().getDeclaredMethods():
+            if m.getName() in ("run", "execute", "process"):
+                m.setAccessible(True)
+                m.invoke(queue, lst)
+                return
+    except:
+        pass
+
+
+def _active_account():
+    try:
+        UC = jclass("org.telegram.messenger.UserConfig")
+        MC = jclass("org.telegram.messenger.MessagesController")
+        CM = jclass("org.telegram.tgnet.ConnectionsManager")
+        acc = int(UC.selectedAccount)
+        mc = MC.getInstance(acc)
+        cm = CM.getInstance(acc)
+        return acc, mc, cm, int(UC.getInstance(acc).getClientUserId())
     except Exception as e:
-        _log(f"re:extera queue cleanup failed: {e}")
+        _log(f"account: {e}")
+        return None, None, None, 0
 
 
 def _can_delete_all(chat):
-    if chat is None:
-        return False
     try:
-        if bool(chat.creator):
+        return ChatObject.canUserDoAction(chat, 8)
+    except:
+        pass
+    try:
+        return bool(chat.admin_rights and chat.admin_rights.delete_messages)
+    except:
+        return False
+
+
+def _peer_title(mc, did):
+    try:
+        if did > 0:
+            u = mc.getUser(int(did))
+            return str(UserObject.getUserName(u) if u else did)
+        c = mc.getChat(int(-did))
+        return str(c.title if c else did)
+    except:
+        return str(did)
+
+
+def _is_tl_channel(chat):
+    try:
+        if isinstance(chat, TLRPC.TL_channel):
             return True
-    except Exception:
+    except:
         pass
+    return type(chat).__name__ in ("TL_channel", "TL_channelForbidden")
+
+
+def _scope_from_dialog(acc, mc, cm, self_id, d):
     try:
-        return bool(ChatObject.canUserDoAdminAction(chat, ChatObject.ACTION_DELETE_MESSAGES))
-    except Exception:
-        pass
-    try:
-        rights = chat.admin_rights
-        return bool(rights is not None and rights.delete_messages)
-    except Exception:
-        return False
-
-
-def _topic_title(mc, chat, topic_id):
-    try:
-        topic = mc.getTopicsController().findTopic(int(chat.id), int(topic_id))
-        if topic is not None and topic.title:
-            return str(topic.title)
-    except Exception:
-        pass
-    return ""
-
-
-def _peer_title(mc, dialog_id):
-    try:
-        if dialog_id > 0:
-            user = mc.getUser(int(dialog_id))
-            if user is not None:
-                return str(UserObject.getUserName(user) or "")
-        else:
-            chat = mc.getChat(int(-dialog_id))
-            if chat is not None:
-                return str(chat.title or "")
-    except Exception:
-        pass
-    return ""
-
-
-def _ctx_get(context, key):
-    if context is None:
+        did = int(d.id)
+    except:
+        return None
+    if not did or did == self_id:
         return None
     try:
-        return context.get(key)
-    except Exception:
+        if DialogObject.isEncryptedDialog(jlong(did)):
+            return None
+    except:
         pass
     try:
-        return context[key]
-    except Exception:
+        if DialogObject.isFolderDialogId(jlong(did)):
+            return None
+    except:
         pass
-    try:
-        return getattr(context, key)
-    except Exception:
-        return None
-
-
-def _read_scope(frag, context):
-    if frag is None or not JClass.forName("org.telegram.ui.ChatActivity").isInstance(frag):
-        return None, _t("Откройте чат, который нужно очистить.", "Open the chat you want to clean.")
-    did = 0
-    try:
-        did = int(frag.getDialogId())
-    except Exception:
-        pass
-    if did == 0:
-        try:
-            did = int(_ctx_get(context, "dialog_id") or 0)
-        except Exception:
-            did = 0
-    if did == 0:
-        return None, _t("Не удалось определить чат.", "Could not detect the chat.")
-    encrypted = None
-    try:
-        encrypted = frag.getCurrentEncryptedChat()
-    except Exception:
-        pass
-    is_secret = encrypted is not None
-    try:
-        is_secret = is_secret or bool(DialogObject.isEncryptedDialog(jlong(did)))
-    except Exception:
-        pass
-    if is_secret:
-        return None, _t("Секретные чаты не поддерживаются — там можно очистить историю штатно.", "Secret chats are not supported — use Clear history there.")
-    mode = 0
-    try:
-        mode = int(frag.getChatMode())
-    except Exception:
-        pass
-    if mode not in (0, 3):
-        return None, _t("Откройте обычный чат: в отложенных, закреплённых и других режимах очистка не работает.", "Open the regular chat: scheduled, pinned and other modes are not supported.")
-    mc = frag.getMessagesController()
-    cm = frag.getConnectionsManager()
-    self_id = int(frag.getUserConfig().getClientUserId())
-    acc = 0
-    try:
-        acc = int(frag.getCurrentAccount())
-    except Exception:
-        acc = 0
     chat = None
-    try:
-        chat = frag.getCurrentChat()
-    except Exception:
-        pass
-    topic = 0
-    try:
-        topic = int(frag.getTopicId())
-    except Exception:
-        topic = 0
-    saved = 0
-    if mode == 3:
+    user = None
+    is_tl_channel = False
+    is_bot = False
+    is_deleted = False
+    if did < 0:
         try:
-            saved = int(frag.getSavedDialogId()) or topic
-        except Exception:
-            saved = topic
-        topic = 0
-        if not saved:
-            return None, _t("Не удалось определить диалог в Избранном.", "Could not detect the Saved Messages dialog.")
-        if getattr(TLRPC, "TL_messages_getSavedHistory", None) is None:
-            return None, _t("Эта версия приложения не умеет очищать диалоги Избранного по отдельности.", "This app version cannot clean single Saved Messages dialogs.")
-    elif topic:
-        mono = False
-        try:
-            mono = bool(ChatObject.isMonoForum(chat))
-        except Exception:
-            mono = False
-        if mono:
-            return None, _t("В личных сообщениях канала очистка по диалогам не поддерживается.", "Channel direct message dialogs are not supported.")
-    channel_id = 0
-    input_channel = None
-    try:
-        if chat is not None and ChatObject.isChannel(chat):
-            channel_id = int(chat.id)
-            input_channel = jclass("org.telegram.messenger.MessagesController").getInputChannel(chat)
-    except Exception:
-        channel_id = 0
-        input_channel = None
-    if chat is not None and ChatObject.isChannel(chat) and input_channel is None:
-        return None, _t("Не удалось получить доступ к каналу.", "Could not access the channel.")
-    peer = mc.getInputPeer(jlong(did))
-    saved_peer = mc.getInputPeer(jlong(saved)) if saved else None
-    self_chat = did == self_id
-    if self_chat:
-        title = _t("Избранное", "Saved Messages")
-        if saved:
-            name = _peer_title(mc, saved)
-            if name:
-                title = f"{title} · {name}"
+            chat = mc.getChat(int(-did))
+        except:
+            pass
+        if not chat:
+            return None
+        if type(chat).__name__ in ("TL_chatForbidden", "TL_channelForbidden"):
+            return None
+        if getattr(chat, "left", False) or getattr(chat, "kicked", False):
+            return None
+        is_tl_channel = _is_tl_channel(chat)
+        is_broadcast = is_tl_channel and not bool(getattr(chat, "megagroup", False))
+        if is_broadcast and not _can_delete_all(chat):
+            return None
+        kind = "channel" if is_broadcast else "group"
     else:
-        title = _peer_title(mc, did) or _t("этот чат", "this chat")
-        if topic and chat is not None:
-            name = _topic_title(mc, chat, topic)
-            if name:
-                title = f"{title} · {name}"
-    if self_chat:
-        kind = "saved"
-    elif did > 0:
+        try:
+            user = mc.getUser(int(did))
+        except:
+            pass
+        if user is not None:
+            try:
+                is_bot = bool(getattr(user, "bot", False))
+            except:
+                pass
+            try:
+                is_deleted = bool(UserObject.isDeleted(user))
+            except:
+                pass
         kind = "private"
-    elif channel_id and chat is not None and not bool(getattr(chat, "megagroup", False)):
-        kind = "channel"
-    else:
-        kind = "group"
-    merged = []
     try:
-        merge_id = int(frag.getMergeDialogId())
-    except Exception:
-        merge_id = 0
-    if merge_id and not topic and not saved:
+        peer = mc.getInputPeer(did)
+        if not peer or isinstance(peer, TLRPC.TL_inputPeerEmpty):
+            return None
+    except:
+        return None
+    input_channel = None
+    channel_id = 0
+    if did < 0 and is_tl_channel:
         try:
-            merged.append({
-                "dialog_id": merge_id,
-                "topic_id": 0,
-                "saved_id": 0,
-                "saved_peer": None,
-                "self_chat": False,
-                "channel_id": 0,
-                "input_channel": None,
-                "peer": mc.getInputPeer(jlong(merge_id)),
-                "account": acc,
-                "mc": mc,
-                "cm": cm,
-                "title": title,
-                "kind": "group",
-                "can_all": False,
-                "merged": [],
-            })
-        except Exception:
-            merged = []
-    scope = {
+            input_channel = mc.getInputChannel(int(-did))
+            channel_id = int(-did)
+        except:
+            pass
+    try:
+        empty_dialog = int(getattr(d, "top_message", 1) or 0) <= 0
+    except:
+        empty_dialog = False
+    return {
+        "kind": kind,
         "dialog_id": did,
-        "topic_id": topic,
-        "saved_id": saved,
-        "saved_peer": saved_peer,
-        "self_chat": self_chat,
-        "channel_id": channel_id,
-        "input_channel": input_channel,
+        "topic_id": 0,
+        "saved_id": 0,
+        "saved_peer": None,
+        "title": _peer_title(mc, did),
         "peer": peer,
-        "account": acc,
+        "tl_obj": chat if did < 0 else user,
+        "input_channel": input_channel,
+        "channel_id": channel_id,
+        "can_all": did > 0 or _can_delete_all(chat),
+        "can_leave": did < 0,
+        "is_bot": is_bot,
+        "is_deleted": is_deleted,
+        "can_remove_dialog": did > 0,
+        "empty_dialog": empty_dialog,
+        "self_chat": False,
         "mc": mc,
         "cm": cm,
-        "title": title,
-        "kind": kind,
-        "can_all": did > 0 or _can_delete_all(chat),
-        "merged": merged,
+        "account": acc,
+        "merged": [],
     }
-    return scope, None
+
+
+def _load_scopes(acc, mc, cm, self_id):
+    raw = []
+    for attr in ("getAllDialogs", "allDialogs", "dialogs"):
+        try:
+            val = getattr(mc, attr)
+            arr = val() if callable(val) else val
+            if arr is not None:
+                raw = list(arr.toArray())
+                if raw:
+                    break
+        except:
+            pass
+    if not raw:
+        for folder in (0, 1):
+            try:
+                arr = mc.getDialogs(jint(folder))
+                if arr is not None:
+                    raw.extend(list(arr.toArray()))
+            except:
+                pass
+    if not raw:
+        for args in ((0, 0, 0, None, PICKER_DIALOGS), (0, 0, 0, None, PICKER_DIALOGS, True)):
+            try:
+                arr = mc.getDialogs(*args)
+                if arr is not None:
+                    raw = list(arr.toArray())
+                    if raw:
+                        break
+            except:
+                pass
+    scopes = []
+    seen = set()
+    for d in raw:
+        sc = _scope_from_dialog(acc, mc, cm, self_id, d)
+        if sc and sc["dialog_id"] not in seen:
+            seen.add(sc["dialog_id"])
+            scopes.append(sc)
+            if len(scopes) >= PICKER_DIALOGS:
+                break
+    return scopes
+
+
+def _count_request(scope):
+    req = TLRPC.TL_messages_search()
+    req.peer = scope["peer"]
+    req.q = ""
+    req.from_id = TLRPC.TL_inputPeerSelf()
+    req.flags |= 1
+    req.filter = TLRPC.TL_inputMessagesFilterEmpty()
+    req.min_date = 0
+    req.max_date = 0
+    req.offset_id = 0
+    req.add_offset = 0
+    req.min_id = 0
+    req.max_id = 0
+    req.hash = 0
+    req.limit = 1
+    return req
+
+
+def _extract_search_count(res):
+    if res is None:
+        return COUNT_ERROR
+    try:
+        sz = int(res.messages.size()) if res.messages is not None else 0
+    except:
+        sz = 0
+    if isinstance(res, (TLRPC.TL_messages_messagesSlice, TLRPC.TL_messages_channelMessages)):
+        try:
+            return max(int(res.count), sz)
+        except:
+            return sz
+    return sz
+
+
+def _prefetch_counts(scopes, cm, is_cancelled, on_result, on_wait=None):
+    queue = list(scopes)
+    lock = threading.Lock()
+    state = {
+        "active": 0,
+        "idx": 0,
+        "sent": 0,
+        "cooldown_until": 0.0,
+        "step_ms": PREFETCH_STEP_MS,
+        "pump_scheduled": False,
+        "retried": set(),
+    }
+
+    def schedule_pump(delay_ms):
+        with lock:
+            if state["pump_scheduled"]:
+                return
+            state["pump_scheduled"] = True
+        run_on_queue(pump, PLUGINS_QUEUE, int(max(0, delay_ms)))
+
+    def pump():
+        if is_cancelled():
+            return
+        to_dispatch = []
+        instant_zero = []
+        with lock:
+            state["pump_scheduled"] = False
+            now = time.time()
+            if now < state["cooldown_until"]:
+                wait_ms = int((state["cooldown_until"] - now) * 1000) + 80
+                state["pump_scheduled"] = True
+                run_on_queue(pump, PLUGINS_QUEUE, wait_ms)
+                return
+            while state["active"] < PREFETCH_WORKERS and state["idx"] < len(queue):
+                sc = queue[state["idx"]]
+                state["idx"] += 1
+                if sc.get("empty_dialog"):
+                    instant_zero.append(sc)
+                    continue
+                state["active"] += 1
+                state["sent"] += 1
+                if state["sent"] > 45 and state["step_ms"] < PREFETCH_SLOW_MS:
+                    state["step_ms"] = PREFETCH_SLOW_MS
+                to_dispatch.append(sc)
+
+        for sc in instant_zero:
+            try:
+                on_result(sc, 0)
+            except Exception as e:
+                _log(f"on_result: {e}")
+
+        for i, sc in enumerate(to_dispatch):
+            if i == 0:
+                _dispatch(sc)
+            else:
+                run_on_queue(lambda s=sc: _dispatch(s), PLUGINS_QUEUE, i * state["step_ms"])
+
+    def _dispatch(sc):
+        if is_cancelled():
+            with lock:
+                state["active"] = max(0, state["active"] - 1)
+            return
+
+        def cb(res, err):
+            if is_cancelled():
+                with lock:
+                    state["active"] = max(0, state["active"] - 1)
+                return
+
+            if err is not None:
+                secs = _flood_seconds(err)
+                did = sc["dialog_id"]
+                if secs is not None and secs <= 30:
+                    wait_s = max(1, secs + 1)
+                    requeued = False
+                    with lock:
+                        state["active"] = max(0, state["active"] - 1)
+                        state["cooldown_until"] = max(state["cooldown_until"], time.time() + wait_s)
+                        state["step_ms"] = min(220, state["step_ms"] + 55)
+                        if did not in state["retried"]:
+                            state["retried"].add(did)
+                            queue.insert(state["idx"], sc)
+                            requeued = True
+                    if on_wait:
+                        try:
+                            on_wait(wait_s)
+                        except:
+                            pass
+                    if not requeued:
+                        try:
+                            on_result(sc, COUNT_ERROR)
+                        except:
+                            pass
+                    schedule_pump(wait_s * 1000 + 80)
+                    return
+                count = COUNT_ERROR
+            else:
+                count = _extract_search_count(res)
+
+            try:
+                on_result(sc, count)
+            except Exception as e:
+                _log(f"on_result: {e}")
+
+            with lock:
+                state["active"] = max(0, state["active"] - 1)
+                delay = state["step_ms"]
+            schedule_pump(delay)
+
+        try:
+            cm.sendRequest(_count_request(sc), RequestCallback(cb))
+        except Exception as e:
+            _log(f"prefetch {sc['dialog_id']}: {e}")
+            with lock:
+                state["active"] = max(0, state["active"] - 1)
+                delay = state["step_ms"]
+            try:
+                on_result(sc, COUNT_ERROR)
+            except:
+                pass
+            schedule_pump(delay)
+
+    pump()
+
+
+class ChatPicker:
+    def __init__(self, ctx, scopes, plugin, on_start):
+        self.ctx = ctx
+        self.scopes = scopes
+        self.plugin = plugin
+        self.on_start = on_start
+        self.selected = set()
+        self.leave_selected = set()
+        self.remove_dialog_selected = set()
+        self.block_selected = set()
+        self.revoke_dialog_selected = set()
+        self.counts = {}
+        self._loaded = 0
+        self._with_count = 0
+        self._without_count = 0
+        self._flood_until = 0.0
+        self._closed = False
+        self._minimized = False
+        self._query = ""
+        self._filter = "all"
+        self._lock = threading.Lock()
+        self._pending = []
+        self._flush_scheduled = False
+        self._seen_done = set()
+        self._row_meta = {}
+        self._refs = []
+        self._persistent_refs = []
+        self._pill_refs = []
+        self._tabs = {}
+        self._sheet = None
+        self._pill = None
+        self._pill_badge_tv = None
+        self._pill_badge_iv = None
+        self._pill_label = None
+        self._footer = None
+        self._sv = None
+        self._container = None
+        self._sec_with = None
+        self._sec_without = None
+        self._hdr_with = None
+        self._hdr_without = None
+        self._empty_tv = None
+        self._progress_bar = None
+        self._subtitle_tv = None
+        self._toggle_tv = None
+        self._search_et = None
+        self._clear_btn = None
+        self._delete_tv = None
+        self._delete_wrap = None
+
+        self.LL = jclass("android.widget.LinearLayout")
+        self.FL = jclass("android.widget.FrameLayout")
+        self.TV = jclass("android.widget.TextView")
+        self.ET = jclass("android.widget.EditText")
+        self.SV = jclass("android.widget.ScrollView")
+        self.PB = jclass("android.widget.ProgressBar")
+        self.View = jclass("android.view.View")
+        self.CSL = jclass("android.content.res.ColorStateList")
+        self.TruncateAt = jclass("android.text.TextUtils$TruncateAt")
+
+        self.c_bg = _theme_color("key_dialogBackground", 0xFF1E242B)
+        self.c_text = _theme_color("key_dialogTextBlack", 0xFF222222)
+        self.c_gray = _theme_color("key_dialogTextGray3", 0xFF888888)
+        self.c_accent = _theme_color("key_dialogTextBlue2", 0xFF2AABEE)
+        self.c_div = _theme_color("key_divider", 0x1F888888)
+        self.c_red = _theme_color("key_text_RedBold", 0xFFE53935)
+        self.c_white = _jcolor(0xFFFFFFFF)
+        self.c_search_bg = _theme_color("key_dialogSearchBackground", 0x16888888)
+        self.c_chip_bg = _with_alpha(self.c_gray, 0x22)
+        self.c_accent_soft = _with_alpha(self.c_accent, 0x24)
+        self.c_red_soft = _with_alpha(self.c_red, 0x22)
+
+    def is_closed(self):
+        return self._closed
+
+    def is_minimized(self):
+        return self._minimized and not self._closed
+
+    def _on_dismiss(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._minimized = False
+        self._remove_pill()
+        with self._lock:
+            self._pending.clear()
+        self._refs.clear()
+        self._persistent_refs.clear()
+        self._row_meta.clear()
+        if self.plugin._picker is self:
+            self.plugin._picker = None
+
+    def _dismiss(self):
+        self._minimized = False
+        self._remove_pill()
+        try:
+            if self._sheet:
+                self._sheet.dismiss()
+        except:
+            pass
+        self._on_dismiss()
+
+    def _minimize(self):
+        if self._closed:
+            return
+        self._minimized = True
+        try:
+            if isinstance(self._sheet, AlertDialogBuilder):
+                d = self._sheet.get_dialog()
+                if d:
+                    d.hide()
+            elif self._sheet:
+                self._sheet.hide()
+        except Exception as e:
+            _log(f"minimize: {e}")
+        self._show_pill()
+
+    def restore(self):
+        if self._closed:
+            return False
+        self._minimized = False
+        self._remove_pill()
+        try:
+            if isinstance(self._sheet, AlertDialogBuilder):
+                d = self._sheet.get_dialog()
+                if d:
+                    d.show()
+                    try:
+                        decor = d.getWindow().getDecorView()
+                        if decor:
+                            decor.setVisibility(0)
+                    except:
+                        pass
+                    self._update_header()
+                    self._relayout_footer()
+                    return True
+            elif self._sheet:
+                self._sheet.show()
+                try:
+                    decor = self._sheet.getWindow().getDecorView()
+                    if decor:
+                        decor.setVisibility(0)
+                except:
+                    pass
+                self._update_header()
+                self._relayout_footer()
+                return True
+        except Exception as e:
+            _log(f"restore: {e}")
+        return False
+
+    def _relayout_footer(self):
+        if self._footer:
+            try:
+                self._footer.post(_Task(self._footer.requestLayout))
+            except:
+                pass
+
+    def _show_pill(self):
+        if self._closed or not self._minimized:
+            return
+        self._remove_pill()
+        ctx = _activity() or self.ctx
+        if not ctx:
+            return
+        try:
+            content = ctx.findViewById(0x01020002)
+            if not content:
+                return
+            dp = lambda n: _dp(ctx, n)
+
+            pill = self.LL(ctx)
+            pill.setOrientation(self.LL.HORIZONTAL)
+            pill.setGravity(16)
+            pill.setClickable(True)
+            pill.setBackground(_round_drawable(self.c_bg, dp(22), dp(1), _with_alpha(self.c_accent, 0x66)))
+            pill.setPadding(dp(8), dp(5), dp(6), dp(5))
+            try:
+                pill.setElevation(float(dp(8)))
+            except:
+                pass
+
+            badge_wrap = self.FL(ctx)
+            badge_wrap.setBackground(_round_drawable(self.c_accent, dp(14)))
+
+            badge_iv = _make_icon_view(ctx, ("msg_delete", "msg_openin"), "up", 16, self.c_white)
+            badge_wrap.addView(badge_iv, self.FL.LayoutParams(dp(16), dp(16), 17))
+
+            badge_tv = self.TV(ctx)
+            badge_tv.setTextSize(12.5)
+            badge_tv.setTextColor(self.c_white)
+            badge_tv.setGravity(17)
+            try:
+                badge_tv.setIncludeFontPadding(False)
+                badge_tv.setTypeface(badge_tv.getTypeface(), 1)
+            except:
+                pass
+            badge_wrap.addView(badge_tv, self.FL.LayoutParams(-1, -1, 17))
+
+            pill.addView(badge_wrap, self.LL.LayoutParams(dp(28), dp(28)))
+
+            label = self.TV(ctx)
+            label.setTextSize(13.5)
+            label.setTextColor(self.c_text)
+            label.setPadding(dp(10), 0, dp(8), 0)
+            try:
+                label.setTypeface(label.getTypeface(), 1)
+                label.setMaxLines(1)
+                label.setEllipsize(self.TruncateAt.END)
+            except:
+                pass
+            pill.addView(label, self.LL.LayoutParams(-2, -2))
+
+            close_wrap = self.FL(ctx)
+            close_wrap.setClickable(True)
+            close_bg = _row_selector()
+            if close_bg:
+                close_wrap.setBackground(close_bg)
+            close_iv = _make_icon_view(ctx, ("msg_close", "ic_close_white", "input_clear"), "close", 15, self.c_gray)
+            close_wrap.addView(close_iv, self.FL.LayoutParams(dp(16), dp(16), 17))
+            c_lst = OnClickListener(lambda *_: self._dismiss())
+            self._pill_refs.append(c_lst)
+            close_wrap.setOnClickListener(c_lst)
+            pill.addView(close_wrap, self.LL.LayoutParams(dp(30), dp(30)))
+
+            drag_lst = _DragTapListener(pill, ctx, lambda: run_on_ui_thread(self.restore))
+            self._pill_refs.append(drag_lst)
+            pill.setOnTouchListener(drag_lst)
+
+            lp = self.FL.LayoutParams(-2, dp(42), 81)
+            lp.setMargins(dp(16), 0, dp(16), dp(68))
+            content.addView(pill, lp)
+
+            self._pill = pill
+            self._pill_badge_tv = badge_tv
+            self._pill_badge_iv = badge_iv
+            self._pill_label = label
+            self._update_pill()
+
+            try:
+                pill.setAlpha(0.0)
+                pill.setScaleX(0.88)
+                pill.setScaleY(0.88)
+                pill.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).setDuration(170).start()
+            except:
+                pass
+        except Exception as e:
+            _log(f"show_pill: {e}")
+
+    def _remove_pill(self):
+        pill = self._pill
+        self._pill = None
+        self._pill_badge_tv = None
+        self._pill_badge_iv = None
+        self._pill_label = None
+        self._pill_refs.clear()
+        if pill is not None:
+            try:
+                p = pill.getParent()
+                if p is not None:
+                    p.removeView(pill)
+            except:
+                pass
+
+    def _update_pill(self):
+        if not self._pill or self._closed:
+            return
+        total_sel = len(self.selected | self.leave_selected | self.remove_dialog_selected)
+        total = len(self.scopes)
+        if self._pill_badge_tv and self._pill_badge_iv:
+            if total_sel > 0:
+                self._pill_badge_tv.setText(str(total_sel))
+                self._pill_badge_tv.setVisibility(0)
+                self._pill_badge_iv.setVisibility(8)
+            else:
+                self._pill_badge_tv.setVisibility(8)
+                self._pill_badge_iv.setVisibility(0)
+        if self._pill_label:
+            if self._loaded < total:
+                self._pill_label.setText(_t(
+                    f"Очистка · {self._loaded}/{total}",
+                    f"Cleaner · {self._loaded}/{total}",
+                ))
+            elif total_sel > 0:
+                self._pill_label.setText(_t(
+                    f"Очистка чатов ({total_sel})",
+                    f"Clean chats ({total_sel})",
+                ))
+            else:
+                self._pill_label.setText(_t("Очистка чатов", "Clean chats"))
+
+    def _make_chip_bg(self, active):
+        dp = lambda n: _dp(self.ctx, n)
+        if active:
+            return _round_drawable(self.c_accent_soft, dp(16), dp(1), _with_alpha(self.c_accent, 0x66))
+        return _round_drawable(self.c_chip_bg, dp(16))
+
+    def show(self):
+        ctx = self.ctx
+        dp = lambda n: _dp(ctx, n)
+
+        root = self.LL(ctx)
+        root.setOrientation(self.LL.VERTICAL)
+
+        handle_wrap = self.LL(ctx)
+        handle_wrap.setOrientation(self.LL.VERTICAL)
+        handle_wrap.setGravity(1)
+        handle_wrap.setPadding(0, dp(8), 0, dp(4))
+        handle = self.View(ctx)
+        handle.setBackground(_round_drawable(_with_alpha(self.c_gray, 0x55), dp(3)))
+        handle_wrap.addView(handle, self.LL.LayoutParams(dp(36), dp(4)))
+        root.addView(handle_wrap, self.LL.LayoutParams(-1, -2))
+
+        hdr = self.LL(ctx)
+        hdr.setOrientation(self.LL.HORIZONTAL)
+        hdr.setGravity(16)
+        hdr.setPadding(dp(20), dp(6), dp(14), dp(8))
+
+        title_col = self.LL(ctx)
+        title_col.setOrientation(self.LL.VERTICAL)
+
+        title_tv = self.TV(ctx)
+        title_tv.setText(_t("Очистка чатов", "Clean chats"))
+        title_tv.setTextSize(20.0)
+        title_tv.setTextColor(self.c_text)
+        try:
+            title_tv.setTypeface(title_tv.getTypeface(), 1)
+        except:
+            pass
+        title_col.addView(title_tv, self.LL.LayoutParams(-1, -2))
+
+        self._subtitle_tv = self.TV(ctx)
+        self._subtitle_tv.setTextSize(13.0)
+        self._subtitle_tv.setTextColor(self.c_gray)
+        sub_lp = self.LL.LayoutParams(-1, -2)
+        sub_lp.setMargins(0, dp(2), 0, 0)
+        title_col.addView(self._subtitle_tv, sub_lp)
+        hdr.addView(title_col, self.LL.LayoutParams(0, -2, 1.0))
+
+        self._toggle_tv = self.TV(ctx)
+        self._toggle_tv.setTextSize(13.0)
+        self._toggle_tv.setTextColor(self.c_accent)
+        self._toggle_tv.setPadding(dp(12), dp(6), dp(12), dp(6))
+        self._toggle_tv.setClickable(True)
+        self._toggle_tv.setBackground(_round_drawable(self.c_accent_soft, dp(16)))
+        try:
+            self._toggle_tv.setTypeface(self._toggle_tv.getTypeface(), 1)
+        except:
+            pass
+        t_lst = OnClickListener(lambda *_: self._toggle_select_all())
+        self._persistent_refs.append(t_lst)
+        self._toggle_tv.setOnClickListener(t_lst)
+        hdr.addView(self._toggle_tv, self.LL.LayoutParams(-2, -2))
+
+        root.addView(hdr, self.LL.LayoutParams(-1, -2))
+
+        search_box = self.LL(ctx)
+        search_box.setOrientation(self.LL.HORIZONTAL)
+        search_box.setGravity(16)
+        search_box.setBackground(_round_drawable(self.c_search_bg, dp(12)))
+        search_box.setPadding(dp(14), dp(2), dp(8), dp(2))
+        sb_lp = self.LL.LayoutParams(-1, dp(42))
+        sb_lp.setMargins(dp(16), dp(2), dp(16), dp(10))
+
+        self._search_et = self.ET(ctx)
+        self._search_et.setBackground(None)
+        self._search_et.setSingleLine(True)
+        self._search_et.setImeOptions(3)
+        self._search_et.setTextSize(15.0)
+        self._search_et.setTextColor(self.c_text)
+        self._search_et.setHintTextColor(self.c_gray)
+        self._search_et.setHint(_t("Поиск чата…", "Search chat…"))
+        self._search_et.setPadding(0, 0, dp(4), 0)
+        tw = _TextWatcher(self._on_search)
+        self._persistent_refs.append(tw)
+        self._search_et.addTextChangedListener(tw)
+        search_box.addView(self._search_et, self.LL.LayoutParams(0, -1, 1.0))
+
+        clear_wrap = self.FL(ctx)
+        clear_wrap.setVisibility(8)
+        clear_wrap.setClickable(True)
+        bg_clear = _row_selector()
+        if bg_clear:
+            clear_wrap.setBackground(bg_clear)
+        clear_iv = _make_icon_view(ctx, ("msg_close", "ic_close_white", "input_clear"), "close", 16, self.c_gray)
+        clear_wrap.addView(clear_iv, self.FL.LayoutParams(dp(18), dp(18), 17))
+        c_lst = OnClickListener(lambda *_: self._clear_search())
+        self._persistent_refs.append(c_lst)
+        clear_wrap.setOnClickListener(c_lst)
+        self._clear_btn = clear_wrap
+        search_box.addView(clear_wrap, self.LL.LayoutParams(dp(34), dp(34)))
+
+        root.addView(search_box, sb_lp)
+
+        tabs_row = self.LL(ctx)
+        tabs_row.setOrientation(self.LL.HORIZONTAL)
+        tabs_row.setPadding(dp(16), 0, dp(16), dp(10))
+
+        for idx, (key, label) in enumerate((
+            ("all", _t("Все", "All")),
+            ("with", _t("С сообщениями", "With messages")),
+            ("without", _t("Пустые", "Empty")),
+        )):
+            tab = self.TV(ctx)
+            tab.setText(label)
+            tab.setTextSize(12.5)
+            tab.setPadding(dp(12), dp(6), dp(12), dp(6))
+            tab.setClickable(True)
+            try:
+                tab.setTypeface(tab.getTypeface(), 1)
+            except:
+                pass
+            tlp = self.LL.LayoutParams(-2, -2)
+            if idx > 0:
+                tlp.setMargins(dp(8), 0, 0, 0)
+
+            def make_tab_click(k):
+                return OnClickListener(lambda *_: self._set_filter(k))
+
+            tab_lst = make_tab_click(key)
+            self._persistent_refs.append(tab_lst)
+            tab.setOnClickListener(tab_lst)
+            self._tabs[key] = tab
+            tabs_row.addView(tab, tlp)
+
+        root.addView(tabs_row, self.LL.LayoutParams(-1, -2))
+
+        try:
+            self._progress_bar = self.PB(ctx, None, 0x01010078)
+            self._progress_bar.setMax(max(1, len(self.scopes)))
+            self._progress_bar.setProgress(0)
+            try:
+                self._progress_bar.setProgressTintList(self.CSL.valueOf(self.c_accent))
+            except:
+                pass
+            root.addView(self._progress_bar, self.LL.LayoutParams(-1, dp(3)))
+        except:
+            self._progress_bar = None
+
+        div_top = self.View(ctx)
+        div_top.setBackgroundColor(self.c_div)
+        root.addView(div_top, self.LL.LayoutParams(-1, dp(1)))
+
+        self._container = self.LL(ctx)
+        self._container.setOrientation(self.LL.VERTICAL)
+        self._container.setPadding(0, dp(4), 0, dp(8))
+
+        def make_hdr():
+            tv = self.TV(ctx)
+            tv.setTextSize(12.5)
+            tv.setTextColor(self.c_accent)
+            tv.setVisibility(8)
+            try:
+                tv.setTypeface(tv.getTypeface(), 1)
+            except:
+                pass
+            lp = self.LL.LayoutParams(-1, -2)
+            lp.setMargins(dp(20), dp(12), dp(20), dp(4))
+            self._container.addView(tv, lp)
+            return tv
+
+        self._hdr_with = make_hdr()
+        self._sec_with = self.LL(ctx)
+        self._sec_with.setOrientation(self.LL.VERTICAL)
+        self._container.addView(self._sec_with, self.LL.LayoutParams(-1, -2))
+
+        self._hdr_without = make_hdr()
+        self._sec_without = self.LL(ctx)
+        self._sec_without.setOrientation(self.LL.VERTICAL)
+        self._container.addView(self._sec_without, self.LL.LayoutParams(-1, -2))
+
+        self._empty_tv = self.TV(ctx)
+        self._empty_tv.setText(_t("Проверяю чаты…", "Checking chats…"))
+        self._empty_tv.setTextSize(14.5)
+        self._empty_tv.setTextColor(self.c_gray)
+        self._empty_tv.setGravity(17)
+        elp = self.LL.LayoutParams(-1, -2)
+        elp.setMargins(dp(20), dp(36), dp(20), dp(36))
+        self._container.addView(self._empty_tv, elp)
+
+        self._sv = self.SV(ctx)
+        self._sv.setVerticalScrollBarEnabled(True)
+        self._sv.addView(self._container, self.LL.LayoutParams(-1, -2))
+
+        try:
+            screen_h = ctx.getResources().getDisplayMetrics().heightPixels
+            list_h = max(dp(240), int(screen_h * 0.48))
+        except:
+            list_h = dp(340)
+        root.addView(self._sv, self.LL.LayoutParams(-1, list_h))
+
+        div_bot = self.View(ctx)
+        div_bot.setBackgroundColor(self.c_div)
+        root.addView(div_bot, self.LL.LayoutParams(-1, dp(1)))
+
+        footer = self.LL(ctx)
+        footer.setOrientation(self.LL.HORIZONTAL)
+        footer.setGravity(16)
+        footer.setWeightSum(1.0)
+        footer.setPadding(dp(16), dp(10), dp(16), dp(14))
+        self._footer = footer
+
+        cancel_wrap = self.FL(ctx)
+        cancel_wrap.setClickable(True)
+        cancel_wrap.setBackground(_selector_round(self.c_chip_bg, 12))
+        cancel_tv = self.TV(ctx)
+        cancel_tv.setText(_t("Отмена", "Cancel"))
+        cancel_tv.setTextSize(14.5)
+        cancel_tv.setTextColor(self.c_text)
+        cancel_tv.setGravity(17)
+        cancel_tv.setSingleLine(True)
+        cancel_tv.setPadding(dp(8), 0, dp(8), 0)
+        try:
+            cancel_tv.setTextAlignment(4)
+            cancel_tv.setIncludeFontPadding(False)
+            cancel_tv.setEllipsize(self.TruncateAt.END)
+            cancel_tv.setTypeface(cancel_tv.getTypeface(), 1)
+        except:
+            pass
+        cancel_wrap.addView(cancel_tv, self.FL.LayoutParams(-1, -1, 17))
+        cancel_lst = OnClickListener(lambda *_: self._dismiss())
+        self._persistent_refs.append(cancel_lst)
+        cancel_wrap.setOnClickListener(cancel_lst)
+        c_lp = self.LL.LayoutParams(0, dp(46), 0.34)
+        c_lp.setMargins(0, 0, dp(10), 0)
+        footer.addView(cancel_wrap, c_lp)
+
+        delete_wrap = self.FL(ctx)
+        delete_wrap.setClickable(True)
+        delete_wrap.setBackground(_selector_round(self.c_red, 12))
+        self._delete_tv = self.TV(ctx)
+        self._delete_tv.setTextSize(14.5)
+        self._delete_tv.setTextColor(self.c_white)
+        self._delete_tv.setGravity(17)
+        self._delete_tv.setSingleLine(True)
+        self._delete_tv.setPadding(dp(10), 0, dp(10), 0)
+        try:
+            self._delete_tv.setTextAlignment(4)
+            self._delete_tv.setIncludeFontPadding(False)
+            self._delete_tv.setEllipsize(self.TruncateAt.END)
+            self._delete_tv.setTypeface(self._delete_tv.getTypeface(), 1)
+        except:
+            pass
+        delete_wrap.addView(self._delete_tv, self.FL.LayoutParams(-1, -1, 17))
+        del_lst = OnClickListener(lambda *_: self._on_delete_click())
+        self._persistent_refs.append(del_lst)
+        delete_wrap.setOnClickListener(del_lst)
+        self._delete_wrap = delete_wrap
+        footer.addView(delete_wrap, self.LL.LayoutParams(0, dp(46), 0.66))
+
+        root.addView(footer, self.LL.LayoutParams(-1, -2))
+
+        self._update_tabs()
+        self._update_header()
+        self._show_sheet(root)
+        self._relayout_footer()
+
+    def _show_sheet(self, root):
+        try:
+            b = BottomSheet.Builder(self.ctx, True)
+            b.setCustomView(root)
+            try:
+                b.setApplyTopPadding(False)
+                b.setApplyBottomPadding(False)
+            except:
+                pass
+            sheet = b.create()
+            try:
+                sheet.setApplyTopPadding(False)
+                sheet.setApplyBottomPadding(False)
+                sheet.setCanDismissWithSwipe(False)
+                sheet.setSmoothKeyboardAnimationEnabled(True)
+            except:
+                pass
+            dl = _DismissListener(self._on_dismiss)
+            self._persistent_refs.append(dl)
+            sheet.setOnDismissListener(dl)
+            sheet.show()
+            self._sheet = sheet
+            return
+        except Exception as e:
+            _log(f"sheet: {e}")
+
+        try:
+            p = root.getParent()
+            if p is not None:
+                p.removeView(root)
+        except:
+            pass
+
+        b = AlertDialogBuilder(self.ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        b.set_view(root)
+        b.set_on_dismiss_listener(lambda *_: self._on_dismiss())
+        b.show()
+        self._sheet = b
+
+    def _on_search(self, text):
+        q = text.strip().lower()
+        if q == self._query:
+            return
+        self._query = q
+        if self._clear_btn:
+            self._clear_btn.setVisibility(0 if q else 8)
+        self._apply_visibility()
+
+    def _clear_search(self):
+        if self._search_et:
+            self._search_et.setText("")
+
+    def _set_filter(self, key):
+        if self._filter == key:
+            return
+        self._filter = key
+        self._update_tabs()
+        self._apply_visibility()
+        self._update_header()
+
+    def _update_tabs(self):
+        labels = {
+            "all": _t(f"Все ({self._loaded})", f"All ({self._loaded})"),
+            "with": _t(f"С сообщениями ({self._with_count})", f"With messages ({self._with_count})"),
+            "without": _t(f"Пустые ({self._without_count})", f"Empty ({self._without_count})"),
+        }
+        for key, tv in self._tabs.items():
+            active = key == self._filter
+            tv.setText(labels[key])
+            tv.setTextColor(self.c_accent if active else self.c_gray)
+            tv.setBackground(self._make_chip_bg(active))
+
+    def _on_delete_click(self):
+        delete_ids = set(self.selected)
+        leave_ids = set(self.leave_selected)
+        remove_dialog_ids = set(self.remove_dialog_selected)
+        block_ids = set(self.block_selected & self.remove_dialog_selected)
+        revoke_dialog_ids = set(self.revoke_dialog_selected & self.remove_dialog_selected)
+        all_ids = delete_ids | leave_ids | remove_dialog_ids
+        chosen = [sc for sc in self.scopes if sc["dialog_id"] in all_ids]
+        if not chosen:
+            try:
+                BulletinHelper.show_info(_t("Выберите хотя бы один чат.", "Select at least one chat."))
+            except:
+                pass
+            return
+        self._dismiss()
+        self.on_start(chosen, leave_ids, delete_ids, remove_dialog_ids, block_ids, revoke_dialog_ids)
+
+    def _toggle_select_all(self):
+        q = self._query
+        eligible = [
+            did for did, meta in self._row_meta.items()
+            if meta["has"] and (not q or q in meta["title"])
+        ]
+        if not eligible:
+            return
+        if all(did in self.selected for did in eligible):
+            self.selected.difference_update(eligible)
+            self.leave_selected.difference_update(eligible)
+        else:
+            self.selected.update(eligible)
+        for did in eligible:
+            meta = self._row_meta.get(did)
+            if meta:
+                self._sync_row_selection(did, meta, animate=True)
+        self._update_header()
+
+    def on_wait(self, secs):
+        if self._closed:
+            return
+        self._flood_until = max(self._flood_until, time.time() + secs)
+        run_on_ui_thread(self._tick_wait)
+
+    def _tick_wait(self):
+        if self._closed:
+            return
+        self._update_header()
+        if self._loaded < len(self.scopes) and self._flood_until > time.time():
+            run_on_queue(lambda: run_on_ui_thread(self._tick_wait), PLUGINS_QUEUE, 1000)
+
+    def on_count(self, scope, count):
+        if self._closed:
+            return
+        self._flood_until = 0.0
+        need_schedule = False
+        with self._lock:
+            self._pending.append((scope, count))
+            if not self._flush_scheduled:
+                self._flush_scheduled = True
+                need_schedule = True
+        if need_schedule:
+            delay = 0 if self._loaded == 0 else 180
+            if delay == 0:
+                run_on_ui_thread(self._flush_pending)
+            else:
+                run_on_queue(lambda: run_on_ui_thread(self._flush_pending), PLUGINS_QUEUE, delay)
+
+    def _flush_pending(self):
+        if self._closed or not self._container:
+            return
+        more = False
+        with self._lock:
+            batch = self._pending[:UI_BATCH_LIMIT]
+            self._pending = self._pending[UI_BATCH_LIMIT:]
+            if self._pending:
+                more = True
+            else:
+                self._flush_scheduled = False
+
+        if batch:
+            for sc, count in batch:
+                did = sc["dialog_id"]
+                if did in self._seen_done:
+                    continue
+                self._seen_done.add(did)
+                self.counts[did] = count
+                self._loaded += 1
+                has_msgs = count > 0
+                if has_msgs:
+                    self._with_count += 1
+                else:
+                    self._without_count += 1
+                row, meta = self._create_row(sc, count)
+                self._row_meta[did] = meta
+                if has_msgs:
+                    self._sec_with.addView(row, self.LL.LayoutParams(-1, -2))
+                else:
+                    self._sec_without.addView(row, self.LL.LayoutParams(-1, -2))
+
+            self._update_tabs()
+            self._apply_visibility()
+            self._update_header()
+
+        if more and not self._closed:
+            run_on_ui_thread(self._flush_pending)
+
+    def _apply_visibility(self):
+        if self._closed:
+            return
+        q = self._query
+        f = self._filter
+        shown_with = 0
+        shown_without = 0
+
+        for meta in self._row_meta.values():
+            match_q = (not q) or (q in meta["title"])
+            has = meta["has"]
+            match_f = (f == "all") or (f == "with" and has) or (f == "without" and not has)
+            vis = 0 if (match_q and match_f) else 8
+            meta["view"].setVisibility(vis)
+            if vis == 0:
+                if has:
+                    shown_with += 1
+                else:
+                    shown_without += 1
+
+        if shown_with > 0:
+            self._hdr_with.setText(_t(
+                f"Есть ваши сообщения · {shown_with}",
+                f"Has your messages · {shown_with}",
+            ))
+            self._hdr_with.setVisibility(0)
+        else:
+            self._hdr_with.setVisibility(8)
+
+        if shown_without > 0:
+            self._hdr_without.setText(_t(
+                f"Нет ваших сообщений · {shown_without}",
+                f"No messages from you · {shown_without}",
+            ))
+            self._hdr_without.setVisibility(0)
+        else:
+            self._hdr_without.setVisibility(8)
+
+        if shown_with == 0 and shown_without == 0:
+            if self._loaded < len(self.scopes) and not q:
+                self._empty_tv.setText(_t("Проверяю чаты…", "Checking chats…"))
+            elif q:
+                self._empty_tv.setText(_t("Ничего не найдено", "Nothing found"))
+            else:
+                self._empty_tv.setText(_t("В этом разделе нет чатов", "No chats in this section"))
+            self._empty_tv.setVisibility(0)
+        else:
+            self._empty_tv.setVisibility(8)
+
+    def _update_header(self):
+        if self._closed:
+            return
+        total = len(self.scopes)
+        sel_count = len(self.selected)
+        leave_count = len(self.leave_selected)
+        rm_count = len(self.remove_dialog_selected)
+        blk_count = len(self.block_selected & self.remove_dialog_selected)
+        extra_n = leave_count + rm_count
+        total_sel = len(self.selected | self.leave_selected | self.remove_dialog_selected)
+
+        if self._progress_bar:
+            if self._loaded >= total:
+                self._progress_bar.setVisibility(8)
+            else:
+                self._progress_bar.setVisibility(0)
+                self._progress_bar.setProgress(self._loaded)
+
+        if self._subtitle_tv:
+            wait_s = int(self._flood_until - time.time())
+            if self._loaded < total and wait_s > 0:
+                self._subtitle_tv.setText(_t(
+                    f"Пауза Telegram ({wait_s} с) · проверено {self._loaded}/{total}",
+                    f"Telegram pause ({wait_s}s) · checked {self._loaded}/{total}",
+                ))
+            elif self._loaded < total:
+                self._subtitle_tv.setText(_t(
+                    f"Сканирование: {self._loaded}/{total} · с сообщениями: {self._with_count}",
+                    f"Scanning: {self._loaded}/{total} · with messages: {self._with_count}",
+                ))
+            elif sel_count > 0 and extra_n > 0:
+                self._subtitle_tv.setText(_t(
+                    f"С сообщениями: {self._with_count} · Очистка: {sel_count} · Доп.: {extra_n}",
+                    f"With messages: {self._with_count} · Clean: {sel_count} · Extra: {extra_n}",
+                ))
+            elif extra_n > 0:
+                parts = []
+                if leave_count > 0:
+                    parts.append(_t(f"Выйти: {leave_count}", f"Leave: {leave_count}"))
+                if rm_count > 0:
+                    parts.append(_t(f"Удалить чат: {rm_count}", f"Delete chat: {rm_count}"))
+                if blk_count > 0:
+                    parts.append(_t(f"Блок: {blk_count}", f"Block: {blk_count}"))
+                self._subtitle_tv.setText(" · ".join(parts))
+            else:
+                self._subtitle_tv.setText(_t(
+                    f"С сообщениями: {self._with_count} · Выбрано: {sel_count}",
+                    f"With messages: {self._with_count} · Selected: {sel_count}",
+                ))
+
+        if self._toggle_tv:
+            if self._with_count == 0 or self._filter == "without":
+                self._toggle_tv.setVisibility(8)
+            else:
+                self._toggle_tv.setVisibility(0)
+                eligible = [did for did, m in self._row_meta.items() if m["has"]]
+                all_sel = eligible and all(did in self.selected for did in eligible)
+                self._toggle_tv.setText(
+                    _t("Снять", "Clear") if all_sel else _t("Выбрать все", "Select all")
+                )
+
+        if self._delete_tv and self._delete_wrap:
+            if total_sel == 0:
+                self._delete_tv.setText(_t("Выберите чаты", "Select chats"))
+                self._delete_wrap.setAlpha(0.5)
+            elif sel_count > 0 and leave_count > 0 and rm_count == 0:
+                self._delete_tv.setText(_t(
+                    f"Удалить ({sel_count}) · выйти ({leave_count})",
+                    f"Delete ({sel_count}) · leave ({leave_count})",
+                ))
+                self._delete_wrap.setAlpha(1.0)
+            elif sel_count > 0 and extra_n > 0:
+                self._delete_tv.setText(_t(
+                    f"Удалить ({sel_count}) и ({extra_n})",
+                    f"Delete ({sel_count}) & ({extra_n})",
+                ))
+                self._delete_wrap.setAlpha(1.0)
+            elif sel_count > 0:
+                self._delete_tv.setText(_t(f"Удалить ({sel_count})", f"Delete ({sel_count})"))
+                self._delete_wrap.setAlpha(1.0)
+            elif leave_count > 0 and rm_count == 0:
+                self._delete_tv.setText(_t(f"Выйти ({leave_count})", f"Leave ({leave_count})"))
+                self._delete_wrap.setAlpha(1.0)
+            elif rm_count > 0 and leave_count == 0:
+                if blk_count == rm_count:
+                    self._delete_tv.setText(_t(
+                        f"Удалить и блок. ({rm_count})",
+                        f"Delete & block ({rm_count})",
+                    ))
+                elif blk_count > 0:
+                    self._delete_tv.setText(_t(
+                        f"Удалить ({rm_count}) · блок ({blk_count})",
+                        f"Delete ({rm_count}) · block ({blk_count})",
+                    ))
+                else:
+                    self._delete_tv.setText(_t(
+                        f"Удалить чаты ({rm_count})",
+                        f"Delete chats ({rm_count})",
+                    ))
+                self._delete_wrap.setAlpha(1.0)
+            else:
+                self._delete_tv.setText(_t(f"Выполнить ({total_sel})", f"Apply ({total_sel})"))
+                self._delete_wrap.setAlpha(1.0)
+            self._relayout_footer()
+
+        self._update_pill()
+
+    def _apply_check_state(self, box, tick, checked, active_color, animate=False):
+        dp = lambda n: _dp(self.ctx, n)
+        if checked:
+            box.setBackground(_round_drawable(active_color, dp(12)))
+            tick.setVisibility(0)
+        else:
+            box.setBackground(_round_drawable(0x00000000, dp(12), dp(2), _with_alpha(self.c_gray, 0x88)))
+            tick.setVisibility(4)
+        if animate:
+            try:
+                box.setScaleX(0.84)
+                box.setScaleY(0.84)
+                box.animate().scaleX(1.0).scaleY(1.0).setDuration(140).start()
+            except:
+                pass
+
+    def _apply_action_chip(self, chip, has_msgs, checked, action_on, kind_chip):
+        dp = lambda n: _dp(self.ctx, n)
+        if not chip:
+            return
+        if kind_chip == "leave":
+            if has_msgs:
+                if not checked:
+                    chip.setVisibility(8)
+                    return
+                chip.setVisibility(0)
+                if action_on:
+                    chip.setText(_t("Выйти после удаления · вкл", "Leave after deleting · on"))
+                    chip.setTextColor(self.c_red)
+                    chip.setBackground(_round_drawable(self.c_red_soft, dp(10), dp(1), _with_alpha(self.c_red, 0x77)))
+                else:
+                    chip.setText(_t("Выйти после удаления", "Leave after deleting"))
+                    chip.setTextColor(self.c_gray)
+                    chip.setBackground(_round_drawable(0x00000000, dp(10), dp(1), _with_alpha(self.c_gray, 0x55)))
+            else:
+                if not action_on:
+                    chip.setVisibility(8)
+                    return
+                chip.setVisibility(0)
+                chip.setText(_t("Выйти из чата", "Leave chat"))
+                chip.setTextColor(self.c_red)
+                chip.setBackground(_round_drawable(self.c_red_soft, dp(10), dp(1), _with_alpha(self.c_red, 0x77)))
+        elif kind_chip == "bot":
+            if not checked:
+                chip.setVisibility(8)
+                return
+            chip.setVisibility(0)
+            if action_on:
+                chip.setText(_t("Заблокировать бота · вкл", "Block bot · on"))
+                chip.setTextColor(self.c_red)
+                chip.setBackground(_round_drawable(self.c_red_soft, dp(10), dp(1), _with_alpha(self.c_red, 0x77)))
+            else:
+                chip.setText(_t("Заблокировать бота", "Block bot"))
+                chip.setTextColor(self.c_gray)
+                chip.setBackground(_round_drawable(0x00000000, dp(10), dp(1), _with_alpha(self.c_gray, 0x55)))
+        elif kind_chip == "private_rm":
+            if not checked:
+                chip.setVisibility(8)
+                return
+            chip.setVisibility(0)
+            if action_on:
+                chip.setText(_t("Удалить у обоих · вкл", "Delete for both · on"))
+                chip.setTextColor(self.c_red)
+                chip.setBackground(_round_drawable(self.c_red_soft, dp(10), dp(1), _with_alpha(self.c_red, 0x77)))
+            else:
+                chip.setText(_t("Удалить у обоих", "Delete for both"))
+                chip.setTextColor(self.c_gray)
+                chip.setBackground(_round_drawable(0x00000000, dp(10), dp(1), _with_alpha(self.c_gray, 0x55)))
+        elif kind_chip == "deleted":
+            if not checked:
+                chip.setVisibility(8)
+                return
+            chip.setVisibility(0)
+            chip.setText(_t("Удалить чат", "Delete chat"))
+            chip.setTextColor(self.c_red)
+            chip.setBackground(_round_drawable(self.c_red_soft, dp(10), dp(1), _with_alpha(self.c_red, 0x77)))
+
+    def _sync_row_selection(self, did, meta, animate=False):
+        if meta["has"]:
+            checked = did in self.selected
+            if not checked:
+                self.leave_selected.discard(did)
+            if meta.get("check") and meta.get("tick"):
+                self._apply_check_state(meta["check"], meta["tick"], checked, self.c_accent, animate=animate)
+            self._apply_action_chip(meta.get("chip"), True, checked, did in self.leave_selected, "leave")
+        elif meta.get("can_leave"):
+            leave_on = did in self.leave_selected
+            if meta.get("check") and meta.get("tick"):
+                self._apply_check_state(meta["check"], meta["tick"], leave_on, self.c_red, animate=animate)
+            self._apply_action_chip(meta.get("chip"), False, False, leave_on, "leave")
+            if meta.get("sub_tv"):
+                meta["sub_tv"].setTextColor(self.c_red if leave_on else self.c_gray)
+        elif meta.get("can_remove"):
+            rm_on = did in self.remove_dialog_selected
+            if not rm_on:
+                self.block_selected.discard(did)
+                self.revoke_dialog_selected.discard(did)
+            if meta.get("check") and meta.get("tick"):
+                self._apply_check_state(meta["check"], meta["tick"], rm_on, self.c_red, animate=animate)
+            if meta.get("is_bot"):
+                self._apply_action_chip(meta.get("chip"), False, rm_on, did in self.block_selected, "bot")
+            elif meta.get("is_deleted"):
+                self._apply_action_chip(meta.get("chip"), False, rm_on, False, "deleted")
+            else:
+                self._apply_action_chip(
+                    meta.get("chip"), False, rm_on, did in self.revoke_dialog_selected, "private_rm"
+                )
+            if meta.get("sub_tv"):
+                meta["sub_tv"].setTextColor(self.c_red if rm_on else self.c_gray)
+
+    def _open_row_chat(self, scope):
+        self._minimize()
+        run_on_queue(lambda: _open_chat(scope), PLUGINS_QUEUE, 60)
+
+    def _show_row_actions(self, scope, has_msgs):
+        did = scope["dialog_id"]
+        can_leave = bool(scope.get("can_leave"))
+        is_bot = bool(scope.get("is_bot"))
+        is_deleted = bool(scope.get("is_deleted"))
+
+        options = [(_t("Перейти в чат", "Open chat"), "open")]
+        if has_msgs and can_leave:
+            if did in self.selected and did in self.leave_selected:
+                options.append((_t("Удалить без выхода", "Delete without leaving"), "no_leave"))
+            else:
+                options.append((_t("Удалить и выйти", "Delete and leave"), "leave"))
+        elif has_msgs:
+            if did in self.selected:
+                options.append((_t("Снять выбор", "Deselect"), "deselect"))
+            else:
+                options.append((_t("Выбрать для удаления", "Select for deletion"), "select"))
+        elif can_leave:
+            if did in self.leave_selected:
+                options.append((_t("Не выходить из чата", "Do not leave"), "unleave_only"))
+            else:
+                options.append((_t("Выйти из чата", "Leave chat"), "leave_only"))
+        elif is_bot:
+            if did in self.remove_dialog_selected:
+                if did in self.block_selected:
+                    options.append((_t("Удалить без блокировки", "Delete without blocking"), "rm_bot"))
+                else:
+                    options.append((_t("Удалить и заблокировать бота", "Delete and block bot"), "rm_block_bot"))
+                options.append((_t("Снять выбор", "Deselect"), "unrm"))
+            else:
+                options.append((_t("Удалить чат", "Delete chat"), "rm_bot"))
+                options.append((_t("Удалить и заблокировать бота", "Delete and block bot"), "rm_block_bot"))
+        elif is_deleted:
+            if did in self.remove_dialog_selected:
+                options.append((_t("Снять выбор", "Deselect"), "unrm"))
+            else:
+                options.append((_t("Удалить чат", "Delete chat"), "rm_deleted"))
+        else:
+            if did in self.remove_dialog_selected:
+                if did in self.revoke_dialog_selected:
+                    options.append((_t("Удалить только у меня", "Delete only for me"), "rm_priv_me"))
+                else:
+                    options.append((_t("Удалить у обоих", "Delete for both"), "rm_priv_both"))
+                options.append((_t("Снять выбор", "Deselect"), "unrm"))
+            else:
+                options.append((_t("Удалить чат (у меня)", "Delete chat (for me)"), "rm_priv_me"))
+                options.append((_t("Удалить чат (у обоих)", "Delete chat (for both)"), "rm_priv_both"))
+
+        b = AlertDialogBuilder(self.ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        b.set_title(scope["title"])
+
+        def on_pick(d, i):
+            act = options[i][1]
+            if act == "open":
+                self._open_row_chat(scope)
+                return
+            if act == "leave":
+                self.selected.add(did)
+                self.leave_selected.add(did)
+            elif act == "no_leave":
+                self.selected.add(did)
+                self.leave_selected.discard(did)
+            elif act == "select":
+                self.selected.add(did)
+            elif act == "deselect":
+                self.selected.discard(did)
+                self.leave_selected.discard(did)
+            elif act == "leave_only":
+                self.leave_selected.add(did)
+            elif act == "unleave_only":
+                self.leave_selected.discard(did)
+            elif act == "rm_bot":
+                self.remove_dialog_selected.add(did)
+                self.block_selected.discard(did)
+            elif act == "rm_block_bot":
+                self.remove_dialog_selected.add(did)
+                self.block_selected.add(did)
+            elif act == "rm_deleted":
+                self.remove_dialog_selected.add(did)
+            elif act == "rm_priv_me":
+                self.remove_dialog_selected.add(did)
+                self.revoke_dialog_selected.discard(did)
+            elif act == "rm_priv_both":
+                self.remove_dialog_selected.add(did)
+                self.revoke_dialog_selected.add(did)
+            elif act == "unrm":
+                self.remove_dialog_selected.discard(did)
+                self.block_selected.discard(did)
+                self.revoke_dialog_selected.discard(did)
+            meta = self._row_meta.get(did)
+            if meta:
+                self._sync_row_selection(did, meta, animate=True)
+            self._update_header()
+
+        b.set_items([o[0] for o in options], lambda d, i: run_on_ui_thread(lambda i=i: on_pick(d, i)))
+        b.set_negative_button(_t("Отмена", "Cancel"), None)
+        b.show()
+
+    def _bind_avatar(self, img, scope):
+        try:
+            img.getImageReceiver().setCurrentAccount(int(scope["account"]))
+        except:
+            pass
+        try:
+            av = AvatarDrawable()
+            obj = scope.get("tl_obj")
+            if obj is not None:
+                av.setInfo(int(scope["account"]), obj)
+                img.setForUserOrChat(obj, av)
+            else:
+                av.setInfo(jlong(scope["dialog_id"]), scope["title"], "")
+                img.setImageDrawable(av)
+        except:
+            try:
+                av = AvatarDrawable()
+                av.setInfo(jlong(scope["dialog_id"]), scope["title"], "")
+                img.setImageDrawable(av)
+            except:
+                pass
+
+    def _create_row(self, scope, count):
+        ctx = self.ctx
+        dp = lambda n: _dp(ctx, n)
+        did = scope["dialog_id"]
+        has_msgs = count > 0
+        can_leave = bool(scope.get("can_leave"))
+        is_bot = bool(scope.get("is_bot"))
+        is_deleted = bool(scope.get("is_deleted"))
+        can_remove = (not has_msgs) and (did > 0)
+
+        row = self.LL(ctx)
+        row.setOrientation(self.LL.HORIZONTAL)
+        row.setGravity(16)
+        row.setMinimumHeight(dp(58))
+        row.setPadding(dp(18), dp(7), dp(14), dp(7))
+
+        av_view = BackupImageView(ctx)
+        av_view.setRoundRadius(dp(21))
+        self._bind_avatar(av_view, scope)
+        av_lp = self.LL.LayoutParams(dp(42), dp(42))
+        av_lp.setMargins(0, 0, dp(12), 0)
+        row.addView(av_view, av_lp)
+
+        info_col = self.LL(ctx)
+        info_col.setOrientation(self.LL.VERTICAL)
+
+        name_tv = self.TV(ctx)
+        name_tv.setText(scope["title"])
+        name_tv.setTextSize(15.5)
+        name_tv.setTextColor(self.c_text)
+        try:
+            name_tv.setTypeface(name_tv.getTypeface(), 1)
+            name_tv.setMaxLines(1)
+            name_tv.setEllipsize(self.TruncateAt.END)
+        except:
+            pass
+        info_col.addView(name_tv, self.LL.LayoutParams(-1, -2))
+
+        kind_txt = _kind_label(scope)
+        if count == COUNT_ERROR:
+            sub_txt = f"{kind_txt} · " + _t("ошибка проверки", "check failed")
+        elif count <= 0:
+            sub_txt = f"{kind_txt} · " + _t("нет ваших сообщений", "no messages from you")
+        else:
+            sub_txt = f"{kind_txt} · {_msgs(count)}"
+
+        sub_tv = self.TV(ctx)
+        sub_tv.setText(sub_txt)
+        sub_tv.setTextSize(13.0)
+        sub_tv.setTextColor(self.c_accent if has_msgs else self.c_gray)
+        try:
+            sub_tv.setMaxLines(1)
+            sub_tv.setEllipsize(self.TruncateAt.END)
+        except:
+            pass
+        sub_lp = self.LL.LayoutParams(-1, -2)
+        sub_lp.setMargins(0, dp(1), 0, 0)
+        info_col.addView(sub_tv, sub_lp)
+
+        chip = None
+        if can_leave or can_remove:
+            chip = self.TV(ctx)
+            chip.setTextSize(11.5)
+            chip.setPadding(dp(9), dp(3), dp(9), dp(3))
+            try:
+                chip.setTypeface(chip.getTypeface(), 1)
+            except:
+                pass
+            l_lp = self.LL.LayoutParams(-2, -2)
+            l_lp.setMargins(0, dp(5), 0, dp(2))
+
+            if can_leave:
+                chip.setClickable(has_msgs)
+                self._apply_action_chip(chip, has_msgs, did in self.selected, did in self.leave_selected, "leave")
+                if has_msgs:
+                    def toggle_leave(*_):
+                        if did in self.leave_selected:
+                            self.leave_selected.discard(did)
+                        else:
+                            self.leave_selected.add(did)
+                        self._apply_action_chip(chip, True, did in self.selected, did in self.leave_selected, "leave")
+                        self._update_header()
+
+                    l_lst = OnClickListener(toggle_leave)
+                    self._refs.append(l_lst)
+                    chip.setOnClickListener(l_lst)
+            elif is_bot:
+                chip.setClickable(True)
+                self._apply_action_chip(
+                    chip, False, did in self.remove_dialog_selected, did in self.block_selected, "bot"
+                )
+
+                def toggle_block(*_):
+                    if did in self.block_selected:
+                        self.block_selected.discard(did)
+                    else:
+                        self.block_selected.add(did)
+                    self._apply_action_chip(
+                        chip, False, did in self.remove_dialog_selected, did in self.block_selected, "bot"
+                    )
+                    self._update_header()
+
+                b_lst = OnClickListener(toggle_block)
+                self._refs.append(b_lst)
+                chip.setOnClickListener(b_lst)
+            elif is_deleted:
+                chip.setClickable(False)
+                self._apply_action_chip(chip, False, did in self.remove_dialog_selected, False, "deleted")
+            else:
+                chip.setClickable(True)
+                self._apply_action_chip(
+                    chip, False, did in self.remove_dialog_selected, did in self.revoke_dialog_selected, "private_rm"
+                )
+
+                def toggle_revoke(*_):
+                    if did in self.revoke_dialog_selected:
+                        self.revoke_dialog_selected.discard(did)
+                    else:
+                        self.revoke_dialog_selected.add(did)
+                    self._apply_action_chip(
+                        chip, False, did in self.remove_dialog_selected, did in self.revoke_dialog_selected, "private_rm"
+                    )
+                    self._update_header()
+
+                rv_lst = OnClickListener(toggle_revoke)
+                self._refs.append(rv_lst)
+                chip.setOnClickListener(rv_lst)
+
+            info_col.addView(chip, l_lp)
+
+        row.addView(info_col, self.LL.LayoutParams(0, -2, 1.0))
+
+        open_wrap = self.FL(ctx)
+        open_wrap.setClickable(True)
+        open_bg = _row_selector()
+        if open_bg:
+            open_wrap.setBackground(open_bg)
+        open_iv = _make_icon_view(
+            ctx,
+            ("msg_openin", "msg_arrowright", "arrow_more"),
+            "open",
+            18,
+            self.c_gray,
+        )
+        open_wrap.addView(open_iv, self.FL.LayoutParams(dp(19), dp(19), 17))
+        o_lst = OnClickListener(lambda *_: self._open_row_chat(scope))
+        self._refs.append(o_lst)
+        open_wrap.setOnClickListener(o_lst)
+        o_lp = self.LL.LayoutParams(dp(34), dp(34))
+        o_lp.setMargins(dp(4), 0, dp(4), 0)
+        row.addView(open_wrap, o_lp)
+
+        row.setClickable(True)
+        bg = _row_selector()
+        if bg:
+            row.setBackground(bg)
+
+        long_lst = _LongClickListener(lambda: self._show_row_actions(scope, has_msgs))
+        self._refs.append(long_lst)
+        row.setOnLongClickListener(long_lst)
+
+        check_box = self.FL(ctx)
+        tick_iv = _make_icon_view(ctx, ("msg_check_s", "ic_done_white"), "check", 14, self.c_white)
+        check_box.addView(tick_iv, self.FL.LayoutParams(dp(14), dp(14), 17))
+
+        if has_msgs:
+            self._apply_check_state(check_box, tick_iv, did in self.selected, self.c_accent, animate=False)
+        elif can_leave:
+            self._apply_check_state(check_box, tick_iv, did in self.leave_selected, self.c_red, animate=False)
+        else:
+            self._apply_check_state(
+                check_box, tick_iv, did in self.remove_dialog_selected, self.c_red, animate=False
+            )
+
+        cb_lp = self.LL.LayoutParams(dp(24), dp(24))
+        cb_lp.setMargins(dp(6), 0, dp(4), 0)
+        row.addView(check_box, cb_lp)
+
+        def toggle(*_):
+            if has_msgs:
+                if did in self.selected:
+                    self.selected.discard(did)
+                else:
+                    self.selected.add(did)
+            elif can_leave:
+                if did in self.leave_selected:
+                    self.leave_selected.discard(did)
+                else:
+                    self.leave_selected.add(did)
+            else:
+                if did in self.remove_dialog_selected:
+                    self.remove_dialog_selected.discard(did)
+                else:
+                    self.remove_dialog_selected.add(did)
+            meta = self._row_meta.get(did)
+            if meta:
+                self._sync_row_selection(did, meta, animate=True)
+            self._update_header()
+
+        lst = OnClickListener(toggle)
+        self._refs.append(lst)
+        row.setOnClickListener(lst)
+
+        meta = {
+            "view": row,
+            "title": scope["title"].lower(),
+            "has": has_msgs,
+            "can_leave": can_leave,
+            "can_remove": can_remove,
+            "is_bot": is_bot,
+            "is_deleted": is_deleted,
+            "check": check_box,
+            "tick": tick_iv,
+            "chip": chip,
+            "sub_tv": sub_tv,
+        }
+        return row, meta
 
 
 class CleanJob:
-    def __init__(self, plugin, scope, mode, revoke):
+    def __init__(
+        self,
+        plugin,
+        scopes,
+        mode,
+        revoke,
+        verify_rounds=VERIFY_ROUNDS,
+        leave_ids=None,
+        delete_ids=None,
+        remove_dialog_ids=None,
+        block_ids=None,
+        revoke_dialog_ids=None,
+    ):
         self.p = plugin
-        self.s = scope
+        self.scopes = list(scopes)
+        self.s = self.scopes[0]
+        self.total_chats = len(self.scopes)
+        self.chat_idx = 0
         self.mode = mode
         self.revoke = revoke
+        self.verify_rounds = int(verify_rounds)
+        self.leave_ids = set(leave_ids or ())
+        self.delete_ids = set(delete_ids) if delete_ids is not None else {sc["dialog_id"] for sc in self.scopes}
+        self.remove_dialog_ids = set(remove_dialog_ids or ())
+        self.block_ids = set(block_ids or ())
+        self.revoke_dialog_ids = set(revoke_dialog_ids or ())
         self.cancelled = False
         self.done = False
+        self.leaving = False
+        self.blocking = False
+        self.removing_dialog = False
         self.error = None
         self.flood_until = 0.0
         self.pending_since = 0.0
         self.round = 0
         self.offset_id = 0
-        self.total = 0
-        self.found = set()
+        self.chat_wanted = 0
+        self.chat_deleted = 0
         self.deleted = 0
         self.round_deleted = 0
-        self.failed = set()
         self.errors = 0
         self.extra_delay = 0
+        self.chats_cleaned = 0
+        self.left_count = 0
+        self.leave_failed = 0
+        self.dialogs_deleted = 0
+        self.dialog_delete_failed = 0
+        self.blocked_count = 0
+        self.block_failed = 0
+        self.found = set()
+        self.failed = set()
+        self.total_failed = 0
         self.split_budget = SPLIT_BUDGET
         self.ui = None
         self.hidden = False
         self.friendly = False
-        self.queue = list(scope.get("merged") or []) if mode == "mine" else []
         self.rex = None
         try:
-            self.started = int(scope["cm"].getCurrentTime())
-        except Exception:
+            self.started = int(self.s["cm"].getCurrentTime())
+        except:
             self.started = int(time.time())
 
     def start(self):
-        _log(f"start mode={self.mode} kind={self.s['kind']} dialog={self.s['dialog_id']} topic={self.s['topic_id']} saved={self.s['saved_id']}")
+        _log(
+            f"start mode={self.mode} chats={self.total_chats} delete={len(self.delete_ids)} "
+            f"leave={len(self.leave_ids)} rm={len(self.remove_dialog_ids)} blk={len(self.block_ids)}"
+        )
         self.show_progress()
-        self._later(self._fetch, 150)
+        self._later(self._start_current_scope, 150)
         self._later(self._tick, 1000)
 
-    def _later(self, fn, delay_ms=0):
+    def _start_current_scope(self):
+        if self.done:
+            return
+        if self.cancelled:
+            self._finish()
+            return
+        if self.s["dialog_id"] not in self.delete_ids:
+            self._after_messages_done()
+            return
+        self._fetch()
+
+    def _later(self, fn, ms=0):
         def run():
             try:
                 fn()
             except Exception as e:
-                _log(f"step failed: {e}")
+                _log(f"step: {e}")
                 self._fail(str(e))
-        run_on_queue(run, PLUGINS_QUEUE, int(max(0, delay_ms)))
+        run_on_queue(run, PLUGINS_QUEUE, int(max(0, ms)))
 
     def _pace(self, base):
         return base + self.extra_delay
@@ -608,7 +2438,7 @@ class CleanJob:
         self.update_progress()
         self._later(self._tick, 1000)
 
-    def _list_request(self):
+    def _list_req(self):
         s = self.s
         if s["saved_id"]:
             req = TLRPC.TL_messages_getSavedHistory()
@@ -634,16 +2464,16 @@ class CleanJob:
                 req.flags |= 2
         req.offset_id = int(self.offset_id)
         req.add_offset = 0
-        req.limit = PAGE
         req.max_id = 0
         req.min_id = 0
         req.hash = 0
+        req.limit = PAGE
         if not isinstance(req, TLRPC.TL_messages_search):
             req.offset_date = 0
         return req
 
-    def _delete_request(self, ids):
-        if self.s["channel_id"]:
+    def _del_req(self, ids):
+        if self.s["channel_id"] and self.s.get("input_channel") is not None:
             req = TLRPC.TL_channels_deleteMessages()
             req.channel = self.s["input_channel"]
         else:
@@ -652,17 +2482,17 @@ class CleanJob:
         req.id = _int_list(ids)
         return req
 
-    def _wanted(self, msg):
+    def _wanted_msg(self, msg):
         if self.mode == "all" or self.s["self_chat"]:
             return True
         try:
             if bool(msg.post):
                 return False
-        except Exception:
+        except:
             pass
         try:
             return bool(msg.out)
-        except Exception:
+        except:
             return True
 
     def _fetch(self):
@@ -671,38 +2501,37 @@ class CleanJob:
         if self.cancelled:
             self._finish()
             return
-        self._send(self._list_request(), self._on_page)
+        self._send(self._list_req(), self._on_page)
 
     def _on_page(self, res, err):
         if self.done:
             return
         if err is not None:
-            if self._handle_flood(err, self._fetch):
+            if self._flood(err, self._fetch):
                 return
-            if _err_code(err) in FATAL:
-                self._fail(_error_text(_err_code(err)), True)
+            code = _err_code(err)
+            if code in FATAL:
+                self._fail(_error_text(code), True)
                 return
             self.errors += 1
             if self.errors <= RETRIES:
                 self._later(self._fetch, 1500 * self.errors)
                 return
-            self._fail(_error_text(_err_code(err)), True)
+            self._fail(_error_text(code), True)
             return
+
         self.errors = 0
         messages = []
         try:
-            if res is not None and res.messages is not None:
+            if res and res.messages:
                 messages = list(res.messages.toArray())
-        except Exception:
+        except:
             messages = []
+
         if not messages:
             self._round_end()
             return
-        if self.round == 0 and self.total == 0:
-            try:
-                self.total = int(res.count or 0)
-            except Exception:
-                self.total = 0
+
         low = None
         ids = []
         services = set()
@@ -717,16 +2546,19 @@ class CleanJob:
             try:
                 if int(msg.date) > self.started:
                     continue
-            except Exception:
+            except:
                 pass
-            if not self._wanted(msg):
+            if not self._wanted_msg(msg):
                 continue
+            self.chat_wanted += 1
             ids.append(mid)
             if _is_service(msg):
                 services.add(mid)
+
         if low is None or (self.offset_id and low >= self.offset_id):
             self._round_end()
             return
+
         self.offset_id = low
         self.found.update(ids)
         self.update_progress()
@@ -738,24 +2570,189 @@ class CleanJob:
     def _round_end(self):
         if self.done:
             return
-        if not self.cancelled and self.round < VERIFY_ROUNDS and self.round_deleted > 0:
+        if not self.cancelled and self.round < self.verify_rounds and self.round_deleted > 0:
             self.round += 1
             self.round_deleted = 0
             self.offset_id = 0
-            _log(f"verify round {self.round}, deleted so far {self.deleted}")
             self.update_progress()
             self._later(self._fetch, 1200)
             return
-        if not self.cancelled and self.queue:
-            self.s = self.queue.pop(0)
+        self._after_messages_done()
+
+    def _after_messages_done(self):
+        if self.done:
+            return
+        if self.cancelled:
+            self._finish()
+            return
+        did = self.s["dialog_id"]
+        if did in self.leave_ids:
+            self._leave_current_chat()
+            return
+        if did in self.block_ids:
+            self._block_current_bot()
+            return
+        if did in self.remove_dialog_ids:
+            self._remove_current_dialog()
+            return
+        self._advance_or_finish()
+
+    def _leave_current_chat(self):
+        if self.done or self.cancelled:
+            self._finish()
+            return
+        s = self.s
+        did = int(s["dialog_id"])
+        if did >= 0:
+            self._advance_or_finish()
+            return
+
+        self.leaving = True
+        self.update_progress()
+
+        if s["channel_id"] and s.get("input_channel") is not None:
+            req = TLRPC.TL_channels_leaveChannel()
+            req.channel = s["input_channel"]
+        else:
+            req = TLRPC.TL_messages_deleteChatUser()
+            req.chat_id = int(-did)
+            req.user_id = TLRPC.TL_inputUserSelf()
+
+        def on_left(res, err):
+            self.leaving = False
+            if self.done:
+                return
+            if err is not None:
+                if self._flood(err, self._leave_current_chat):
+                    return
+                _log(f"leave {did}: {_err_code(err)}")
+                self.leave_failed += 1
+                self._advance_or_finish()
+                return
+
+            self.left_count += 1
+            mc = s["mc"]
+            try:
+                if res is not None:
+                    mc.processUpdates(res, False)
+            except:
+                pass
+            run_on_ui_thread(lambda: self._remove_dialog_local(mc, did))
+            self._advance_or_finish()
+
+        self._send(req, on_left)
+
+    def _block_current_bot(self):
+        if self.done or self.cancelled:
+            self._finish()
+            return
+        s = self.s
+        did = int(s["dialog_id"])
+        mc = s["mc"]
+        if did <= 0:
+            if did in self.remove_dialog_ids:
+                self._remove_current_dialog()
+            else:
+                self._advance_or_finish()
+            return
+
+        self.blocking = True
+        self.update_progress()
+
+        req = TLRPC.TL_contacts_block()
+        try:
+            req.id = s["peer"]
+        except:
+            try:
+                req.id = mc.getInputUser(int(did))
+            except:
+                pass
+
+        def on_blocked(res, err):
+            self.blocking = False
+            if self.done:
+                return
+            if err is not None:
+                if self._flood(err, self._block_current_bot):
+                    return
+                _log(f"block {did}: {_err_code(err)}")
+                self.block_failed += 1
+            else:
+                self.blocked_count += 1
+            if did in self.remove_dialog_ids:
+                self._remove_current_dialog()
+            else:
+                self._advance_or_finish()
+
+        self._send(req, on_blocked)
+
+    def _remove_current_dialog(self):
+        if self.done or self.cancelled:
+            self._finish()
+            return
+        s = self.s
+        did = int(s["dialog_id"])
+        mc = s["mc"]
+
+        self.removing_dialog = True
+        self.update_progress()
+
+        req = TLRPC.TL_messages_deleteHistory()
+        req.peer = s["peer"]
+        req.max_id = 0
+        req.just_clear = False
+        req.revoke = bool(did in self.revoke_dialog_ids)
+
+        def on_deleted_hist(res, err):
+            self.removing_dialog = False
+            if self.done:
+                return
+            if err is not None:
+                if self._flood(err, self._remove_current_dialog):
+                    return
+                _log(f"deleteHistory {did}: {_err_code(err)}")
+                self.dialog_delete_failed += 1
+                self._advance_or_finish()
+                return
+
+            self.dialogs_deleted += 1
+            run_on_ui_thread(lambda: self._remove_dialog_local(mc, did))
+            self._advance_or_finish()
+
+        self._send(req, on_deleted_hist)
+
+    def _remove_dialog_local(self, mc, did):
+        try:
+            mc.deleteDialog(jlong(did), jint(0))
+        except:
+            pass
+
+    def _advance_or_finish(self):
+        if self.done:
+            return
+        if self.chat_deleted > 0:
+            self.chats_cleaned += 1
+        self.total_failed += len(self.failed)
+
+        if not self.cancelled and self.chat_idx + 1 < self.total_chats:
+            self.chat_idx += 1
+            self.s = self.scopes[self.chat_idx]
             self.round = 0
             self.round_deleted = 0
             self.offset_id = 0
-            self.total = self.deleted + len(self.found)
-            _log(f"continue with merged history {self.s['dialog_id']}")
+            self.chat_wanted = 0
+            self.chat_deleted = 0
+            self.errors = 0
+            self.leaving = False
+            self.blocking = False
+            self.removing_dialog = False
+            self.split_budget = SPLIT_BUDGET
+            self.found.clear()
+            self.failed.clear()
             self.update_progress()
-            self._later(self._fetch, 600)
+            self._later(self._start_current_scope, 350)
             return
+
         self._finish()
 
     def _delete(self, ids, services, then):
@@ -767,16 +2764,16 @@ class CleanJob:
         if not ids:
             then()
             return
-        self._send(self._delete_request(ids), lambda res, err: self._on_deleted(ids, services, res, err, then))
+        self._send(self._del_req(ids), lambda r, e: self._on_deleted(ids, services, r, e, then))
 
     def _on_deleted(self, ids, services, res, err, then):
         if err is None:
-            count = 0
             try:
                 count = int(res.pts_count)
-            except Exception:
+            except:
                 count = len(ids)
             self.deleted += count
+            self.chat_deleted += count
             self.round_deleted += count
             self._remove_local(ids)
             self._apply_pts(res)
@@ -786,9 +2783,10 @@ class CleanJob:
             self.update_progress()
             then()
             return
+
         if self.done:
             return
-        if self._handle_flood(err, lambda: self._delete(ids, services, then)):
+        if self._flood(err, lambda: self._delete(ids, services, then)):
             return
         code = _err_code(err)
         if code in FORBIDDEN:
@@ -808,7 +2806,10 @@ class CleanJob:
         special = [i for i in ids if i in services]
         delay = self._pace(DELETE_DELAY_MS)
         if plain and special:
-            self._later(lambda: self._delete(plain, set(), lambda: self._later(lambda: self._delete(special, services, then), delay)), delay)
+            self._later(
+                lambda: self._delete(plain, set(), lambda: self._later(lambda: self._delete(special, services, then), delay)),
+                delay,
+            )
             return
         if special or len(ids) == 1 or self.split_budget <= 0:
             self.failed.update(ids)
@@ -816,20 +2817,26 @@ class CleanJob:
             return
         self.split_budget -= 2
         half = len(ids) // 2
-        first, second = ids[:half], ids[half:]
-        self._later(lambda: self._delete(first, services, lambda: self._later(lambda: self._delete(second, services, then), delay)), delay)
+        self._later(
+            lambda: self._delete(ids[:half], services, lambda: self._later(lambda: self._delete(ids[half:], services, then), delay)),
+            delay,
+        )
 
-    def _handle_flood(self, err, retry):
+    def _flood(self, err, retry):
         secs = _flood_seconds(err)
         if secs is None:
             return False
         if secs > MAX_FLOOD_S:
-            minutes = max(1, secs // 60)
-            self._fail(_t(f"Telegram временно ограничил удаление примерно на {minutes} мин. Запустите очистку ещё раз позже — она продолжит с того, что осталось.", f"Telegram limited deleting for about {minutes} min. Run the cleaner again later — it continues with what is left."), True)
+            self._fail(
+                _t(
+                    f"Telegram ограничил удаление на ~{max(1, secs // 60)} мин. Запустите позже.",
+                    f"Telegram limited deleting for ~{max(1, secs // 60)} min. Try again later.",
+                ),
+                True,
+            )
             return True
         self.flood_until = time.time() + secs + 1
-        self.extra_delay = min(MAX_EXTRA_DELAY_MS, self.extra_delay + 400)
-        _log(f"flood wait {secs}s")
+        self.extra_delay = min(MAX_EXTRA_DELAY, self.extra_delay + 400)
         self.update_progress()
         self._later(retry, (secs + 1) * 1000)
         return True
@@ -838,7 +2845,7 @@ class CleanJob:
         try:
             pts = int(res.pts)
             count = int(res.pts_count)
-        except Exception:
+        except:
             return
         mc = self.s["mc"]
         try:
@@ -846,15 +2853,13 @@ class CleanJob:
                 _channel_pts(mc, pts, count, self.s["channel_id"])
             else:
                 mc.processNewDifferenceParams(jint(-1), jint(pts), jint(-1), jint(count))
-        except Exception as e:
-            _log(f"pts update skipped: {e}")
+        except:
+            pass
 
     def _remove_local(self, ids):
         lst = _int_list(ids)
         if self.rex is None:
             self.rex = _rex_api() or False
-            if not self.rex:
-                _log("local removal via client")
         if self.rex and self._rex_remove(lst):
             return
         self._client_remove(lst)
@@ -873,18 +2878,18 @@ class CleanJob:
                 else:
                     method.invoke(None, jint(acc), jlong(did), lst, True)
             except Exception as e:
-                _log(f"re:extera removal failed, using client: {e}")
+                _log(f"rex: {e}")
                 self.rex = False
                 self._client_remove(lst, s)
                 return
-            if queue is not None:
+            if queue:
                 run_on_queue(lambda: _rex_drain(queue, lst), PLUGINS_QUEUE, DRAIN_DELAY_MS)
 
         try:
             MessagesStorage.getInstance(acc).getStorageQueue().postRunnable(_Task(task))
             return True
         except Exception as e:
-            _log(f"storage queue unavailable: {e}")
+            _log(f"storage: {e}")
             self.rex = False
             return False
 
@@ -897,8 +2902,8 @@ class CleanJob:
         def run():
             try:
                 mc.deleteMessages(lst, None, None, jlong(did), jint(topic), True, jint(0), True)
-            except Exception as e:
-                _log(f"local delete failed: {e}")
+            except:
+                pass
 
         run_on_ui_thread(run)
 
@@ -907,7 +2912,6 @@ class CleanJob:
             return
         self.error = str(text or "?")
         self.friendly = friendly
-        _log(f"stopped by error: {self.error}")
         self._finish()
 
     def cancel(self, silent=False):
@@ -920,45 +2924,88 @@ class CleanJob:
             return
         self._later(self._finish)
 
+    def _title_text(self):
+        title = self.s["title"]
+        if not self.delete_ids:
+            if self.total_chats > 1:
+                return _t(
+                    f"Обработка ({self.chat_idx + 1}/{self.total_chats}): {title}",
+                    f"Processing ({self.chat_idx + 1}/{self.total_chats}): {title}",
+                )
+            return _t(f"Обработка: {title}", f"Processing: {title}")
+        if self.total_chats > 1:
+            return _t(
+                f"Очистка ({self.chat_idx + 1}/{self.total_chats}): {title}",
+                f"Cleaning ({self.chat_idx + 1}/{self.total_chats}): {title}",
+            )
+        return _t(f"Очистка: {title}", f"Cleaning: {title}")
+
     def _status(self):
-        if self.round > 0:
-            line = _t("Проверяю, что ничего не осталось…", "Checking that nothing is left…")
+        prefix = ""
+        if self.total_chats > 1:
+            prefix = f"[{self.chat_idx + 1}/{self.total_chats}] {self.s['title']}\n"
+        if self.leaving:
+            line = _t("Выхожу из чата…", "Leaving chat…")
+        elif self.blocking:
+            line = _t("Блокирую бота…", "Blocking bot…")
+        elif self.removing_dialog:
+            line = _t("Удаляю чат…", "Deleting chat…")
+        elif self.s["dialog_id"] not in self.delete_ids:
+            line = _t("Подготовка…", "Preparing…")
+        elif self.round > 0:
+            line = _t("Проверяю, что ничего не осталось…", "Checking nothing is left…")
             if self.deleted:
                 line += "\n" + _t(f"Удалено {_num(self.deleted)}", f"Deleted {_num(self.deleted)}")
         elif not self.found:
             line = _t("Ищу сообщения…", "Looking for messages…")
-        elif self.total > self.deleted:
-            line = _t(f"Удалено {_num(self.deleted)} из ~{_num(self.total)}", f"Deleted {_num(self.deleted)} of ~{_num(self.total)}")
+        elif self.chat_wanted > self.chat_deleted:
+            line = _t(
+                f"Удалено {_num(self.chat_deleted)} из {_num(self.chat_wanted)}",
+                f"Deleted {_num(self.chat_deleted)} of {_num(self.chat_wanted)}",
+            )
+            if self.total_chats > 1 and self.deleted > self.chat_deleted:
+                line += _t(f" (всего {_num(self.deleted)})", f" (total {_num(self.deleted)})")
         else:
             line = _t(f"Удалено {_num(self.deleted)}, ищу дальше…", f"Deleted {_num(self.deleted)}, looking further…")
+
         wait = self.flood_until - time.time()
         if wait > 1:
-            line += "\n" + _t(f"Telegram просит подождать — продолжу сам через {int(wait)} с", f"Telegram asked to wait — resuming in {int(wait)} s")
+            line += "\n" + _t(
+                f"Telegram просит подождать — продолжу через {int(wait)} с",
+                f"Waiting for Telegram — resuming in {int(wait)} s",
+            )
         elif self.pending_since and time.time() - self.pending_since > SLOW_HINT_S:
-            line += "\n" + _t("Сервер притормозил запросы — продолжу автоматически", "The server slowed requests down — will continue automatically")
-        return line
+            line += "\n" + _t(
+                "Сервер притормозил — продолжу автоматически",
+                "Server slowed down — resuming automatically",
+            )
+        return prefix + line
 
     def _percent(self):
-        total = max(self.total, len(self.found), 1)
-        if self.round > 0:
-            return 99
-        return max(0, min(99, int(self.deleted * 100 / total)))
+        if self.leaving or self.blocking or self.removing_dialog:
+            chat_frac = 0.5 if self.s["dialog_id"] not in self.delete_ids else 0.99
+        elif self.round > 0:
+            chat_frac = 0.99
+        else:
+            chat_frac = min(0.99, self.chat_deleted / max(self.chat_wanted, len(self.found), 1))
+        total_frac = (self.chat_idx + chat_frac) / max(1, self.total_chats)
+        return max(0, min(99, int(total_frac * 100)))
 
     def show_progress(self):
         text = self._status()
-        percent = self._percent()
-        title = self.s["title"]
+        pct = self._percent()
+        title = self._title_text()
 
         def show():
             if self.done:
                 return
             ctx = _activity()
-            if ctx is None:
+            if not ctx:
                 self.hidden = True
                 return
             try:
                 b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_LOADING)
-                b.set_title(_t(f"Очистка: {title}", f"Cleaning: {title}"))
+                b.set_title(title)
                 b.set_message(text)
                 b.create()
                 b.set_cancelable(False)
@@ -966,11 +3013,11 @@ class CleanJob:
                 b.set_positive_button(_t("Скрыть", "Hide"), lambda d, w: self._on_hide())
                 b.set_negative_button(_t("Остановить", "Stop"), lambda d, w: self.cancel())
                 b.show()
-                b.set_progress(percent)
+                b.set_progress(pct)
                 self.ui = b
                 self.hidden = False
             except Exception as e:
-                _log(f"progress dialog failed: {e}")
+                _log(f"progress: {e}")
                 self.hidden = True
 
         run_on_ui_thread(show)
@@ -979,27 +3026,34 @@ class CleanJob:
         self.hidden = True
         self.ui = None
         try:
-            BulletinHelper.show_info(_t("Очистка идёт в фоне. Прогресс — снова через ⋮ → «Очистить сообщения».", "Cleaning continues in the background. Open ⋮ → Clean messages to see progress."))
-        except Exception:
+            BulletinHelper.show_info(_t(
+                "Очистка идёт в фоне. Настройки плагина → «Выбрать чаты» — посмотреть прогресс.",
+                "Cleaning in background. Plugin settings → Select chats to see progress.",
+            ))
+        except:
             pass
 
     def update_progress(self):
         if self.hidden or self.done:
             return
         text = self._status()
-        percent = self._percent()
+        pct = self._percent()
+        title = self._title_text()
 
         def apply():
             ui = self.ui
-            if ui is None or self.done:
+            if not ui or self.done:
                 return
             try:
-                dialog = ui.get_dialog()
-                if dialog is None or not dialog.isShowing():
-                    return
-                dialog.setMessage(text)
-                ui.set_progress(percent)
-            except Exception:
+                d = ui.get_dialog()
+                if d and d.isShowing():
+                    try:
+                        d.setTitle(title)
+                    except:
+                        pass
+                    d.setMessage(text)
+                    ui.set_progress(pct)
+            except:
                 pass
 
         run_on_ui_thread(apply)
@@ -1008,32 +3062,78 @@ class CleanJob:
         def close():
             ui = self.ui
             self.ui = None
-            if ui is None:
+            if not ui:
                 return
             try:
-                dialog = ui.get_dialog()
-                if dialog is not None and dialog.isShowing():
+                d = ui.get_dialog()
+                if d and d.isShowing():
                     ui.dismiss()
-            except Exception:
+            except:
                 pass
 
         run_on_ui_thread(close)
 
     def _summary(self):
         lines = []
+        has_extra = (
+            self.left_count > 0 or self.leave_failed > 0
+            or self.dialogs_deleted > 0 or self.dialog_delete_failed > 0
+            or self.blocked_count > 0 or self.block_failed > 0
+        )
         if self.deleted > 0:
-            lines.append(_t(f"Удалено {_msgs(self.deleted)}.", f"Deleted {_msgs(self.deleted)}."))
-        elif not self.found and not self.error and not self.cancelled:
-            if self.mode == "all" or self.s["self_chat"]:
-                lines.append(_t("Здесь нет сообщений для удаления.", "There are no messages to delete here."))
+            if len(self.delete_ids) > 1:
+                lines.append(_t(
+                    f"Удалено {_msgs(self.deleted)} в {_chats_word(self.chats_cleaned)}.",
+                    f"Deleted {_msgs(self.deleted)} in {_chats_word(self.chats_cleaned)}.",
+                ))
             else:
-                lines.append(_t("Ваших сообщений здесь нет.", "You have no messages here."))
+                lines.append(_t(f"Удалено {_msgs(self.deleted)}.", f"Deleted {_msgs(self.deleted)}."))
+        elif self.delete_ids and not self.found and not self.error and not self.cancelled and not has_extra:
+            lines.append(_t("Сообщений для удаления не найдено.", "No messages found to delete."))
+        elif self.deleted == 0 and has_extra:
+            pass
         else:
             lines.append(_t("Ничего не удалено.", "Nothing was deleted."))
-        if self.failed:
-            lines.append(_t(f"Не удалось удалить {_msgs(len(self.failed))}: обычно это служебные сообщения или сообщения, на которые нет прав.", f"Could not delete {_msgs(len(self.failed))}: usually service messages or messages you have no rights for."))
+
+        if self.left_count > 0:
+            lines.append(_t(
+                f"Вышли из {_chats_gen(self.left_count)}.",
+                f"Left {_chats_gen(self.left_count)}.",
+            ))
+        if self.leave_failed > 0:
+            lines.append(_t(
+                f"Не удалось выйти из {_chats_gen(self.leave_failed)}.",
+                f"Could not leave {_chats_gen(self.leave_failed)}.",
+            ))
+        if self.dialogs_deleted > 0:
+            lines.append(_t(
+                f"Удалено {_chats_acc(self.dialogs_deleted)}.",
+                f"Deleted {_chats_acc(self.dialogs_deleted)}.",
+            ))
+        if self.dialog_delete_failed > 0:
+            lines.append(_t(
+                f"Не удалось удалить {_chats_acc(self.dialog_delete_failed)}.",
+                f"Could not delete {_chats_acc(self.dialog_delete_failed)}.",
+            ))
+        if self.blocked_count > 0:
+            lines.append(_t(
+                f"Заблокировано {_bots_gen(self.blocked_count)}.",
+                f"Blocked {_bots_gen(self.blocked_count)}.",
+            ))
+        if self.block_failed > 0:
+            lines.append(_t(
+                f"Не удалось заблокировать {_bots_gen(self.block_failed)}.",
+                f"Could not block {_bots_gen(self.block_failed)}.",
+            ))
+
+        failed_total = self.total_failed + len(self.failed)
+        if failed_total:
+            lines.append(_t(
+                f"Не удалось удалить {_msgs(failed_total)}: служебные сообщения или нет прав.",
+                f"Could not delete {_msgs(failed_total)}: service messages or no rights.",
+            ))
         if self.cancelled:
-            lines.append(_t("Очистка остановлена.", "Cleaning was stopped."))
+            lines.append(_t("Операция остановлена.", "Operation was stopped."))
         if self.error:
             lines.append(self.error if self.friendly else _t(f"Ошибка: {self.error}", f"Error: {self.error}"))
         return "\n\n".join(lines)
@@ -1042,26 +3142,33 @@ class CleanJob:
         if self.done:
             return
         self.done = True
+        if self.chat_deleted > 0 and self.chat_idx >= self.chats_cleaned:
+            self.chats_cleaned += 1
         self.p.job_finished(self)
         summary = self._summary()
-        _log(f"finished deleted={self.deleted} found={len(self.found)} failed={len(self.failed)} cancelled={self.cancelled} error={self.error}")
         ok = not self.error and not self.cancelled
-        title = _t("Готово", "Done") if ok else (_t("Остановлено", "Stopped") if self.cancelled and not self.error else _t("Очистка прервана", "Cleaning interrupted"))
+        title = (
+            _t("Готово", "Done")
+            if ok
+            else _t("Остановлено", "Stopped")
+            if self.cancelled and not self.error
+            else _t("Прервано", "Interrupted")
+        )
         hidden = self.hidden and not self.cancelled
         ui = self.ui
         self.ui = None
 
         def show():
             try:
-                if ui is not None:
-                    dialog = ui.get_dialog()
-                    if dialog is not None and dialog.isShowing():
+                if ui:
+                    d = ui.get_dialog()
+                    if d and d.isShowing():
                         ui.dismiss()
-            except Exception:
+            except:
                 pass
             if not hidden:
                 ctx = _activity()
-                if ctx is not None:
+                if ctx:
                     try:
                         b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
                         b.set_title(title)
@@ -1069,17 +3176,24 @@ class CleanJob:
                         b.set_positive_button("OK", None)
                         b.show()
                         return
-                    except Exception as e:
-                        _log(f"result dialog failed: {e}")
+                    except:
+                        pass
             try:
                 short = summary.split("\n\n")[0]
-                if ok and self.deleted > 0 and not self.failed:
+                any_fail = (
+                    (self.total_failed + len(self.failed)) > 0
+                    or self.leave_failed > 0
+                    or self.dialog_delete_failed > 0
+                    or self.block_failed > 0
+                )
+                any_ok = self.deleted > 0 or self.left_count > 0 or self.dialogs_deleted > 0 or self.blocked_count > 0
+                if ok and any_ok and not any_fail:
                     BulletinHelper.show_success(short)
                 elif ok:
                     BulletinHelper.show_info(summary.replace("\n\n", " "))
                 else:
                     BulletinHelper.show_error(summary.replace("\n\n", " "))
-            except Exception:
+            except:
                 pass
 
         run_on_ui_thread(show)
@@ -1088,12 +3202,14 @@ class CleanJob:
 class MessageCleanerPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        self._job = None
+        self._jobs = []
         self._blocked = None
         self._unloaded = False
+        self._picker = None
 
     def on_plugin_load(self):
         self._unloaded = False
+        self._apply_lang()
         self._blocked = _client_problem()
         if self._blocked:
             _log(self._blocked)
@@ -1103,108 +3219,596 @@ class MessageCleanerPlugin(BasePlugin):
             menu_type=MenuItemType.CHAT_ACTION_MENU,
             text=_t("Очистить сообщения", "Clean messages"),
             icon="msg_delete",
-            on_click=self._on_menu,
+            on_click=self._on_chat_menu,
         ))
 
     def on_plugin_unload(self):
         self._unloaded = True
-        job = self._job
-        self._job = None
-        if job is not None:
-            job.cancel(silent=True)
+        if self._picker:
+            self._picker._dismiss()
+        jobs = self._jobs[:]
+        self._jobs = []
+        for j in jobs:
+            j.cancel(silent=True)
 
     def job_finished(self, job):
-        if self._job is job:
-            self._job = None
-
-    def _on_menu(self, context):
         try:
-            job = self._job
-            if job is not None and not job.done:
-                job.show_progress()
+            self._jobs.remove(job)
+        except ValueError:
+            pass
+
+    def _apply_lang(self):
+        _LANG[0] = self._int("language", 0)
+
+    def _on_lang_change(self, *args):
+        try:
+            _LANG[0] = int(args[0]) if args else 0
+        except:
+            pass
+
+    def create_settings(self):
+        self._apply_lang()
+        return [
+            Selector(
+                key="language",
+                text="Язык / Language",
+                default=0,
+                items=["Авто / Auto", "Русский", "English"],
+                icon="msg_language",
+                on_change=self._on_lang_change,
+            ),
+            Divider(),
+            Header(text=_t("Очистка", "Cleanup")),
+            Text(
+                text=_t("Выбрать чаты и удалить сообщения", "Select chats and delete messages"),
+                subtext=_t(
+                    "Список всех чатов: где есть ваши сообщения — сверху, где нет — снизу",
+                    "All chats: those with your messages on top, empty ones below",
+                ),
+                icon="msg_delete",
+                on_click=self._open_picker,
+            ),
+            Divider(text=_t(
+                "Также «Очистить сообщения» доступно в меню ⋮ открытого чата.",
+                "\"Clean messages\" is also available in the ⋮ menu of an open chat.",
+            )),
+        ]
+
+    def _int(self, key, default=0):
+        try:
+            return int(self.get_setting(key, default) or default)
+        except:
+            return default
+
+    def _open_picker(self, *args):
+        self._apply_lang()
+        run_on_ui_thread(self._do_open_picker)
+
+    def _do_open_picker(self):
+        if self._blocked:
+            try:
+                BulletinHelper.show_info(self._blocked)
+            except:
+                pass
+            return
+        ctx = _activity()
+        if not ctx:
+            return
+        if self._jobs:
+            self._jobs[0].show_progress()
+            return
+        if self._picker and not self._picker.is_closed():
+            if self._picker.is_minimized():
+                if self._picker.restore():
+                    return
+                self._picker._dismiss()
+            else:
+                return
+
+        acc, mc, cm, self_id = _active_account()
+        if not mc:
+            try:
+                BulletinHelper.show_error(_t("Не удалось получить список чатов.", "Could not load chats."))
+            except:
+                pass
+            return
+
+        def load_and_show():
+            try:
+                scopes = _load_scopes(acc, mc, cm, self_id)
+            except Exception as e:
+                _log(f"load_scopes: {e}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(_t(f"Ошибка загрузки: {e}", f"Load error: {e}")))
+                return
+
+            if not scopes:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(_t("Чаты не найдены.", "No chats found.")))
+                return
+
+            def on_start(chosen, leave_ids, delete_ids, remove_dialog_ids, block_ids, revoke_dialog_ids):
+                run_on_ui_thread(
+                    lambda: self._confirm_and_start(
+                        _activity() or ctx,
+                        chosen,
+                        verify=False,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                )
+
+            def show_picker():
+                if self._unloaded:
+                    return
+                try:
+                    picker = ChatPicker(_activity() or ctx, scopes, self, on_start)
+                    self._picker = picker
+                    picker.show()
+                    _prefetch_counts(scopes, cm, picker.is_closed, picker.on_count, picker.on_wait)
+                except Exception as e:
+                    _log(f"show_picker: {e}")
+                    self._picker = None
+                    try:
+                        BulletinHelper.show_error(_t(f"Ошибка меню: {e}", f"Menu error: {e}"))
+                    except:
+                        pass
+
+            run_on_ui_thread(show_picker)
+
+        run_on_queue(load_and_show, PLUGINS_QUEUE, 20)
+
+    def _on_chat_menu(self, context):
+        self._apply_lang()
+        try:
+            if self._jobs:
+                self._jobs[0].show_progress()
                 return
             frag = get_last_fragment()
-            scope, problem = _read_scope(frag, context)
+            sc, problem = self._scope_from_frag(frag, context)
             if problem:
-                BulletinHelper.show_info(problem)
+                try:
+                    BulletinHelper.show_info(problem)
+                except:
+                    pass
                 return
-            self._choose(frag, scope)
+            ctx = frag.getParentActivity()
+            if not ctx:
+                return
+            self._confirm_and_start(ctx, [sc], verify=True)
         except Exception as e:
-            _log(f"menu failed: {e}")
+            _log(f"chat menu: {e}")
             try:
-                BulletinHelper.show_error(_t("Не удалось открыть очистку", "Could not open the cleaner"))
-            except Exception:
+                BulletinHelper.show_error(_t("Не удалось открыть очистку.", "Could not open the cleaner."))
+            except:
                 pass
 
-    def _choose(self, frag, scope):
-        ctx = frag.getParentActivity()
-        if ctx is None:
-            return
-        kind = scope["kind"]
-        options = []
-        if kind == "saved":
-            options.append((_t("Удалить все сообщения здесь", "Delete all messages here"), "all"))
-        elif kind == "channel":
-            if not scope["can_all"]:
-                BulletinHelper.show_info(_t("В канале посты может удалять только администратор с правом удаления сообщений.", "Only admins with the delete right can delete channel posts."))
-                return
-            options.append((_t("Все посты в канале", "All posts in the channel"), "all"))
+    def _scope_from_frag(self, frag, context):
+        if frag is None:
+            return None, _t("Откройте чат.", "Open a chat.")
+        try:
+            mc = frag.getMessagesController()
+            cm = frag.getConnectionsManager()
+            cfg = frag.getUserConfig()
+            self_id = int(cfg.getClientUserId())
+            acc = int(frag.getCurrentAccount())
+        except Exception as e:
+            return None, _t(f"Ошибка: {e}", f"Error: {e}")
+
+        did = 0
+        try:
+            did = int(frag.getDialogId())
+        except:
+            pass
+        if not did:
+            try:
+                did = int(context.get("dialog_id") if hasattr(context, "get") else getattr(context, "dialog_id", 0) or 0)
+            except:
+                pass
+        if not did:
+            return None, _t("Не удалось определить чат.", "Could not detect the chat.")
+
+        try:
+            if DialogObject.isEncryptedDialog(jlong(did)):
+                return None, _t("Секретные чаты не поддерживаются.", "Secret chats are not supported.")
+        except:
+            pass
+
+        chat = None
+        is_tl_channel = False
+        is_broadcast = False
+        if did < 0:
+            try:
+                chat = frag.getCurrentChat()
+            except:
+                try:
+                    chat = mc.getChat(int(-did))
+                except:
+                    pass
+            if not chat:
+                return None, _t("Чат не найден.", "Chat not found.")
+            is_tl_channel = _is_tl_channel(chat)
+            is_broadcast = is_tl_channel and not bool(getattr(chat, "megagroup", False))
+
+        kind = "channel" if is_broadcast else ("group" if did < 0 else "private")
+        try:
+            peer = mc.getInputPeer(did)
+        except:
+            return None, _t("Не удалось получить peer.", "Could not get peer.")
+
+        input_channel = None
+        channel_id = 0
+        if did < 0 and is_tl_channel:
+            try:
+                input_channel = mc.getInputChannel(int(-did))
+                channel_id = int(-did)
+            except:
+                pass
+
+        topic_id = 0
+        try:
+            topic_id = int(frag.getTopicId() or 0)
+        except:
+            pass
+
+        return {
+            "kind": kind,
+            "dialog_id": did,
+            "topic_id": topic_id,
+            "saved_id": 0,
+            "saved_peer": None,
+            "title": _peer_title(mc, did),
+            "peer": peer,
+            "tl_obj": chat if did < 0 else None,
+            "input_channel": input_channel,
+            "channel_id": channel_id,
+            "can_all": did > 0 or _can_delete_all(chat),
+            "can_leave": did < 0,
+            "is_bot": False,
+            "is_deleted": False,
+            "can_remove_dialog": did > 0,
+            "empty_dialog": False,
+            "self_chat": did == self_id,
+            "mc": mc,
+            "cm": cm,
+            "account": acc,
+            "merged": [],
+        }, None
+
+    def _confirm_and_start(
+        self,
+        ctx,
+        scopes,
+        verify=True,
+        leave_ids=None,
+        delete_ids=None,
+        remove_dialog_ids=None,
+        block_ids=None,
+        revoke_dialog_ids=None,
+    ):
+        leave_ids = set(leave_ids or ())
+        remove_dialog_ids = set(remove_dialog_ids or ())
+        block_ids = set(block_ids or ())
+        revoke_dialog_ids = set(revoke_dialog_ids or ())
+        if delete_ids is None:
+            delete_ids = {sc["dialog_id"] for sc in scopes}
         else:
-            options.append((_t("Только мои сообщения", "Only my messages"), "mine"))
-            if scope["can_all"]:
-                where = _t("в теме", "in the topic") if scope["topic_id"] else (_t("в канале", "in the channel") if kind == "channel" else _t("в чате", "in the chat"))
-                options.append((_t(f"Все сообщения {where}", f"All messages {where}"), "all"))
+            delete_ids = set(delete_ids)
+
+        if not delete_ids and (leave_ids or remove_dialog_ids):
+            lines = []
+            if leave_ids:
+                leave_scopes = [sc for sc in scopes if sc["dialog_id"] in leave_ids]
+                names = ", ".join(f'"{sc["title"]}"' for sc in leave_scopes[:3])
+                if len(leave_scopes) > 3:
+                    names += _t(f" и ещё {len(leave_scopes) - 3}", f" and {len(leave_scopes) - 3} more")
+                lines.append(_t(f"Выйти из {names}.", f"Leave {names}."))
+            if remove_dialog_ids:
+                rm_scopes = [sc for sc in scopes if sc["dialog_id"] in remove_dialog_ids]
+                names = ", ".join(f'"{sc["title"]}"' for sc in rm_scopes[:3])
+                if len(rm_scopes) > 3:
+                    names += _t(f" и ещё {len(rm_scopes) - 3}", f" and {len(rm_scopes) - 3} more")
+                lines.append(_t(f"Удалить чаты: {names}.", f"Delete chats: {names}."))
+            if revoke_dialog_ids:
+                lines.append(_t(
+                    f"Удалить у обоих: {_chats_acc(len(revoke_dialog_ids))}.",
+                    f"Delete for both: {_chats_acc(len(revoke_dialog_ids))}.",
+                ))
+            if block_ids:
+                lines.append(_t(
+                    f"Заблокировать {_bots_gen(len(block_ids))}.",
+                    f"Block {_bots_gen(len(block_ids))}.",
+                ))
+            b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            if leave_ids and not remove_dialog_ids:
+                b.set_title(_t("Выйти из чата?", "Leave chat?") if len(leave_ids) == 1 else _t("Выйти из чатов?", "Leave chats?"))
+                btn_txt = _t("Выйти", "Leave")
+            elif remove_dialog_ids and not leave_ids:
+                if block_ids:
+                    b.set_title(_t("Удалить и заблокировать?", "Delete & block?"))
+                else:
+                    b.set_title(_t("Удалить чат?", "Delete chat?") if len(remove_dialog_ids) == 1 else _t("Удалить чаты?", "Delete chats?"))
+                btn_txt = _t("Удалить", "Delete")
+            else:
+                b.set_title(_t("Выполнить очистку?", "Apply cleanup?"))
+                btn_txt = _t("Продолжить", "Continue")
+            b.set_message("\n\n".join(lines))
+            b.set_positive_button(
+                btn_txt,
+                lambda d, w: run_on_ui_thread(
+                    lambda: self._start_all(
+                        scopes,
+                        "mine",
+                        True,
+                        verify=verify,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                ),
+            )
+            b.set_negative_button(_t("Отмена", "Cancel"), None)
+            b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            b.show()
+            return
+
+        if len(scopes) == 1 and scopes[0]["dialog_id"] in delete_ids:
+            self._confirm_one(
+                ctx,
+                scopes[0],
+                verify=verify,
+                leave_ids=leave_ids,
+                delete_ids=delete_ids,
+                remove_dialog_ids=remove_dialog_ids,
+                block_ids=block_ids,
+                revoke_dialog_ids=revoke_dialog_ids,
+            )
+        else:
+            del_scopes = [sc for sc in scopes if sc["dialog_id"] in delete_ids]
+            names = ", ".join(f'"{sc["title"]}"' for sc in del_scopes[:3])
+            if len(del_scopes) > 3:
+                names += _t(f" и ещё {len(del_scopes) - 3}", f" and {len(del_scopes) - 3} more")
+            msg = _t(
+                f"Удалить ваши сообщения в {names}?",
+                f"Delete your messages in {names}?",
+            )
+            if leave_ids:
+                msg += "\n\n" + _t(
+                    f"Также вы выйдете из {_chats_gen(len(leave_ids))}.",
+                    f"You will also leave {_chats_gen(len(leave_ids))}.",
+                )
+            if remove_dialog_ids:
+                msg += "\n\n" + _t(
+                    f"Удалить {_chats_acc(len(remove_dialog_ids))}.",
+                    f"Delete {_chats_acc(len(remove_dialog_ids))}.",
+                )
+            if block_ids:
+                msg += "\n\n" + _t(
+                    f"Заблокировать {_bots_gen(len(block_ids))}.",
+                    f"Block {_bots_gen(len(block_ids))}.",
+                )
+            msg += "\n\n" + _t("Отменить нельзя.", "This cannot be undone.")
+            b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            b.set_title(_t("Удалить сообщения?", "Delete messages?"))
+            b.set_message(msg)
+            b.set_positive_button(
+                _t("Удалить и выйти", "Delete & leave") if leave_ids and not remove_dialog_ids else _t("Удалить", "Delete"),
+                lambda d, w: run_on_ui_thread(
+                    lambda: self._start_all(
+                        scopes,
+                        "mine",
+                        True,
+                        verify=verify,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                ),
+            )
+            b.set_negative_button(_t("Отмена", "Cancel"), None)
+            b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            b.show()
+
+    def _confirm_one(
+        self,
+        ctx,
+        scope,
+        verify=True,
+        leave_ids=None,
+        delete_ids=None,
+        remove_dialog_ids=None,
+        block_ids=None,
+        revoke_dialog_ids=None,
+    ):
+        leave_ids = set(leave_ids or ())
+        remove_dialog_ids = set(remove_dialog_ids or ())
+        block_ids = set(block_ids or ())
+        revoke_dialog_ids = set(revoke_dialog_ids or ())
+        delete_ids = set(delete_ids) if delete_ids is not None else {scope["dialog_id"]}
+        name = scope["title"]
+        options = [(_t("Только мои сообщения", "Only my messages"), "mine")]
+        if scope.get("can_all"):
+            where = _t("в теме", "in the topic") if scope["topic_id"] else _t("в чате", "in the chat")
+            options.append((_t(f"Все сообщения {where}", f"All messages {where}"), "all"))
+        if len(options) == 1:
+            self._confirm_mode(
+                ctx,
+                scope,
+                options[0][1],
+                verify=verify,
+                leave_ids=leave_ids,
+                delete_ids=delete_ids,
+                remove_dialog_ids=remove_dialog_ids,
+                block_ids=block_ids,
+                revoke_dialog_ids=revoke_dialog_ids,
+            )
+            return
         b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
-        b.set_title(_t("Очистка сообщений", "Clean messages"))
-        b.set_items([o[0] for o in options], lambda d, i: run_on_ui_thread(lambda: self._confirm(scope, options[i][1])))
+        b.set_title(_t(f"Очистка: {name}", f"Clean: {name}"))
+        b.set_items(
+            [o[0] for o in options],
+            lambda d, i: run_on_ui_thread(
+                lambda i=i: self._confirm_mode(
+                    ctx,
+                    scope,
+                    options[i][1],
+                    verify=verify,
+                    leave_ids=leave_ids,
+                    delete_ids=delete_ids,
+                    remove_dialog_ids=remove_dialog_ids,
+                    block_ids=block_ids,
+                    revoke_dialog_ids=revoke_dialog_ids,
+                )
+            ),
+        )
         b.set_negative_button(_t("Отмена", "Cancel"), None)
         b.show()
 
-    def _confirm(self, scope, mode):
-        ctx = _activity()
-        if ctx is None:
-            return
+    def _confirm_mode(
+        self,
+        ctx,
+        scope,
+        mode,
+        verify=True,
+        leave_ids=None,
+        delete_ids=None,
+        remove_dialog_ids=None,
+        block_ids=None,
+        revoke_dialog_ids=None,
+    ):
+        leave_ids = set(leave_ids or ())
+        remove_dialog_ids = set(remove_dialog_ids or ())
+        block_ids = set(block_ids or ())
+        revoke_dialog_ids = set(revoke_dialog_ids or ())
+        delete_ids = set(delete_ids) if delete_ids is not None else {scope["dialog_id"]}
+        will_leave = scope["dialog_id"] in leave_ids
         name = scope["title"]
-        kind = scope["kind"]
-        private = kind == "private"
-        if kind == "saved":
+        private = scope["kind"] == "private"
+        if mode == "all":
             title = _t("Удалить все сообщения?", "Delete all messages?")
-            text = _t(f"Все сообщения в «{name}» будут удалены.", f"All messages in “{name}” will be deleted.")
-        elif mode == "all":
-            title = _t("Удалить все сообщения?", "Delete all messages?")
-            if private:
-                text = _t(f"Все сообщения в «{name}» — ваши и собеседника — будут удалены.", f"All messages in “{name}”, yours and theirs, will be deleted.")
-            else:
-                text = _t(f"Все сообщения в «{name}» — ваши и чужие — будут удалены у всех участников.", f"All messages in “{name}”, yours and others', will be deleted for everyone.")
+            text = (
+                _t(
+                    f'Все сообщения в "{name}" — ваши и собеседника — будут удалены.',
+                    f'All messages in "{name}", yours and theirs, will be deleted.',
+                )
+                if private
+                else _t(
+                    f'Все сообщения в "{name}" будут удалены у всех.',
+                    f'All messages in "{name}" will be deleted for everyone.',
+                )
+            )
         else:
             title = _t("Удалить ваши сообщения?", "Delete your messages?")
-            if private:
-                text = _t(f"Все ваши сообщения в «{name}» будут удалены.", f"All your messages in “{name}” will be deleted.")
-            else:
-                text = _t(f"Все ваши сообщения в «{name}» будут удалены у всех участников.", f"All your messages in “{name}” will be deleted for everyone.")
-        text += "\n\n" + _t("Отменить это нельзя. Новые сообщения, пришедшие во время очистки, не тронутся.", "This cannot be undone. Messages that arrive while cleaning are kept.")
+            text = (
+                _t(
+                    f'Все ваши сообщения в "{name}" будут удалены.',
+                    f'All your messages in "{name}" will be deleted.',
+                )
+                if private
+                else _t(
+                    f'Все ваши сообщения в "{name}" будут удалены у всех.',
+                    f'All your messages in "{name}" will be deleted for everyone.',
+                )
+            )
+        if will_leave:
+            text += "\n\n" + _t(
+                "После очистки вы также выйдете из этого чата.",
+                "You will also leave this chat after cleaning.",
+            )
+        text += "\n\n" + _t(
+            "Отменить нельзя. Новые сообщения, пришедшие во время очистки, не тронутся.",
+            "This cannot be undone. Messages that arrive while cleaning are kept.",
+        )
         b = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
         b.set_title(title)
         b.set_message(text)
         b.create()
-        if private:
-            b.set_positive_button(_t("Удалить у обоих", "Delete for both"), lambda d, w: run_on_ui_thread(lambda: self._start(scope, mode, True)))
-            b.set_neutral_button(_t("Только у меня", "Only for me"), lambda d, w: run_on_ui_thread(lambda: self._start(scope, mode, False)))
+        if private and mode != "all":
+            b.set_positive_button(
+                _t("Удалить у обоих", "Delete for both"),
+                lambda d, w: run_on_ui_thread(
+                    lambda: self._start_all(
+                        [scope],
+                        mode,
+                        True,
+                        verify=verify,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                ),
+            )
+            b.set_neutral_button(
+                _t("Только у меня", "Only for me"),
+                lambda d, w: run_on_ui_thread(
+                    lambda: self._start_all(
+                        [scope],
+                        mode,
+                        False,
+                        verify=verify,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                ),
+            )
         else:
-            b.set_positive_button(_t("Удалить", "Delete"), lambda d, w: run_on_ui_thread(lambda: self._start(scope, mode, True)))
+            b.set_positive_button(
+                _t("Удалить", "Delete"),
+                lambda d, w: run_on_ui_thread(
+                    lambda: self._start_all(
+                        [scope],
+                        mode,
+                        True,
+                        verify=verify,
+                        leave_ids=leave_ids,
+                        delete_ids=delete_ids,
+                        remove_dialog_ids=remove_dialog_ids,
+                        block_ids=block_ids,
+                        revoke_dialog_ids=revoke_dialog_ids,
+                    )
+                ),
+            )
         b.set_negative_button(_t("Отмена", "Cancel"), None)
         b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
-        if private:
+        if private and mode != "all":
             b.make_button_red(AlertDialogBuilder.BUTTON_NEUTRAL)
         b.show()
 
-    def _start(self, scope, mode, revoke):
-        if self._unloaded:
+    def _start_all(
+        self,
+        scopes,
+        mode,
+        revoke,
+        verify=True,
+        leave_ids=None,
+        delete_ids=None,
+        remove_dialog_ids=None,
+        block_ids=None,
+        revoke_dialog_ids=None,
+    ):
+        if self._unloaded or not scopes:
             return
-        job = self._job
-        if job is not None and not job.done:
-            job.show_progress()
-            return
-        job = CleanJob(self, scope, mode, revoke)
-        self._job = job
+        job = CleanJob(
+            self,
+            scopes,
+            mode,
+            revoke,
+            verify_rounds=VERIFY_ROUNDS if verify else 0,
+            leave_ids=leave_ids,
+            delete_ids=delete_ids,
+            remove_dialog_ids=remove_dialog_ids,
+            block_ids=block_ids,
+            revoke_dialog_ids=revoke_dialog_ids,
+        )
+        self._jobs.append(job)
         job.start()
