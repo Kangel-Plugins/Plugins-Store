@@ -1,0 +1,2294 @@
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import threading
+import time
+
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
+from android_utils import OnClickListener, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from ui.settings import Header, Divider, Text, Switch, Input, Selector
+
+__id__ = 'ayu_soundpad'
+__name__ = "Soundpad in rounds"
+__description__ = "Добавляет звуки в видеокружки. Добавьте аудио в настройках и нажмите S в наушниках при записи."
+__author__ = "@CAMOKAT_HA_MAPCE & ChatGPT 6.1 sol"
+__version__ = "1.0.0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["media", "chats", "fun"]
+
+MAX_SOUNDS = 80
+MAX_SIZE = 16 * 1024 * 1024
+MAX_ALL_SIZE = 96 * 1024 * 1024
+PICK_CODE = 0x6A71
+PACK_PICK_CODE = 0x6A72
+PACK_SAVE_CODE = 0x6A73
+DEFAULT_SYMBOL = 'Звуки'
+
+
+def _declared_methods(clazz, name=None):
+    """Chaquopy class proxy -> java.lang.Class reflection object."""
+    try:
+        from java import jclass
+        reflected = jclass('java.lang.Class').forName(name or str(clazz.__name__))
+        return reflected.getDeclaredMethods()
+    except Exception:
+        try:
+            from java import jclass
+            reflected = jclass('java.lang.Class').forName(str(clazz.__javaclass__))
+            return reflected.getDeclaredMethods()
+        except Exception:
+            try:
+                return clazz.class_.getDeclaredMethods()
+            except Exception:
+                return []
+
+
+def _java_class(name):
+    try:
+        return find_class(name)
+    except Exception:
+        return None
+
+
+class CameraOpenHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if self.plugin._alive:
+            run_on_ui_thread(lambda: self.plugin._attach(param.thisObject))
+
+
+class CameraCloseHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._alive:
+            run_on_ui_thread(lambda: self.plugin._detach(param.thisObject))
+
+
+class PickerResultHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if int(param.args[0]) in (PICK_CODE, PACK_PICK_CODE, PACK_SAVE_CODE):
+                self.plugin._activity_result(int(param.args[0]), int(param.args[1]), param.args[2])
+        except Exception as exc:
+            pass
+
+
+class CodecBufferHook(MethodHook):
+    def __init__(self, plugin, native=False):
+        self.plugin, self.native = plugin, native
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        if not p._alive or p._digital_broken or p._codec_target is None or param.thisObject != p._codec_target:
+            return
+        try:
+            if self.native and not bool(param.args[0]):
+                return
+            index = int(param.args[1] if self.native else param.args[0])
+            buffer = param.getResult()
+            if buffer is not None:
+                with p._lock:
+                    p._codec_buffers[index] = buffer.duplicate()
+                p._codec_buffers_seen += 1
+        except Exception as exc:
+            p._digital_failure('codec_buffer_capture', exc)
+
+
+class CodecQueueHook(MethodHook):
+    def __init__(self, plugin, native=False):
+        self.plugin, self.native = plugin, native
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        frames = getattr(p._read_local, 'queue_frames', None)
+        if frames is None:
+            frames = p._read_local.queue_frames = []
+        target = p._alive and not p._digital_broken and p._codec_target is not None and param.thisObject == p._codec_target
+        outer = not any(frames)
+        frames.append(target)
+        if not target or not outer:
+            return
+        try:
+            p._codec_calls += 1
+            if self.native:
+                p._codec_native_calls += 1
+            else:
+                p._codec_public_calls += 1
+            p._last_codec_context = dict(native=self.native, index=int(param.args[0]), offset=int(param.args[1]), size=int(param.args[2]), pts_us=int(param.args[3]), flags=int(param.args[4]), stage='entry')
+            p._mix_codec_input(param, native=self.native)
+        except Exception as exc:
+            p._codec_issue(exc)
+
+    def after_hooked_method(self, param):
+        p = self.plugin
+        frames = getattr(p._read_local, 'queue_frames', [])
+        target = frames.pop() if frames else False
+        if target and not any(frames):
+            with p._lock:
+                p._codec_buffers.pop(int(param.args[0]), None)
+
+
+class SoundpadPlugin(BasePlugin):
+    def on_plugin_load(self):
+        from org.telegram.messenger import ApplicationLoader
+        self._context = ApplicationLoader.applicationContext
+        self._base = os.path.join(str(self._context.getFilesDir().getAbsolutePath()), 'ayu_soundpad')
+        self._sounds_dir = os.path.join(self._base, 'sounds')
+        os.makedirs(self._sounds_dir, exist_ok=True)
+        shutil.rmtree(os.path.join(self._base, 'logs'), ignore_errors=True)
+        self._index_path = os.path.join(self._base, 'library.json')
+        self._alive = False
+        self._buttons = {}
+        self._stop_buttons = {}
+        self._popups = {}
+        self._players = {}
+        self._player_number = 0
+        self._lock = threading.RLock()
+        self._handles = []
+        self._picker_activity = None
+        self._delete_confirm = {}
+        self._sound_views = {}
+        self._camera_ok = False
+        self._dialogs = []
+        self._items = self._read_library()
+        self._preview_serial = threading.Lock()
+        self._library_builder = None
+        self._library_column = None
+        self._library_rows = {}
+        self._library_menus = []
+        self._library_drag_refs = []
+        self._library_epoch = 0
+        self._drag_sid = None
+        self._touch_origin = None
+        self._touch_drag = None
+        self._drag_epoch = 0
+        self._hold_epoch = 0
+        self._touch_pending = None
+        self._progress_running = False
+        self._durations = {}
+        self._recent_progress = {}
+        self._media_progress = {}
+        self._pending_export = None
+        self._export_busy = False
+        self._cache_cleanup_pending = False
+        hooks = 0
+        try:
+            for name in ('org.telegram.ui.Components.InstantCameraView', 'org.telegram.ui.Components.InstantCameraView2'):
+                cls = _java_class(name)
+                if cls is None:
+                    continue
+                for method in _declared_methods(cls, name):
+                    name_m = str(method.getName())
+                    sig = [str(x.getName()) for x in method.getParameterTypes()]
+                    h = None
+                    if name_m == 'showCamera' and sig == ['boolean']:
+                        h = CameraOpenHook(self)
+                        hooks += 1
+                    elif name_m in ('cancel', 'hideCamera', 'destroy', 'onDetachedFromWindow'):
+                        h = CameraCloseHook(self)
+                    if h:
+                        method.setAccessible(True)
+                        try:
+                            handle = self.hook_method(method, h)
+                        except Exception as exc:
+                            handle = None
+                        if handle is not None:
+                            self._handles.append(handle)
+                        elif isinstance(h, CameraOpenHook):
+                            hooks -= 1
+            self._camera_ok = bool(hooks)
+            activity_cls = _java_class('org.telegram.ui.LaunchActivity')
+            if activity_cls:
+                for method in _declared_methods(activity_cls, 'org.telegram.ui.LaunchActivity'):
+                    if str(method.getName()) == 'onActivityResult' and [str(t.getName()) for t in method.getParameterTypes()] == ['int', 'int', 'android.content.Intent']:
+                        method.setAccessible(True)
+                        try:
+                            handle = self.hook_method(method, PickerResultHook(self))
+                        except Exception as exc:
+                            handle = None
+                        if handle:
+                            self._handles.append(handle)
+                            self._picker_available = True
+                            break
+            if not hasattr(self, '_picker_available'):
+                self._picker_available = False
+            self.add_menu_item(MenuItemData(menu_type=MenuItemType.MESSAGE_CONTEXT_MENU, text='Добавить в Soundpad', icon='msg_audio', on_click=self._add_message))
+            self._alive = True
+            self._init_digital()
+        except Exception as exc:
+            self._unhook_all()
+            raise
+
+
+    def _read_library(self):
+        raw = None
+        for path in (self._index_path, self._index_path + '.bak'):
+            try:
+                with open(path, encoding='utf-8') as f:
+                    value = json.load(f)
+                if not isinstance(value, list):
+                    raise ValueError('index_type')
+                raw = value
+                break
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                pass
+        items, seen = ([], set())
+        for item in raw or []:
+            try:
+                sid = item['id']
+                path = os.path.join(self._sounds_dir, sid + '.audio')
+                if not re.fullmatch('[a-f0-9]{24}', sid) or sid in seen or (not os.path.isfile(path)):
+                    continue
+                items.append(dict(id=sid, name=str(item.get('name') or 'Звук')[:48], bytes=os.path.getsize(path), favorite=bool(item.get('favorite', False))))
+                seen.add(sid)
+            except Exception as exc:
+                pass
+        for name in sorted(os.listdir(self._sounds_dir)):
+            if re.fullmatch('[a-f0-9]{24}\\.audio', name) and name[:-6] not in seen:
+                items.append(dict(id=name[:-6], name='Восстановленный звук', bytes=os.path.getsize(os.path.join(self._sounds_dir, name))))
+        return items
+
+    def _save_library(self):
+        # One lock covers snapshot AND replace: parallel imports cannot overwrite
+        # a newer index with an older snapshot. Never back up a corrupt index.
+        with self._lock:
+            snapshot = [dict(x) for x in self._items]
+            temporary = self._index_path + '.tmp'
+            with open(temporary, 'w', encoding='utf-8') as stream:
+                json.dump(snapshot, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                with open(self._index_path, encoding='utf-8') as f:
+                    old = json.load(f)
+                if isinstance(old, list):
+                    shutil.copyfile(self._index_path, self._index_path + '.bak')
+            except (OSError, ValueError):
+                pass
+            os.replace(temporary, self._index_path)
+
+    def _notify(self, message):
+
+        def show():
+            try:
+                from android.widget import Toast
+                Toast.makeText(self._context, message, Toast.LENGTH_SHORT).show()
+            except Exception as exc:
+                pass
+        run_on_ui_thread(show)
+
+
+    def _import_async(self, source=None, uri=None, name=None):
+
+        def worker():
+            try:
+                if not self._alive:
+                    return
+                stamp = str(time.monotonic_ns())
+                tmp = os.path.join(self._sounds_dir, '.import-' + stamp)
+                digest = hashlib.sha256()
+                total = 0
+                try:
+                    if source:
+                        f = open(source, 'rb')
+                        java_stream = False
+                    else:
+                        f = self._context.getContentResolver().openInputStream(uri)
+                        if f is None:
+                            raise IOError('Невозможно открыть выбранный аудиофайл')
+                        java_stream = True
+                    with open(tmp, 'wb') as output:
+                        if java_stream:
+                            from java import jarray, jbyte
+                            buf = jarray(jbyte)(32768)
+                            while True:
+                                count = int(f.read(buf))
+                                if count <= 0:
+                                    break
+                                part = bytes((int(v) & 255 for v in buf[:count]))
+                                total += len(part)
+                                if total > MAX_SIZE:
+                                    raise ValueError('Файл больше 16 МБ')
+                                output.write(part)
+                                digest.update(part)
+                        else:
+                            while True:
+                                part = f.read(65536)
+                                if not part:
+                                    break
+                                total += len(part)
+                                if total > MAX_SIZE:
+                                    raise ValueError('Файл больше 16 МБ')
+                                output.write(part)
+                                digest.update(part)
+                    f.close()
+                    if total < 100:
+                        raise ValueError('Пустой или слишком маленький звук')
+                    sound_id = digest.hexdigest()[:24]
+                    with self._lock:
+                        if any((x['id'] == sound_id for x in self._items)):
+                            self._notify('Этот звук уже добавлен')
+                            return
+                        if len(self._items) >= MAX_SOUNDS:
+                            raise ValueError('Библиотека заполнена (80 звуков)')
+                        if sum((x['bytes'] for x in self._items)) + total > MAX_ALL_SIZE:
+                            raise ValueError('Лимит библиотеки 96 МБ')
+                        dest = os.path.join(self._sounds_dir, sound_id + '.audio')
+                        os.replace(tmp, dest)
+                        clean = os.path.splitext(os.path.basename(str(name or 'Звук')))[0]
+                        clean = ''.join((ch for ch in clean if ch.isprintable())).strip()[:22] or 'Звук'
+                        self._items.append({'id': sound_id, 'name': clean, 'bytes': total})
+                        self._save_library()
+                    self._decode_jobs.put((10, sound_id, (sound_id, None, None)))
+                    run_on_ui_thread(self._refresh_panels)
+                    run_on_ui_thread(self._render_library)
+                    run_on_ui_thread(lambda sid=sound_id: self._rename(sid))
+                finally:
+                    if 'f' in locals():
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+            except Exception as exc:
+                self._notify(str(exc)[:100] if isinstance(exc, ValueError) else 'Не удалось добавить звук')
+        threading.Thread(target=worker, daemon=True, name='AyuSoundImport').start()
+
+    def _find_activity(self, context):
+        from android.app import Activity
+        for i in range(8):
+            if isinstance(context, Activity):
+                return context
+            if not hasattr(context, 'getBaseContext'):
+                break
+            nxt = context.getBaseContext()
+            if nxt is None or nxt == context:
+                break
+            context = nxt
+        return None
+
+    def _pick_file(self):
+        if not self._picker_available:
+            self._notify('Выбор файлов недоступен. Добавьте аудио из сообщения')
+            return
+        try:
+            from android.content import Intent
+            activity = self._find_activity(self._context)
+            if activity is None:
+                activity = self._activity()
+            if activity is None:
+                raise RuntimeError('Откройте настройки плагина из Telegram')
+            self._picker_activity = activity
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.setType('audio/*')
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            activity.startActivityForResult(intent, PICK_CODE)
+        except Exception as exc:
+            self._notify('Не удалось открыть файлы. Добавьте аудио из сообщения')
+
+    def _picker_result(self, result_code, intent):
+        if int(result_code) != -1 or intent is None:
+            return
+        try:
+            uri = intent.getData()
+            if uri is None:
+                return
+            name = 'Звук'
+            try:
+                cursor = self._context.getContentResolver().query(uri, None, None, None, None)
+                if cursor:
+                    try:
+                        if cursor.moveToFirst():
+                            col = cursor.getColumnIndex('_display_name')
+                            if col >= 0:
+                                name = str(cursor.getString(col))
+                    finally:
+                        cursor.close()
+            except Exception as exc:
+                pass
+            self._import_async(uri=uri, name=name)
+        except Exception as exc:
+            pass
+
+    def _init_digital(self):
+        self._capture_record = None
+        self._capture_owner = None
+        self._codec_target = self._round_encoder = None
+        self._codec_buffers = {}
+        self._codec_calls = self._codec_buffers_seen = self._codec_uncached = self._feed_calls = 0
+        self._audio_handles = []
+        self._read_local = threading.local()
+        self._digital_voices = {}
+        self._monitor_finishing = {}
+        self._decode_jobs = queue.PriorityQueue()
+        self._pcm_cache = {}
+        self._pcm_folder = os.path.join(self._base, 'pcm48')
+        os.makedirs(self._pcm_folder, exist_ok=True)
+        self._mix_reads = self._mix_bytes = self._mix_total_us = self._mix_max_us = 0
+        self._digital_broken = False
+        self._digital_error = ''
+        self._first_codec_issue = None
+        self._codec_skipped = self._codec_public_calls = self._codec_native_calls = 0
+        self._last_codec_context = {}
+        try:
+            import audioop
+            self._audioop = audioop
+        except ImportError:
+            self._audioop = None
+            self._digital_error = 'audioop_unavailable'
+        self._decode_thread = threading.Thread(target=self._decode_loop, name='AyuPCMDecode', daemon=True)
+        self._decode_thread.start()
+        for item in self._items:
+            self._decode_jobs.put((10, item['id'], (item['id'], None, None)))
+
+    def _set_digital_mode(self, enabled):
+        self.set_setting('digital_mix', bool(enabled))
+        self._stop_all()
+        self._clear_digital()
+        self._digital_broken = False
+        self._digital_error = '' if self._audioop is not None else 'audioop_unavailable'
+        if enabled:self._show_audio_help('digital')
+
+    def _bind_digital(self, owner):
+        if self._audioop is None:
+            raise RuntimeError('audioop_unavailable')
+        if self._digital_broken:
+            raise RuntimeError('digital_disabled_after_error')
+        encoder = get_private_field(owner, 'videoEncoder')
+        if encoder is None:
+            raise RuntimeError('encoder_not_ready')
+        if str(encoder.getClass().getName()) != 'com.exteragram.messenger.camera.RoundVideoEncoder':
+            raise RuntimeError('unsupported_encoder')
+        session = get_private_field(encoder, 'activeAudioCapture')
+        if session is None:
+            raise RuntimeError('capture_not_ready')
+        record = get_private_field(session, 'audioRecorder')
+        if record is None:
+            raise RuntimeError('audio_recorder_missing')
+        if (int(record.getSampleRate()), int(record.getChannelCount()), int(record.getAudioFormat())) != (48000, 1, 2):
+            raise RuntimeError('capture_format_not_48k_mono_s16')
+        if self._capture_record != record:
+            self._clear_digital()
+            self._capture_record, self._capture_owner = (record, owner)
+        if self._audio_handles:
+            return
+        self._round_encoder = encoder
+        self._codec_target = get_private_field(encoder, 'audioEncoder')
+        if self._codec_target is None:
+            raise RuntimeError('audio_encoder_not_ready')
+        queue_hooks = 0
+        cls = _java_class('android.media.MediaCodec')
+        for method in _declared_methods(cls, 'android.media.MediaCodec'):
+            name = str(method.getName())
+            sig = [str(t.getName()) for t in method.getParameterTypes()]
+            hook = None
+            if name == 'queueInputBuffer' and sig == ['int', 'int', 'int', 'long', 'int']:
+                hook = CodecQueueHook(self, native=name.startswith('native_'))
+            if hook is not None:
+                try:
+                    method.setAccessible(True)
+                    handle = self.hook_method(method, hook)
+                    if handle is not None:
+                        self._audio_handles.append(handle)
+                        queue_hooks += 1
+                except Exception as exc:
+                    pass
+        if not queue_hooks:
+            self._clear_digital()
+            raise RuntimeError('codec_queue_hooks_unavailable')
+
+    def _clear_digital(self, owner=None):
+        if owner is not None and owner != self._capture_owner:
+            return
+        with self._lock:
+            if self._capture_owner is not None:
+                for ticket, entry in list(self._players.items()):
+                    if entry[1] == self._capture_owner:
+                        self._players.pop(ticket, None)
+            self._digital_voices.clear()
+            getattr(self, '_recent_progress', {}).clear()
+            getattr(self, '_monitor_finishing', {}).clear()
+            self._capture_record = self._capture_owner = None
+            self._codec_target = self._round_encoder = None
+            self._codec_buffers.clear()
+        for handle in self._audio_handles:
+            try:
+                self.unhook_method(handle)
+            except Exception as exc:
+                pass
+        self._audio_handles = []
+
+    def _codec_issue(self, exc):
+        context = dict(self._last_codec_context)
+        message = str(exc)
+        message = re.sub('https?://\\S+|(?:/[A-Za-z0-9_. -]+){2,}', '[redacted]', message)[:400]
+        record = dict(kind=type(exc).__name__, message=message, **context)
+        if self._first_codec_issue is None:
+            self._first_codec_issue = record
+        recoverable = type(exc).__name__ == 'IllegalStateException' and context.get('stage') in ('acquire', 'duplicate', 'read') and any((word in message.lower() for word in ('freed', 'inaccessible', 'invalidated')))
+        if recoverable:
+            self._codec_skipped += 1
+            with self._lock:
+                self._codec_buffers.pop(context.get('index'), None)
+            return
+        self._digital_failure('codec_mix', exc)
+
+    def _digital_failure(self, where, exc):
+        self._digital_broken = True
+        if not self._digital_error or self._digital_error == 'digital_disabled_after_error':
+            self._digital_error = where + ': ' + type(exc).__name__
+        self._capture_record = self._codec_target = None
+        with self._lock:
+            for ticket in list(self._digital_voices):
+                self._players.pop(ticket, None)
+            self._digital_voices.clear()
+        self._notify('Не удалось добавить звук в запись. Начните новый кружок')
+        run_on_ui_thread(self._update_active)
+
+    def _play_digital(self, sid, owner):
+        try:
+            self._bind_digital(owner)
+            with self._lock:
+                if any((x[2] == sid for x in self._players.values())) and int(self.get_setting('repeat_mode', 0)) == 0:
+                    self._stop_sound(sid)
+                if not any((x['id'] == sid for x in self._items)):
+                    return
+                self._player_number += 1
+                ticket = self._player_number
+                self._players[ticket] = (None, owner, sid)
+            self._decode_jobs.put((0, ticket, (sid, ticket, owner)))
+            run_on_ui_thread(self._update_active)
+
+            def verify():
+                with self._lock:
+                    waiting = ticket in self._digital_voices
+                if waiting and self._mix_reads == 0:
+                    self._notify('Звук не добавился в запись. Начните новый кружок')
+            run_on_ui_thread(verify, 2500)
+        except Exception as exc:
+            reason = str(exc)
+            if not re.fullmatch('[a-z0-9_]{1,80}', reason):
+                reason = type(exc).__name__
+            if reason != 'digital_disabled_after_error' or not self._digital_error:
+                self._digital_error = reason
+            self._notify('Не удалось добавить звук в этот кружок')
+
+    def _decode_loop(self):
+        while self._alive:
+            try:
+                _priority, _order, (sid, ticket, owner) = self._decode_jobs.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                if sid is None:
+                    self._clear_temp_files()
+                    continue
+                if self._audioop is None:
+                    continue
+                if ticket is not None:
+                    with self._lock:
+                        if ticket not in self._players:
+                            continue
+                pcm = self._pcm_cache.get(sid)
+                if pcm is None:
+                    path = os.path.join(self._pcm_folder, sid + '.pcm')
+                    if os.path.isfile(path):
+                        with open(path, 'rb') as f:
+                            pcm = f.read(48000 * 2 * 180 + 1)
+                        if not pcm or len(pcm) % 2 or len(pcm) > 48000 * 2 * 180:
+                            os.remove(path)
+                            pcm = None
+                    if pcm is None:
+                        pcm = self._decode_pcm(sid)
+                        temporary = path + '.tmp'
+                        with open(temporary, 'wb') as f:
+                            f.write(pcm)
+                        os.replace(temporary, path)
+                        self._trim_pcm_disk(path)
+                    while self._pcm_cache and sum(map(len, self._pcm_cache.values())) + len(pcm) > 32 * 1024 * 1024:
+                        self._pcm_cache.pop(next(iter(self._pcm_cache)))
+                    self._pcm_cache[sid] = pcm
+                self._durations[sid] = len(pcm) * 1000 // 96000
+                monitor = False
+                if ticket is not None:
+                    with self._lock:
+                        if self._alive and ticket in self._players and (owner == self._capture_owner) and (self._capture_record is not None):
+                            self._digital_voices[ticket] = [pcm, 0, sid, owner, time.monotonic(), ticket]
+                            monitor = True
+                        else:
+                            self._players.pop(ticket, None)
+                    if monitor:
+                        self._start_monitor(ticket, sid, owner)
+                    run_on_ui_thread(self._update_active)
+            except Exception as exc:
+                if ticket is not None and self._alive:
+                    self._release_one(ticket)
+                    self._notify('Не удалось подготовить звук. Нужен поддерживаемый файл до 180 секунд')
+            finally:
+                self._decode_jobs.task_done()
+
+    def _trim_pcm_disk(self, keep):
+        files = []
+        for name in os.listdir(self._pcm_folder):
+            if re.fullmatch(r'[a-f0-9]{24}\.pcm', name):
+                path = os.path.join(self._pcm_folder, name)
+                files.append((os.path.getmtime(path), path, os.path.getsize(path)))
+        total = sum(row[2] for row in files)
+        for _, path, size in sorted(files):
+            if total <= 64 * 1024 * 1024:
+                break
+            if path != keep:
+                os.remove(path)
+                total -= size
+
+    def _decode_pcm(self, sid):
+        from android.media import MediaExtractor, MediaCodec
+        from java import jarray, jbyte
+        extractor, codec = MediaExtractor(), None
+        pieces, size, state = [], 0, None
+        try:
+            extractor.setDataSource(os.path.join(self._sounds_dir, sid + '.audio'))
+            track_format = None
+            for i in range(int(extractor.getTrackCount())):
+                fmt = extractor.getTrackFormat(i)
+                if str(fmt.getString('mime')).startswith('audio/'):
+                    track_format = fmt
+                    extractor.selectTrack(i)
+                    break
+            if track_format is None:
+                raise ValueError('no_audio_track')
+            codec = MediaCodec.createDecoderByType(str(track_format.getString('mime')))
+            track_format.setInteger('pcm-encoding', 2)
+            codec.configure(track_format, None, None, 0)
+            codec.start()
+            info = MediaCodec.BufferInfo()
+            input_eos, output_eos = False, False
+            rate, channels, encoding = 0, 0, 2
+            last_output = time.monotonic()
+            while self._alive and not output_eos:
+                if time.monotonic() - last_output > 15:
+                    raise TimeoutError('decoder_stalled')
+                if not input_eos:
+                    index = int(codec.dequeueInputBuffer(5000))
+                    if index >= 0:
+                        buf = codec.getInputBuffer(index)
+                        buf.clear()
+                        count = int(extractor.readSampleData(buf, 0))
+                        if count < 0:
+                            codec.queueInputBuffer(index, 0, 0, 0, 4)
+                            input_eos = True
+                        else:
+                            codec.queueInputBuffer(index, 0, count, int(extractor.getSampleTime()), 0)
+                            extractor.advance()
+                index = int(codec.dequeueOutputBuffer(info, 5000))
+                if index == -2:
+                    fmt = codec.getOutputFormat()
+                    rate = int(fmt.getInteger('sample-rate'))
+                    channels = int(fmt.getInteger('channel-count'))
+                    encoding = int(fmt.getInteger('pcm-encoding')) if fmt.containsKey('pcm-encoding') else 2
+                    if channels not in (1, 2) or rate < 8000 or encoding != 2:
+                        raise ValueError('unsupported_decoder_pcm')
+                elif index >= 0:
+                    try:
+                        count = int(info.size)
+                        if count and not (int(info.flags) & 2):
+                            if not rate:
+                                fmt = codec.getOutputFormat()
+                                rate, channels = int(fmt.getInteger('sample-rate')), int(fmt.getInteger('channel-count'))
+                                encoding = int(fmt.getInteger('pcm-encoding')) if fmt.containsKey('pcm-encoding') else 2
+                                if channels not in (1, 2) or encoding != 2:
+                                    raise ValueError('unsupported_decoder_pcm')
+                            buf = codec.getOutputBuffer(index).duplicate()
+                            buf.position(int(info.offset))
+                            buf.limit(int(info.offset) + count)
+                            raw = jarray(jbyte)(count)
+                            buf.get(raw)
+                            pcm = bytes(raw)
+                            if channels == 2:
+                                pcm = self._audioop.tomono(pcm, 2, .5, .5)
+                            if rate != 48000:
+                                pcm, state = self._audioop.ratecv(pcm, 2, 1, rate, 48000, state)
+                            size += len(pcm)
+                            if size > 48000 * 2 * 180:
+                                raise ValueError('sound_longer_than_180_seconds')
+                            pieces.append(pcm)
+                            last_output = time.monotonic()
+                        output_eos = bool(int(info.flags) & 4)
+                    finally:
+                        codec.releaseOutputBuffer(index, False)
+            if not self._alive or not pieces:
+                raise RuntimeError('decoder_cancelled_or_empty')
+            return b''.join(pieces)
+        finally:
+            if codec is not None:
+                try:
+                    codec.stop()
+                except Exception:
+                    pass
+                codec.release()
+            extractor.release()
+
+    def _mix_pcm(self, original):
+        with self._lock:
+            if not self._digital_voices:
+                return (None, False)
+            mixed = original
+            gain = max(0.0, min(1.0, int(self.get_setting('volume_mvp', 3)) / 4.0))
+            count = len(self._digital_voices)
+            finished = []
+            for ticket, voice in list(self._digital_voices.items()):
+                if ticket not in self._players:
+                    finished.append(ticket)
+                    continue
+                pcm, pos = voice[:2]
+                part = pcm[pos:pos + len(original)]
+                voice[1] += len(part)
+                if len(part) < len(original):
+                    part += bytes(len(original) - len(part))
+                part = self._audioop.mul(part, 2, gain / max(1, count))
+                mixed = self._audioop.add(mixed, part, 2)
+                if voice[1] >= len(pcm):
+                    finished.append(ticket)
+            for ticket in finished:
+                ended_voice = self._digital_voices.get(ticket)
+                if ended_voice and ended_voice[1] >= len(ended_voice[0]) and (ticket in self._players) and (self._players[ticket][0] is not None):
+                    self._monitor_finishing[ticket] = ended_voice[2]
+                if ended_voice and len(ended_voice) > 4:
+                    self._recent_progress[ended_voice[2]] = (ended_voice[4], len(ended_voice[0]), ticket)
+                self._digital_voices.pop(ticket, None)
+                self._players.pop(ticket, None)
+            return (mixed, bool(finished))
+
+    def _mix_codec_input(self, param, native=False):
+        index, offset, size = (int(param.args[i]) for i in range(3))
+        flags = int(param.args[4])
+        if size <= 0 or flags & 2:
+            return
+        if offset < 0 or size % 2:
+            raise ValueError('unaligned_codec_pcm')
+        with self._lock:
+            if not self._digital_voices:
+                return
+            buf = self._codec_buffers.get(index) if native else None
+        self._last_codec_context['stage'] = 'acquire'
+        if not native:
+            buf = param.thisObject.getInputBuffer(index)
+        if buf is None:
+            self._codec_uncached += 1
+            return
+        started = time.perf_counter_ns()
+        from java import jarray, jbyte
+        self._last_codec_context['stage'] = 'duplicate'
+        view = buf.duplicate()
+        for name in ('capacity', 'position', 'limit', 'isDirect', 'isReadOnly'):
+            try:
+                self._last_codec_context[name] = getattr(view, name)()
+            except Exception:
+                pass
+        if offset + size > int(view.capacity()):
+            raise ValueError('codec_pcm_out_of_bounds')
+        view.clear()
+        view.limit(offset + size)
+        view.position(offset)
+        raw = jarray(jbyte)(size)
+        self._last_codec_context['stage'] = 'read'
+        view.get(raw)
+        self._last_codec_context['stage'] = 'mix'
+        mixed, ended = self._mix_pcm(bytes(raw))
+        if mixed is None:
+            return
+        self._last_codec_context['stage'] = 'write'
+        view.position(offset)
+        view.put(jarray(jbyte)(mixed))
+        self._last_codec_context['stage'] = 'done'
+        elapsed = (time.perf_counter_ns() - started) // 1000
+        self._mix_reads += 1
+        self._mix_bytes += size
+        self._mix_total_us += elapsed
+        self._mix_max_us = max(self._mix_max_us, elapsed)
+        if ended:
+            run_on_ui_thread(self._update_active)
+
+    def _play(self, sound_id, owner=None):
+        if not self._alive:
+            return
+        if owner is not None and self.get_setting('digital_mix', True):
+            run_on_ui_thread(lambda: self._play_digital(sound_id, owner))
+            return
+        with self._lock:
+            if any((x[2] == sound_id and x[1] == owner for x in self._players.values())) and int(self.get_setting('repeat_mode', 0)) == 0:
+                if owner is None:
+                    self._stop_preview()
+                else:
+                    self._stop_sound(sound_id)
+            if not any((x['id'] == sound_id for x in self._items)):
+                return
+            self._player_number += 1
+            ticket = self._player_number
+            self._players[ticket] = (None, owner, sound_id)
+        run_on_ui_thread(self._update_active)
+
+        def worker():
+            player = None
+            acquired = False
+            try:
+                if owner is None:
+                    self._preview_serial.acquire()
+                    acquired = True
+                    with self._lock:
+                        if ticket not in self._players or not self._alive:
+                            return
+                from android.media import MediaPlayer, AudioAttributes
+                player = MediaPlayer()
+                player.setAudioAttributes(AudioAttributes.Builder().setUsage(1).setContentType(2).build())
+                if self.get_setting('force_speaker', False):
+                    manager = self._context.getSystemService('audio')
+                    for device in manager.getDevices(2):
+                        if int(device.getType()) == 2:
+                            player.setPreferredDevice(device)
+                            break
+                player.setDataSource(os.path.join(self._sounds_dir, sound_id + '.audio'))
+                volume = max(0, min(100, int(self.get_setting('volume_mvp', 3)) * 25)) / 100.0
+                player.setVolume(volume, volume)
+                player.prepare()
+                with self._lock:
+                    cancelled = ticket not in self._players or not self._alive
+                if cancelled:
+                    return
+                player.start()
+                while self._alive:
+                    with self._lock:
+                        if ticket not in self._players:
+                            break
+                    if not player.isPlaying():
+                        break
+                    self._media_progress[ticket] = (sound_id, int(player.getCurrentPosition()), int(player.getDuration()))
+                    time.sleep(0.04)
+            except Exception as exc:
+                self._notify('Не удалось воспроизвести звук')
+            finally:
+                if player is not None:
+                    try:
+                        player.release()
+                    except Exception as exc:
+                        pass
+                with self._lock:
+                    self._players.pop(ticket, None)
+                if acquired:
+                    self._preview_serial.release()
+                run_on_ui_thread(self._update_active)
+        threading.Thread(target=worker, daemon=True, name='AyuSoundPlay').start()
+
+    def _release_one(self, ticket):
+        with self._lock:
+            self._players.pop(ticket, None)
+            getattr(self, '_digital_voices', {}).pop(ticket, None)
+            getattr(self, '_media_progress', {}).pop(ticket, None)
+        run_on_ui_thread(self._update_active)
+
+    def _stop_all(self):
+        with self._lock:
+            self._players.clear()
+            getattr(self, '_digital_voices', {}).clear()
+            getattr(self, '_recent_progress', {}).clear()
+            getattr(self, '_monitor_finishing', {}).clear()
+            getattr(self, '_media_progress', {}).clear()
+        run_on_ui_thread(self._update_active)
+
+    def _stop_sound(self, sound_id):
+        with self._lock:
+            for ticket, entry in list(self._players.items()):
+                if entry[2] == sound_id:
+                    self._players.pop(ticket, None)
+                    getattr(self, '_digital_voices', {}).pop(ticket, None)
+        getattr(self, '_recent_progress', {}).pop(sound_id, None)
+        for ticket, sid in list(getattr(self, '_monitor_finishing', {}).items()):
+            if sid == sound_id:
+                self._monitor_finishing.pop(ticket, None)
+        run_on_ui_thread(self._update_active)
+
+
+    def _color(self, key):
+        from org.telegram.ui.ActionBar import Theme
+        field = {'listSelectorSDK21': 'listSelector'}.get(key, key)
+        try:
+            return int(Theme.getColor(getattr(Theme, 'key_' + field)))
+        except Exception as exc:
+            pass
+        try:
+            dark = bool(Theme.isCurrentThemeDark())
+        except Exception:
+            dark = True
+        light = {'windowBackgroundWhite': 4294967295, 'windowBackgroundGray': 4294046709, 'windowBackgroundWhiteBlackText': 4280295716, 'windowBackgroundWhiteBlueText': 4280776377, 'listSelectorSDK21': 402653184}
+        night = {'windowBackgroundWhite': 4280298037, 'windowBackgroundGray': 4281153862, 'windowBackgroundWhiteBlackText': 4294309365, 'windowBackgroundWhiteBlueText': 4281825453, 'listSelectorSDK21': 620756991}
+        value = (night if dark else light).get(key, 4286611584)
+        return value if value < 2147483648 else value - 4294967296
+
+    def _style(self, view, key='windowBackgroundGray', radius=12):
+        from org.telegram.ui.ActionBar import Theme
+        from org.telegram.messenger import AndroidUtilities
+        normal, pressed = (self._color(key), self._color('listSelectorSDK21'))
+        try:
+            background = Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(radius), normal, pressed)
+        except Exception as exc:
+            from android.graphics.drawable import GradientDrawable
+            from java import jint
+            background = GradientDrawable()
+            background.setColor(jint(normal))
+            background.setCornerRadius(float(AndroidUtilities.dp(radius)))
+        view.setBackground(background)
+
+    def _text_button(self, context, text, size=14, color=None):
+        from android.widget import TextView
+        from org.telegram.messenger import AndroidUtilities
+        view = TextView(context)
+        view.setText(str(text))
+        view.setTextSize(float(size))
+        view.setTextColor(self._color('windowBackgroundWhiteBlackText'))
+        view.setGravity(17)
+        view.setPadding(AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12), 0)
+        self._style(view)
+        return view
+
+
+    def _toggle(self, camera):
+        if camera in self._popups:
+            self._close_panel(camera)
+        else:
+            self._open_panel(camera)
+
+
+    def _close_panel(self, camera):
+        self._sound_views.pop(camera, None)
+        popup = self._popups.pop(camera, None)
+        self._mark_panel(camera, False)
+        if popup:
+            try:
+                popup.dismiss()
+            except Exception as exc:
+                pass
+
+    def _refresh_panels(self):
+        for camera in list(self._popups):
+            self._close_panel(camera)
+            self._open_panel(camera)
+
+    def _detach(self, camera):
+        self._clear_digital(owner=camera)
+        self._close_panel(camera)
+        with self._lock:
+            ids = [ticket for ticket, entry in self._players.items() if entry[1] == camera]
+        for ticket in ids:
+            self._release_one(ticket)
+        btn = self._buttons.pop(camera, None)
+        if btn:
+            try:
+                btn.setOnClickListener(None)
+                parent = btn.getParent()
+                if parent is not None:
+                    parent.removeView(btn)
+            except Exception as exc:
+                pass
+        stop_btn = self._stop_buttons.pop(camera, None)
+        if stop_btn:
+            try:
+                stop_btn.setOnClickListener(None)
+                parent = stop_btn.getParent()
+                if parent is not None:
+                    parent.removeView(stop_btn)
+            except Exception as exc:
+                pass
+
+    def _edit(self, sound_id, field, value):
+        value = ''.join((c for c in str(value or '') if c.isprintable())).strip()[:48] or 'Звук'
+        try:
+            with self._lock:
+                for item in self._items:
+                    if item['id'] == sound_id:
+                        item['name'] = value
+                self._save_library()
+            self._refresh_panels()
+            self._render_library()
+        except Exception as exc:
+            self._notify('Не удалось сохранить название')
+
+    def _activity(self):
+        from client_utils import get_last_fragment
+        fragment = get_last_fragment()
+        if fragment is None or fragment.getParentActivity() is None:
+            raise RuntimeError('activity_missing')
+        return fragment.getParentActivity()
+
+    def _rename(self, sid):
+        if not self._alive:
+            return
+        try:
+            from ui.alert import AlertDialogBuilder
+            from org.telegram.ui.Components import EditTextBoldCursor
+            from org.telegram.messenger import AndroidUtilities as AU
+            item = next((x for x in self._items if x['id'] == sid), None)
+            if not item:
+                return
+            self._close_all_panels()
+            activity = self._activity()
+            field = EditTextBoldCursor(activity)
+            field.setSingleLine(True)
+            field.setText(item['name'])
+            field.setTextSize(16.0)
+            field.setTextColor(self._color('windowBackgroundWhiteBlackText'))
+            field.setPadding(AU.dp(24), AU.dp(12), AU.dp(24), AU.dp(12))
+            field.selectAll()
+            dialog = AlertDialogBuilder(activity)
+            dialog.set_title('Название звука')
+            dialog.set_view(field)
+
+            def save(b, w):
+                self._edit(sid, 'name', str(field.getText()))
+                b.dismiss()
+            dialog.set_positive_button('Сохранить', save)
+            dialog.set_negative_button('Отмена', lambda b, w: b.dismiss())
+            self._show_dialog(dialog)
+        except Exception as exc:
+            self._notify('Не удалось открыть переименование')
+
+
+    def _close_all_panels(self):
+        for camera in list(self._popups):
+            self._close_panel(camera)
+
+
+    def _confirm_delete(self, sid):
+        from ui.alert import AlertDialogBuilder
+        dialog = AlertDialogBuilder(self._activity())
+        dialog.set_title('Удалить звук?')
+        dialog.set_message('Звук будет удалён из списка.')
+        dialog.set_positive_button('Удалить', lambda b, w: (b.dismiss(), self._delete(sid)))
+        dialog.set_negative_button('Отмена', lambda b, w: b.dismiss())
+        self._show_dialog(dialog)
+
+    def _delete(self, sid):
+        self._stop_sound(sid)
+        try:
+            with self._lock:
+                original = self._items
+                self._items = [x for x in original if x['id'] != sid]
+                try:
+                    self._save_library()
+                except Exception:
+                    self._items = original
+                    raise
+                path = os.path.join(self._sounds_dir, sid + '.audio')
+                if os.path.exists(path):
+                    os.remove(path)
+            self._pcm_cache.pop(sid, None)
+            pcm_path = os.path.join(self._pcm_folder, sid + '.pcm')
+            if os.path.exists(pcm_path):
+                os.remove(pcm_path)
+            self._refresh_panels()
+            self._render_library()
+        except Exception as exc:
+            self._notify('Не удалось удалить звук')
+
+
+    def _unhook_all(self):
+        for handle in reversed(getattr(self, '_handles', [])):
+            try:
+                self.unhook_method(handle)
+            except Exception as exc:
+                pass
+        self._handles = []
+
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._clear_digital()
+        self._unhook_all()
+        self._stop_all()
+
+        def cleanup():
+            for camera in list(self._buttons):
+                self._detach(camera)
+            for dialog in list(self._dialogs):
+                dialog.dismiss()
+        run_on_ui_thread(cleanup)
+
+    def _ui_action(self, name, fn, **details):
+        def call(*args):
+            try:return fn()
+            except Exception:self._notify('Не удалось выполнить действие')
+        return call
+
+    @staticmethod
+    def _blend(first, second, amount, alpha=255):
+        a, b = int(first) & 0xffffffff, int(second) & 0xffffffff
+        values = [round(((a >> shift) & 255) * (1-amount) + ((b >> shift) & 255) * amount)
+                  for shift in (16, 8, 0)]
+        result = (alpha << 24) | (values[0] << 16) | (values[1] << 8) | values[2]
+        return result if result < 0x80000000 else result - 0x100000000
+
+    def _surface(self, view, radius=20, alpha=232, accent=.12):
+        from android.graphics.drawable import GradientDrawable
+        from org.telegram.messenger import AndroidUtilities as AU
+        from java import jint
+        shape = GradientDrawable()
+        base, color = self._color('windowBackgroundWhite'), self._color('windowBackgroundWhiteBlueText')
+        shape.setColor(jint(self._blend(base, color, accent, alpha)))
+        shape.setCornerRadius(float(AU.dp(radius)))
+        shape.setStroke(AU.dp(1), jint(self._blend(base, color, .5, 75)))
+        try:
+            from android.graphics.drawable import RippleDrawable
+            from android.content.res import ColorStateList
+            mask=GradientDrawable();mask.setColor(jint(-1));mask.setCornerRadius(float(AU.dp(radius)))
+            view.setBackground(RippleDrawable(ColorStateList.valueOf(self._blend(color,-1,.15,55)),shape,mask))
+        except Exception:
+            view.setBackground(shape)
+
+
+    def _ordered_items(self):
+        with self._lock:
+            return sorted([dict(x) for x in self._items], key=lambda x: not x.get('favorite', False))
+
+
+    def _make_track_row(self, context, item, camera):
+        from android.widget import FrameLayout, TextView
+        from android.view import Gravity
+        from android.graphics.drawable import GradientDrawable, ClipDrawable
+        from org.telegram.messenger import AndroidUtilities as AU
+        from java import jint
+        sid = item['id']
+        row = FrameLayout(context)
+        self._surface(row, radius=16, alpha=125, accent=.08)
+        fill_shape = GradientDrawable()
+        fill_shape.setColor(jint(self._blend(self._color('windowBackgroundWhiteBlueText'), -1, .08, 110)))
+        fill_shape.setCornerRadius(float(AU.dp(16)))
+        fill = ClipDrawable(fill_shape, Gravity.LEFT, ClipDrawable.HORIZONTAL)
+        fill.setLevel(0)
+        fill_view=FrameLayout(context)
+        fill_view.setBackground(fill)
+        row.addView(fill_view,FrameLayout.LayoutParams(-1,-1))
+        title = TextView(context)
+        title.setText(item['name'])
+        title.setTextSize(14.0)
+        title.setTextColor(self._color('windowBackgroundWhiteBlackText'))
+        title.setGravity(Gravity.CENTER_VERTICAL)
+        title.setMaxLines(2)
+        params = FrameLayout.LayoutParams(-1,-1)
+        params.setMargins(AU.dp(14),0,AU.dp(74),0)
+        row.addView(title,params)
+        time_view = TextView(context)
+        time_view.setTextSize(11.0)
+        time_view.setTextColor(self._color('windowBackgroundWhiteBlackText'))
+        time_view.setGravity(Gravity.CENTER)
+        params = FrameLayout.LayoutParams(AU.dp(70),-1,Gravity.RIGHT)
+        row.addView(time_view,params)
+        row.setContentDescription('Включить: '+item['name'])
+        row.setOnClickListener(OnClickListener(self._ui_action('track_play', lambda: self._play(sid,camera), id=sid[:7])))
+        # Rename/reorder belongs to My Sounds, never to a recording gesture.
+        self._sound_views[camera][sid] = (row,title,fill,time_view,item['name'])
+        return row
+
+    def _open_panel(self, camera):
+        popup = None
+        try:
+            from android.widget import LinearLayout, FrameLayout, ScrollView, PopupWindow
+            from android.view import Gravity
+            from android.graphics import Rect
+            from android.graphics.drawable import ColorDrawable
+            from org.telegram.messenger import AndroidUtilities as AU
+            from java import jarray, jint
+            context = camera.getContext()
+            root = LinearLayout(context)
+            root.setOrientation(1)
+            root.setPadding(AU.dp(10), AU.dp(10), AU.dp(10), AU.dp(6))
+            self._surface(root, radius=24, alpha=230, accent=0.15)
+            scroller = ScrollView(context)
+            scroller.setVerticalScrollBarEnabled(True)
+            column = LinearLayout(context)
+            column.setOrientation(1)
+            scroller.addView(column)
+            self._sound_views[camera] = {}
+            sounds = self._ordered_items()
+            for item in sounds:
+                row = self._make_track_row(context, item, camera)
+                params = LinearLayout.LayoutParams(-1, AU.dp(52))
+                params.setMargins(0, 0, 0, AU.dp(4))
+                column.addView(row, params)
+            if not sounds:
+                empty = self._text_button(context, 'Добавьте звуки в настройках', 14)
+                column.addView(empty, LinearLayout.LayoutParams(-1, AU.dp(140)))
+            root.addView(scroller, LinearLayout.LayoutParams(-1, 0, 1.0))
+            anchor = self._buttons[camera]
+            visible = Rect()
+            anchor.getWindowVisibleDisplayFrame(visible)
+            on_screen, in_window = (jarray(jint)(2), jarray(jint)(2))
+            anchor.getLocationOnScreen(on_screen)
+            anchor.getLocationInWindow(in_window)
+            dx, dy = (int(on_screen[0] - in_window[0]), int(on_screen[1] - in_window[1]))
+            screen = context.getResources().getDisplayMetrics()
+            left, top, right, bottom = (int(visible.left) - dx, int(visible.top) - dy, int(visible.right) - dx, int(visible.bottom) - dy)
+            if right <= left or bottom <= top:
+                left, top, right, bottom = (0, 0, int(screen.widthPixels), int(screen.heightPixels))
+            x, y, width, height = self._panel_bounds(left, top, right, bottom, int(in_window[1]), float(screen.density), len(sounds))
+            if width < AU.dp(160) or height < AU.dp(112):
+                raise RuntimeError('panel_space_insufficient')
+            popup = PopupWindow(root, width, height, False)
+            popup.setBackgroundDrawable(ColorDrawable(0))
+            popup.setOutsideTouchable(False)
+            popup.setFocusable(False)
+            popup.setClippingEnabled(True)
+            popup.setElevation(float(AU.dp(8)))
+            popup.showAtLocation(anchor, Gravity.TOP | Gravity.LEFT, x, y)
+            self._popups[camera] = popup
+            self._mark_panel(camera, True)
+            self._update_active()
+            self._ensure_progress()
+        except Exception as exc:
+            if popup is not None:
+                try:
+                    popup.dismiss()
+                except Exception:
+                    pass
+            self._popups.pop(camera, None)
+            self._sound_views.pop(camera, None)
+            self._mark_panel(camera, False)
+            self._notify('Не удалось открыть список звуков')
+
+    @staticmethod
+    def _clock(seconds):
+        seconds=max(0,int(seconds))
+        return '%d:%02d' % (seconds//60,seconds%60)
+
+    def _ensure_progress(self):
+        if self._progress_running:
+            return
+        self._progress_running = True
+
+        def tick():
+            if not self._alive or not self._popups:
+                self._progress_running = False
+                return
+            try:
+                self._update_active()
+            except Exception as exc:
+                self._progress_running = False
+                return
+            run_on_ui_thread(tick, 100)
+        run_on_ui_thread(tick)
+
+    def _update_active(self):
+        now = time.monotonic()
+        with self._lock:
+            latest = {v[2]: (min(v[1], max(0, (now - v[4]) * 96000)) if len(v) > 4 else v[1], len(v[0])) for v in getattr(self, '_digital_voices', {}).values()}
+            active = {x[2] for x in self._players.values()}
+            for sid, (start, total, ticket) in list(self._recent_progress.items()):
+                if now - start <= total / 96000.0 + 0.2:
+                    latest.setdefault(sid, (min(total, max(0, (now - start) * 96000)), total))
+                    active.add(sid)
+                else:
+                    self._recent_progress.pop(sid, None)
+            for ticket, (sid, position, duration) in list(self._media_progress.items()):
+                if ticket in self._players:
+                    latest.setdefault(sid, (position * 96, duration * 96))
+                else:
+                    self._media_progress.pop(ticket, None)
+        for views in list(self._sound_views.values()):
+            for sid, entry in views.items():
+                row, title, fill, time_view, name = entry
+                position, total = latest.get(sid, (0, 0))
+                fraction = position / max(1, total)
+                fill.setLevel(max(1, min(10000, int(fraction * 10000))) if sid in active else 0)
+                title.setText(name)
+                duration = total / 96000.0 if total else self._durations.get(sid, 0) / 1000.0
+                time_view.setText(self._clock(position / 96000.0) + ' / ' + self._clock(duration) if total else self._clock(duration) if duration else '')
+                row.setContentDescription(('Играет: ' if sid in active else 'Включить: ') + name)
+        if self._stop_buttons:
+            from android.view import View
+            with self._lock:
+                owners = [entry[1] for entry in self._players.values()]
+            for camera, button in self._stop_buttons.items():
+                playing = camera in owners or (self._capture_owner == camera and bool(self._monitor_finishing))
+                visibility = View.VISIBLE if playing else View.GONE
+                if int(button.getVisibility()) != visibility:
+                    button.setVisibility(visibility)
+
+
+    def _info(self,title,text):
+        from ui.alert import AlertDialogBuilder
+        dialog=AlertDialogBuilder(self._activity()); dialog.set_title(title); dialog.set_message(text)
+        dialog.set_positive_button('Понятно',lambda b,w:b.dismiss())
+        self._show_dialog(dialog)
+
+
+    def create_settings(self):
+        return [
+            Header(text='Soundpad'),
+            Text(text='Мои звуки',on_click=self._ui_action('library_open',self._library_dialog)),
+            Text(text='Добавить звук',on_click=self._ui_action('sound_import',self._pick_file)),
+            Selector(key='repeat_mode',text='Повторное нажатие',default=0,items=['Начать заново','Наложить']),
+            Selector(key='volume_mvp',text='Громкость эффектов',default=3,items=['0%','25%','50%','75%','100%']),
+            Switch(key='digital_mix',text='Звук внутри кружка',default=True,on_change=self._set_digital_mode),
+            Switch(key='monitor',text='Слышать при записи',default=True,on_change=self._set_monitor_mode),
+            Header(text='Набор звуков'),
+            Text(text='Сохранить набор',on_click=self._ui_action('pack_export',self._export_pack)),
+            Text(text='Поделиться набором',on_click=self._ui_action('pack_share',lambda:self._export_pack(share=True))),
+            Text(text='Добавить набор',on_click=self._ui_action('pack_import',self._pick_pack)),
+            Header(text='На всякий случай'),
+            Text(text='Как пользоваться',on_click=self._ui_action('guide',self._show_guide)),
+            Text(text='Очистить временные файлы',on_click=self._ui_action('cache_clear',self._request_cache_cleanup)),
+        ]
+
+    def _show_guide(self):
+        self._info('Как пользоваться',
+            'Добавьте аудио файлом или выберите «Добавить в Soundpad» в меню сообщения. '
+            'В «Мои звуки» можно прослушать, переименовать и удалить звук. Тяните ручку слева, чтобы изменить порядок.\n\n'
+            'Начните запись кружка и нажмите S в наушниках. Выберите звук. Полоса в строке показывает ход воспроизведения. '
+            'Повторное нажатие запускает звук заново или накладывает ещё один, в зависимости от настройки. '
+            'Кнопка «Стоп» выключает все эффекты. Нажмите S ещё раз, чтобы скрыть список.\n\n'
+            '«Звук внутри кружка» добавляет эффект прямо в запись, даже при нулевой громкости медиа. '
+            '«Слышать при записи» включает прослушивание на телефоне или в наушниках. '
+            'Если оба режима включены и звук идёт из динамика, микрофон может записать его повторно. '
+            'Чтобы избежать дубля, используйте наушники или выключите прослушивание.\n\n'
+            '«Сохранить набор» сохраняет звуки, названия и порядок в файл .music. '
+            '«Поделиться набором» сначала сохранит файл, затем откроет выбор приложения для отправки. '
+            'Получатель скачивает .music и выбирает «Добавить в Soundpad» в меню сообщения или «Добавить набор» в настройках. '
+            'Совпадающие звуки повторно не добавляются, существующие остаются.\n\n'
+            'Очистка временных файлов удаляет подготовленные копии звуков. Оригиналы, названия и порядок сохраняются. '
+            'При следующем запуске звук может готовиться чуть дольше.')
+
+    def _set_monitor_mode(self, enabled):
+        self.set_setting('monitor',bool(enabled))
+        if enabled:self._show_audio_help('monitor')
+
+    def _show_audio_help(self, mode):
+        if mode=='digital':
+            title='Звук внутри кружка'
+            text='Эффект добавляется прямо в запись. Громкость медиа на телефоне на него не влияет. Голос остаётся без изменений.'
+        else:
+            title='Слышать при записи'
+            text='Эффект слышен на телефоне или в подключённых наушниках. Громкость прослушивания зависит от медиа.'
+        self._info(title,text+' Если включены оба режима и звук идёт из динамика, микрофон может записать его повторно. Используйте наушники или выключите «Слышать при записи».')
+
+    def _request_cache_cleanup(self):
+        if getattr(self,'_cache_cleanup_pending',False):return
+        self._cache_cleanup_pending=True
+        self._decode_jobs.put((-1,'',(None,None,None)))
+
+    def _clear_temp_files(self):
+        # Runs on the decoder worker, after any current cache read or write.
+        try:
+            # Drop queued background warming, retaining actual playback jobs.
+            playback=[]
+            for _ in range(self._decode_jobs.qsize()):
+                try:job=self._decode_jobs.get_nowait()
+                except queue.Empty:break
+                self._decode_jobs.task_done()
+                if job[2][1] is not None:playback.append(job)
+            for job in playback:self._decode_jobs.put(job)
+            self._pcm_cache.clear()
+            for name in os.listdir(self._pcm_folder):
+                if re.fullmatch(r'[a-f0-9]{24}\.pcm(?:\.tmp)?',name):
+                    path=os.path.join(self._pcm_folder,name)
+                    try:os.remove(path)
+                    except FileNotFoundError:pass
+            old_logs=os.path.join(self._base,'logs')
+            if os.path.isdir(old_logs):shutil.rmtree(old_logs)
+            self._notify('Временные файлы удалены')
+        except OSError:
+            self._notify('Не удалось удалить часть временных файлов')
+        finally:
+            self._cache_cleanup_pending=False
+
+
+    def _pack_write(self,path):
+        import zipfile
+        items=self._ordered_items()
+        if not items:raise ValueError('empty_pack')
+        if len(items)>MAX_SOUNDS:raise ValueError('too_many_tracks')
+        if sum(os.path.getsize(os.path.join(self._sounds_dir,x['id']+'.audio')) for x in items)>MAX_ALL_SIZE:raise ValueError('pack_too_large')
+        manifest={'format':'ayu-soundpad','version':1,'tracks':[]}
+        with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED) as z:
+            for item in items:
+                sid=item['id']; source=os.path.join(self._sounds_dir,sid+'.audio')
+                digest=hashlib.sha256()
+                with open(source,'rb') as f:
+                    for chunk in iter(lambda:f.read(65536),b''):digest.update(chunk)
+                if digest.hexdigest()[:24]!=sid:raise ValueError('source_checksum_mismatch')
+                if os.path.getsize(source)>MAX_SIZE:raise ValueError('track_too_large')
+                filename='sounds/'+sid+'.audio'
+                z.write(source,filename)
+                manifest['tracks'].append(dict(id=sid,name=item['name'],favorite=bool(item.get('favorite')),bytes=os.path.getsize(source),sha256=digest.hexdigest(),file=filename))
+            z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False))
+        return len(items)
+
+    def _pack_read(self,path):
+        import zipfile,tempfile
+        with zipfile.ZipFile(path) as z, tempfile.TemporaryDirectory(prefix='pack-',dir=self._base) as stage:
+            infos=z.infolist()
+            if len(infos)>MAX_SOUNDS+1 or len({i.filename for i in infos})!=len(infos):
+                raise ValueError('invalid_pack_members')
+            info=z.getinfo('manifest.json')
+            if info.file_size>131072:raise ValueError('manifest_too_large')
+            manifest=json.loads(z.read(info))
+            if manifest.get('format')!='ayu-soundpad' or manifest.get('version')!=1:
+                raise ValueError('unknown_pack_format')
+            tracks=manifest.get('tracks')
+            if not isinstance(tracks,list) or not 0<len(tracks)<=MAX_SOUNDS:
+                raise ValueError('invalid_pack_tracks')
+            staged=[]; ids=set(); total=0; expected={'manifest.json'}
+            for track in tracks:
+                sid=track.get('id','')
+                if not isinstance(sid,str) or not re.fullmatch('[a-f0-9]{24}',sid) or sid in ids:
+                    raise ValueError('invalid_track_id')
+                ids.add(sid); filename='sounds/'+sid+'.audio'; expected.add(filename)
+                if track.get('file')!=filename:raise ValueError('invalid_track_path')
+                info=z.getinfo(filename)
+                if info.file_size<100 or info.file_size>MAX_SIZE or info.flag_bits&1:
+                    raise ValueError('invalid_track_size')
+                total+=info.file_size
+                if total>MAX_ALL_SIZE:raise ValueError('pack_too_large')
+                destination=os.path.join(stage,sid+'.audio');digest=hashlib.sha256(); actual=0
+                with z.open(info) as source,open(destination,'wb') as output:
+                    for chunk in iter(lambda:source.read(65536),b''):
+                        actual+=len(chunk)
+                        if actual>MAX_SIZE:raise ValueError('track_too_large')
+                        output.write(chunk);digest.update(chunk)
+                checksum=digest.hexdigest()
+                if actual!=info.file_size or checksum!=track.get('sha256') or checksum[:24]!=sid:
+                    raise ValueError('track_checksum_mismatch')
+                name=''.join(c for c in str(track.get('name') or 'Звук') if c.isprintable()).strip()[:48] or 'Звук'
+                staged.append(dict(id=sid,name=name,favorite=bool(track.get('favorite')),bytes=actual))
+            if {i.filename for i in infos}!=expected:raise ValueError('unexpected_pack_members')
+            created=[]
+            with self._lock:
+                known={x['id'] for x in self._items};new=[x for x in staged if x['id'] not in known]
+                if len(self._items)+len(new)>MAX_SOUNDS or sum(x['bytes'] for x in self._items)+sum(x['bytes'] for x in new)>MAX_ALL_SIZE:
+                    raise ValueError('library_limit_exceeded')
+                original=list(self._items)
+                try:
+                    for item in new:
+                        dest=os.path.join(self._sounds_dir,item['id']+'.audio')
+                        if not os.path.exists(dest):
+                            os.replace(os.path.join(stage,item['id']+'.audio'),dest);created.append(dest)
+                    self._items.extend(new);self._save_library()
+                except Exception:
+                    self._items=original
+                    for dest in created:
+                        if os.path.exists(dest):os.remove(dest)
+                    raise
+            return new,len(staged)-len(new)
+
+    def _pick_pack(self):
+        if not self._picker_available:
+            self._notify('Выбор файлов недоступен. Добавьте набор из сообщения')
+            return
+        from android.content import Intent
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.setType('*/*')
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        self._activity().startActivityForResult(intent, PACK_PICK_CODE)
+
+    def _copy_uri_to_path(self,uri,path,limit):
+        from java import jarray,jbyte
+        source=self._context.getContentResolver().openInputStream(uri)
+        if source is None:raise IOError('uri_unreadable')
+        total=0
+        try:
+            buffer=jarray(jbyte)(65536)
+            with open(path,'wb') as out:
+                while True:
+                    count=int(source.read(buffer))
+                    if count<=0:break
+                    total+=count
+                    if total>limit:raise ValueError('file_too_large')
+                    out.write(bytes(buffer[:count]))
+        finally:source.close()
+
+    def _import_pack(self, source=None, uri=None):
+
+        def work():
+            import tempfile
+            temporary = None
+            try:
+                if uri is not None:
+                    fd, temporary = tempfile.mkstemp(prefix='import-', suffix='.music', dir=self._base)
+                    os.close(fd)
+                    self._copy_uri_to_path(uri, temporary, MAX_ALL_SIZE + 1024 * 1024)
+                    path = temporary
+                else:
+                    path = source
+                new, duplicates = self._pack_read(path)
+                self._notify('Набор добавлен' if new else 'Эти звуки уже добавлены')
+                for item in new:
+                    self._decode_jobs.put((10, item['id'], (item['id'], None, None)))
+                run_on_ui_thread(self._refresh_panels)
+                run_on_ui_thread(self._render_library)
+            except Exception as exc:
+                self._notify('Набор не добавлен. Файл повреждён или превышен лимит')
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.remove(temporary)
+        threading.Thread(target=work, daemon=True, name='AyuPackImport').start()
+
+    def _export_pack(self, share=False):
+        if not self._items:
+            self._notify('Добавьте хотя бы один звук')
+            return
+        if not self._picker_available:
+            self._notify('Сохранение файла недоступно в этой версии клиента')
+            return
+        if self._export_busy:
+            self._notify('Сохранение уже открыто')
+            return
+        self._export_busy = True
+        self._export_share = bool(share)
+
+        def work():
+            import tempfile
+            path = None
+            try:
+                fd, path = tempfile.mkstemp(prefix='export-', suffix='.music', dir=self._base)
+                os.close(fd)
+                self._pack_write(path)
+                if not self._alive:
+                    os.remove(path)
+                    self._export_busy = False
+                    return
+                self._pending_export = path
+
+                def picker():
+                    try:
+                        if not self._alive:
+                            self._cleanup_export()
+                            return
+                        from android.content import Intent
+                        intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                        intent.addCategory(Intent.CATEGORY_OPENABLE)
+                        intent.setType('application/octet-stream')
+                        intent.putExtra(Intent.EXTRA_TITLE, 'my_sounds.music')
+                        self._activity().startActivityForResult(intent, PACK_SAVE_CODE)
+                    except Exception as exc:
+                        self._cleanup_export()
+                        self._notify('Не удалось открыть сохранение файла')
+                run_on_ui_thread(picker)
+            except Exception as exc:
+                self._notify('Не удалось собрать набор')
+                if path and os.path.exists(path):
+                    os.remove(path)
+                self._export_busy = False
+        threading.Thread(target=work, daemon=True, name='AyuPackExport').start()
+
+    def _cleanup_export(self):
+        path=self._pending_export;self._pending_export=None;self._export_busy=False
+        if path and os.path.exists(path):os.remove(path)
+
+    def _save_pack_uri(self, uri):
+        path = self._pending_export
+        share = getattr(self, '_export_share', False)
+        if not path:
+            return
+
+        def work():
+            from java import jarray, jbyte
+            output = None
+            try:
+                output = self._context.getContentResolver().openOutputStream(uri)
+                if output is None:
+                    raise IOError('uri_unwritable')
+                with open(path, 'rb') as source:
+                    for chunk in iter(lambda: source.read(65536), b''):
+                        output.write(jarray(jbyte)(chunk))
+                output.flush()
+                output.close()
+                output = None
+
+                def done():
+                    if not self._alive:return
+                    if share:
+                        try:self._share_pack(uri)
+                        except Exception:self._notify('Файл сохранён. Не удалось открыть отправку')
+                    else:self._notify('Набор сохранён')
+                run_on_ui_thread(done)
+            except Exception as exc:
+                self._notify('Не удалось сохранить файл')
+            finally:
+                if output is not None:
+                    try:
+                        output.close()
+                    except Exception:
+                        pass
+                self._cleanup_export()
+        threading.Thread(target=work, daemon=True, name='AyuPackSave').start()
+
+    def _share_pack(self, uri):
+        from android.content import Intent, ClipData
+        intent = Intent(Intent.ACTION_SEND)
+        intent.setType('application/octet-stream')
+        intent.setClipData(ClipData.newRawUri('Soundpad', uri))
+        intent.putExtra(Intent.EXTRA_STREAM, uri)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        self._activity().startActivity(Intent.createChooser(intent, 'Поделиться набором'))
+
+
+    def _start_monitor(self, ticket, sid, owner):
+        if not self.get_setting('monitor', True):
+            return
+
+        def work():
+            player = None
+            try:
+                from android.media import MediaPlayer, AudioAttributes
+                player = MediaPlayer()
+                player.setAudioAttributes(AudioAttributes.Builder().setUsage(1).setContentType(2).build())
+                player.setDataSource(os.path.join(self._sounds_dir, sid + '.audio'))
+                player.prepare()
+                with self._lock:
+                    if not self._alive or ticket not in self._players:
+                        return
+                    self._players[ticket] = (player, owner, sid)
+                gain = max(0, min(4, int(self.get_setting('volume_mvp', 3)))) / 4.0 / max(1, len(self._digital_voices))
+                player.setVolume(gain, gain)
+                player.start()
+                previous = None
+                while self._alive and self.get_setting('monitor', True):
+                    with self._lock:
+                        if ticket not in self._players and ticket not in self._monitor_finishing:
+                            break
+                        layers = max(1, len(self._digital_voices))
+                    gain = max(0, min(4, int(self.get_setting('volume_mvp', 3)))) / 4.0 / layers
+                    if gain != previous:
+                        player.setVolume(gain, gain)
+                        previous = gain
+                    if not player.isPlaying():
+                        break
+                    time.sleep(0.04)
+            except Exception as exc:
+                pass
+            finally:
+                if player is not None:
+                    try:
+                        player.release()
+                    except Exception:
+                        pass
+                with self._lock:
+                    self._monitor_finishing.pop(ticket, None)
+                    if ticket in self._players and self._players[ticket][0] is player:
+                        self._players[ticket] = (None, owner, sid)
+                run_on_ui_thread(self._update_active)
+        threading.Thread(target=work, daemon=True, name='AyuMonitor').start()
+
+    def _activity_result(self, code, result, intent):
+        if code == PICK_CODE:
+            self._picker_result(result, intent)
+        elif code == PACK_SAVE_CODE:
+            if int(result) == -1 and intent is not None and (intent.getData() is not None):
+                self._save_pack_uri(intent.getData())
+            else:
+                self._cleanup_export()
+        elif code == PACK_PICK_CODE and int(result) == -1 and (intent is not None) and (intent.getData() is not None):
+            self._import_pack(uri=intent.getData())
+
+    def _add_message(self, context):
+        try:
+            from org.telegram.messenger import FileLoader
+            message = context.get('message')
+            if message is None:
+                raise ValueError('Выберите аудио или набор .music')
+            doc = message.getDocument()
+            if doc is None:
+                raise ValueError('Выберите файл или аудио')
+            try:
+                name = str(FileLoader.getDocumentFileName(doc))
+            except Exception:
+                name = ''
+            if not name or name == 'None':
+                for attr in getattr(doc, 'attributes', []):
+                    candidate = getattr(attr, 'file_name', None)
+                    if candidate:
+                        name = str(candidate)
+                        break
+            is_pack = name.lower().endswith('.music')
+            if not is_pack and (not str(doc.mime_type or '').startswith('audio/')):
+                raise ValueError('Нужен аудиофайл или набор .music')
+            owner = message.messageOwner
+            source = str(owner.attachPath or '')
+            if not os.path.isfile(source):
+                account = context.get('account')
+                if account is None:
+                    account = getattr(message, 'currentAccount', 0)
+                source = str(FileLoader.getInstance(int(account)).getPathToMessage(owner).getAbsolutePath())
+            if not os.path.isfile(source):
+                raise ValueError('Сначала скачайте файл в Telegram')
+            if is_pack:
+                self._import_pack(source=source)
+            else:
+                self._import_async(source=source, name=name or os.path.basename(source))
+        except Exception as exc:
+            self._notify(str(exc)[:100] if isinstance(exc, ValueError) else 'Не удалось добавить файл')
+
+
+    def _show_dialog(self, dialog, on_dismiss=None):
+        self._dialogs.append(dialog)
+
+        def closed(builder):
+            if builder in self._dialogs:
+                self._dialogs.remove(builder)
+            if on_dismiss is not None:
+                try:
+                    on_dismiss()
+                except Exception as exc:
+                    pass
+        dialog.set_on_dismiss_listener(closed)
+        dialog.show()
+
+    def _stop_preview(self):
+        with self._lock:
+            for ticket, entry in list(self._players.items()):
+                if entry[1] is None:
+                    self._players.pop(ticket, None)
+                    self._media_progress.pop(ticket, None)
+
+    def _preview_toggle(self, sid):
+        with self._lock:
+            playing = any((x[1] is None and x[2] == sid for x in self._players.values()))
+        self._stop_preview()
+        if not playing:
+            self._play(sid)
+        self._update_library_preview()
+
+    def _library_closed(self):
+        self._finish_touch_drag(False, render=False)
+        self._stop_preview()
+        self._library_epoch += 1
+        self._library_builder = None
+        self._library_column = None
+        self._library_rows = {}
+        self._drag_sid = None
+        self._library_drag_refs = []
+        for menu in list(self._library_menus):
+            try:
+                menu.dismiss()
+            except Exception:
+                pass
+        self._library_menus = []
+
+
+    def _track_menu(self, sid, anchor=None):
+        if not any((x['id'] == sid for x in self._items)):
+            return
+        if anchor is not None:
+            try:
+                from android.widget import PopupMenu
+                from java import dynamic_proxy, jclass
+                plugin = self
+                menu = PopupMenu(self._library_context, anchor)
+                menu.getMenu().add(0, 1, 0, 'Переименовать')
+                menu.getMenu().add(0, 2, 1, 'Удалить')
+
+                class Choice(dynamic_proxy(jclass('android.widget.PopupMenu$OnMenuItemClickListener'))):
+
+                    def __init__(self):
+                        super().__init__()
+
+                    def onMenuItemClick(self, item):
+                        fn = (lambda: plugin._rename(sid)) if int(item.getItemId()) == 1 else lambda: plugin._confirm_delete(sid)
+                        plugin._ui_action('library_edit_menu', fn, id=sid[:7])()
+                        return True
+                listener = Choice()
+                menu.setOnMenuItemClickListener(listener)
+                self._library_menus.append(menu)
+                self._library_drag_refs.append(listener)
+                menu.show()
+                return
+            except Exception as exc:
+                pass
+        from ui.alert import AlertDialogBuilder
+        dialog = AlertDialogBuilder(self._activity())
+        dialog.set_title('Действия со звуком')
+
+        def selected(builder, index):
+            builder.dismiss()
+            (lambda: self._rename(sid), lambda: self._confirm_delete(sid))[index]()
+        dialog.set_items(['Переименовать', 'Удалить'], selected)
+        self._show_dialog(dialog)
+
+
+    def _icon(self,context,kind,size=44,color=None):
+        from android.widget import ImageView
+        from android.graphics import Bitmap,Canvas,Paint,Path,RectF
+        from org.telegram.messenger import AndroidUtilities as AU
+        from java import jint
+        px=AU.dp(28);bitmap=Bitmap.createBitmap(px,px,Bitmap.Config.ARGB_8888)
+        canvas=Canvas(bitmap);canvas.scale(px/24.0,px/24.0)
+        paint=Paint(3);paint.setColor(jint(-1 if color is None else color))
+        paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(1.7)
+        paint.setStrokeCap(Paint.Cap.ROUND);paint.setStrokeJoin(Paint.Join.ROUND)
+        if kind=='soundpad':
+            path=Path();path.moveTo(3.5,13);path.lineTo(3.5,10);path.cubicTo(3.5,0,20.5,0,20.5,10);path.lineTo(20.5,13)
+            canvas.drawPath(path,paint);canvas.drawRoundRect(RectF(2.5,11,6,18),1.5,1.5,paint);canvas.drawRoundRect(RectF(18,11,21.5,18),1.5,1.5,paint)
+            path=Path();path.moveTo(15.2,10.3);path.cubicTo(9,7.7,7.8,13,12,13.5);path.cubicTo(17,14,15.2,19.2,9,17.3);canvas.drawPath(path,paint)
+        elif kind=='stop_audio':
+            path=Path();path.moveTo(3,10);path.lineTo(7,10);path.lineTo(12,6);path.lineTo(12,18);path.lineTo(7,14);path.lineTo(3,14);path.close();canvas.drawPath(path,paint)
+            canvas.drawLine(16,9,21,14,paint);canvas.drawLine(21,9,16,14,paint)
+        elif kind=='play':
+            paint.setStyle(Paint.Style.FILL);path=Path();path.moveTo(9,6);path.lineTo(18,12);path.lineTo(9,18);path.close();canvas.drawPath(path,paint)
+        elif kind=='more':
+            paint.setStyle(Paint.Style.FILL)
+            for y in (6,12,18):canvas.drawCircle(12,y,1.3,paint)
+        elif kind=='drag':
+            canvas.drawLine(6,9,18,9,paint);canvas.drawLine(6,15,18,15,paint)
+        else:
+            paint.setStyle(Paint.Style.FILL);canvas.drawRoundRect(RectF(6.5,6.5,17.5,17.5),2.5,2.5,paint)
+        view=ImageView(context);view.setImageBitmap(bitmap);view.setScaleType(ImageView.ScaleType.CENTER)
+        if kind in ('soundpad','more','drag','play'):self._plain_ripple(view,size/2)
+        else:self._surface(view,radius=size/2,alpha=80,accent=.12)
+        return view
+
+
+    @staticmethod
+    def _panel_bounds(left,top,right,bottom,anchor_y,density,count):
+        dp=lambda n:max(1,round(n*density))
+        # Keep the client's one-time-send and recording controls exposed on the
+        # right. There is no Soundpad stop row inside this popup anymore.
+        safe_left=left+dp(12);safe_right=right-dp(76)
+        width=min(dp(280),safe_right-safe_left)
+        desired=dp(16+3*56)
+        available=anchor_y-top-dp(16)
+        height=min(desired,available if available>=dp(112) else bottom-top-dp(24))
+        y=anchor_y-dp(8)-height if available>=dp(112) else top+dp(8)
+        return int(safe_left),int(y),int(width),int(height)
+
+
+    def _plain_ripple(self,view,radius=12):
+        # A press-only selector: no permanent fill or outline.
+        from android.graphics.drawable import GradientDrawable,RippleDrawable
+        from android.content.res import ColorStateList
+        from org.telegram.messenger import AndroidUtilities as AU
+        from java import jint
+        mask=GradientDrawable();mask.setColor(jint(-1));mask.setCornerRadius(float(AU.dp(radius)))
+        ripple=RippleDrawable(ColorStateList.valueOf(self._blend(self._color('windowBackgroundWhiteBlueText'),-1,.1,45)),None,mask)
+        view.setBackground(ripple)
+
+    def _library_dialog(self):
+        if self._library_builder is not None:
+            return
+        from ui.alert import AlertDialogBuilder
+        from android.widget import ScrollView, LinearLayout
+        from org.telegram.messenger import AndroidUtilities as AU
+        context = self._activity()
+        root = LinearLayout(context)
+        root.setOrientation(1)
+        scroller = ScrollView(context)
+        column = LinearLayout(context)
+        column.setOrientation(1)
+        scroller.addView(column)
+        count = max(1, len(self._items))
+        screen = context.getResources().getDisplayMetrics()
+        height = min(AU.dp(count * 64), AU.dp(320), max(AU.dp(64), int(screen.heightPixels) - AU.dp(200)))
+        root.addView(scroller, LinearLayout.LayoutParams(-1, height))
+        self._library_context = context
+        self._library_column = column
+        self._library_scroller = scroller
+        dialog = AlertDialogBuilder(context)
+        dialog.set_title('Мои звуки')
+        dialog.set_view(root)
+        try:
+            dialog.set_blurred_background(False)
+        except Exception:
+            pass
+        self._library_builder = dialog
+        try:
+            self._render_library()
+        except Exception:
+            self._library_builder = None
+            self._library_column = None
+            raise
+        dialog.set_negative_button('Закрыть', lambda b, w: b.dismiss())
+        self._show_dialog(dialog, on_dismiss=self._library_closed)
+        self._library_epoch += 1
+        epoch = self._library_epoch
+
+        def tick():
+            if not self._alive or self._library_builder is None or self._library_epoch != epoch:
+                return
+            try:
+                self._update_library_preview()
+            except Exception as exc:
+                return
+            run_on_ui_thread(tick, 100)
+        run_on_ui_thread(tick)
+
+
+    def _render_library(self):
+        if self._library_builder is None or self._library_column is None:
+            return
+        self._finish_touch_drag(False, render=False)
+        from android.widget import FrameLayout, TextView, LinearLayout
+        from android.view import Gravity, View
+        from android.text import TextUtils
+        from org.telegram.messenger import AndroidUtilities as AU
+        context = self._library_context
+        column = self._library_column
+        column.removeAllViews()
+        self._library_rows = {}
+        self._library_drag_refs = []
+        drag_error = False
+        color = self._color('windowBackgroundWhiteBlackText')
+        ordered = self._ordered_items()
+        for index, item in enumerate(ordered):
+            sid = item['id']
+            row = FrameLayout(context)
+            self._plain_ripple(row, 8)
+            column.addView(row, LinearLayout.LayoutParams(-1, AU.dp(64)))
+            grip = self._icon(context, 'drag', 32, color=color)
+            grip.setContentDescription('Удерживайте, чтобы переместить')
+            lp = FrameLayout.LayoutParams(AU.dp(32), AU.dp(48), Gravity.LEFT | Gravity.CENTER_VERTICAL)
+            lp.leftMargin = AU.dp(8)
+            row.addView(grip, lp)
+            title = TextView(context)
+            title.setText(item['name'])
+            title.setTextSize(16.0)
+            title.setTextColor(color)
+            title.setGravity(Gravity.CENTER_VERTICAL)
+            title.setMaxLines(2)
+            title.setEllipsize(TextUtils.TruncateAt.END)
+            lp = FrameLayout.LayoutParams(-1, -1)
+            lp.setMargins(AU.dp(48), 0, AU.dp(112), 0)
+            row.addView(title, lp)
+            play = self._icon(context, 'play', 44, color=color)
+            lp = FrameLayout.LayoutParams(AU.dp(44), AU.dp(48), Gravity.RIGHT | Gravity.CENTER_VERTICAL)
+            lp.rightMargin = AU.dp(60)
+            row.addView(play, lp)
+            play.setOnClickListener(OnClickListener(self._ui_action('library_preview', lambda k=sid: self._preview_toggle(k), id=sid[:7])))
+            more = self._icon(context, 'more', 44, color=color)
+            lp = FrameLayout.LayoutParams(AU.dp(44), AU.dp(48), Gravity.RIGHT | Gravity.CENTER_VERTICAL)
+            lp.rightMargin = AU.dp(4)
+            row.addView(more, lp)
+            more.setContentDescription('Действия со звуком')
+            more.setOnClickListener(OnClickListener(self._ui_action('library_menu', lambda k=sid, v=more: self._track_menu(k, v), id=sid[:7])))
+            if index + 1 < len(ordered):
+                line = View(context)
+                line.setBackgroundColor(self._blend(self._color('windowBackgroundWhite'), -16777216, 0.65, 180))
+                lp = FrameLayout.LayoutParams(-1, 1, Gravity.BOTTOM)
+                lp.setMargins(AU.dp(48), 0, AU.dp(16), 0)
+                row.addView(line, lp)
+            self._library_rows[sid] = (row, title, play, None)
+            try:
+                self._install_touch_drag(sid, row, grip, title)
+            except Exception as exc:
+                if not drag_error:
+                    self._notify('Не удалось включить перенос треков')
+                    drag_error = True
+        self._update_library_preview()
+
+    def _update_library_preview(self):
+        if self._library_builder is None:return
+        with self._lock:active={x[2] for x in self._players.values() if x[1] is None}
+        for sid,(row,title,button,previous) in list(self._library_rows.items()):
+            playing=sid in active
+            if previous is not playing:
+                icon=self._icon(self._library_context,'stop' if playing else 'play',44,color=self._color('windowBackgroundWhiteBlackText'))
+                button.setImageDrawable(icon.getDrawable());self._plain_ripple(button,22)
+                button.setColorFilter(self._color('windowBackgroundWhiteBlueText' if playing else 'windowBackgroundWhiteBlackText'))
+                button.setContentDescription('Остановить прослушивание' if playing else 'Прослушать с начала')
+                self._library_rows[sid]=(row,title,button,playing)
+
+
+    @staticmethod
+    def _screen_y(view):
+        from java import jarray,jint
+        location=jarray(jint)(2);view.getLocationOnScreen(location);return float(location[1])
+
+    def _start_library_drag(self, sid, row):
+        if self._library_builder is None or self._touch_drag is not None:
+            return False
+        order = list(self._library_rows)
+        if sid not in order:
+            return False
+        raw_y = self._touch_origin[1] if self._touch_origin and self._touch_origin[0] == sid else self._screen_y(row) + row.getHeight() / 2
+        index = order.index(sid)
+        self._touch_drag = dict(sid=sid, row=row, order=order, origin=index, target=index, raw_y=raw_y, hotspot=raw_y - self._screen_y(row), offsets={})
+        self._drag_sid = sid
+        self._drag_epoch += 1
+        epoch = self._drag_epoch
+        from android.graphics.drawable import GradientDrawable
+        from org.telegram.messenger import AndroidUtilities as AU
+        from java import jint
+        background = GradientDrawable()
+        background.setColor(jint(self._color('windowBackgroundWhite')))
+        background.setCornerRadius(float(AU.dp(8)))
+        row.setBackground(background)
+        row.setAlpha(1.0)
+        row.setElevation(float(AU.dp(4)))
+        row.performHapticFeedback(0)
+        self._library_scroller.requestDisallowInterceptTouchEvent(True)
+
+        def follow():
+            if not self._alive or self._touch_drag is None or self._drag_epoch != epoch:
+                return
+            try:
+                self._move_touch_drag()
+            except Exception as exc:
+                self._finish_touch_drag(False)
+                return
+            run_on_ui_thread(follow, 50)
+        run_on_ui_thread(follow, 50)
+        return True
+
+    @staticmethod
+    def _drag_position(count,pitch,top,source):
+        top=max(0,min((count-1)*pitch,top))
+        target=max(0,min(count-1,int((top+pitch/2)//pitch)))
+        offsets=[-pitch if source<k<=target else (pitch if target<=k<source else 0) for k in range(count)]
+        return top,target,offsets
+
+    def _move_touch_drag(self):
+        state = self._touch_drag
+        if state is None:
+            return
+        from org.telegram.messenger import AndroidUtilities as AU
+        scroller = self._library_scroller
+        raw = state['raw_y']
+        screen_top = self._screen_y(scroller)
+        if raw < screen_top + AU.dp(36):
+            scroller.scrollBy(0, -AU.dp(12))
+        elif raw > screen_top + scroller.getHeight() - AU.dp(36):
+            scroller.scrollBy(0, AU.dp(12))
+        pitch = AU.dp(64)
+        requested = raw - self._screen_y(self._library_column) - state['hotspot']
+        top, target, offsets = self._drag_position(len(state['order']), pitch, requested, state['origin'])
+        state['row'].setTranslationY(float(top - state['row'].getTop()))
+        if target != state['target']:
+            state['target'] = target
+        for index, sid in enumerate(state['order']):
+            if sid == state['sid']:
+                continue
+            view = self._library_rows[sid][0]
+            offset = offsets[index]
+            if state['offsets'].get(sid) != offset:
+                state['offsets'][sid] = offset
+                view.animate().translationY(float(offset)).setDuration(90).start()
+
+    def _finish_touch_drag(self, save, render=True):
+        state = getattr(self, '_touch_drag', None)
+        self._touch_drag = None
+        self._touch_origin = None
+        self._drag_sid = None
+        self._touch_pending = None
+        self._hold_epoch = getattr(self, '_hold_epoch', 0) + 1
+        self._drag_epoch = getattr(self, '_drag_epoch', 0) + 1
+        if state is None:
+            try:
+                self._library_scroller.requestDisallowInterceptTouchEvent(False)
+            except Exception:
+                pass
+            return
+        for row, title, button, previous in list(self._library_rows.values()):
+            try:
+                row.animate().cancel()
+                row.setTranslationY(0.0)
+                row.setAlpha(1.0)
+                row.setElevation(0.0)
+            except Exception:
+                pass
+        try:
+            self._library_scroller.requestDisallowInterceptTouchEvent(False)
+        except Exception:
+            pass
+        if state.get('row') is not None:
+            try:
+                self._plain_ripple(state['row'], 8)
+            except Exception as exc:
+                pass
+        changed = save and state['target'] != state['origin']
+        if changed:
+            order = list(state['order'])
+            order.remove(state['sid'])
+            order.insert(state['target'], state['sid'])
+            try:
+                self._commit_library_order(order)
+            except Exception as exc:
+                self._notify('Не удалось сохранить порядок')
+                changed = False
+        if render and self._library_builder is not None:
+            run_on_ui_thread(self._render_library)
+
+    def _commit_library_order(self,order):
+        with self._lock:
+            current={x['id']:x for x in self._items};original=self._items
+            identifiers=list(dict.fromkeys([sid for sid in order if sid in current]+[x['id'] for x in self._ordered_items() if x['id'] not in order]))
+            result=[dict(current[sid],favorite=False) for sid in identifiers]
+            self._items=result
+            try:self._save_library()
+            except Exception:self._items=original;raise
+        self._refresh_panels()
+
+    def _drop_library_track(self,source,target,before=True):
+        order=[x['id'] for x in self._ordered_items()]
+        if source==target or source not in order or target not in order:return
+        order.remove(source);index=order.index(target)+(0 if before else 1);order.insert(index,source)
+        self._commit_library_order(order);run_on_ui_thread(self._render_library)
+
+    def _mark_panel(self, camera, opened):
+        view = self._buttons.get(camera)
+        if view is None:
+            return
+        if opened:
+            self._surface(view, radius=22, alpha=205, accent=0.6)
+        else:
+            self._plain_ripple(view, 22)
+        view.setAlpha(1.0)
+        view.setSelected(bool(opened))
+        view.setContentDescription('Скрыть звуки Soundpad' if opened else 'Открыть звуки Soundpad')
+
+    def _attach(self, camera):
+        if not self._alive or camera in self._buttons:
+            return
+        added = []
+        try:
+            from android.widget import LinearLayout, TextView, FrameLayout
+            from org.telegram.messenger import AndroidUtilities as AU
+            from android.view import Gravity, View
+            from java import jarray, jint
+            try:
+                layout = camera.getButtonsLayout()
+            except Exception:
+                layout = get_private_field(camera, 'buttonsLayout')
+            if layout is None:
+                raise RuntimeError('buttonsLayout_missing')
+            button = self._icon(camera.getContext(), 'soundpad')
+            self._plain_ripple(button, 22)
+            button.setContentDescription('Открыть звуки Soundpad')
+            button.setOnClickListener(OnClickListener(self._ui_action('panel_toggle', lambda: self._toggle(camera))))
+            layout.addView(button, LinearLayout.LayoutParams(AU.dp(44), AU.dp(44)))
+            added.append(button)
+            self._buttons[camera] = button
+            root = camera
+            stop = TextView(camera.getContext())
+            stop.setText('Стоп')
+            stop.setTextSize(14.0)
+            stop.setTextColor(self._color('windowBackgroundWhiteBlackText'))
+            stop.setGravity(Gravity.CENTER)
+            self._surface(stop, radius=22, alpha=225, accent=0.25)
+            stop.setContentDescription('Остановить все звуки Soundpad')
+            stop.setOnClickListener(OnClickListener(self._ui_action('camera_stop_sounds', self._stop_all)))
+            root.addView(stop, FrameLayout.LayoutParams(AU.dp(68), AU.dp(44)))
+            added.append(stop)
+            self._stop_buttons[camera] = stop
+            stop.setVisibility(View.GONE)
+
+            def place():
+                if camera not in self._buttons or stop.getParent() is None:
+                    return
+                a, b = (jarray(jint)(2), jarray(jint)(2))
+                layout.getLocationOnScreen(a)
+                root.getLocationOnScreen(b)
+                x = int(a[0] - b[0] + layout.getWidth() + AU.dp(12))
+                y = int(a[1] - b[1] + (layout.getHeight() - AU.dp(44)) / 2)
+                x = min(x, int(root.getWidth()) - AU.dp(76 + 68))
+                stop.setX(float(max(0, x)))
+                stop.setY(float(max(0, y)))
+                self._update_active()
+            run_on_ui_thread(place, 120)
+            run_on_ui_thread(place, 350)
+        except Exception as exc:
+            for view in added:
+                if view.getParent() is not None:
+                    view.getParent().removeView(view)
+            self._buttons.pop(camera, None)
+            self._stop_buttons.pop(camera, None)
+
+
+    def _try_start_library_drag(self, sid, row):
+        if self._touch_drag is not None:
+            return self._touch_drag['sid'] == sid
+        success = bool(self._ui_action('library_drag_start', lambda: self._start_library_drag(sid, row), id=sid[:7])())
+        if not success:
+            self._finish_touch_drag(False)
+        return success
+
+    def _install_touch_drag(self, sid, row, grip, title=None):
+        from java import dynamic_proxy, jclass
+        from android_utils import OnLongClickListener
+        from org.telegram.messenger import AndroidUtilities as AU
+        plugin = self
+
+        class Touch(dynamic_proxy(jclass('android.view.View$OnTouchListener'))):
+
+            def __init__(self, handle):
+                super().__init__()
+                self.handle = handle
+
+            def onTouch(self, view, event):
+                try:
+                    action = int(event.getActionMasked())
+                    raw_y = float(event.getRawY())
+                    if action == 0:
+                        plugin._hold_epoch += 1
+                        epoch = plugin._hold_epoch
+                        plugin._touch_origin = (sid, raw_y)
+                        plugin._touch_pending = dict(sid=sid, row=row, down_y=raw_y, raw_y=raw_y, epoch=epoch)
+                        if self.handle:
+                            plugin._library_scroller.requestDisallowInterceptTouchEvent(True)
+                            plugin._try_start_library_drag(sid, row)
+                            return True
+
+                        def hold():
+                            pending = plugin._touch_pending
+                            if not plugin._alive or plugin._library_builder is None or pending is None or (pending['epoch'] != epoch) or (plugin._hold_epoch != epoch):
+                                return
+                            plugin._try_start_library_drag(sid, row)
+                        run_on_ui_thread(hold, 350)
+                        return False
+                    if action == 2:
+                        if plugin._touch_drag is not None:
+                            plugin._touch_drag['raw_y'] = raw_y
+                            plugin._move_touch_drag()
+                            return True
+                        pending = plugin._touch_pending
+                        if pending is not None and pending['sid'] == sid:
+                            pending['raw_y'] = raw_y
+                            if abs(raw_y - pending['down_y']) > AU.dp(8):
+                                plugin._hold_epoch += 1
+                                plugin._touch_pending = None
+                        return self.handle
+                    if action in (1, 3):
+                        was_drag = plugin._touch_drag is not None
+                        plugin._hold_epoch += 1
+                        plugin._touch_pending = None
+                        if was_drag:
+                            plugin._finish_touch_drag(action == 1)
+                        else:
+                            plugin._touch_origin = None
+                            plugin._library_scroller.requestDisallowInterceptTouchEvent(False)
+                        return was_drag or self.handle
+                    return self.handle or plugin._touch_drag is not None
+                except Exception as exc:
+                    plugin._touch_pending = None
+                    plugin._hold_epoch += 1
+                    plugin._finish_touch_drag(False)
+                    return True
+        zones = [(row, False), (grip, True)]
+        if title is not None:
+            zones.append((title, False))
+        for view, handle in zones:
+            listener = Touch(handle)
+            self._library_drag_refs.append(listener)
+            view.setClickable(True)
+            view.setOnTouchListener(listener)
+            view.setOnLongClickListener(OnLongClickListener(lambda v, k=sid, r=row: bool(self._try_start_library_drag(k, r))))
+
