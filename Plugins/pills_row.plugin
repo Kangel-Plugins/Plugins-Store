@@ -1,0 +1,779 @@
+import math
+from typing import Iterable, Optional
+
+from android.graphics import PorterDuff
+from android.util import TypedValue
+from android.view import Gravity, HapticFeedbackConstants, MotionEvent, View, ViewConfiguration, ViewGroup
+from android.view.animation import DecelerateInterpolator, OvershootInterpolator
+from android.widget import FrameLayout, HorizontalScrollView, ImageView, LinearLayout, TextView
+from java.lang import System
+from java.util import Collections, WeakHashMap
+
+from android_utils import OnClickListener, OnLongClickListener, R, run_on_ui_thread
+from base_plugin import BasePlugin
+from hook_utils import find_class, get_private_field
+from ui.settings import Selector, Switch
+
+__id__ = "pills_row"
+__name__ = "Search Pills"
+__description__ = "Lays the search bar pills out in one smooth scrollable row with faded edges, adds a search pill, and can collapse them into a single pill that unfolds on swipe. Works on exteraGram and exteraless"
+__author__ = "@huecoder"
+__version__ = "1.4.1"
+__icon__ = "pillsrow_by_W1fmaSnc23f0akxcmbot/0"
+__permissions__ = ["ui", "hooks"]
+
+PILL_STACK_VIEW_CLASSES = (
+    "app.exteraless.pillstack.PillStackView",
+    "com.exteragram.messenger.pillstack.ui.PillStackLayout",
+)
+PILL_REGISTRY_CLASS = "app.exteraless.pillstack.PillRegistry"
+LEGACY_SEARCH_PILL_ID = 7301
+SEARCH_TEXT_WATCHER_CLASS = "org.telegram.messenger.utils.SearchTextWatcher"
+PILL_EVENTS_CLASSES = (
+    "app.exteraless.pillstack.PillStackEvents",
+    "com.exteragram.messenger.pillstack.core.PillStackEvents",
+)
+SEARCH_FIELD_CLASS = "org.telegram.ui.Components.FragmentSearchField"
+HORIZONTAL_SCROLL_VIEW_CLASS = "android.widget.HorizontalScrollView"
+TEXT_VIEW_CLASS = "android.widget.TextView"
+ANDROID_UTILITIES_CLASS = "org.telegram.messenger.AndroidUtilities"
+THEME_CLASS = "org.telegram.ui.ActionBar.Theme"
+LOCALE_CONTROLLER_CLASS = "org.telegram.messenger.LocaleController"
+DRAWABLE_RESOURCES_CLASS = "org.telegram.messenger.R$drawable"
+STRING_RESOURCES_CLASS = "org.telegram.messenger.R$string"
+
+SEARCH_ICON_FIELD = "searchIcon"
+SEARCH_EDIT_TEXT_FIELD = "editText"
+SEARCH_ICON_RESOURCE = "outline_search_1_24"
+SEARCH_STRING_RESOURCE = "Search"
+
+SETTING_MODE = "mode"
+SETTING_SEARCH_PILL = "search_pill"
+MODE_ROW = 0
+MODE_COLLAPSIBLE = 1
+DEFAULT_MODE = MODE_COLLAPSIBLE
+
+SCROLLER_TAG = "pills_row_scroller"
+SEARCH_PILL_TAG = "pills_row_search_pill"
+SCROLLER_INDEX_IN_SEARCH_FIELD = 1
+
+MATCH_PARENT = -1
+WRAP_CONTENT = -2
+TRANSPARENT = 0
+MAX_ROW_WIDTH_PX = 1 << 20
+
+EDGE_FADE_DP = 28
+ROW_SIDE_PADDING_DP = 6
+PILL_SPACING_DP = 6
+
+SEARCH_PILL_HEIGHT_DP = 28
+SEARCH_PILL_PADDING_DP = 10
+SEARCH_PILL_ICON_SIZE_DP = 16
+SEARCH_PILL_ICON_GAP_DP = 4
+SEARCH_PILL_TEXT_SIZE_DP = 13
+SEARCH_PILL_CORNER_RADIUS_DP = 14
+SEARCH_PILL_TEXT_ALPHA = 0.75
+SEARCH_PILL_LIGHT_FILL_ALPHA = 0.09
+SEARCH_PILL_RIPPLE_ALPHA = 0.1
+
+DRAG_LIMIT_DP = 120
+COMMIT_FRACTION = 0.6
+COLLAPSE_DURATION_MS = 220
+SPRING_BACK_DURATION_MS = 320
+SPRING_BACK_TENSION = 2.0
+EXPAND_DURATION_MS = 360
+EXPAND_DECELERATION = 2.5
+ROW_ENTER_OFFSET_FRACTION = 0.45
+ROW_FADE_DURATION_MS = 160
+
+
+def dp(value: int) -> int:
+    return int(find_class(ANDROID_UTILITIES_CLASS).dp(float(value)))
+
+
+def resisted_offset(distance: float) -> float:
+    limit = dp(DRAG_LIMIT_DP)
+    return limit * (1.0 - math.exp(-distance / limit))
+
+
+def is_committed(distance: float) -> bool:
+    return resisted_offset(distance) >= dp(DRAG_LIMIT_DP) * COMMIT_FRACTION
+
+
+class GestureState:
+    __slots__ = (
+        "expanded", "hint_hidden", "pills_hidden", "dragging", "pulling", "crossed", "start_x", "start_y", "stack", "pill_snapshots", "search_expanded"
+    )
+
+    def __init__(self):
+        self.search_expanded = False
+        self.stack = None
+        self.pill_snapshots = {}
+        self.expanded = False
+        self.hint_hidden = False
+        self.pills_hidden = False
+        self.dragging = False
+        self.pulling = False
+        self.crossed = False
+        self.start_x = None
+        self.start_y = None
+
+
+def find_scroller(search_field) -> Optional[object]:
+    for index in range(search_field.getChildCount()):
+        child = search_field.getChildAt(index)
+        if child.getTag() == SCROLLER_TAG:
+            return child
+    return None
+
+
+def find_search_field(view) -> Optional[object]:
+    parent = view.getParent()
+    while parent is not None and getattr(parent, SEARCH_EDIT_TEXT_FIELD, None) is None:
+        parent = parent.getParent()
+    return parent
+
+
+def open_search(edit_text) -> None:
+    edit_text.requestFocus()
+    find_class(ANDROID_UTILITIES_CLASS).showKeyboard(edit_text)
+
+
+def search_label() -> str:
+    return find_class(LOCALE_CONTROLLER_CLASS).getString(getattr(find_class(STRING_RESOURCES_CLASS), SEARCH_STRING_RESOURCE))
+
+
+def apply_search_pill_colors(pill) -> None:
+    theme = find_class(THEME_CLASS)
+    color = theme.multAlpha(theme.getColor(theme.key_windowBackgroundWhiteBlackText), float(SEARCH_PILL_TEXT_ALPHA))
+    fill = (
+        theme.getColor(theme.key_windowBackgroundWhite)
+        if theme.isCurrentThemeDark()
+        else theme.multAlpha(color, float(SEARCH_PILL_LIGHT_FILL_ALPHA))
+    )
+    pill.setBackground(
+        theme.createSimpleSelectorRoundRectDrawable(dp(SEARCH_PILL_CORNER_RADIUS_DP), fill, theme.multAlpha(color, float(SEARCH_PILL_RIPPLE_ALPHA)))
+    )
+    pill.getChildAt(0).setColorFilter(color, PorterDuff.Mode.SRC_IN)
+    pill.getChildAt(1).setTextColor(color)
+
+
+def create_search_pill(search_field) -> object:
+    context = search_field.getContext()
+    pill = LinearLayout(context)
+    pill.setTag(SEARCH_PILL_TAG)
+    pill.setOrientation(LinearLayout.HORIZONTAL)
+    pill.setGravity(Gravity.CENTER)
+    pill.setPadding(dp(SEARCH_PILL_PADDING_DP), 0, dp(SEARCH_PILL_PADDING_DP), 0)
+
+    icon = ImageView(context)
+    icon.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+    icon.setImageResource(getattr(find_class(DRAWABLE_RESOURCES_CLASS), SEARCH_ICON_RESOURCE))
+    icon_params = LinearLayout.LayoutParams(dp(SEARCH_PILL_ICON_SIZE_DP), dp(SEARCH_PILL_ICON_SIZE_DP))
+    icon_params.setMargins(0, 0, dp(SEARCH_PILL_ICON_GAP_DP), 0)
+    pill.addView(icon, icon_params)
+
+    label = TextView(context)
+    label.setTextSize(TypedValue.COMPLEX_UNIT_PX, float(dp(SEARCH_PILL_TEXT_SIZE_DP)))
+    label.setTypeface(find_class(ANDROID_UTILITIES_CLASS).bold())
+    label.setIncludeFontPadding(False)
+    label.setSingleLine(True)
+    label.setText(search_label())
+    pill.addView(label, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+
+    apply_search_pill_colors(pill)
+    pill.setOnClickListener(OnClickListener(lambda view: open_search(find_search_field(view).editText)))
+    return pill
+
+
+def refresh_search_pill_colors(search_field) -> None:
+    scroller = find_scroller(search_field)
+    if scroller is None:
+        return
+    row = scroller.getChildAt(0)
+    for index in range(row.getChildCount()):
+        child = row.getChildAt(index)
+        if child.getTag() == SEARCH_PILL_TAG:
+            apply_search_pill_colors(child)
+
+
+def create_scroller(search_field) -> object:
+    context = search_field.getContext()
+    scroller = HorizontalScrollView(context)
+    scroller.setTag(SCROLLER_TAG)
+    scroller.setHorizontalScrollBarEnabled(False)
+    scroller.setOverScrollMode(View.OVER_SCROLL_NEVER)
+    scroller.setFillViewport(True)
+    scroller.setHorizontalFadingEdgeEnabled(True)
+    scroller.setFadingEdgeLength(dp(EDGE_FADE_DP))
+    scroller.setOnClickListener(OnClickListener(lambda view: open_search(view.getParent().editText)))
+
+    row = LinearLayout(context)
+    row.setOrientation(LinearLayout.HORIZONTAL)
+    row.setGravity(Gravity.CENTER_VERTICAL)
+    row.setPadding(dp(ROW_SIDE_PADDING_DP), 0, dp(ROW_SIDE_PADDING_DP), 0)
+    scroller.addView(row, FrameLayout.LayoutParams(WRAP_CONTENT, MATCH_PARENT))
+    return scroller
+
+
+def create_pill_params(height: int = WRAP_CONTENT) -> object:
+    params = LinearLayout.LayoutParams(WRAP_CONTENT, height)
+    params.setMargins(0, 0, dp(PILL_SPACING_DP), 0)
+    return params
+
+
+def prepare_pill(pill, on_click, on_long_click) -> None:
+    pill.setVisibility(View.VISIBLE)
+    pill.setAlpha(1.0)
+    pill.setScaleX(1.0)
+    pill.setScaleY(1.0)
+    pill.setTranslationY(0.0)
+    pill.setOnClickListener(on_click)
+    pill.setOnLongClickListener(on_long_click)
+
+
+def snapshot_pill(pill) -> tuple:
+    return (
+        pill.getVisibility(),
+        pill.getAlpha(),
+        pill.getScaleX(),
+        pill.getScaleY(),
+        pill.getTranslationY(),
+        pill.getLayoutParams(),
+    )
+
+
+def move_pills_into_row(stack, row, on_click, on_long_click) -> dict:
+    pills = [stack.getChildAt(index) for index in range(stack.getChildCount())]
+    row.removeAllViews()
+    snapshots = {}
+    for pill in pills:
+        snapshots[System.identityHashCode(pill)] = snapshot_pill(pill)
+        stack.removeView(pill)
+        prepare_pill(pill, on_click, on_long_click)
+        row.addView(pill, create_pill_params())
+    return snapshots
+
+
+def move_pills_back(row, stack, snapshots: dict) -> None:
+    pills = [row.getChildAt(index) for index in range(row.getChildCount())]
+    for pill in pills:
+        snapshot = snapshots.get(System.identityHashCode(pill))
+        if snapshot is None:
+            continue
+        visibility, alpha, scale_x, scale_y, translation_y, params = snapshot
+        row.removeView(pill)
+        pill.setOnLongClickListener(None)
+        pill.setVisibility(visibility)
+        pill.setAlpha(alpha)
+        pill.setScaleX(scale_x)
+        pill.setScaleY(scale_y)
+        pill.setTranslationY(translation_y)
+        stack.addView(pill, params)
+
+
+def reset_stack_appearance(stack) -> None:
+    stack.setTranslationX(0.0)
+    stack.setVisibility(View.VISIBLE)
+    stack.setAlpha(1.0)
+    stack.setScaleX(1.0)
+    stack.setScaleY(1.0)
+
+
+def measure_row_with_natural_width(scroller, row, parent_height_spec) -> None:
+    width_spec = View.MeasureSpec.makeMeasureSpec(MAX_ROW_WIDTH_PX, View.MeasureSpec.AT_MOST)
+    vertical_padding = scroller.getPaddingTop() + scroller.getPaddingBottom()
+    height_spec = ViewGroup.getChildMeasureSpec(parent_height_spec, vertical_padding, row.getLayoutParams().height)
+    row.measure(width_spec, height_spec)
+
+
+def hide_search_hint(search_field) -> None:
+    icon = get_private_field(search_field, SEARCH_ICON_FIELD)
+    if icon is not None:
+        icon.setImageDrawable(None)
+    search_field.editText.setHintTextColor(TRANSPARENT)
+
+
+def show_search_hint(search_field) -> None:
+    icon = get_private_field(search_field, SEARCH_ICON_FIELD)
+    if icon is not None:
+        icon.setImageResource(getattr(find_class(DRAWABLE_RESOURCES_CLASS), SEARCH_ICON_RESOURCE))
+    search_field.updateColors()
+
+
+def restore_search_field(search_field) -> None:
+    scroller = find_scroller(search_field)
+    if scroller is not None:
+        search_field.removeView(scroller)
+    show_search_hint(search_field)
+
+
+def fade_out(view, on_end) -> None:
+    view.animate().alpha(0.0).translationX(0.0).setDuration(ROW_FADE_DURATION_MS).withEndAction(R(on_end)).start()
+
+
+def fade_in(view) -> None:
+    view.setVisibility(View.VISIBLE)
+    view.animate().alpha(1.0).translationX(0.0).setDuration(ROW_FADE_DURATION_MS).start()
+
+
+def animate_row_in(scroller, search_field) -> None:
+    scroller.setAlpha(0.0)
+    scroller.setTranslationX(search_field.getWidth() * ROW_ENTER_OFFSET_FRACTION)
+    scroller.animate().alpha(1.0).translationX(0.0).setDuration(EXPAND_DURATION_MS).setInterpolator(
+        DecelerateInterpolator(EXPAND_DECELERATION)
+    ).start()
+
+
+def animate_row_out(scroller, search_field, on_end) -> None:
+    scroller.animate().alpha(0.0).translationX(search_field.getWidth() * ROW_ENTER_OFFSET_FRACTION).setDuration(
+        COLLAPSE_DURATION_MS
+    ).setInterpolator(DecelerateInterpolator(EXPAND_DECELERATION)).start()
+    run_on_ui_thread(on_end, COLLAPSE_DURATION_MS)
+
+
+def spring_back(view) -> None:
+    view.animate().translationX(0.0).setDuration(SPRING_BACK_DURATION_MS).setInterpolator(
+        OvershootInterpolator(SPRING_BACK_TENSION)
+    ).start()
+
+
+def unregister_legacy_search_pill() -> None:
+    registry = find_class(PILL_REGISTRY_CLASS)
+    if registry is not None and registry.isRegistered(LEGACY_SEARCH_PILL_ID):
+        registry.unregister(LEGACY_SEARCH_PILL_ID)
+
+
+def rebuild_pill_stacks(search_fields: Iterable[object]) -> None:
+    for class_name in PILL_EVENTS_CLASSES:
+        events = find_class(class_name)
+        if events is not None and hasattr(events, "notifyLayoutChanged"):
+            events.notifyLayoutChanged()
+            return
+    for search_field in search_fields:
+        search_field.updatePillStack(False)
+
+
+class PillsRowPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._active = False
+        self._search_fields = Collections.newSetFromMap(WeakHashMap())
+        self._states = {}
+        self._on_pill_click = OnClickListener(lambda pill: pill.onPillClicked())
+        self._on_pill_long_click = OnLongClickListener(lambda pill: bool(pill.onPillLongClicked()))
+        self._on_collapsed_pill_click = OnClickListener(lambda pill: self._expand_from_pill(pill))
+
+    def on_plugin_load(self):
+        self._active = True
+        self._try_hook(PILL_STACK_VIEW_CLASSES, "addPill", after=self._after_pill_added)
+        self._try_hook(PILL_STACK_VIEW_CLASSES, "clearPills", after=self._after_pills_cleared)
+        self._try_hook(PILL_STACK_VIEW_CLASSES, "onInterceptTouchEvent", before=self._before_stack_intercept)
+        self._try_hook(PILL_STACK_VIEW_CLASSES, "onTouchEvent", before=self._before_stack_touch)
+        self._try_hook((SEARCH_FIELD_CLASS,), "updateColors", after=self._after_colors_update)
+        self._try_hook((SEARCH_FIELD_CLASS,), "checkCloseButtonVisible", after=self._after_text_changed)
+        self._try_hook((TEXT_VIEW_CLASS,), "onFocusChanged", after=self._after_focus_changed)
+        self._try_hook(PILL_STACK_VIEW_CLASSES, "setVisibilityFactor", after=self._after_visibility_change)
+        self._try_hook((SEARCH_TEXT_WATCHER_CLASS,), "toggleSearch", after=self._after_search_toggled)
+        self._try_hook((HORIZONTAL_SCROLL_VIEW_CLASS,), "measureChildWithMargins", before=self._before_scroller_measure)
+        self._try_hook((HORIZONTAL_SCROLL_VIEW_CLASS,), "onTouchEvent", before=self._before_scroller_touch)
+        run_on_ui_thread(self._purge_legacy_and_rebuild)
+
+    def on_plugin_unload(self):
+        self._active = False
+        run_on_ui_thread(self._restore_all)
+
+    def create_settings(self):
+        return [
+            Selector(
+                key=SETTING_MODE,
+                text="Layout",
+                default=DEFAULT_MODE,
+                items=["Row", "Collapsed"],
+                subtext="Collapsed: one pill, swipe left or tap to unfold the row",
+                on_change=self._on_setting_changed,
+            ),
+            Switch(
+                key=SETTING_SEARCH_PILL,
+                text="Search pill",
+                default=True,
+                on_change=self._on_setting_changed,
+            ),
+        ]
+
+    def _try_hook(self, class_names, method_name, before=None, after=None) -> None:
+        last_error = None
+        for class_name in class_names:
+            try:
+                if self.hook_method((class_name, method_name), before=before, after=after) is not None:
+                    return
+            except Exception as error:
+                last_error = error
+        self.log_exception(f"pills_row: hook {method_name} unavailable", last_error)
+
+    def _on_setting_changed(self, *_) -> None:
+        run_on_ui_thread(self._rebuild_all)
+
+    def _purge_legacy_and_rebuild(self) -> None:
+        try:
+            unregister_legacy_search_pill()
+        except Exception as error:
+            self.log_exception("pills_row: legacy search pill cleanup failed", error)
+        self._rebuild_all()
+
+    def _tracked_search_fields(self) -> list:
+        return list(self._search_fields.toArray())
+
+    def _rebuild_all(self) -> None:
+        try:
+            rebuild_pill_stacks(self._tracked_search_fields())
+        except Exception as error:
+            self.log_exception("pills_row: rebuild failed", error)
+
+    def _is_collapsible(self) -> bool:
+        return int(self.get_setting(SETTING_MODE, DEFAULT_MODE)) == MODE_COLLAPSIBLE
+
+    def _state(self, search_field) -> GestureState:
+        return self._states.setdefault(System.identityHashCode(search_field), GestureState())
+
+    def _is_row_layout(self, search_field) -> bool:
+        return not self._is_collapsible() or self._state(search_field).expanded
+
+    def _collapsed_state(self, stack) -> Optional[GestureState]:
+        search_field = stack.getParent()
+        if search_field is None or not self._is_collapsible() or find_scroller(search_field) is not None:
+            return None
+        state = self._state(search_field)
+        return None if state.expanded else state
+
+    def _restore_all(self) -> None:
+        search_fields = self._tracked_search_fields()
+        for search_field in search_fields:
+            try:
+                restore_search_field(search_field)
+                stack = self._state(search_field).stack
+                if stack is not None:
+                    reset_stack_appearance(stack)
+            except Exception as error:
+                self.log_exception("pills_row: restore failed", error)
+        self._states.clear()
+        try:
+            rebuild_pill_stacks(search_fields)
+        except Exception as error:
+            self.log_exception("pills_row: rebuild after restore failed", error)
+        self._search_fields.clear()
+
+    def _show_search(self, search_field) -> None:
+        state = self._state(search_field)
+        if state.hint_hidden or find_scroller(search_field) is not None:
+            restore_search_field(search_field)
+            state.hint_hidden = False
+
+    def _hide_search(self, search_field) -> None:
+        hide_search_hint(search_field)
+        self._state(search_field).hint_hidden = True
+
+    def _schedule_layout(self, stack, search_field) -> None:
+        stack.post(R(lambda: self._layout_stack(stack, search_field)))
+
+    def _layout_stack(self, stack, search_field) -> None:
+        if not self._active:
+            return
+        try:
+            if not self._search_fields.contains(search_field):
+                self._search_fields.add(search_field)
+                restore_search_field(search_field)
+                self._state(search_field).hint_hidden = False
+            self._state(search_field).stack = stack
+            if stack.getChildCount() == 0:
+                scroller = find_scroller(search_field)
+                if scroller is not None and scroller.getChildAt(0).getChildCount() == 0:
+                    self._show_search(search_field)
+            elif self._is_row_layout(search_field):
+                self._build_row(search_field, stack)
+            else:
+                self._build_collapsed(search_field, stack)
+        except Exception as error:
+            self.log_exception("pills_row: layout failed", error)
+
+    def _build_row(self, search_field, stack) -> None:
+        state = self._state(search_field)
+        scroller = find_scroller(search_field)
+        if scroller is None:
+            scroller = create_scroller(search_field)
+            search_field.addView(scroller, SCROLLER_INDEX_IN_SEARCH_FIELD, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            state.pills_hidden = False
+        row = scroller.getChildAt(0)
+        state.pill_snapshots = move_pills_into_row(stack, row, self._on_pill_click, self._on_pill_long_click)
+        if self.get_setting(SETTING_SEARCH_PILL, True):
+            row.addView(create_search_pill(search_field), 0, create_pill_params(dp(SEARCH_PILL_HEIGHT_DP)))
+        if not state.pills_hidden:
+            self._hide_search(search_field)
+        self._apply_pills_visibility(search_field)
+
+    def _build_collapsed(self, search_field, stack) -> None:
+        self._show_search(search_field)
+        for index in range(stack.getChildCount()):
+            stack.getChildAt(index).setOnClickListener(self._on_collapsed_pill_click)
+        if not self._state(search_field).pills_hidden:
+            reset_stack_appearance(stack)
+        self._apply_pills_visibility(search_field)
+
+    def _pills_view(self, search_field) -> Optional[object]:
+        scroller = find_scroller(search_field)
+        return scroller if scroller is not None else self._state(search_field).stack
+
+    def _is_search_active(self, search_field) -> bool:
+        edit_text = search_field.editText
+        return bool(edit_text.hasFocus()) or edit_text.length() > 0 or self._state(search_field).search_expanded
+
+    def _apply_pills_visibility(self, search_field) -> None:
+        state = self._state(search_field)
+        view = self._pills_view(search_field)
+        hidden = self._is_search_active(search_field)
+        if view is None or hidden == state.pills_hidden:
+            return
+        state.pills_hidden = hidden
+        is_row = find_scroller(search_field) is not None
+        if hidden:
+            if is_row:
+                show_search_hint(search_field)
+            fade_out(view, lambda: self._finish_pills_fade(search_field))
+        else:
+            if is_row:
+                self._hide_search(search_field)
+            fade_in(view)
+
+    def _finish_pills_fade(self, search_field) -> None:
+        view = self._pills_view(search_field)
+        if view is not None and self._state(search_field).pills_hidden:
+            view.setVisibility(View.GONE)
+
+    def _expand(self, stack) -> None:
+        search_field = stack.getParent()
+        self._state(search_field).expanded = True
+        stack.setTranslationX(0.0)
+        self._build_row(search_field, stack)
+        animate_row_in(find_scroller(search_field), search_field)
+
+    def _expand_from_pill(self, pill) -> None:
+        try:
+            self._expand(pill.getParent())
+        except Exception as error:
+            self.log_exception("pills_row: expand failed", error)
+
+    def _collapse(self, search_field) -> None:
+        try:
+            state = self._state(search_field)
+            state.expanded = False
+            stack = state.stack
+            scroller = find_scroller(search_field)
+            if scroller is not None and stack is not None and stack.getParent() is not None:
+                move_pills_back(scroller.getChildAt(0), stack, state.pill_snapshots)
+                reset_stack_appearance(stack)
+            self._show_search(search_field)
+            if stack is not None and stack.getChildCount() > 0:
+                self._build_collapsed(search_field, stack)
+            else:
+                self._rebuild_all()
+        except Exception as error:
+            self.log_exception("pills_row: collapse failed", error)
+
+    def _after_pill_added(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            stack = param.thisObject
+            search_field = stack.getParent()
+            if search_field is not None and getattr(search_field, SEARCH_EDIT_TEXT_FIELD, None) is not None:
+                self._schedule_layout(stack, search_field)
+        except Exception as error:
+            self.log_exception("pills_row: pill added hook failed", error)
+
+    def _after_pills_cleared(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            stack = param.thisObject
+            search_field = stack.getParent()
+            if search_field is None or getattr(search_field, SEARCH_EDIT_TEXT_FIELD, None) is None:
+                return
+            scroller = find_scroller(search_field)
+            if scroller is not None:
+                scroller.getChildAt(0).removeAllViews()
+            self._schedule_layout(stack, search_field)
+        except Exception as error:
+            self.log_exception("pills_row: pills cleared hook failed", error)
+
+    def _before_scroller_touch(self, param) -> None:
+        if not self._active:
+            return
+        scroller = param.thisObject
+        if scroller.getTag() != SCROLLER_TAG or not self._is_collapsible():
+            return
+        try:
+            search_field = scroller.getParent()
+            state = self._state(search_field)
+            event = param.args[0]
+            action = event.getActionMasked()
+            position = event.getRawX()
+            if not state.pulling and (action == MotionEvent.ACTION_DOWN or state.start_x is None or scroller.getScrollX() > 0):
+                state.start_x = position
+            distance = max(0.0, position - state.start_x)
+            committed = is_committed(distance)
+            if action == MotionEvent.ACTION_MOVE:
+                slop = ViewConfiguration.get(scroller.getContext()).getScaledTouchSlop()
+                if not state.pulling and distance <= slop:
+                    return
+                if not state.pulling:
+                    state.pulling = True
+                    state.crossed = False
+                    search_field.requestDisallowInterceptTouchEvent(True)
+                    scroller.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                scroller.setTranslationX(resisted_offset(distance))
+                if committed != state.crossed:
+                    state.crossed = committed
+                    scroller.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                param.setResult(True)
+            elif action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                was_pulling = state.pulling
+                state.pulling = False
+                state.crossed = False
+                state.start_x = None
+                if not was_pulling:
+                    return
+                if committed and action == MotionEvent.ACTION_UP:
+                    animate_row_out(scroller, search_field, lambda: self._collapse(search_field))
+                else:
+                    spring_back(scroller)
+                param.setResult(True)
+        except Exception as error:
+            self.log_exception("pills_row: collapse gesture failed", error)
+
+    def _before_stack_intercept(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            stack = param.thisObject
+            state = self._collapsed_state(stack)
+            if state is None:
+                return
+            event = param.args[0]
+            action = event.getActionMasked()
+            if action == MotionEvent.ACTION_DOWN:
+                state.start_x = event.getRawX()
+                state.start_y = event.getRawY()
+                state.dragging = False
+            elif action == MotionEvent.ACTION_MOVE and state.start_x is not None:
+                leftward = state.start_x - event.getRawX()
+                vertical = abs(event.getRawY() - state.start_y)
+                slop = ViewConfiguration.get(stack.getContext()).getScaledTouchSlop()
+                if not state.dragging and leftward > slop and leftward > vertical:
+                    state.dragging = True
+                    state.crossed = False
+                    stack.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    stack.getParent().requestDisallowInterceptTouchEvent(True)
+                if state.dragging:
+                    param.setResult(True)
+        except Exception as error:
+            self.log_exception("pills_row: intercept failed", error)
+
+    def _before_stack_touch(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            stack = param.thisObject
+            state = self._collapsed_state(stack)
+            if state is None or not state.dragging:
+                return
+            event = param.args[0]
+            action = event.getActionMasked()
+            distance = max(0.0, state.start_x - event.getRawX())
+            committed = is_committed(distance)
+            if action == MotionEvent.ACTION_MOVE:
+                stack.setTranslationX(-resisted_offset(distance))
+                if committed != state.crossed:
+                    state.crossed = committed
+                    stack.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            elif action == MotionEvent.ACTION_UP:
+                state.dragging = False
+                if committed:
+                    self._expand(stack)
+                else:
+                    spring_back(stack)
+            elif action == MotionEvent.ACTION_CANCEL:
+                state.dragging = False
+                spring_back(stack)
+            param.setResult(True)
+        except Exception as error:
+            self.log_exception("pills_row: drag failed", error)
+
+    def _before_scroller_measure(self, param) -> None:
+        if not self._active:
+            return
+        scroller = param.thisObject
+        if scroller.getTag() != SCROLLER_TAG:
+            return
+        try:
+            row, _, _, parent_height_spec, _ = param.args
+            measure_row_with_natural_width(scroller, row, parent_height_spec)
+            param.setResult(None)
+        except Exception as error:
+            self.log_exception("pills_row: row measure failed", error)
+
+    def _after_colors_update(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            search_field = param.thisObject
+            refresh_search_pill_colors(search_field)
+            if self._is_row_layout(search_field) and find_scroller(search_field) is not None and not self._state(search_field).pills_hidden:
+                self._hide_search(search_field)
+        except Exception as error:
+            self.log_exception("pills_row: colors update failed", error)
+
+    def _after_text_changed(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            self._apply_pills_visibility(param.thisObject)
+        except Exception as error:
+            self.log_exception("pills_row: text visibility failed", error)
+
+    def _after_focus_changed(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            view = param.thisObject
+            search_field = view.getParent()
+            if search_field is not None and getattr(search_field, SEARCH_EDIT_TEXT_FIELD, None) is view:
+                self._apply_pills_visibility(search_field)
+        except Exception as error:
+            self.log_exception("pills_row: focus visibility failed", error)
+
+    def _after_search_toggled(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            watcher = param.thisObject
+            edit_text = get_private_field(watcher, SEARCH_EDIT_TEXT_FIELD)
+            search_field = None if edit_text is None else edit_text.getParent()
+            if search_field is None or getattr(search_field, SEARCH_EDIT_TEXT_FIELD, None) != edit_text:
+                return
+            self._state(search_field).search_expanded = bool(watcher.isSearchExpanded())
+            self._apply_pills_visibility(search_field)
+        except Exception as error:
+            self.log_exception("pills_row: search toggle failed", error)
+
+    def _after_visibility_change(self, param) -> None:
+        if not self._active:
+            return
+        try:
+            stack = param.thisObject
+            search_field = stack.getParent()
+            if search_field is None or getattr(search_field, SEARCH_EDIT_TEXT_FIELD, None) is None:
+                return
+            if self._state(search_field).pills_hidden:
+                stack.setVisibility(View.GONE)
+        except Exception as error:
+            self.log_exception("pills_row: stack visibility failed", error)
