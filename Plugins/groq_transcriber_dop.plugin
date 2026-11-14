@@ -1,0 +1,571 @@
+# groq_transcriber_dop.py — Groq Whisper для exteraGram (без LLM)
+# Тяжёлые задачи — в отдельном потоке, чтобы не блокировать очередь плагинов.
+
+import os
+import random
+import re
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, List
+
+import requests
+
+from java.chaquopy import dynamic_proxy
+from java.lang import String as JavaString
+from java.util import ArrayList, HashMap, Objects
+
+from android.content import Intent
+from android.net import Uri
+
+from hook_utils import find_class, get_private_field, set_private_field
+from base_plugin import (
+    BasePlugin, MethodHook, MethodReplacement, MenuItemData, MenuItemType,
+)
+from android_utils import run_on_ui_thread
+from client_utils import (
+    RequestCallback, get_last_fragment, get_messages_controller,
+    get_notification_center, send_request,
+)
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Selector, Switch, Text
+
+from org.telegram.messenger import FileLoader, MessageObject, NotificationCenter, UserConfig
+from org.telegram.tgnet import TLRPC
+
+__id__ = "groq_transcriber_dop"
+__name__ = "Groq Transcriber 2"
+__description__ = "Расшифровка голосовых и кружков через Groq Whisper: кнопка под сообщением + авто-цитата для своих ГС/кружков."
+__author__ = "@n0white (Fork) | rebild by @Dkaq1"
+__version__ = "2.1"
+__icon__ = "aisdhjaiosdhoiuashd/0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.5.0"
+__category__ = ["media", "integrations"]
+
+GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+WHISPER_MODELS = ["whisper-large-v3", "whisper-large-v3-turbo"]
+LANGUAGES = [
+    ("Русский", "ru"), ("Авто", "auto"), ("English", "en"), ("Deutsch", "de"),
+    ("Français", "fr"), ("Español", "es"), ("Polski", "pl"),
+]
+CHUNK = 3900
+MAX_FILE_BYTES = 100 * 1024 * 1024
+
+
+def _fit_bytes(s: str, limit: int = 896) -> str:
+    b = s.encode("utf-8")
+    return s if len(b) <= limit else b[:limit].decode("utf-8", errors="ignore")
+
+
+class _AutoObserver(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def didReceivedNotification(self, id, account, args):
+        try:
+            if id == NotificationCenter.didReceiveNewMessages:
+                self.plugin._on_new_messages(int(account), args)
+        except Exception:
+            self.plugin.logger.exception("auto observer error")
+
+
+class GroqTranscriberPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._lock = threading.RLock()
+        self._cache = OrderedDict()
+        self._seen = OrderedDict()
+        self._observers = {}
+
+        TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
+        ChatMessageCell = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        if TranscribeButton is not None and ChatMessageCell is not None:
+            self.hook_method(
+                TranscribeButton.getClass().getDeclaredMethod("onTap"),
+                CreateTranscribeButtonHook(self))
+            self.hook_method(
+                ChatMessageCell.getClass().getDeclaredMethod("updateWaveform"),
+                CreateUpdateWaveformHook())
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Расшифровать аудио в чат",
+            icon="msg_reply",
+            priority=11,
+            condition="message != null && (message.isVoice() || message.isRoundVideo())",
+            on_click=self._on_quote_click,
+        ))
+
+        def register():
+            for acc in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+                try:
+                    d = _AutoObserver(self)
+                    get_notification_center(acc).addObserver(d, NotificationCenter.didReceiveNewMessages)
+                    self._observers[acc] = d
+                except Exception:
+                    self.logger.exception("observer register failed")
+        run_on_ui_thread(register)
+
+    def on_plugin_unload(self):
+        observers = dict(self._observers)
+
+        def unregister():
+            for acc, d in observers.items():
+                try:
+                    get_notification_center(acc).removeObserver(d, NotificationCenter.didReceiveNewMessages)
+                except Exception:
+                    pass
+        run_on_ui_thread(unregister)
+        with self._lock:
+            self._cache.clear()
+            self._seen.clear()
+            self._observers.clear()
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Groq API"),
+            Input(key="groq_token", text="API-токен", default=""),
+            Text(text="console.groq.com", icon="msg_openin", accent=True, on_click=self._open_groq_url),
+            Header(text="Распознавание"),
+            Selector(key="model_idx", text="Модель", default=0, items=WHISPER_MODELS),
+            Selector(key="language_idx", text="Язык", default=0, items=[l for l, _ in LANGUAGES]),
+            Header(text="Цитата"),
+            Switch(key="reply_to_original", text="Отправлять ответом на сообщение", default=False),
+            Switch(key="auto_quote_out", text="Авто-цитата для моих ГС и кружков", default=False),
+            Input(key="auto_max_sec", text="Макс. длительность авто-цитаты в секундах", default="300"),
+        ]
+
+    # фоновый поток вместо общей очереди плагинов (не блокирует движок)
+    def _run_bg(self, fn):
+        def safe():
+            try:
+                fn()
+            except Exception:
+                self.logger.exception("bg task failed")
+        threading.Thread(target=safe, daemon=True).start()
+
+    def _open_groq_url(self, view):
+        try:
+            frag = get_last_fragment()
+            if frag and frag.getParentActivity():
+                frag.getParentActivity().startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse("https://console.groq.com")))
+        except Exception:
+            self.logger.exception("open url failed")
+
+    def _token(self) -> str:
+        return str(self.get_setting("groq_token", "") or "").strip()
+
+    def _lang(self) -> str:
+        try:
+            i = int(self.get_setting("language_idx", 0))
+        except (TypeError, ValueError):
+            i = 0
+        return LANGUAGES[max(0, min(i, len(LANGUAGES) - 1))][1]
+
+    def _model(self) -> str:
+        try:
+            i = int(self.get_setting("model_idx", 0))
+        except (TypeError, ValueError):
+            i = 0
+        return WHISPER_MODELS[max(0, min(i, len(WHISPER_MODELS) - 1))]
+
+    @staticmethod
+    def _doc_duration(doc) -> int:
+        try:
+            for a in doc.attributes:
+                if isinstance(a, (TLRPC.TL_documentAttributeAudio, TLRPC.TL_documentAttributeVideo)):
+                    return int(a.duration)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _is_sent(owner) -> bool:
+        try:
+            return int(owner.id) > 0 and int(getattr(owner, "sendState", 0)) == 0
+        except Exception:
+            return int(getattr(owner, "id", 0)) > 0
+
+    def _wait_sent(self, owner, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._is_sent(owner):
+            time.sleep(0.3)
+        return self._is_sent(owner)
+
+    @staticmethod
+    def _whisper_hint(lang: str) -> str:
+        if lang in ("ru", "auto"):
+            return _fit_bytes(
+                "блять, нахуй, пиздец, ёбаный, ебать, сука, хуй, залупа, мудак, гондон, уёбок, "
+                "заебись, охуенно, ахуенно, невъебенно, дохуя, охуеть, разъебай, задрот, "
+                "кринж, рофл, чиллить, шарить, хайп, скам, треш, угар, лол, кек, имхо, го, "
+                "катка, тимейт, рандом, лут, читер, нерф, баф, апнуть, хилить, тащить, слив, "
+                "щас, чё, ничё, короч, вобщем, типа, пофиг, похер, хз, лан, спс, пж, кста, мб, гс, "
+                "Тинькофф, Сбер, Озон, Вайлдберриз, Авито, Госуслуги, Яндекс, ВК, Телега, "
+                "Дискорд, Ютуб, ГитХаб, ЧатГПТ, айфон, макбук, вайфай, Москва, Питер")
+        return ""
+
+    @staticmethod
+    def _format_text(text: str) -> str:
+        t = re.sub(r"\s+", " ", (text or "")).strip()
+        if not t:
+            return t
+        t = re.sub(r"\s+([,.;:!?…])", r"\1", t)
+        t = re.sub(r"([,;:!?…])(?=\S)", r"\1 ", t)
+        t = re.sub(r"\.(?=[A-Za-zА-Яа-яЁё])", r". ", t)
+        t = t[0].upper() + t[1:]
+        t = re.sub(r"([.!?…]\s+)([a-zа-яё])", lambda m: m.group(1) + m.group(2).upper(), t)
+        if t[-1] not in ".!?…":
+            t += "."
+        return t
+
+    def _resolve_audio(self, account: int, owner) -> str:
+        attach = getattr(owner, "attachPath", None)
+        if attach and os.path.isfile(attach) and os.path.getsize(attach) > 0:
+            return attach
+        loader = FileLoader.getInstance(account)
+        f = loader.getPathToMessage(owner)
+        path = str(f.getAbsolutePath()) if f is not None else ""
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+        doc = getattr(getattr(owner, "media", None), "document", None)
+        if doc is not None:
+            loader.loadFile(doc, None, FileLoader.PRIORITY_HIGH, 0)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+            time.sleep(0.2)
+        raise RuntimeError("файл не скачался")
+
+    def _transcribe_path(self, path: str, is_round: bool, token: str, lang: str) -> str:
+        if os.path.getsize(path) > MAX_FILE_BYTES:
+            raise RuntimeError("файл больше 100 МБ")
+        filename = os.path.basename(path)
+        if "." not in filename:
+            filename += ".mp4" if is_round else ".ogg"
+        mime = "video/mp4" if is_round else "audio/ogg"
+        form = {"model": (None, self._model()), "response_format": (None, "json"),
+                "temperature": (None, "0")}
+        if lang != "auto":
+            form["language"] = (None, lang)
+        hint = self._whisper_hint(lang)
+        if hint:
+            form["prompt"] = (None, hint)
+        try:
+            with open(path, "rb") as f:
+                resp = requests.post(
+                    GROQ_WHISPER_URL, headers={"Authorization": "Bearer " + token},
+                    files={**form, "file": (filename, f, mime)}, timeout=45)
+        except requests.exceptions.Timeout:
+            raise RuntimeError("Groq не отвечает (таймаут). Проверь интернет/VPN")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Нет соединения с Groq (сеть/регион/VPN)")
+        if resp.status_code == 429:
+            raise RuntimeError("Groq: лимит запросов (429), подожди")
+        if resp.status_code == 401:
+            raise RuntimeError("Groq: неверный токен (401)")
+        if resp.status_code != 200:
+            raise RuntimeError("Groq %d: %s" % (resp.status_code, resp.text[:200]))
+        data = resp.json()
+        text = (data.get("text") or "").strip()
+        if not text:
+            text = " ".join(s.get("text", "").strip() for s in (data.get("segments") or [])).strip()
+        if not text:
+            raise RuntimeError("пустая расшифровка")
+        return self._format_text(text)
+
+    def get_transcription(self, account: int, owner, is_round: bool) -> str:
+        doc = getattr(getattr(owner, "media", None), "document", None)
+        key = (int(account), int(doc.id) if doc is not None else int(owner.id))
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        token = self._token()
+        if not token:
+            raise RuntimeError("укажи Groq API Token в настройках")
+        text = self._transcribe_path(self._resolve_audio(account, owner), is_round, token, self._lang())
+        with self._lock:
+            self._cache[key] = text
+            if len(self._cache) > 200:
+                self._cache.popitem(last=False)
+        return text
+
+    def _on_quote_click(self, context):
+        message = context.get("message")
+        if message is None:
+            BulletinHelper.show_error("Не удалось получить сообщение")
+            return
+        try:
+            if not (message.isVoice() or message.isRoundVideo()):
+                BulletinHelper.show_error("Это не голосовое и не кружок")
+                return
+            if message.isVoiceOnce() or message.isRoundOnce():
+                BulletinHelper.show_error("Одноразовые не расшифровываются")
+                return
+        except Exception:
+            return
+        if not self._token():
+            BulletinHelper.show_error("Укажи Groq API Token в настройках")
+            return
+        account = context.get("account")
+        account = int(account) if account is not None else int(message.currentAccount)
+        self._run_bg(lambda: self._quote_job(
+            account, int(message.getDialogId()), int(message.getId()),
+            self._topic_top(message.messageOwner), message.messageOwner,
+            bool(message.isRoundVideo())))
+
+    @staticmethod
+    def _topic_top(owner) -> int:
+        try:
+            r = owner.reply_to
+            if r is not None:
+                top = int(getattr(r, "reply_to_top_id", 0) or 0)
+                if not top and getattr(r, "forum_topic", False):
+                    top = int(getattr(r, "reply_to_msg_id", 0) or 0)
+                return top
+        except Exception:
+            pass
+        return 0
+
+    def _quote_job(self, account, dialog_id, msg_id, top, owner, is_round):
+        if not self._wait_sent(owner, 120):
+            BulletinHelper.show_error("Сообщение не отправлено — расшифровка отменена")
+            return
+        try:
+            text = self.get_transcription(account, owner, is_round)
+        except Exception as e:
+            self.logger.exception("quote failed")
+            BulletinHelper.show_error("Ошибка расшифровки: %s" % str(e)[:150])
+            return
+        self._send_text_quotes(account, dialog_id, msg_id, top, text)
+
+    def _send_req(self, req, callback, account):
+        wrapped = RequestCallback(callback)
+        try:
+            return send_request(req, wrapped, account=account)
+        except TypeError:
+            return send_request(req, wrapped)
+
+    def _send_text_quotes(self, account, dialog_id, msg_id, top, text):
+        rest = text
+        while rest:
+            if len(rest) <= CHUNK:
+                chunk, rest = rest, ""
+            else:
+                cut = rest.rfind("\n", 0, CHUNK)
+                if cut < CHUNK // 2:
+                    cut = rest.rfind(" ", 0, CHUNK)
+                if cut < CHUNK // 2:
+                    cut = CHUNK
+                chunk, rest = rest[:cut].rstrip(), rest[cut:].lstrip()
+            if chunk:
+                self._send_one_quote(account, dialog_id, msg_id, top, chunk)
+
+    def _send_one_quote(self, account, dialog_id, msg_id, top, text):
+        try:
+            peer = get_messages_controller(account).getInputPeer(dialog_id)
+            if peer is None or isinstance(peer, TLRPC.TL_inputPeerEmpty):
+                raise ValueError("empty peer")
+            req = TLRPC.TL_messages_sendMessage()
+            req.peer = peer
+            req.message = text
+            req.random_id = random.getrandbits(63)
+            req.entities = self._blockquote_entities(text)
+            req.flags |= 8
+            reply_on = bool(self.get_setting("reply_to_original", False))
+            target = msg_id if (reply_on and msg_id > 0) else (top if top > 0 else 0)
+            if target > 0:
+                reply = TLRPC.TL_inputReplyToMessage()
+                reply.reply_to_msg_id = target
+                if top > 0:
+                    reply.top_msg_id = top
+                    reply.flags |= 2
+                req.reply_to = reply
+                req.flags |= 1
+
+            def on_sent(response, error):
+                if error is not None:
+                    BulletinHelper.show_error("Цитата не отправлена: %s"
+                                              % (getattr(error, "text", None) or "ошибка"))
+            self._send_req(req, on_sent, account)
+        except Exception:
+            self.logger.exception("send quote failed")
+            BulletinHelper.show_error("Не удалось отправить расшифровку")
+
+    def _blockquote_entities(self, text):
+        e = TLRPC.TL_messageEntityBlockquote()
+        e.offset = 0
+        e.length = JavaString(text).length()
+        e.collapsed = True
+        arr = ArrayList()
+        arr.add(e)
+        return arr
+
+    def _on_new_messages(self, account: int, args):
+        if not self.get_setting("auto_quote_out", False):
+            return
+        try:
+            messages = args[1]
+        except Exception:
+            return
+        if messages is None:
+            return
+        for i in range(messages.size()):
+            try:
+                owner = messages.get(i).messageOwner
+                if getattr(owner, "out", False):
+                    self._auto_consider(account, owner)
+            except Exception:
+                self.logger.exception("auto process failed")
+
+    def _auto_consider(self, account: int, owner):
+        try:
+            if owner is None or not getattr(owner, "out", False):
+                return
+            if isinstance(owner, TLRPC.TL_message_secret):
+                return
+            media = MessageObject.getMedia(owner)
+            if not isinstance(media, TLRPC.TL_messageMediaDocument) or getattr(media, "ttl_seconds", 0):
+                return
+            doc = media.document
+            if doc is None:
+                return
+            is_voice = bool(MessageObject.isVoiceDocument(doc))
+            is_round = bool(MessageObject.isRoundVideoDocument(doc))
+            if not (is_voice or is_round):
+                return
+            try:
+                cap = float(self.get_setting("auto_max_sec", "300") or 300)
+            except ValueError:
+                cap = 300.0
+            if self._doc_duration(doc) > cap:
+                return
+            dialog_id = int(MessageObject.getDialogId(owner))
+            key = (int(account), dialog_id, int(doc.id))
+            with self._lock:
+                if key in self._seen:
+                    return
+                self._seen[key] = True
+                if len(self._seen) > 500:
+                    self._seen.popitem(last=False)
+            top = self._topic_top(owner)
+            self._run_bg(lambda: self._auto_job(int(account), dialog_id, top, owner, is_round))
+        except Exception:
+            self.logger.exception("auto consider failed")
+
+    def _auto_job(self, account, dialog_id, top, owner, is_round):
+        if not self._wait_sent(owner, 300):
+            return
+        try:
+            text = self.get_transcription(account, owner, is_round)
+        except Exception as e:
+            self.logger.exception("auto failed")
+            BulletinHelper.show_error("Авто-расшифровка: %s" % str(e)[:150])
+            return
+        self._send_text_quotes(account, dialog_id, int(getattr(owner, "id", 0)), top, text)
+
+
+class CreateTranscribeButtonHook(MethodReplacement):
+    def __init__(self, plugin_instance):
+        super().__init__()
+        self.plugin = plugin_instance
+
+    def replace_hooked_method(self, param):
+        self.plugin._run_bg(lambda: self.onTap(param))
+
+    def onTap(self, param):
+        this = param.thisObject
+        parent = get_private_field(this, "parent")
+        shouldBeOpen = get_private_field(this, "shouldBeOpen")
+        loading = get_private_field(this, "loading")
+        if parent is None:
+            return
+        set_private_field(this, "clickedToOpen", False)
+        toOpen = not shouldBeOpen
+        if not shouldBeOpen:
+            if not loading:
+                this.setLoading(True, True)
+            else:
+                set_private_field(this, "pressed", False)
+                return
+        else:
+            this.setOpen(False, True)
+            this.setLoading(False, True)
+        set_private_field(this, "pressed", False)
+        if toOpen:
+            set_private_field(this, "clickedToOpen", True)
+        self.transcribePressed(param, parent.getMessageObject(), toOpen)
+
+    def transcribePressed(self, param, messageObject, open):
+        if not self.plugin._token():
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Укажи Groq API Token в настройках"))
+            return
+        TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
+        MessagesStorage = find_class("org.telegram.messenger.MessagesStorage")
+        DialogObject = find_class("org.telegram.messenger.DialogObject")
+        MessagesController = find_class("org.telegram.messenger.MessagesController")
+        NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+        this = param.thisObject
+        opsByPos = get_private_field(this, "transcribeOperationsByDialogPosition")
+        opsById = get_private_field(this, "transcribeOperationsById")
+        if messageObject is None or messageObject.messageOwner is None or not messageObject.isSent():
+            return
+        account = messageObject.currentAccount
+        peer = MessagesController.getInstance(account).getInputPeer(messageObject.messageOwner.peer_id)
+        dialogId = DialogObject.getPeerDialogId(peer)
+        messageId = messageObject.messageOwner.id
+        if open:
+            if (messageObject.messageOwner.voiceTranscription is not None
+                    and messageObject.messageOwner.voiceTranscriptionFinal):
+                TranscribeButton.openVideoTranscription(messageObject)
+                messageObject.messageOwner.voiceTranscriptionOpen = True
+                MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                    dialogId, messageId, messageObject.messageOwner)
+                run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                    NotificationCenter.voiceTranscriptionUpdate, messageObject, None, None, True, True))
+                return
+            if opsByPos is None:
+                set_private_field(this, "transcribeOperationsByDialogPosition", HashMap())
+                opsByPos = get_private_field(this, "transcribeOperationsByDialogPosition")
+            opsByPos.put(int(self.reqInfoHash(messageObject)), messageObject)
+            if opsById is None:
+                set_private_field(this, "transcribeOperationsById", HashMap())
+                opsById = get_private_field(this, "transcribeOperationsById")
+            opsById.put(int(self.reqInfoHash(messageObject)), messageObject)
+            messageObject.messageOwner.voiceTranscriptionId = messageId
+            try:
+                text = self.plugin.get_transcription(account, messageObject.messageOwner, False)
+            except Exception as e:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Groq: %s" % str(e)[:150]))
+                self.plugin.logger.exception("ui-hook failed")
+                return
+            TranscribeButton.openVideoTranscription(messageObject)
+            messageObject.messageOwner.voiceTranscriptionOpen = True
+            messageObject.messageOwner.voiceTranscriptionFinal = True
+            MessagesStorage.getInstance(account).updateMessageVoiceTranscription(
+                dialogId, messageId, text, messageObject.messageOwner)
+            run_on_ui_thread(lambda: this.finishTranscription(messageObject, messageId, text))
+            opsByPos.remove(int(self.reqInfoHash(messageObject)))
+        else:
+            if opsByPos is not None:
+                opsByPos.remove(int(self.reqInfoHash(messageObject)))
+            messageObject.messageOwner.voiceTranscriptionOpen = False
+            MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                dialogId, messageId, messageObject.messageOwner)
+            run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                NotificationCenter.voiceTranscriptionUpdate, messageObject, None, None, False, None))
+
+    def reqInfoHash(self, messageObject):
+        if messageObject is None:
+            return 0
+        return Objects.hash(messageObject.currentAccount, messageObject.getDialogId(), messageObject.getId())
+
+
+class CreateUpdateWaveformHook(MethodHook):
+    def after_hooked_method(self, param):
+        set_private_field(param.thisObject, "useTranscribeButton", True)
