@@ -1,0 +1,3724 @@
+# Security Manager — exteraGram security plugin
+#
+# Feature 1: detect a wrong Telegram passcode and silently send a text alert
+# to Saved Messages, a chosen @username, or a Telegram bot (Bot API).
+# Feature 2: a decoy passcode logs this device out of the account.
+# Feature 3: hidden chats, revealed by a secret code in Telegram search.
+#
+# Install: copy this file to the device as passguard.plugin and enable it
+# in exteraGram -> Settings -> Plugins.
+
+import os
+import threading
+import time
+from datetime import datetime
+
+import requests
+
+from android.graphics import ImageFormat, SurfaceTexture
+from android.hardware import Camera
+from android.os import CountDownTimer, Handler, HandlerThread, Looper
+from android.text import InputType, SpannableString, Spanned
+from android.text.method import PasswordTransformationMethod
+from android.text.style import ImageSpan
+from android.view import HapticFeedbackConstants, View
+from android.widget import EditText, LinearLayout, Toast
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from client_utils import (
+    PLUGINS_QUEUE,
+    get_last_fragment,
+    get_selected_account,
+    get_user_config,
+    run_on_queue,
+    send_document,
+    send_message,
+    send_photo,
+    send_request,
+    send_text,
+)
+from file_utils import get_files_dir
+from hook_utils import get_static_private_field
+from java import dynamic_proxy, jclass
+from java.lang import Integer, Runnable
+from java.util import ArrayList
+from org.telegram.messenger import (
+    ApplicationLoader,
+    MessagesController,
+    NotificationCenter,
+)
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.ActionBar import Theme
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+
+__id__ = "passguard"  # kept for settings compatibility with older versions
+__name__ = "Security Manager"
+__description__ = "Скрытые чаты: исчезают из общего списка и открываются только по секретному паролю в поиске. Экстренный выход из аккаунта по коду-приманке. Тихие уведомления с фото при неверном пароле."
+__author__ = "@xeate, @xeplagin"
+__version__ = "1.0.7"
+__icon__ = "zamokdliamoegoebanogonikomunenujnogoplagina/0"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.5.0"
+__category__ = ["privacy"]
+
+SHARED_CONFIG_CLASS = "org.telegram.messenger.SharedConfig"
+ALERT_COOLDOWN_SECONDS = 3.0
+
+
+class PasscodeHook(MethodHook):
+    """After-hook for SharedConfig.checkPasscode(String)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_passcode_checked(param)
+
+
+class DialogListHook(MethodHook):
+    """After-hook for dialog list getters."""
+
+    def __init__(self, plugin, source="activity", kind=""):
+        self.plugin = plugin
+        self.source = source
+        self.kind = kind
+
+    def after_hooked_method(self, param):
+        self.plugin.on_dialogs_array(param, self.source, self.kind)
+
+
+class SearchResultsHook(MethodHook):
+    """After-hook for DialogsSearchAdapter.updateSearchResults(...)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_search_results(param)
+
+
+class SearchQueryHook(MethodHook):
+    """After-hook for DialogsSearchAdapter.searchDialogs(String,int,boolean)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_search_query_changed(param)
+
+
+class SearchHelperResultsHook(MethodHook):
+    """After-hook for SearchAdapterHelper result getters."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_search_helper_results(param)
+
+
+class RecentSearchHook(MethodHook):
+    """After-hook for DialogsSearchAdapter.filterRecent(String)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_recent_search_filtered(param)
+
+
+class ChatResumeHook(MethodHook):
+    """After-hook for ChatActivity.onResume()."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_chat_resume(param)
+
+
+class ProfileResumeHook(MethodHook):
+    """After-hook for ProfileActivity.onResume()."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_profile_resume(param)
+
+
+class DialogsResumeHook(MethodHook):
+    """After-hook for DialogsActivity.onResume()."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_dialogs_resume(param)
+
+
+class FragmentOpenHook(MethodHook):
+    """Before-hook for BaseFragment.presentFragment(...)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_fragment_open(param)
+
+
+class UserNameOpenHook(MethodHook):
+    """Before-hook for MessagesController.openByUserName(...)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_user_name_open(param)
+
+
+class SearchTapHook(MethodHook):
+    """Before-hook for the search delegate's didPressedOnSubDialog(long)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_search_result_tapped(param)
+
+
+class DialogItemClickHook(MethodHook):
+    """Before-hook for DialogsActivity.onItemClick(View, int, Adapter)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_dialog_item_click(param)
+
+
+class ProfileCellHook(MethodHook):
+    """Before-hook for ProfileSearchCell.setData(...)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_profile_cell(param)
+
+
+class CameraRunnable(dynamic_proxy(Runnable)):
+    """Runs camera setup on a HandlerThread with a free Looper."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        self._fn()
+
+
+class UiRunnable(dynamic_proxy(Runnable)):
+    """Runs a Python callable on the Android UI thread."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        self._fn()
+
+
+COUNTDOWN_TIMER_AVAILABLE = False
+try:
+    from extera_utils.classes import Base, java_subclass, joverride
+
+    @java_subclass(CountDownTimer)
+    class DuressCountDownTimer(Base):
+        """Native Android countdown; callbacks run on the UI thread."""
+
+        def __init__(self, plugin, builder, state):
+            self.plugin = plugin
+            self.builder = builder
+            self.state = state
+
+        @joverride()
+        def onTick(self, millis_until_finished):
+            try:
+                if self.state["confirmed"] or self.state["cancelled"]:
+                    return
+                remaining = int(
+                    (int(millis_until_finished) + 999) // 1000
+                )
+                if remaining < 1:
+                    remaining = 1
+                self.plugin._set_duress_button(
+                    self.builder, remaining
+                )
+            except Exception:
+                pass
+
+        @joverride()
+        def onFinish(self):
+            try:
+                if self.state["confirmed"] or self.state["cancelled"]:
+                    return
+                self.plugin._set_duress_button(self.builder, 0)
+                self.state["ready"] = True
+            except Exception:
+                pass
+
+    COUNTDOWN_TIMER_AVAILABLE = True
+except Exception:
+    COUNTDOWN_TIMER_AVAILABLE = False
+
+
+class CameraPictureCallback(dynamic_proxy(Camera.PictureCallback)):
+    """Receives JPEG bytes from the deprecated Camera API."""
+
+    def __init__(self, holder, event):
+        super().__init__()
+        self.holder = holder
+        self.event = event
+
+    def onPictureTaken(self, data, camera):
+        try:
+            self.holder["data"] = bytes(data)
+        except Exception:
+            self.holder["error"] = True
+        finally:
+            # Release the camera here, on the camera thread. Releasing it
+            # from the waiting thread while the callback is still running
+            # can crash the camera service on some devices.
+            try:
+                camera.stopPreview()
+            except Exception:
+                pass
+            try:
+                camera.release()
+            except Exception:
+                pass
+            self.holder["camera"] = None
+            self.event.set()
+
+
+
+
+class PassGuardPlugin(BasePlugin):
+    _shared_search_ts = 0.0
+    _shared_search_ids = set()
+    _shared_unlock_id = None
+    _shared_unlock_ts = 0.0
+    # Hidden-chat state shared by every plugin instance. The dialog list
+    # hooks run on every scroll frame, so they must never re-read settings
+    # there; the settings screen publishes changes into these fields.
+    _shared_hidden_enabled = None
+    _shared_hidden_code = None
+    _shared_hidden_ids = None
+    _shared_hidden_ts = 0.0
+
+    def on_plugin_load(self):
+        self._unhook = None
+        self._shared_config_class = None
+        self._last_alert_ts = 0.0
+        self._hidden_unhooks = []
+        self._hidden_menu_item_id = None
+        self._hidden_menu_dialog_id = None
+        self._search_results_field = None
+        self._search_names_field = None
+        self._recent_field = None
+        self._recent_all_field = None
+        self._search_query_field = None
+        self._chat_list_field = None
+        self._chat_enter_field = None
+        self._chat_fragment_field = None
+        self._secret_search_ts = 0.0
+        self._secret_unlock_id = None
+        self._secret_unlock_ts = 0.0
+        self._secret_tap_id = None
+        self._secret_tap_ts = 0.0
+        self._hidden_enabled = bool(self.get_setting("hidden_enabled", False))
+        self._hidden_code = str(
+            self.get_setting("hidden_code", "") or ""
+        ).strip()
+        self._hidden_ids = self._load_hidden_ids()
+        self._publish_hidden_state()
+
+        # Older builds used "-" as a visual placeholder for an empty code.
+        # Treat it as empty and remove it so the input stays blank.
+        if str(self.get_setting("duress_password", "") or "") == "-":
+            self.set_setting("duress_password", "")
+
+        self._dialogs_hook_logged = False
+        self._dialog_filter_cache = {}
+        self._dialog_filter_generation = 0
+        self._dialog_filter_last_removed = -1
+        self._controller_dialogs_hooked = False
+        self._install_passcode_hook()
+        self._install_hidden_hooks()
+        self._refresh_hidden_menu()
+
+    def on_plugin_unload(self):
+        if self._unhook:
+            try:
+                self.unhook_method(self._unhook)
+            except Exception:
+                self.logger.exception("Failed to remove passcode hook")
+            self._unhook = None
+
+        for unhook in self._hidden_unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                self.logger.exception("Failed to remove hidden chat hook")
+        self._hidden_unhooks = []
+
+        if self._hidden_menu_item_id:
+            try:
+                self.remove_menu_item(self._hidden_menu_item_id)
+            except Exception:
+                self.logger.exception("Failed to remove hidden chat menu item")
+        self._hidden_menu_item_id = None
+        self._hidden_menu_dialog_id = None
+
+    # ------------------------------------------------------------------
+    # Hook installation
+    # ------------------------------------------------------------------
+
+    def _install_passcode_hook(self):
+        try:
+            # find_class() returns a Chaquopy wrapper without reflection on
+            # some builds, so use java.lang.Class.forName() for getDeclaredMethod.
+            self._shared_config_class = jclass("java.lang.Class").forName(
+                SHARED_CONFIG_CLASS
+            )
+            string_class = jclass("java.lang.String")
+            method = self._shared_config_class.getDeclaredMethod(
+                "checkPasscode", string_class
+            )
+            method.setAccessible(True)
+            self._unhook = self.hook_method(
+                method, PasscodeHook(self), priority=10
+            )
+            if self._unhook:
+                self.logger.info("Hooked SharedConfig.checkPasscode(String)")
+            else:
+                self.logger.error("hook_method returned None for checkPasscode")
+        except Exception:
+            self.logger.exception("Could not hook SharedConfig.checkPasscode")
+
+    def _install_hidden_hooks(self):
+        self._hidden_unhooks = []
+        try:
+            class_loader = jclass("java.lang.Class")
+            dialogs_class = class_loader.forName(
+                "org.telegram.ui.DialogsActivity"
+            )
+            for method in dialogs_class.getDeclaredMethods():
+                if (
+                    method.getName() == "getDialogsArray"
+                    and len(method.getParameterTypes()) == 4
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, DialogListHook(self, "activity"), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked DialogsActivity.getDialogsArray"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsActivity.getDialogsArray"
+            )
+
+        # The search delegate runs when a search result is tapped. The
+        # callback tells us exactly which hidden dialog was opened from
+        # the secret-code search, so only that chat can be unlocked.
+        try:
+            class_loader = jclass("java.lang.Class")
+            dialogs_class = class_loader.forName(
+                "org.telegram.ui.DialogsActivity"
+            )
+            hooked_tap = 0
+            for inner_class in dialogs_class.getDeclaredClasses():
+                for method in inner_class.getDeclaredMethods():
+                    params = method.getParameterTypes()
+                    if (
+                        method.getName() == "didPressedOnSubDialog"
+                        and len(params) == 1
+                        and params[0].getName() == "long"
+                    ):
+                        try:
+                            method.setAccessible(True)
+                        except Exception:
+                            pass
+                        unhook = self.hook_method(
+                            method, SearchTapHook(self), priority=10
+                        )
+                        if unhook:
+                            self._hidden_unhooks.append(unhook)
+                            hooked_tap += 1
+                            self.logger.info(
+                                "Hooked search result tap callback %s",
+                                inner_class.getName(),
+                            )
+        except Exception:
+            self.logger.exception(
+                "Could not hook the search result tap callback"
+            )
+
+        # Some builds open search results from DialogsActivity.onItemClick
+        # instead of the search delegate. Remember the tapped hidden dialog
+        # there too, so presentFragment() does not reject the result.
+        try:
+            class_loader = jclass("java.lang.Class")
+            dialogs_class = class_loader.forName(
+                "org.telegram.ui.DialogsActivity"
+            )
+            for method in dialogs_class.getDeclaredMethods():
+                params = method.getParameterTypes()
+                if (
+                    method.getName() == "onItemClick"
+                    and len(params) == 3
+                    and params[1].getName() == "int"
+                    and "Adapter" in params[2].getName()
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, DialogItemClickHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked DialogsActivity.onItemClick"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsActivity.onItemClick"
+            )
+
+        # ProfileSearchCell is the row used by search results. Badging the
+        # name here guarantees that the marker survives every list rebuild.
+        try:
+            class_loader = jclass("java.lang.Class")
+            cell_class = class_loader.forName(
+                "org.telegram.ui.Cells.ProfileSearchCell"
+            )
+            for method in cell_class.getDeclaredMethods():
+                params = method.getParameterTypes()
+                if (
+                    method.getName() == "setData"
+                    and len(params) == 6
+                    and params[0].getName() == "java.lang.Object"
+                    and params[2].getName() == "java.lang.CharSequence"
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, ProfileCellHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked ProfileSearchCell.setData"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook ProfileSearchCell.setData"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            chat_class = class_loader.forName(
+                "org.telegram.ui.ChatActivity"
+            )
+            for method in chat_class.getDeclaredMethods():
+                if (
+                    method.getName() == "onResume"
+                    and len(method.getParameterTypes()) == 0
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, ChatResumeHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info("Hooked ChatActivity.onResume")
+                    break
+        except Exception:
+            self.logger.exception("Could not hook ChatActivity.onResume")
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            dialogs_class = class_loader.forName(
+                "org.telegram.ui.DialogsActivity"
+            )
+            for method in dialogs_class.getDeclaredMethods():
+                if (
+                    method.getName() == "onResume"
+                    and len(method.getParameterTypes()) == 0
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, DialogsResumeHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info("Hooked DialogsActivity.onResume")
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsActivity.onResume"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            profile_class = class_loader.forName(
+                "org.telegram.ui.ProfileActivity"
+            )
+            for method in profile_class.getDeclaredMethods():
+                if (
+                    method.getName() == "onResume"
+                    and len(method.getParameterTypes()) == 0
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, ProfileResumeHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info("Hooked ProfileActivity.onResume")
+                    break
+        except Exception:
+            self.logger.exception("Could not hook ProfileActivity.onResume")
+
+        # Block navigation before a hidden chat or profile is shown.
+        try:
+            class_loader = jclass("java.lang.Class")
+            base_fragment_class = class_loader.forName(
+                "org.telegram.ui.ActionBar.BaseFragment"
+            )
+            for method in base_fragment_class.getDeclaredMethods():
+                params = method.getParameterTypes()
+                if (
+                    method.getName() == "presentFragment"
+                    and 1 <= len(params) <= 3
+                    and params[0].getName()
+                    == "org.telegram.ui.ActionBar.BaseFragment"
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, FragmentOpenHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+            self.logger.info("Hooked BaseFragment.presentFragment")
+        except Exception:
+            self.logger.exception(
+                "Could not hook BaseFragment.presentFragment"
+            )
+
+        for class_name, wanted_count in (
+            ("org.telegram.ui.DialogsActivity", 1),
+            ("org.telegram.ui.LaunchActivity", 3),
+        ):
+            try:
+                class_loader = jclass("java.lang.Class")
+                target_class = class_loader.forName(class_name)
+                for method in target_class.getDeclaredMethods():
+                    params = method.getParameterTypes()
+                    if (
+                        method.getName() == "presentFragment"
+                        and len(params) == wanted_count
+                        and params[0].getName()
+                        == "org.telegram.ui.ActionBar.BaseFragment"
+                    ):
+                        try:
+                            method.setAccessible(True)
+                        except Exception:
+                            pass
+                        unhook = self.hook_method(
+                            method, FragmentOpenHook(self), priority=10
+                        )
+                        if unhook:
+                            self._hidden_unhooks.append(unhook)
+                            self.logger.info(
+                                "Hooked %s.presentFragment", class_name
+                            )
+                        break
+            except Exception:
+                self.logger.exception(
+                    "Could not hook %s.presentFragment", class_name
+                )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            controller_class = class_loader.forName(
+                "org.telegram.messenger.MessagesController"
+            )
+            for method in controller_class.getDeclaredMethods():
+                params = method.getParameterTypes()
+                if (
+                    method.getName() == "openByUserName"
+                    and len(params) == 4
+                    and params[0].getName() == "java.lang.String"
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, UserNameOpenHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked MessagesController.openByUserName"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook MessagesController.openByUserName"
+            )
+
+        # Fallback: the main folder list is returned directly from
+        # MessagesController.getDialogs(int). Filtering it here guarantees
+        # the chat disappears even if the activity-level hook cannot run.
+        try:
+            class_loader = jclass("java.lang.Class")
+            controller_class = class_loader.forName(
+                "org.telegram.messenger.MessagesController"
+            )
+            wanted = ("getDialogs", "getDialogsByCommunity")
+            for method in controller_class.getDeclaredMethods():
+                if (
+                    method.getName() in wanted
+                    and len(method.getParameterTypes()) == 1
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method,
+                        DialogListHook(
+                            self, "controller", str(method.getName())
+                        ),
+                        priority=10,
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        if method.getName() == "getDialogs":
+                            self._controller_dialogs_hooked = True
+                        self.logger.info(
+                            "Hooked MessagesController.%s",
+                            method.getName(),
+                        )
+        except Exception:
+            self.logger.exception(
+                "Could not hook MessagesController.getDialogs"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            search_class = class_loader.forName(
+                "org.telegram.ui.Adapters.DialogsSearchAdapter"
+            )
+            for method in search_class.getDeclaredMethods():
+                if (
+                    method.getName() == "updateSearchResults"
+                    and len(method.getParameterTypes()) == 5
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, SearchResultsHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked DialogsSearchAdapter.updateSearchResults"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsSearchAdapter.updateSearchResults"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            search_class = class_loader.forName(
+                "org.telegram.ui.Adapters.DialogsSearchAdapter"
+            )
+            for method in search_class.getDeclaredMethods():
+                if (
+                    method.getName() == "filterRecent"
+                    and len(method.getParameterTypes()) == 1
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, RecentSearchHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked DialogsSearchAdapter.filterRecent"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsSearchAdapter.filterRecent"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            search_class = class_loader.forName(
+                "org.telegram.ui.Adapters.DialogsSearchAdapter"
+            )
+            for method in search_class.getDeclaredMethods():
+                if (
+                    method.getName() == "searchDialogs"
+                    and len(method.getParameterTypes()) == 3
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, SearchQueryHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked DialogsSearchAdapter.searchDialogs"
+                        )
+                    break
+        except Exception:
+            self.logger.exception(
+                "Could not hook DialogsSearchAdapter.searchDialogs"
+            )
+
+        try:
+            class_loader = jclass("java.lang.Class")
+            helper_class = class_loader.forName(
+                "org.telegram.ui.Adapters.SearchAdapterHelper"
+            )
+            wanted = (
+                "getGlobalSearch",
+                "getLocalServerSearch",
+                "getPhoneSearch",
+                "getGroupSearch",
+            )
+            for method in helper_class.getDeclaredMethods():
+                if (
+                    method.getName() in wanted
+                    and len(method.getParameterTypes()) == 0
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, SearchHelperResultsHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info(
+                            "Hooked SearchAdapterHelper.%s",
+                            method.getName(),
+                        )
+        except Exception:
+            self.logger.exception(
+                "Could not hook SearchAdapterHelper result getters"
+            )
+
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
+    def on_passcode_checked(self, param):
+        try:
+            result = param.getResult()
+            if result is None or bool(result):
+                return  # correct passcode (or method failed safely)
+
+            # appLocked == true only on the lock screen. This filters out
+            # passcode confirmation in Settings (change / disable passcode).
+            if not bool(
+                get_static_private_field(self._shared_config_class, "appLocked")
+            ):
+                return
+
+            # A deliberately wrong "duress" password logs this device out
+            # of the current account without touching other sessions.
+            # This works independently of the tracking switch.
+            duress_password = self._get_duress_password()
+            if (
+                bool(self.get_setting("duress_enabled", False))
+                and duress_password
+            ):
+                try:
+                    entered = str(param.args[0] or "")
+                except Exception:
+                    entered = ""
+                if entered and entered == duress_password:
+                    self._perform_emergency_logout()
+                    return
+
+            if not self.get_setting("enabled", True):
+                return
+
+            now = time.time()
+            if now - self._last_alert_ts < ALERT_COOLDOWN_SECONDS:
+                return
+            self._last_alert_ts = now
+
+            # Never block the UI thread with network / Telegram requests.
+            run_on_queue(self._send_alert, PLUGINS_QUEUE)
+        except Exception:
+            self.logger.exception("Failed to process wrong passcode")
+
+    def _get_duress_password(self):
+        value = str(self.get_setting("duress_password", "") or "")
+        # Legacy builds stored "-" as a visual placeholder.
+        return "" if value in ("", "-") else value
+
+    def _perform_emergency_logout(self):
+        try:
+            account = get_selected_account()
+            self.logger.warning(
+                "Duress password entered; logging out current session "
+                "of account %s",
+                account,
+            )
+
+            # Do not leave the last captured photo behind.
+            try:
+                photo_path = os.path.join(
+                    get_files_dir(), "passguard_last.jpg"
+                )
+                if os.path.exists(photo_path):
+                    os.remove(photo_path)
+            except Exception:
+                self.logger.exception(
+                    "Could not remove the last captured photo"
+                )
+
+            def logout():
+                try:
+                    # performLogout(1) sends auth.logOut, i.e. terminates
+                    # only this session. Other devices stay logged in.
+                    MessagesController.getInstance(account).performLogout(1)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to log out after duress password"
+                    )
+
+            run_on_ui_thread(logout)
+        except Exception:
+            self.logger.exception("Failed to perform emergency logout")
+
+    # ------------------------------------------------------------------
+    # Hidden chats
+    # ------------------------------------------------------------------
+
+    def _load_hidden_ids(self):
+        value = str(self.get_setting("hidden_dialogs", "") or "")
+        result = set()
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                result.add(int(part))
+            except ValueError:
+                continue
+        return result
+
+    def _save_hidden_ids(self, reload_settings=False):
+        self.set_setting(
+            "hidden_dialogs",
+            ",".join(str(item) for item in sorted(self._hidden_ids)),
+            reload_settings=reload_settings,
+        )
+
+    def _hidden_configured(self):
+        return bool(getattr(self, "_hidden_enabled", False)) and bool(
+            getattr(self, "_hidden_code", "")
+        )
+
+    def _publish_hidden_state(self):
+        """Share hidden-chat state with every plugin instance.
+
+        The dialog list hooks are called on every scroll frame. Reading
+        settings there caused periodic jank, so the settings screen and the
+        hide/unhide actions publish their state here instead.
+        """
+        PassGuardPlugin._shared_hidden_enabled = bool(
+            getattr(self, "_hidden_enabled", False)
+        )
+        PassGuardPlugin._shared_hidden_code = str(
+            getattr(self, "_hidden_code", "") or ""
+        )
+        PassGuardPlugin._shared_hidden_ids = self._hidden_ids
+        PassGuardPlugin._shared_hidden_ts = time.time()
+
+    def _refresh_hidden_state(self):
+        try:
+            self._hidden_enabled = bool(
+                self.get_setting("hidden_enabled", False)
+            )
+            self._hidden_code = str(
+                self.get_setting("hidden_code", "") or ""
+            ).strip()
+            self._hidden_ids = self._load_hidden_ids()
+            self._publish_hidden_state()
+        except Exception:
+            self.logger.exception(
+                "Could not refresh hidden chat settings"
+            )
+
+    def _hidden_active(self):
+        shared_ids = PassGuardPlugin._shared_hidden_ids
+        if shared_ids is None:
+            self._refresh_hidden_state()
+        else:
+            self._hidden_enabled = PassGuardPlugin._shared_hidden_enabled
+            self._hidden_code = PassGuardPlugin._shared_hidden_code
+            self._hidden_ids = shared_ids
+
+        return self._hidden_configured() and bool(self._hidden_ids)
+
+    def _dialog_id_fast(self, obj):
+        """Fast path for the common TLRPC.Dialog items in chat lists."""
+        try:
+            if isinstance(obj, TLRPC.Dialog):
+                return int(obj.id)
+        except Exception:
+            pass
+        return self._object_dialog_id(obj)
+
+    def _object_dialog_id(self, obj):
+        try:
+            if isinstance(obj, TLRPC.Dialog):
+                return int(obj.id)
+            if isinstance(obj, TLRPC.User):
+                return int(obj.id)
+            if isinstance(obj, TLRPC.Chat):
+                return -int(obj.id)
+            if isinstance(obj, TLRPC.EncryptedChat):
+                return (int(obj.id) & 0xFFFFFFFF) | 4611686018427387904
+        except Exception:
+            pass
+
+        # Fallback for builds where isinstance() on a TLRPC subclass is
+        # not reliable.
+        try:
+            name = str(obj.getClass().getSimpleName()).lower()
+            if name.startswith("tl_user") or name == "user":
+                return int(obj.id)
+            if (
+                name.startswith("tl_chat")
+                or name.startswith("tl_channel")
+                or name in ("chat", "channel")
+            ):
+                return -int(obj.id)
+            if name.startswith("tl_dialog") or name == "dialog":
+                return int(obj.id)
+            if "encryptedchat" in name:
+                return (int(obj.id) & 0xFFFFFFFF) | 4611686018427387904
+        except Exception:
+            pass
+        return None
+
+    def _dialog_name(self, obj):
+        try:
+            if isinstance(obj, TLRPC.User):
+                name = " ".join(
+                    part
+                    for part in (
+                        str(getattr(obj, "first_name", "") or ""),
+                        str(getattr(obj, "last_name", "") or ""),
+                    )
+                    if part
+                )
+                if name:
+                    return name
+                if getattr(obj, "username", None):
+                    return "@" + str(obj.username)
+            if isinstance(obj, TLRPC.Chat):
+                if getattr(obj, "title", None):
+                    return str(obj.title)
+                if getattr(obj, "username", None):
+                    return "@" + str(obj.username)
+        except Exception:
+            pass
+        return "Скрытый чат"
+
+    def _drawable_id(self, name):
+        # Resource ids are stable even when Telegram's resource names are
+        # obfuscated in a particular build.
+        for class_name in (
+            "org.telegram.messenger.R$drawable",
+            "com.exteragram.messenger.R$drawable",
+        ):
+            try:
+                drawable_class = jclass(class_name)
+                res_id = int(getattr(drawable_class, name))
+                if res_id:
+                    return res_id
+            except Exception:
+                pass
+        try:
+            context = ApplicationLoader.applicationContext
+            resources = context.getResources()
+            packages = []
+            try:
+                packages.append(context.getPackageName())
+            except Exception:
+                pass
+            packages.extend(
+                ["com.exteragram.messenger", "org.telegram.messenger"]
+            )
+            for package in packages:
+                if not package:
+                    continue
+                try:
+                    res_id = resources.getIdentifier(
+                        name, "drawable", package
+                    )
+                    if res_id:
+                        return int(res_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return 0
+
+    def _badged_name(self, name):
+        # The icon goes after the name, separated by one space. The real
+        # Telegram replacement span is used first: it is the same class
+        # Telegram itself uses for inline icons and survives ellipsizing.
+        text = str(name)
+        plain = text + " ⊘"
+        try:
+            context = ApplicationLoader.applicationContext
+            resources = context.getResources()
+
+            res_id = self._drawable_id("msg_archive_hide")
+            if not res_id:
+                res_id = self._drawable_id("design_ic_visibility_off")
+            if not res_id:
+                self.logger.error("Hidden chat badge drawable not found")
+                return plain
+
+            try:
+                tint = int(
+                    Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+                )
+            except Exception:
+                tint = -7829368  # neutral gray fallback
+            if (tint & 0xFF000000) == 0:
+                tint = -7829368
+
+            density = resources.getDisplayMetrics().density
+            size = int(17 * density)
+            start = len(text) + 1
+            end = start + 1
+            spannable_text = text + " \u00a0"
+            try:
+                span_class = jclass(
+                    "org.telegram.ui.Components.ColoredImageSpan"
+                )
+                span = span_class(int(res_id))
+                span.setSize(size)
+                span.setOverrideColor(tint)
+                spannable = SpannableString(spannable_text)
+                spannable.setSpan(
+                    span,
+                    start,
+                    end,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+                self.logger.info(
+                    "Hidden chat badge created with ColoredImageSpan, drawable id %s",
+                    res_id,
+                )
+                return spannable
+            except Exception:
+                self.logger.exception(
+                    "ColoredImageSpan failed, falling back to ImageSpan"
+                )
+
+            drawable = resources.getDrawable(res_id)
+            try:
+                drawable.mutate()
+                drawable.setTint(tint)
+                drawable.setAlpha(255)
+            except Exception:
+                pass
+            drawable.setBounds(0, 0, size, size)
+            spannable = SpannableString(spannable_text)
+            spannable.setSpan(
+                ImageSpan(drawable),
+                start,
+                end,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            self.logger.info(
+                "Hidden chat badge created with ImageSpan, drawable id %s",
+                res_id,
+            )
+            return spannable
+        except Exception:
+            self.logger.exception("Could not create hidden chat badge")
+            return plain
+
+    def on_profile_cell(self, param):
+        try:
+            if not self._hidden_active():
+                return
+            obj = param.args[0]
+            if obj is None or not self._is_hidden_object(obj):
+                return
+            name = param.args[2]
+            if name is None:
+                name = self._dialog_name(obj)
+            if str(name).rstrip().endswith(("⊘", "\u00a0")):
+                return
+            param.args[2] = self._badged_name(name)
+        except Exception:
+            self.logger.exception(
+                "Could not badge a hidden search result"
+            )
+
+    def _resolve_dialog_object(self, dialog_id):
+        try:
+            account = int(get_selected_account())
+            controller = MessagesController.getInstance(account)
+            if dialog_id > 0:
+                if dialog_id & 4611686018427387904:
+                    encrypted_id = int(dialog_id & 0xFFFFFFFF)
+                    return controller.getEncryptedChat(Integer(encrypted_id))
+                return controller.getUser(dialog_id)
+            return controller.getChat(-dialog_id)
+        except Exception:
+            self.logger.exception(
+                "Could not resolve hidden dialog %s", dialog_id
+            )
+            return None
+
+    def _current_profile_dialog_id(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return None
+            if "ProfileActivity" not in fragment.getClass().getName():
+                return None
+            return self._fragment_dialog_id(fragment)
+        except Exception:
+            return None
+
+    def _refresh_hidden_menu(self, dialog_id=None):
+        try:
+            if self._hidden_menu_item_id:
+                try:
+                    self.remove_menu_item(self._hidden_menu_item_id)
+                except Exception:
+                    pass
+            self._hidden_menu_item_id = None
+            self._hidden_menu_dialog_id = None
+
+            if not self._hidden_configured():
+                return
+            if dialog_id is None:
+                dialog_id = self._current_profile_dialog_id()
+            if dialog_id is None:
+                return
+            dialog_id = int(dialog_id)
+
+            self._hidden_ids = self._load_hidden_ids()
+            self._publish_hidden_state()
+            hidden = dialog_id in self._hidden_ids
+            if hidden:
+                text = "Вернуть"
+                subtext = "Вернуть чат в общий список"
+                handler = self._on_unhide_chat_click
+                priority = 101
+                icon = "msg_views"
+            else:
+                text = "Скрыть"
+                subtext = "Скрыть чат из общего списка"
+                handler = self._on_hide_chat_click
+                priority = 100
+                icon = "msg_archive_hide"
+
+            item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                    text=text,
+                    on_click=handler,
+                    icon=icon,
+                    subtext=subtext,
+                    priority=priority,
+                )
+            )
+            if item_id:
+                self._hidden_menu_item_id = item_id
+                self._hidden_menu_dialog_id = dialog_id
+                self.logger.info(
+                    "Added hidden chat profile menu item: %s for %s",
+                    text,
+                    dialog_id,
+                )
+        except Exception:
+            self.logger.exception("Could not refresh hidden chat menu")
+
+    def _dialog_id_from_context(self, context):
+        for key in ("dialog_id", "dialogId"):
+            value = context.get(key)
+            if value is not None:
+                try:
+                    value = int(value)
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+        for key in ("encryptedChat", "user", "chat"):
+            obj = context.get(key)
+            if obj is not None:
+                value = self._object_dialog_id(obj)
+                if value:
+                    return value
+
+        user_id = context.get("userId")
+        if user_id is not None:
+            try:
+                return int(user_id)
+            except Exception:
+                pass
+
+        chat_id = context.get("chatId")
+        if chat_id is not None:
+            try:
+                chat_id = int(chat_id)
+                return chat_id if chat_id < 0 else -chat_id
+            except Exception:
+                pass
+
+        return None
+
+    def _reload_dialogs(self, account=None):
+        try:
+            if account is None:
+                account = int(get_selected_account())
+            else:
+                account = int(account)
+        except Exception:
+            try:
+                account = int(get_selected_account())
+            except Exception:
+                return
+
+        try:
+            NotificationCenter.getInstance(account).postNotificationName(
+                NotificationCenter.dialogsNeedReload
+            )
+        except Exception:
+            self.logger.exception("Could not refresh the dialog list")
+
+        # The first notification can be ignored while the dialog list is
+        # frozen (for example during an animation). Repeat it after the
+        # list becomes interactive again.
+        try:
+            Handler(Looper.getMainLooper()).postDelayed(
+                UiRunnable(
+                    lambda: NotificationCenter.getInstance(
+                        account
+                    ).postNotificationName(
+                        NotificationCenter.dialogsNeedReload
+                    )
+                ),
+                800,
+            )
+        except Exception:
+            self.logger.exception(
+                "Could not schedule the second dialog refresh"
+            )
+
+    def _schedule_hidden_menu_refresh(self, dialog_id=None):
+        """Rebuild the menu after the current click finishes."""
+        try:
+            Handler(Looper.getMainLooper()).postDelayed(
+                UiRunnable(lambda: self._refresh_hidden_menu(dialog_id)),
+                500,
+            )
+        except Exception:
+            self._refresh_hidden_menu(dialog_id)
+
+    def _on_hide_chat_click(self, context):
+        try:
+            if not self._hidden_configured():
+                return
+
+            self._hidden_ids = self._load_hidden_ids()
+            dialog_id = self._dialog_id_from_context(context)
+            if dialog_id is None:
+                BulletinHelper.show_error(
+                    "Не удалось определить чат", get_last_fragment()
+                )
+                return
+
+            if dialog_id in self._hidden_ids:
+                BulletinHelper.show_info(
+                    "Чат уже скрыт", get_last_fragment()
+                )
+                return
+
+            self._hidden_ids.add(dialog_id)
+            self._save_hidden_ids()
+            self._publish_hidden_state()
+            self._schedule_hidden_menu_refresh(dialog_id)
+            BulletinHelper.show_success(
+                "Чат успешно скрыт", get_last_fragment()
+            )
+
+            try:
+                account = int(context.get("account"))
+            except Exception:
+                account = int(get_selected_account())
+            self._reload_dialogs(account)
+
+            self.logger.info("Hidden chat dialog id %s", dialog_id)
+        except Exception:
+            self.logger.exception("Failed to hide chat")
+
+    def _on_unhide_chat_click(self, context):
+        try:
+            if not self._hidden_configured():
+                return
+
+            self._hidden_ids = self._load_hidden_ids()
+            dialog_id = self._dialog_id_from_context(context)
+            if dialog_id is None:
+                BulletinHelper.show_error(
+                    "Не удалось определить чат", get_last_fragment()
+                )
+                return
+
+            if dialog_id not in self._hidden_ids:
+                BulletinHelper.show_info(
+                    "Этот чат не скрыт", get_last_fragment()
+                )
+                return
+
+            self._hidden_ids.discard(dialog_id)
+            self._save_hidden_ids()
+            self._publish_hidden_state()
+            self._schedule_hidden_menu_refresh(dialog_id)
+            if self._current_unlock()[0] == dialog_id:
+                self._clear_unlock_state()
+
+            BulletinHelper.show_success(
+                "Чат возвращён в общий список", get_last_fragment()
+            )
+            try:
+                account = int(context.get("account"))
+            except Exception:
+                account = int(get_selected_account())
+            self._reload_dialogs(account)
+            self.logger.info("Unhidden chat dialog id %s", dialog_id)
+        except Exception:
+            self.logger.exception("Failed to unhide chat")
+
+    def _current_unlock(self):
+        """Freshest unlock, shared between plugin instances."""
+        shared_id = PassGuardPlugin._shared_unlock_id
+        shared_ts = PassGuardPlugin._shared_unlock_ts
+        if self._secret_unlock_id is not None and (
+            shared_id is None or self._secret_unlock_ts >= shared_ts
+        ):
+            return self._secret_unlock_id, self._secret_unlock_ts
+        return shared_id, shared_ts
+
+    def _set_unlock(self, dialog_id, ts=None):
+        ts = time.time() if ts is None else ts
+        self._secret_unlock_id = dialog_id
+        self._secret_unlock_ts = ts
+        PassGuardPlugin._shared_unlock_id = dialog_id
+        PassGuardPlugin._shared_unlock_ts = ts
+
+    def _clear_unlock_state(self):
+        self._secret_unlock_id = None
+        self._secret_unlock_ts = 0.0
+        PassGuardPlugin._shared_unlock_id = None
+        PassGuardPlugin._shared_unlock_ts = 0.0
+
+    def _hidden_unlock_active(self):
+        unlock_id, unlock_ts = self._current_unlock()
+        if unlock_id is None or time.time() - unlock_ts >= 21600:
+            return False
+        try:
+            top = get_last_fragment()
+            if top is None:
+                return False
+            name = str(top.getClass().getName())
+            if "ProfileActivity" in name:
+                # Profile of the hidden chat; its dialog id may differ
+                # because group profiles carry the group id.
+                return True
+            if "ChatActivity" in name:
+                return self._fragment_dialog_id(top) == unlock_id
+        except Exception:
+            pass
+        return False
+
+    def _persist_unlock(self, dialog_id):
+        unlock_id, _unlock_ts = self._current_unlock()
+        if unlock_id == dialog_id:
+            self._set_unlock(dialog_id)
+            return
+        self._set_unlock(dialog_id)
+        self.logger.info(
+            "Persisted hidden chat unlock for %s", dialog_id
+        )
+
+    def _secret_unlocked(self, dialog_id):
+        unlock_id, unlock_ts = self._current_unlock()
+        return (
+            unlock_id == dialog_id
+            and time.time() - unlock_ts < 21600
+        )
+
+    def _secret_tap_active(self, dialog_id):
+        """True right after the hidden chat was tapped in the search list."""
+        return (
+            self._secret_tap_id == dialog_id
+            and time.time() - self._secret_tap_ts < 5
+        )
+
+    def _dialogs_on_top(self):
+        try:
+            top = get_last_fragment()
+            if top is None:
+                return False
+            return "DialogsActivity" in str(top.getClass().getName())
+        except Exception:
+            return False
+
+    def _opened_from_secret_search(self, dialog_id):
+        """True when this dialog was just opened from the password results."""
+        search_ts = max(
+            self._secret_search_ts,
+            PassGuardPlugin._shared_search_ts,
+        )
+        if not search_ts:
+            return False
+        age = time.time() - search_ts
+        visible = dialog_id in PassGuardPlugin._shared_search_ids
+        if visible and age < 5:
+            # The row is on screen and was just tapped; top-fragment
+            # detection can briefly lag behind the search adapter.
+            return True
+        if not self._dialogs_on_top():
+            return False
+        return visible or age < 60
+
+    def _secret_tap_from_list(self):
+        """A hidden search row was tapped while the dialog list is on top."""
+        if (
+            self._secret_tap_id is None
+            or time.time() - self._secret_tap_ts >= 5
+        ):
+            return False
+        return self._dialogs_on_top()
+
+    def _remember_secret_tap(self, dialog_id):
+        self._secret_tap_id = dialog_id
+        self._secret_tap_ts = time.time()
+
+    def on_dialog_item_click(self, param):
+        """Unlock a hidden chat when its row is tapped in search results."""
+        try:
+            if not self._hidden_active():
+                return
+            adapter = param.args[2] if len(param.args) > 2 else None
+            if adapter is None:
+                return
+            if "DialogsSearchAdapter" not in str(
+                adapter.getClass().getName()
+            ):
+                return
+            position = int(param.args[1])
+            obj = adapter.getItem(position)
+            dialog_id = self._object_dialog_id(obj)
+            if dialog_id is None or dialog_id not in self._hidden_ids:
+                return
+            if (
+                not self._secret_search_ts
+                or time.time() - self._secret_search_ts > 60
+            ):
+                return
+            self._set_unlock(dialog_id)
+            self._remember_secret_tap(dialog_id)
+            self.logger.info(
+                "Hidden chat %s unlocked from the search list tap",
+                dialog_id,
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to process a search list item click"
+            )
+
+    def on_search_result_tapped(self, param):
+        try:
+            dialog_id = int(param.args[0])
+            if not self._hidden_active():
+                return
+            if dialog_id not in self._hidden_ids:
+                return
+            if time.time() - self._secret_search_ts > 60:
+                self.logger.info(
+                    "Hidden chat %s opened without the secret search",
+                    dialog_id,
+                )
+                return
+            self._set_unlock(dialog_id)
+            self._remember_secret_tap(dialog_id)
+            self.logger.info(
+                "Hidden chat %s unlocked from the secret search", dialog_id
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to process a search result tap"
+            )
+
+    def _fragment_dialog_id(self, fragment):
+        try:
+            value = int(fragment.getDialogId())
+            if value:
+                return value
+        except Exception:
+            pass
+        try:
+            arguments = fragment.getArguments()
+            if arguments is None:
+                return None
+            user_id = int(arguments.getLong("user_id", 0))
+            if user_id:
+                return user_id
+            chat_id = int(arguments.getLong("chat_id", 0))
+            if chat_id:
+                return -chat_id
+            dialog_id = int(arguments.getLong("dialog_id", 0))
+            if dialog_id:
+                return dialog_id
+        except Exception:
+            pass
+        return None
+
+    def _show_blocked_toast(self, dialog_id, profile=False):
+        try:
+            if profile:
+                text = "Ошибка"
+            elif int(dialog_id) > 0:
+                text = "Аккаунт не найден"
+            else:
+                text = "Чат не найден"
+            Toast.makeText(
+                ApplicationLoader.applicationContext,
+                text,
+                Toast.LENGTH_SHORT,
+            ).show()
+        except Exception:
+            self.logger.exception("Could not show the hidden chat error")
+
+    def _close_fragment(self, fragment):
+        try:
+            fragment.getFragmentView().setVisibility(View.INVISIBLE)
+        except Exception:
+            pass
+        try:
+            fragment.finishFragment()
+            return
+        except Exception:
+            pass
+        try:
+            fragment.getParentActivity().finish()
+        except Exception:
+            self.logger.exception("Could not close a hidden chat screen")
+
+    def on_fragment_open(self, param):
+        try:
+            fragment = param.args[0]
+            if fragment is None:
+                return
+            class_name = str(fragment.getClass().getName())
+            # While a hidden chat is open, its profile must stay reachable.
+            # The dialog id in the profile arguments can differ from the
+            # chat id (for example, a group dialog id), so do not reject it
+            # by id during an active unlock.
+            if "ProfileActivity" in class_name and self._hidden_unlock_active():
+                return
+            dialog_id = self._fragment_dialog_id(fragment)
+            if dialog_id is None:
+                return
+            if not self._hidden_active() or dialog_id not in self._hidden_ids:
+                return
+
+            is_profile = "ProfileActivity" in class_name
+            from_search = self._opened_from_secret_search(dialog_id)
+            # A hidden profile is allowed only while its hidden chat is
+            # actually open. Returning to the dialog list must block avatar
+            # and username opens immediately.
+            if is_profile and not (
+                self._hidden_unlock_active()
+                or self._secret_tap_active(dialog_id)
+                or self._secret_tap_from_list()
+                or from_search
+            ):
+                self._show_blocked_toast(dialog_id, profile=True)
+                param.setResult(False)
+                self.logger.info(
+                    "Blocked hidden profile %s outside the open chat",
+                    dialog_id,
+                )
+                return
+
+            if self._secret_unlocked(dialog_id):
+                self._persist_unlock(dialog_id)
+                return
+
+            if from_search:
+                self._set_unlock(dialog_id)
+                self._remember_secret_tap(dialog_id)
+                self.logger.info(
+                    "Hidden chat %s unlocked from the password search "
+                    "(fragment path)",
+                    dialog_id,
+                )
+                return
+
+            self._show_blocked_toast(dialog_id, profile=is_profile)
+            param.setResult(False)
+            self.logger.info(
+                "Blocked hidden %s %s",
+                "profile" if is_profile else "chat",
+                dialog_id,
+            )
+        except Exception:
+            self.logger.exception("Failed to block a hidden chat screen")
+
+    def on_user_name_open(self, param):
+        try:
+            username = str(param.args[0] or "").lstrip("@").strip()
+            if not username:
+                return
+            controller = param.thisObject
+            if controller is None:
+                controller = MessagesController.getInstance(
+                    int(get_selected_account())
+                )
+            obj = controller.getUserOrChat(username)
+            dialog_id = self._object_dialog_id(obj) if obj is not None else None
+            if dialog_id is None:
+                return
+            if not self._hidden_active() or dialog_id not in self._hidden_ids:
+                return
+            if (
+                self._secret_unlocked(dialog_id)
+                and (
+                    self._hidden_unlock_active()
+                    or self._secret_tap_active(dialog_id)
+                )
+            ):
+                return
+
+            # In exteraGram 12.9.0 a search result for a user can open
+            # through openByUserName() instead of the search delegate.
+            # While the password is still the active search query and the
+            # dialog list is on top, treat this as the intended result tap.
+            search_ts = max(
+                self._secret_search_ts,
+                PassGuardPlugin._shared_search_ts,
+            )
+            visible_in_search = dialog_id in PassGuardPlugin._shared_search_ids
+            if self._opened_from_secret_search(dialog_id):
+                self._set_unlock(dialog_id)
+                self._remember_secret_tap(dialog_id)
+                self.logger.info(
+                    "Hidden chat %s unlocked from the password search "
+                    "(username path, visible=%s)",
+                    dialog_id,
+                    visible_in_search,
+                )
+                return
+
+            fragment = param.args[1] if len(param.args) > 1 else None
+            text = "Аккаунт не найден" if dialog_id > 0 else "Чат не найден"
+            if fragment is not None:
+                BulletinHelper.show_error(text, fragment)
+            else:
+                self._show_blocked_toast(dialog_id)
+            param.setResult(None)
+            self.logger.info(
+                "Blocked hidden username %s (%s); search_age=%s; "
+                "dialogs_on_top=%s; visible=%s",
+                username,
+                dialog_id,
+                round(time.time() - search_ts, 1) if search_ts else None,
+                self._dialogs_on_top(),
+                visible_in_search,
+            )
+        except Exception:
+            self.logger.exception("Failed to block a hidden username")
+
+    def on_profile_resume(self, param):
+        try:
+            activity = param.thisObject
+            if activity is None:
+                return
+            dialog_id = self._fragment_dialog_id(activity)
+            self._refresh_hidden_menu(dialog_id)
+            if not self._hidden_active():
+                return
+            # The profile arguments may carry a group dialog id instead of
+            # the hidden user id. While a hidden chat is unlocked, allow
+            # its profile regardless of the id mismatch.
+            if self._hidden_unlock_active() or self._secret_tap_active(
+                dialog_id
+            ):
+                return
+            if dialog_id is None:
+                return
+            if dialog_id not in self._hidden_ids:
+                return
+            if self._secret_unlocked(dialog_id):
+                self._persist_unlock(dialog_id)
+                return
+            self._show_blocked_toast(dialog_id, profile=True)
+            self._close_fragment(activity)
+            self.logger.info("Blocked hidden profile %s", dialog_id)
+        except Exception:
+            self.logger.exception("Failed to block a hidden profile")
+
+    def on_chat_resume(self, param):
+        try:
+            activity = param.thisObject
+            if activity is None:
+                return
+            dialog_id = self._fragment_dialog_id(activity)
+            if dialog_id is None:
+                return
+            if not self._hidden_active() or dialog_id not in self._hidden_ids:
+                return
+            if self._secret_unlocked(dialog_id):
+                self._persist_unlock(dialog_id)
+                return
+            # The native search-result callback is not always delivered
+            # before ChatActivity opens. If the password was searched
+            # moments ago, treat this hidden chat as the one opened from
+            # those search results and keep it unlocked while it is open.
+            now = time.time()
+            search_ts = max(
+                self._secret_search_ts,
+                PassGuardPlugin._shared_search_ts,
+            )
+            if (
+                search_ts
+                and now - search_ts < 60
+            ):
+                self._set_unlock(dialog_id, now)
+                self.logger.info(
+                    "Hidden chat %s unlocked by the recent password search",
+                    dialog_id,
+                )
+                return
+            self._show_blocked_toast(dialog_id)
+            self._close_fragment(activity)
+            self.logger.info(
+                "Blocked hidden chat %s until the password is used",
+                dialog_id,
+            )
+        except Exception:
+            self.logger.exception("Failed to close a hidden chat")
+
+    def _clear_unlock_if_on_list(self, attempt=0):
+        try:
+            top = get_last_fragment()
+            name = ""
+            if top is not None:
+                name = str(top.getClass().getName())
+                if "ChatActivity" in name or "ProfileActivity" in name:
+                    self.logger.info(
+                        "Kept hidden chat unlock while %s is open", name
+                    )
+                    # The list's onResume can fire while an opening
+                    # fragment is not on top yet. Retry briefly; if the
+                    # chat/profile is genuinely open, keep the unlock.
+                    if attempt < 2:
+                        Handler(Looper.getMainLooper()).postDelayed(
+                            UiRunnable(
+                                lambda: self._clear_unlock_if_on_list(
+                                    attempt + 1
+                                )
+                            ),
+                            300,
+                        )
+                    return
+                if "DialogsActivity" not in name:
+                    return
+            had_unlock = self._current_unlock()[0] is not None
+            self._clear_unlock_state()
+            self._secret_search_ts = 0.0
+            PassGuardPlugin._shared_search_ts = 0.0
+            PassGuardPlugin._shared_search_ids = set()
+            self._secret_tap_id = None
+            self._secret_tap_ts = 0.0
+            self.logger.info(
+                "Hidden chat access locked again after returning to the list"
+            )
+            if had_unlock:
+                self.logger.info(
+                    "Cleared persisted hidden chat unlock on the list"
+                )
+        except Exception:
+            self.logger.exception(
+                "Failed to clear the hidden chat unlock"
+            )
+
+    def on_dialogs_resume(self, param):
+        try:
+            # Even a brief return to the dialog list must cancel the
+            # password-search authorization. A tiny delay lets an opening
+            # ChatActivity/ProfileActivity become the top fragment first.
+            Handler(Looper.getMainLooper()).postDelayed(
+                UiRunnable(self._clear_unlock_if_on_list), 300
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to schedule the hidden chat unlock clear"
+            )
+
+    def _is_hidden_object(self, obj):
+        dialog_id = self._object_dialog_id(obj)
+        return dialog_id is not None and dialog_id in self._hidden_ids
+
+    def on_search_helper_results(self, param):
+        try:
+            if not self._hidden_active():
+                return
+            result = param.getResult()
+            if result is None or result.isEmpty():
+                return
+
+            filtered = ArrayList()
+            removed = False
+            for index in range(result.size()):
+                item = result.get(index)
+                if self._is_hidden_object(item):
+                    removed = True
+                    continue
+                filtered.add(item)
+            if removed:
+                param.setResult(filtered)
+        except Exception:
+            self.logger.exception(
+                "Failed to filter hidden chats from server search"
+            )
+
+    def _search_adapter_fields(self):
+        if getattr(self, "_search_results_field", None) is None:
+            class_loader = jclass("java.lang.Class")
+            search_class = class_loader.forName(
+                "org.telegram.ui.Adapters.DialogsSearchAdapter"
+            )
+            results_field = search_class.getDeclaredField("searchResult")
+            results_field.setAccessible(True)
+            names_field = search_class.getDeclaredField(
+                "searchResultNames"
+            )
+            names_field.setAccessible(True)
+            recent_field = search_class.getDeclaredField(
+                "filtered2RecentSearchObjects"
+            )
+            recent_field.setAccessible(True)
+            recent_all_field = search_class.getDeclaredField(
+                "filteredRecentSearchObjects"
+            )
+            recent_all_field.setAccessible(True)
+            query_field = search_class.getDeclaredField("lastSearchText")
+            query_field.setAccessible(True)
+            self._search_results_field = results_field
+            self._search_names_field = names_field
+            self._recent_field = recent_field
+            self._recent_all_field = recent_all_field
+            self._search_query_field = query_field
+        return (
+            self._search_results_field,
+            self._search_names_field,
+            self._recent_field,
+            self._recent_all_field,
+            self._search_query_field,
+        )
+
+    def _filter_recent_entries(self, recent):
+        if recent is None:
+            return
+        for index in range(recent.size() - 1, -1, -1):
+            entry = recent.get(index)
+            dialog_id = None
+            obj = getattr(entry, "object", None)
+            if obj is not None:
+                dialog_id = self._object_dialog_id(obj)
+            if dialog_id is None:
+                try:
+                    did = int(getattr(entry, "did", 0) or 0)
+                    if did:
+                        dialog_id = did
+                except Exception:
+                    pass
+            if dialog_id is not None and dialog_id in self._hidden_ids:
+                recent.remove(index)
+
+    def on_recent_search_filtered(self, param):
+        try:
+            if not self._hidden_active():
+                return
+            adapter = param.thisObject
+            if adapter is None:
+                return
+
+            _results, _names, recent_field, recent_all_field, _query = (
+                self._search_adapter_fields()
+            )
+            self._filter_recent_entries(recent_field.get(adapter))
+            self._filter_recent_entries(recent_all_field.get(adapter))
+        except Exception:
+            self.logger.exception(
+                "Failed to filter hidden chats from recent searches"
+            )
+
+    def on_dialogs_array(self, param, source="activity", kind=""):
+        try:
+            # The main folder list is already filtered by the controller
+            # hook. Return before touching any plugin state so scrolling
+            # this list costs nothing.
+            if source == "activity":
+                try:
+                    dialogs_type = int(param.args[1])
+                    frozen = bool(param.args[3])
+                except Exception:
+                    dialogs_type = -1
+                    frozen = False
+                if (
+                    dialogs_type == 0
+                    and not frozen
+                    and getattr(self, "_controller_dialogs_hooked", False)
+                ):
+                    return
+
+            if not self._hidden_active():
+                return
+
+            result = param.getResult()
+            if result is None:
+                return
+
+            size = int(result.size())
+            if size:
+                first_id = self._dialog_id_fast(result.get(0))
+                middle_id = self._dialog_id_fast(result.get(size // 2))
+                last_id = self._dialog_id_fast(result.get(size - 1))
+            else:
+                first_id = middle_id = last_id = None
+            fingerprint = (size, first_id, middle_id, last_id)
+
+            if source == "controller":
+                try:
+                    account = int(param.thisObject.currentAccount)
+                except Exception:
+                    try:
+                        account = int(get_selected_account())
+                    except Exception:
+                        account = -1
+                try:
+                    key = (
+                        "controller",
+                        account,
+                        kind,
+                        int(param.args[0]),
+                    )
+                except Exception:
+                    key = ("controller", account, kind)
+            else:
+                try:
+                    key = (
+                        "activity",
+                        int(param.args[0]),
+                        int(param.args[1]),
+                        int(param.args[2]),
+                        bool(param.args[3]),
+                    )
+                except Exception:
+                    key = ("activity",)
+
+            cache_map = getattr(self, "_dialog_filter_cache", None)
+            if cache_map is None:
+                cache_map = {}
+                self._dialog_filter_cache = cache_map
+            generation = getattr(self, "_dialog_filter_generation", 0)
+            cached = cache_map.get(key)
+            # No time-based expiry here. While the user scrolls, the list
+            # content and the hidden set do not change, so this is a plain
+            # cache hit instead of a full rescan every 150 ms.
+            if (
+                cached is not None
+                and cached[0] == self._hidden_ids
+                and cached[1] == fingerprint
+                and (source == "controller" or cached[2] == generation)
+            ):
+                if cached[3] is not None:
+                    param.setResult(cached[3])
+                return
+
+            # A cache miss means the list itself changed (new message,
+            # folder switch, hide/unhide). Only here is it safe to re-read
+            # settings; the scroll path never does.
+            if time.time() - PassGuardPlugin._shared_hidden_ts >= 60.0:
+                self._refresh_hidden_state()
+                if not self._hidden_active():
+                    return
+
+            filtered = ArrayList()
+            removed = 0
+            for index in range(size):
+                item = result.get(index)
+                dialog_id = self._dialog_id_fast(item)
+                if dialog_id is not None and dialog_id in self._hidden_ids:
+                    removed += 1
+                    continue
+                filtered.add(item)
+
+            if source == "controller":
+                generation += 1
+                self._dialog_filter_generation = generation
+            cache_map[key] = (
+                set(self._hidden_ids),
+                fingerprint,
+                generation,
+                filtered if removed else None,
+            )
+
+            if removed:
+                last_removed = getattr(
+                    self, "_dialog_filter_last_removed", -1
+                )
+                if removed != last_removed:
+                    self._dialog_filter_last_removed = removed
+                    self.logger.info(
+                        "Filtered %s hidden chat(s) from the dialog list",
+                        removed,
+                    )
+                param.setResult(filtered)
+        except Exception:
+            self.logger.exception("Failed to filter hidden chats")
+
+    def on_search_results(self, param):
+        try:
+            if not self._hidden_active():
+                return
+            adapter = param.thisObject
+            if adapter is None:
+                return
+            # Handler.post always queues, even when the caller is already
+            # on the UI thread. This must run after updateSearchResults()
+            # has assigned its fresh result lists.
+            handler = Handler(Looper.getMainLooper())
+            handler.post(
+                UiRunnable(
+                    lambda: self._patch_hidden_search_results(adapter)
+                )
+            )
+        except Exception:
+            self.logger.exception("Failed to schedule hidden search patch")
+
+    def on_search_query_changed(self, param):
+        """Drop stale hidden results the moment the query leaves the code."""
+        try:
+            if not self._hidden_active():
+                return
+            adapter = param.thisObject
+            if adapter is None:
+                return
+
+            results_field, names_field, _recent, _recent_all, query_field = (
+                self._search_adapter_fields()
+            )
+            code = str(getattr(self, "_hidden_code", "") or "").strip()
+            query = str(query_field.get(adapter) or "").strip()
+            if query == code:
+                self._secret_search_ts = time.time()
+                PassGuardPlugin._shared_search_ts = self._secret_search_ts
+                # The exact visible ids are filled by the adapter patch.
+                PassGuardPlugin._shared_search_ids = set()
+                return
+
+            results = results_field.get(adapter)
+            names = names_field.get(adapter)
+            if results is None or names is None:
+                return
+
+            PassGuardPlugin._shared_search_ids = set()
+            removed = False
+            for index in range(results.size() - 1, -1, -1):
+                dialog_id = self._object_dialog_id(results.get(index))
+                if dialog_id is not None and dialog_id in self._hidden_ids:
+                    results.remove(index)
+                    if index < names.size():
+                        names.remove(index)
+                    removed = True
+            if removed:
+                adapter.notifyDataSetChanged()
+        except Exception:
+            self.logger.exception(
+                "Failed to drop hidden chats from stale search results"
+            )
+
+    def _patch_hidden_search_results(self, adapter):
+        try:
+            if not self._hidden_active():
+                return
+
+            results_field, names_field, _recent, _recent_all, query_field = (
+                self._search_adapter_fields()
+            )
+
+            results = results_field.get(adapter)
+            names = names_field.get(adapter)
+            if results is None or names is None:
+                return
+
+            self._filter_recent_entries(_recent.get(adapter))
+            self._filter_recent_entries(_recent_all.get(adapter))
+
+            code = str(getattr(self, "_hidden_code", "") or "").strip()
+            query = str(query_field.get(adapter) or "").strip()
+
+            if query == code:
+                self._secret_search_ts = time.time()
+                PassGuardPlugin._shared_search_ts = self._secret_search_ts
+                present = set()
+                for index in range(results.size()):
+                    dialog_id = self._object_dialog_id(results.get(index))
+                    if dialog_id in self._hidden_ids:
+                        present.add(dialog_id)
+                        if index < names.size():
+                            names.set(
+                                index,
+                                self._badged_name(
+                                    self._dialog_name(results.get(index))
+                                ),
+                            )
+
+                for dialog_id in sorted(self._hidden_ids):
+                    if dialog_id in present:
+                        continue
+                    obj = self._resolve_dialog_object(dialog_id)
+                    if obj is None:
+                        continue
+                    results.add(obj)
+                    names.add(
+                        self._badged_name(self._dialog_name(obj))
+                    )
+                    present.add(dialog_id)
+                PassGuardPlugin._shared_search_ids = set(present)
+            else:
+                PassGuardPlugin._shared_search_ids = set()
+                for index in range(results.size() - 1, -1, -1):
+                    dialog_id = self._object_dialog_id(results.get(index))
+                    if dialog_id in self._hidden_ids:
+                        results.remove(index)
+                        if index < names.size():
+                            names.remove(index)
+
+            adapter.notifyDataSetChanged()
+        except Exception:
+            self.logger.exception("Failed to patch hidden search results")
+
+    # ------------------------------------------------------------------
+    # Delivery
+    # ------------------------------------------------------------------
+
+    def _send_alert(self):
+        try:
+            account = get_selected_account()
+            text = (
+                "Был неверно введён пароль от Telegram в "
+                + datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            photo_path = None
+            if self.get_setting("send_photo", True):
+                photo_path = self._capture_front_photo()
+
+            destination = int(self.get_setting("destination", 0))
+            self.logger.info(
+                "Wrong passcode alert: account=%s, destination=%s, photo=%s",
+                account,
+                destination,
+                photo_path,
+            )
+            if destination == 0:
+                self._send_to_saved_messages(account, text, photo_path)
+            elif destination == 1:
+                self._send_to_username(account, text, photo_path)
+            else:
+                self._send_to_bot(account, text, photo_path)
+        except Exception:
+            self.logger.exception("Failed to send passcode alert")
+
+    def _send_to_peer(self, account, peer, text, photo_path, label):
+        """Send the photo and the text to exactly the same peer.
+
+        Returns True when Telegram accepted at least one send call.
+        """
+        if photo_path:
+            try:
+                send_photo(
+                    peer,
+                    photo_path,
+                    caption=text,
+                    account=account,
+                    notify=False,
+                )
+                self.logger.info("Passcode photo sent to %s", label)
+                return True
+            except Exception:
+                self.logger.exception(
+                    "Failed to send photo to %s; trying as a document",
+                    label,
+                )
+                try:
+                    send_document(
+                        peer,
+                        photo_path,
+                        caption=text,
+                        account=account,
+                        notify=False,
+                    )
+                    self.logger.info(
+                        "Passcode photo sent to %s as document", label
+                    )
+                    return True
+                except Exception:
+                    self.logger.exception(
+                        "Failed to send document to %s; falling back to text",
+                        label,
+                    )
+
+        try:
+            send_message(
+                {"peer": peer, "message": text, "notify": False},
+                account=account,
+            )
+            self.logger.info("Passcode alert sent to %s", label)
+            return True
+        except Exception:
+            self.logger.exception(
+                "Failed to send alert to %s; trying send_text", label
+            )
+
+        try:
+            send_text(peer, text, account=account, notify=False)
+            self.logger.info("Passcode alert sent to %s via send_text", label)
+            return True
+        except Exception:
+            self.logger.exception("Failed to send alert to %s", label)
+            return False
+
+    def _send_to_saved_messages(self, account, text, photo_path):
+        user = get_user_config(account).getCurrentUser()
+        if user is None:
+            self.logger.error("Current user is not available")
+            return False
+        return self._send_to_peer(
+            account, user.id, text, photo_path, "Saved Messages"
+        )
+
+    def _fallback_to_saved_messages(self, account, text, reason):
+        """Never lose the alert: report a delivery failure to Saved Messages."""
+        try:
+            self.logger.warning(
+                "Falling back to Saved Messages: %s", reason
+            )
+            note = (
+                "⚠️ Не удалось отправить уведомление выбранным способом.\n"
+                "Причина: %s\n\n%s" % (reason, text)
+            )
+            self._send_to_saved_messages(account, note, None)
+        except Exception:
+            self.logger.exception(
+                "Could not send the fallback alert to Saved Messages"
+            )
+
+    def _normalize_username(self, value):
+        username = str(value or "").strip()
+        lowered = username.lower()
+        for prefix in (
+            "https://t.me/",
+            "http://t.me/",
+            "https://telegram.me/",
+            "http://telegram.me/",
+            "t.me/",
+            "telegram.me/",
+        ):
+            if lowered.startswith(prefix):
+                username = username[len(prefix):]
+                break
+        username = username.split("?", 1)[0]
+        username = username.split("/", 1)[0]
+        return username.strip().lstrip("@")
+
+    def _resolved_peer_id(self, response):
+        """Convert contacts.resolvedPeer into a dialog id.
+
+        response.peer is authoritative; the users/chats lists are only a
+        fallback for unusual responses.
+        """
+        peer = getattr(response, "peer", None)
+        if peer is not None:
+            for attribute, sign in (
+                ("user_id", 1),
+                ("chat_id", -1),
+                ("channel_id", -1),
+            ):
+                try:
+                    value = int(getattr(peer, attribute, 0) or 0)
+                except Exception:
+                    value = 0
+                if value:
+                    return sign * value
+
+        try:
+            users = getattr(response, "users", None)
+            if users is not None and users.size() > 0:
+                return int(users.get(0).id)
+            chats = getattr(response, "chats", None)
+            if chats is not None and chats.size() > 0:
+                return -int(chats.get(0).id)
+        except Exception:
+            self.logger.exception("Could not read the resolved peer")
+        return None
+
+    def _send_to_username(self, account, text, photo_path):
+        username = self._normalize_username(
+            self.get_setting("target_username", "")
+        )
+        if not username:
+            self.logger.error("Target username is empty")
+            self._fallback_to_saved_messages(
+                account, text, "не задан юзернейм получателя"
+            )
+            return
+
+        request = TLRPC.TL_contacts_resolveUsername()
+        request.username = username
+
+        def on_resolved(response, error):
+            try:
+                if error is not None:
+                    reason = "не удалось найти @%s: %s" % (
+                        username,
+                        getattr(error, "text", None) or str(error),
+                    )
+                    self.logger.error(
+                        "Could not resolve @%s: %s", username, reason
+                    )
+                    self._fallback_to_saved_messages(account, text, reason)
+                    return
+                if response is None:
+                    self.logger.error(
+                        "Empty response while resolving @%s", username
+                    )
+                    self._fallback_to_saved_messages(
+                        account,
+                        text,
+                        "пустой ответ при поиске @%s" % username,
+                    )
+                    return
+
+                # A raw resolve request does not populate the controller
+                # cache. send_message() calls getInputPeer(), which needs
+                # access_hash from these objects, otherwise Telegram
+                # rejects the peer and nothing is delivered.
+                try:
+                    controller = MessagesController.getInstance(account)
+                    if response.users is not None:
+                        controller.putUsers(response.users, False)
+                    if response.chats is not None:
+                        controller.putChats(response.chats, False)
+                except Exception:
+                    self.logger.exception(
+                        "Could not cache the resolved peer @%s", username
+                    )
+
+                peer = self._resolved_peer_id(response)
+                if peer is None:
+                    self.logger.error("@%s was not found", username)
+                    self._fallback_to_saved_messages(
+                        account, text, "@%s не найден" % username
+                    )
+                    return
+
+                self.logger.info(
+                    "Resolved @%s to dialog %s", username, peer
+                )
+                if not self._send_to_peer(
+                    account, peer, text, photo_path, "@" + username
+                ):
+                    self._fallback_to_saved_messages(
+                        account,
+                        text,
+                        "не удалось отправить сообщение @%s" % username,
+                    )
+            except Exception:
+                self.logger.exception(
+                    "Failed to send alert to @%s", username
+                )
+                self._fallback_to_saved_messages(
+                    account, text, "ошибка при отправке @%s" % username
+                )
+
+        send_request(request, on_resolved, account=account)
+
+    def _normalize_bot_chat_id(self, value):
+        chat_id = str(value or "").strip()
+        if not chat_id:
+            return ""
+        if chat_id.startswith("+") and chat_id[1:].isdigit():
+            return chat_id[1:]
+        if chat_id.startswith("@") and chat_id[1:].isdigit():
+            return chat_id[1:]
+        if chat_id.startswith("@") or chat_id.startswith("-"):
+            return chat_id
+        if chat_id.isdigit():
+            return chat_id
+        return "@" + chat_id
+
+    def _normalize_bot_token(self, value):
+        token = "".join(str(value or "").split())
+        if token.lower().startswith("bot") and token[3:4].isdigit():
+            token = token[3:]
+        return token
+
+    def _sanitize_bot_error(self, error, token):
+        message = str(error)
+        if token:
+            message = message.replace(token, "<bot-token>")
+            message = message.replace(
+                token.replace(":", "%3A"), "<bot-token>"
+            )
+        return "%s: %s" % (type(error).__name__, message)
+
+    def _bot_response_error(self, response):
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            description = str(payload.get("description") or "").strip()
+            code = payload.get("error_code") or response.status_code
+            if description:
+                return "HTTP %s: %s" % (code, description)
+        body = str(getattr(response, "text", "") or "").strip()
+        if len(body) > 300:
+            body = body[:300] + "..."
+        return "HTTP %s: %s" % (
+            response.status_code,
+            body or "пустой ответ",
+        )
+
+    def _bot_api_post(self, token, method, data, files=None):
+        url = "https://api.telegram.org/bot%s/%s" % (token, method)
+        return requests.post(
+            url,
+            data=data,
+            files=files,
+            timeout=20 if files is None else 30,
+        )
+
+    def _send_bot_photo(self, token, chat_id, photo_path, caption):
+        try:
+            with open(photo_path, "rb") as photo:
+                response = self._bot_api_post(
+                    token,
+                    "sendPhoto",
+                    {
+                        "chat_id": chat_id,
+                        "caption": caption,
+                        "disable_notification": "true",
+                    },
+                    files={
+                        "photo": (
+                            "passguard.jpg",
+                            photo,
+                            "image/jpeg",
+                        )
+                    },
+                )
+            if response.status_code == 200:
+                self.logger.info("Passcode photo sent via bot")
+                return True
+            self.logger.error(
+                "Bot sendPhoto failed: %s",
+                self._bot_response_error(response),
+            )
+        except Exception as error:
+            self.logger.error(
+                "Bot sendPhoto failed: %s",
+                self._sanitize_bot_error(error, token),
+            )
+        return False
+
+    def _send_bot_text(self, token, chat_id, text):
+        error = None
+        response = None
+        for attempt in range(2):
+            try:
+                response = self._bot_api_post(
+                    token,
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": text,
+                        "disable_notification": "true",
+                    },
+                )
+                break
+            except Exception as exc:
+                error = self._sanitize_bot_error(exc, token)
+                self.logger.error(
+                    "Bot sendMessage attempt %d failed: %s",
+                    attempt + 1,
+                    error,
+                )
+                if attempt == 0:
+                    time.sleep(1.0)
+
+        if response is None:
+            return False, error
+        if response.status_code == 200:
+            return True, None
+        error = self._bot_response_error(response)
+        self.logger.error("Bot sendMessage failed: %s", error)
+        return False, error
+
+    def _bot_get_json(self, token, method, data=None):
+        try:
+            response = self._bot_api_post(token, method, data or {})
+        except Exception as error:
+            return None, self._sanitize_bot_error(error, token)
+        try:
+            payload = response.json()
+        except Exception:
+            return None, self._bot_response_error(response)
+        if not isinstance(payload, dict):
+            return None, "некорректный ответ Bot API"
+        if not payload.get("ok"):
+            return None, "HTTP %s: %s" % (
+                payload.get("error_code") or response.status_code,
+                payload.get("description") or "ошибка Bot API",
+            )
+        return payload.get("result"), None
+
+    def _bot_username(self, token):
+        result, error = self._bot_get_json(token, "getMe")
+        if error or not isinstance(result, dict):
+            return None
+        username = result.get("username")
+        return str(username) if username else None
+
+    def _discover_bot_chat_id(self, token, configured_chat_id):
+        """Find the numeric chat id after Bot API says chat not found."""
+        username = ""
+        if configured_chat_id.startswith("@"):
+            username = configured_chat_id[1:]
+
+        # Public channels and groups can often be resolved directly.
+        if configured_chat_id.startswith("@"):
+            result, error = self._bot_get_json(
+                token, "getChat", {"chat_id": configured_chat_id}
+            )
+            if isinstance(result, dict) and result.get("id") is not None:
+                return result.get("id"), None
+
+        result, error = self._bot_get_json(
+            token,
+            "getUpdates",
+            {"limit": 100, "timeout": 0},
+        )
+        if error:
+            return None, error
+        if not isinstance(result, list):
+            return None, "Bot API вернул пустой список обновлений"
+
+        chats = []
+        seen = set()
+        for update in result:
+            if not isinstance(update, dict):
+                continue
+            message = (
+                update.get("message")
+                or update.get("edited_message")
+                or update.get("channel_post")
+                or update.get("edited_channel_post")
+            )
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat")
+            if not isinstance(chat, dict) or chat.get("id") is None:
+                continue
+            chat_id = chat.get("id")
+            if chat_id in seen:
+                continue
+            seen.add(chat_id)
+            chats.append(chat)
+
+        if not chats:
+            return None, "бот ещё не получал сообщений"
+
+        if username:
+            wanted = username.lower()
+            for chat in reversed(chats):
+                if str(chat.get("username") or "").lower() == wanted:
+                    return chat.get("id"), None
+
+        private_chats = [
+            chat for chat in chats if chat.get("type") == "private"
+        ]
+        if len(private_chats) == 1:
+            return private_chats[0].get("id"), None
+        if len(private_chats) > 1:
+            ids = ", ".join(
+                str(chat.get("id")) for chat in private_chats[:5]
+            )
+            return None, (
+                "в getUpdates несколько получателей (%s); "
+                "укажите числовой chat_id" % ids
+            )
+
+        if len(chats) == 1:
+            return chats[0].get("id"), None
+        return None, "в getUpdates несколько чатов; укажите числовой chat_id"
+
+    def _bot_chat_hint(self, token, discovery_error):
+        bot_username = self._bot_username(token)
+        if bot_username:
+            hint = "Напишите /start боту @%s" % bot_username
+        else:
+            hint = "Напишите /start боту"
+        hint += " и укажите числовой chat_id."
+        if discovery_error:
+            if "webhook" in str(discovery_error).lower():
+                hint += (
+                    " У бота включён webhook, поэтому автоопределение"
+                    " недоступно."
+                )
+            else:
+                hint += " Автоопределение: %s" % discovery_error
+        return hint
+
+    def _send_to_bot(self, account, text, photo_path):
+        token = self._normalize_bot_token(
+            self.get_setting("bot_token", "")
+        )
+        chat_id = self._normalize_bot_chat_id(
+            self.get_setting("bot_chat_id", "")
+        )
+        if not token or not chat_id:
+            self.logger.error("Bot token or recipient is empty")
+            self._fallback_to_saved_messages(
+                account, text, "не задан токен бота или получатель"
+            )
+            return
+        if ":" not in token:
+            self.logger.error("Bot token has no ':' separator")
+            self._fallback_to_saved_messages(
+                account, text, "токен бота выглядит неверно (нет «:»)"
+            )
+            return
+
+        # Text first: it is the critical part of the alert and does not
+        # depend on uploading a photo. The photo is sent as a second
+        # message when it is available.
+        sent, text_error = self._send_bot_text(token, chat_id, text)
+
+        if (
+            not sent
+            and text_error
+            and "chat not found" in text_error.lower()
+        ):
+            discovered, discovery_error = self._discover_bot_chat_id(
+                token, chat_id
+            )
+            if discovered is not None:
+                discovered = str(discovered)
+                self.logger.info(
+                    "Bot chat_id %s was not found; using %s from getUpdates",
+                    chat_id,
+                    discovered,
+                )
+                chat_id = discovered
+                sent, text_error = self._send_bot_text(
+                    token, chat_id, text
+                )
+                if sent:
+                    try:
+                        self.set_setting(
+                            "bot_chat_id",
+                            chat_id,
+                            reload_settings=False,
+                        )
+                        self.logger.info(
+                            "Saved discovered bot chat_id %s", chat_id
+                        )
+                    except Exception:
+                        self.logger.exception(
+                            "Could not save the discovered bot chat_id"
+                        )
+            else:
+                self.logger.error(
+                    "Could not discover bot chat_id: %s", discovery_error
+                )
+                text_error = text_error + ". " + self._bot_chat_hint(
+                    token, discovery_error
+                )
+
+        if sent:
+            self.logger.info("Passcode alert sent via bot")
+            if photo_path:
+                self._send_bot_photo(
+                    token, chat_id, photo_path, "Фото с камеры"
+                )
+            return
+
+        # The text request failed; a photo with the alert as a caption is
+        # the last chance to deliver it through Bot API.
+        if photo_path and self._send_bot_photo(
+            token, chat_id, photo_path, text
+        ):
+            return
+
+        self._fallback_to_saved_messages(
+            account,
+            text,
+            "бот: " + (text_error or "неизвестная ошибка"),
+        )
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+
+
+    def _save_captured_photo(self, data):
+        path = os.path.join(get_files_dir(), "passguard_last.jpg")
+        with open(path, "wb") as photo_file:
+            photo_file.write(data)
+        self.logger.info(
+            "Camera photo saved to %s (%d bytes)", path, len(data)
+        )
+        return path
+
+    def _start_front_capture(self, holder, event):
+        """Open a camera and start a capture on the HandlerThread.
+
+        Front camera is preferred, back camera is used as a fallback on
+        devices without a working front camera. This method must return
+        quickly: the same Looper that receives Camera.PictureCallback also
+        runs this method, so waiting here would deadlock.
+        """
+        camera = None
+        try:
+            context = ApplicationLoader.applicationContext
+            if context is None:
+                self.logger.error("Application context is not available")
+                holder["error"] = True
+                event.set()
+                return
+
+            if context.checkCallingOrSelfPermission(
+                "android.permission.CAMERA"
+            ) != 0:
+                self.logger.error(
+                    "CAMERA permission is not granted; sending text only"
+                )
+                holder["error"] = True
+                event.set()
+                return
+
+            # Prefer the front camera, then any other camera, then the
+            # default Camera.open().
+            candidates = []
+            try:
+                camera_count = Camera.getNumberOfCameras()
+            except Exception:
+                camera_count = 0
+
+            for index in range(camera_count):
+                try:
+                    info = Camera.CameraInfo()
+                    Camera.getCameraInfo(index, info)
+                    orientation = int(info.orientation)
+                    if info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT:
+                        candidates.insert(0, (index, orientation))
+                    else:
+                        candidates.append((index, orientation))
+                except Exception:
+                    self.logger.exception(
+                        "Could not inspect camera %s", index
+                    )
+
+            if not candidates:
+                candidates = [(-1, 270)]
+            elif candidates[-1][0] != -1:
+                candidates.append((-1, 270))
+
+            for index, orientation in candidates:
+                try:
+                    camera = (
+                        Camera.open(index) if index >= 0 else Camera.open()
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Could not open camera %s", index
+                    )
+                    camera = None
+                    continue
+
+                holder["camera"] = camera
+
+                try:
+                    parameters = camera.getParameters()
+                    try:
+                        parameters.setPictureFormat(ImageFormat.JPEG)
+                    except Exception:
+                        pass
+                    try:
+                        parameters.setJpegQuality(85)
+                    except Exception:
+                        pass
+                    try:
+                        parameters.setRotation(orientation)
+                    except Exception:
+                        pass
+                    camera.setParameters(parameters)
+                except Exception:
+                    self.logger.exception(
+                        "Could not set parameters for camera %s", index
+                    )
+
+                # Best effort: Japanese models may still force the sound.
+                try:
+                    if not bool(camera.enableShutterSound(False)):
+                        self.logger.warning(
+                            "Camera %s enforces the shutter sound", index
+                        )
+                except Exception:
+                    pass
+
+                # Some devices require a preview before takePicture();
+                # others work without it. Try preview first and still
+                # attempt the capture if preview setup fails.
+                try:
+                    texture = SurfaceTexture(0)
+                    holder["texture"] = texture
+                    camera.setPreviewTexture(texture)
+                    camera.startPreview()
+                except Exception:
+                    self.logger.exception(
+                        "Preview setup failed for camera %s", index
+                    )
+                    try:
+                        camera.stopPreview()
+                    except Exception:
+                        pass
+
+                try:
+                    camera.takePicture(
+                        None, None, CameraPictureCallback(holder, event)
+                    )
+                    return
+                except Exception:
+                    self.logger.exception(
+                        "takePicture failed for camera %s", index
+                    )
+                    try:
+                        camera.release()
+                    except Exception:
+                        pass
+                    holder["camera"] = None
+                    camera = None
+
+            holder["error"] = True
+            event.set()
+        except Exception:
+            self.logger.exception("Failed to start camera capture")
+            holder["error"] = True
+            if camera is not None:
+                try:
+                    camera.stopPreview()
+                except Exception:
+                    pass
+                try:
+                    camera.release()
+                except Exception:
+                    pass
+                holder["camera"] = None
+            event.set()
+
+    def _capture_front_photo(self):
+        thread = HandlerThread("PassGuardCamera")
+        thread.start()
+        handler = Handler(thread.getLooper())
+        holder = {"handler": handler}
+        event = threading.Event()
+        try:
+            handler.post(
+                CameraRunnable(
+                    lambda: self._start_front_capture(holder, event)
+                )
+            )
+            if not event.wait(20):
+                self.logger.error("Camera capture timed out")
+                return None
+
+            if holder.get("error"):
+                return None
+
+            data = holder.get("data")
+            if not data:
+                self.logger.error("Camera returned no JPEG data")
+                return None
+
+            return self._save_captured_photo(data)
+        except Exception:
+            self.logger.exception("Failed to capture camera photo")
+            return None
+        finally:
+            camera = holder.get("camera")
+            if camera is not None:
+                try:
+                    camera.stopPreview()
+                except Exception:
+                    pass
+                try:
+                    camera.release()
+                except Exception:
+                    pass
+            try:
+                thread.quitSafely()
+            except Exception:
+                try:
+                    thread.quit()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def _on_enabled_change(self, value):
+        self.set_setting("enabled", bool(value), reload_settings=True)
+
+    def _on_destination_change(self, value):
+        self.set_setting("destination", int(value), reload_settings=True)
+
+    def _on_duress_enabled_change(self, value):
+        if not bool(value):
+            self.set_setting(
+                "duress_enabled", False, reload_settings=True
+            )
+            return
+        self._show_duress_warning()
+
+    def _on_hidden_enabled_change(self, value):
+        self._hidden_enabled = bool(value)
+        self.set_setting(
+            "hidden_enabled", self._hidden_enabled, reload_settings=True
+        )
+        self._publish_hidden_state()
+        self._refresh_hidden_menu()
+
+    def _save_new_hidden_code(self, builder, field):
+        try:
+            code = str(field.getText().toString() or "").strip()
+            if not code:
+                BulletinHelper.show_error(
+                    "Пароль не может быть пустым", get_last_fragment()
+                )
+                return
+
+            self._hidden_code = code
+            self.set_setting("hidden_code", code, reload_settings=True)
+            self._publish_hidden_state()
+            self._clear_unlock_state()
+            self._refresh_hidden_menu()
+            builder.dismiss()
+            BulletinHelper.show_success(
+                "Пароль сохранён", get_last_fragment()
+            )
+            self.logger.info("Hidden chat password updated")
+        except Exception:
+            self.logger.exception("Could not save the hidden chat password")
+
+    def _on_hidden_password_click(self, view):
+        try:
+            fragment = get_last_fragment()
+            activity = (
+                fragment.getParentActivity() if fragment is not None else None
+            )
+            if activity is None:
+                return
+
+            resources = activity.getResources()
+            density = resources.getDisplayMetrics().density
+            try:
+                text_color = int(
+                    Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+                )
+            except Exception:
+                text_color = -7829368
+            try:
+                hint_color = int(
+                    Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)
+                )
+            except Exception:
+                hint_color = -7829368
+            if (text_color & 0xFF000000) == 0:
+                text_color = -7829368
+            if (hint_color & 0xFF000000) == 0:
+                hint_color = -7829368
+
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            pixel_padding = int(24 * density)
+            layout.setPadding(
+                pixel_padding, int(8 * density), pixel_padding, 0
+            )
+
+            first = EditText(activity)
+            first.setHint("Пароль")
+            first.setSingleLine(True)
+            first.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD
+            )
+            first.setTransformationMethod(
+                PasswordTransformationMethod.getInstance()
+            )
+            first.setTextColor(text_color)
+            first.setHintTextColor(hint_color)
+
+            layout.addView(first, LinearLayout.LayoutParams(-1, -2))
+
+            AlertDialogBuilder(activity).set_title(
+                "Пароль для скрытых чатов"
+            ).set_message(
+                "Он скрыт и вводится один раз. Этот пароль нужно вводить "
+                "в поиске Telegram, чтобы увидеть скрытые чаты."
+            ).set_view(layout).set_positive_button(
+                "Сохранить",
+                lambda builder, which: self._save_new_hidden_code(
+                    builder, first
+                ),
+            ).set_negative_button(
+                "Отмена", None
+            ).show()
+        except Exception:
+            self.logger.exception(
+                "Could not show the hidden chat password dialog"
+            )
+
+    def _show_duress_warning(self):
+        try:
+            fragment = get_last_fragment()
+            activity = (
+                fragment.getParentActivity() if fragment is not None else None
+            )
+            if activity is None:
+                self.logger.error(
+                    "No activity to show the duress warning dialog"
+                )
+                self.set_setting(
+                    "duress_enabled", False, reload_settings=True
+                )
+                return
+
+            state = {
+                "confirmed": False,
+                "cancelled": False,
+                "ready": False,
+            }
+
+            def on_confirm(bld, which):
+                if state["confirmed"]:
+                    return
+                # The button stays clickable during the countdown so an
+                # early tap can be answered with haptic feedback.
+                if not state["ready"]:
+                    self._duress_haptic(bld)
+                    return
+                state["confirmed"] = True
+                self._cancel_duress_timers(state)
+                bld.dismiss()
+                self.set_setting(
+                    "duress_enabled", True, reload_settings=True
+                )
+
+            def on_dismiss(bld):
+                state["cancelled"] = True
+                self._cancel_duress_timers(state)
+                if not state["confirmed"]:
+                    self.set_setting(
+                        "duress_enabled", False, reload_settings=True
+                    )
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Код экстренного стирания")
+            builder.set_message(
+                "Эта функция выходит из аккаунта на этом устройстве "
+                "при вводе заданного пароля"
+            )
+            builder.set_negative_button(
+                "Отмена", lambda bld, which: bld.dismiss()
+            )
+            builder.set_positive_button("Я понимаю (3)", on_confirm)
+            builder.set_on_dismiss_listener(on_dismiss)
+            builder.create()
+            builder.set_cancelable(False)
+            builder.show()
+
+            button = self._get_duress_button(builder)
+            if button is not None:
+                button.setAlpha(0.5)
+                try:
+                    # Handle the click ourselves so an early tap can give
+                    # haptic feedback without dismissing the dialog.
+                    button.setOnClickListener(
+                        OnClickListener(
+                            lambda view: self._on_duress_button_click(
+                                builder, state
+                            )
+                        )
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Could not override the duress dialog button"
+                    )
+
+            self._set_duress_button(builder, 3)
+            # CountDownTimer is a native Android timer. Unlike Python
+            # threading.Timer or run_on_ui_thread() it reliably keeps a
+            # one-second interval and calls onTick on the UI thread.
+            state["timer"] = None
+            if COUNTDOWN_TIMER_AVAILABLE:
+                try:
+                    timer = DuressCountDownTimer.new_instance(
+                        3000, 1000, init_args=[self, builder, state]
+                    )
+                    state["timer"] = timer
+                    timer.start()
+                    return
+                except Exception:
+                    self.logger.exception(
+                        "Failed to start native duress countdown"
+                    )
+
+            # Fallback for builds where java_subclass is unavailable.
+            state["handler"] = Handler(Looper.getMainLooper())
+            state["runnables"] = []
+            self._schedule_duress_tick(builder, state, 2, 1000)
+        except Exception:
+            self.logger.exception("Failed to show duress warning")
+            self.set_setting(
+                "duress_enabled", False, reload_settings=True
+            )
+
+    def _get_duress_button(self, builder):
+        try:
+            button = builder.get_button(
+                AlertDialogBuilder.BUTTON_POSITIVE
+            )
+            if button is not None:
+                return button
+        except Exception:
+            self.logger.exception("builder.get_button failed")
+
+        try:
+            dialog = builder.get_dialog()
+            if dialog is not None:
+                return dialog.getButton(
+                    AlertDialogBuilder.BUTTON_POSITIVE
+                )
+        except Exception:
+            self.logger.exception("dialog.getButton failed")
+
+        return None
+
+    def _duress_haptic(self, builder):
+        try:
+            button = self._get_duress_button(builder)
+            if button is not None:
+                button.performHapticFeedback(
+                    HapticFeedbackConstants.LONG_PRESS
+                )
+        except Exception:
+            self.logger.exception("Duress haptic feedback failed")
+
+    def _cancel_duress_timers(self, state):
+        timer = state.get("timer")
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                self.logger.exception(
+                    "Failed to cancel duress countdown"
+                )
+        handler = state.get("handler")
+        if handler is not None:
+            try:
+                handler.removeCallbacksAndMessages(None)
+            except Exception:
+                self.logger.exception("Failed to cancel duress timers")
+        state["runnables"] = []
+
+    def _schedule_duress_tick(self, builder, state, remaining, delay):
+        handler = state.get("handler")
+        if handler is None:
+            return
+        runnable = UiRunnable(
+            lambda: self._duress_tick(builder, state, remaining)
+        )
+        state.setdefault("runnables", []).append(runnable)
+        handler.postDelayed(runnable, delay)
+
+    def _on_duress_button_click(self, builder, state):
+        if state["confirmed"]:
+            return
+        if not state["ready"]:
+            self._duress_haptic(builder)
+            return
+        state["confirmed"] = True
+        self._cancel_duress_timers(state)
+        builder.dismiss()
+        self.set_setting("duress_enabled", True, reload_settings=True)
+
+    def _duress_tick(self, builder, state, remaining):
+        if state["confirmed"] or state["cancelled"]:
+            return
+        try:
+            self._set_duress_button(builder, remaining)
+            if remaining <= 0:
+                state["ready"] = True
+                return
+            self._schedule_duress_tick(
+                builder, state, remaining - 1, 1000
+            )
+        except Exception:
+            self.logger.exception("Duress countdown failed")
+
+    def _set_duress_button(self, builder, remaining):
+        try:
+            button = self._get_duress_button(builder)
+            if button is None:
+                self.logger.error("Duress dialog button was not found")
+                return
+            if remaining > 0:
+                button.setText("Я понимаю ({})".format(remaining))
+                button.setEnabled(True)
+                button.setAlpha(0.5)
+            else:
+                button.setText("Я понимаю")
+                button.setEnabled(True)
+                button.setAlpha(1.0)
+        except Exception:
+            self.logger.exception("Failed to update duress dialog button")
+
+    def _on_send_photo_change(self, value):
+        enabled = bool(value)
+        self.set_setting("send_photo", enabled, reload_settings=True)
+        if enabled:
+            self._request_camera_permission()
+
+    def _has_camera_permission(self):
+        try:
+            context = ApplicationLoader.applicationContext
+            if context is None:
+                return False
+            return (
+                context.checkCallingOrSelfPermission(
+                    "android.permission.CAMERA"
+                )
+                == 0
+            )
+        except Exception:
+            return False
+
+    def _on_request_camera_click(self, *args):
+        self._request_camera_permission()
+
+    def _request_camera_permission(self):
+        try:
+            context = ApplicationLoader.applicationContext
+            if context is None:
+                return
+            if context.checkCallingOrSelfPermission(
+                "android.permission.CAMERA"
+            ) == 0:
+                return
+
+            fragment = get_last_fragment()
+            activity = (
+                fragment.getParentActivity() if fragment is not None else None
+            )
+            if activity is None:
+                self.logger.error("No activity to request camera permission")
+                return
+
+            run_on_ui_thread(
+                lambda: activity.requestPermissions(
+                    ["android.permission.CAMERA"], 7401
+                )
+            )
+        except Exception:
+            self.logger.exception("Failed to request camera permission")
+
+    def _destination_name(self):
+        destination = int(self.get_setting("destination", 0) or 0)
+        return {
+            0: "Избранное",
+            1: "Аккаунт по @username",
+            2: "Бот",
+        }.get(destination, "Избранное")
+
+    def _open_author_chat(self, *args):
+        self._open_username("xeate")
+
+    def _open_author_channel(self, *args):
+        self._open_username("xeplagin")
+
+    def _open_username(self, username):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            account = int(get_selected_account())
+            if account < 0:
+                return
+            controller = MessagesController.getInstance(account)
+
+            def open_chat():
+                try:
+                    controller.openByUserName(username, fragment, 1)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to open @%s", username
+                    )
+
+            run_on_ui_thread(open_chat)
+        except Exception:
+            self.logger.exception("Failed to open @%s", username)
+
+    def create_settings(self):
+        tracking_enabled = bool(self.get_setting("enabled", True))
+        photo_enabled = bool(self.get_setting("send_photo", True))
+        if tracking_enabled:
+            tracking_status = "Включено · " + self._destination_name()
+            if photo_enabled:
+                tracking_status += " · с фото"
+        else:
+            tracking_status = "Выключено"
+
+        duress_enabled = bool(self.get_setting("duress_enabled", False))
+        duress_password = self._get_duress_password()
+        if duress_enabled and duress_password:
+            duress_status = "Включено"
+        elif duress_enabled:
+            duress_status = "Включено, пароль не задан"
+        else:
+            duress_status = "Выключено"
+
+        hidden_enabled = bool(self.get_setting("hidden_enabled", False))
+        hidden_code = str(self.get_setting("hidden_code", "") or "")
+        hidden_count = len(getattr(self, "_hidden_ids", set()))
+        if hidden_enabled and hidden_code:
+            hidden_status = "Включено · скрыто " + str(hidden_count)
+        elif hidden_enabled:
+            hidden_status = "Включено, код не задан"
+        else:
+            hidden_status = "Выключено"
+
+        return [
+            Header(text=__name__ + " " + __version__),
+            Text(
+                text="Код экстренного стирания",
+                subtext=duress_status,
+                icon="msg_delete_auto",
+                create_sub_fragment=self._duress_settings,
+            ),
+            Text(
+                text="Отслеживать неверный пароль",
+                subtext=tracking_status,
+                icon="msg2_secret",
+                create_sub_fragment=self._tracking_settings,
+            ),
+            Text(
+                text="Скрытые чаты",
+                subtext=hidden_status,
+                icon="msg_archive_hide",
+                create_sub_fragment=self._hidden_chats_settings,
+            ),
+            Divider(text="Авторы"),
+            Text(
+                text="Связаться с автором",
+                subtext="@xeate",
+                icon="msg_contacts",
+                on_click=self._open_author_chat,
+            ),
+            Text(
+                text="Канал автора",
+                subtext="@xeplagin",
+                icon="msg_channel",
+                on_click=self._open_author_channel,
+            ),
+        ]
+
+    def _duress_settings(self):
+        enabled = bool(self.get_setting("duress_enabled", False))
+        note = (
+            "Задайте заведомо неверный код. Если вас "
+            "заставят разблокировать Telegram, введите его — "
+            "устройство выйдет из аккаунта."
+        )
+        items = [
+            Header(text="Код экстренного стирания"),
+            Switch(
+                key="duress_enabled",
+                text="Выход по коду",
+                default=False,
+                subtext=(
+                    "Ввод этого кода на экране блокировки "
+                    "выведет из аккаунта на этом устройстве"
+                ),
+                on_change=self._on_duress_enabled_change,
+            ),
+        ]
+
+        if enabled:
+            items.append(
+                Input(
+                    key="duress_password",
+                    text="Код экстренного стирания",
+                    default="",
+                    subtext=(
+                        "Обязательно неверный пароль, не настоящий. "
+                        "Например: 0000"
+                    ),
+                )
+            )
+        items.append(Divider(text=note))
+
+        return items
+
+    def _tracking_settings(self):
+        enabled = bool(self.get_setting("enabled", True))
+        photo_enabled = bool(self.get_setting("send_photo", True))
+
+        items = [
+            Header(text="Отслеживать неверный пароль"),
+            Switch(
+                key="enabled",
+                text="Тихая отправка при ошибке",
+                default=True,
+                subtext=(
+                    "При неверном пароле отправить уведомление"
+                    + (" и фото с камеры" if photo_enabled else "")
+                ),
+                on_change=self._on_enabled_change,
+            ),
+        ]
+
+        if not enabled:
+            return items
+
+        destination = int(self.get_setting("destination", 0) or 0)
+        items.extend(
+            [
+                Divider(text="Куда отправлять"),
+                Selector(
+                    key="destination",
+                    text="Получатель",
+                    default=0,
+                    items=[
+                        "Избранное (этот аккаунт)",
+                        "Аккаунт по @username",
+                        "Бот через Bot API",
+                    ],
+                    on_change=self._on_destination_change,
+                ),
+                Switch(
+                    key="send_photo",
+                    text="Отправлять фото с камеры",
+                    default=True,
+                    subtext="Фото с камеры в момент ошибки",
+                    on_change=self._on_send_photo_change,
+                ),
+            ]
+        )
+
+        if photo_enabled and not self._has_camera_permission():
+            items.append(
+                Text(
+                    text="Разрешить камеру",
+                    subtext="Нажмите, чтобы выдать разрешение",
+                    icon="msg_info",
+                    on_click=self._on_request_camera_click,
+                )
+            )
+
+        if destination == 1:
+            items.append(
+                Input(
+                    key="target_username",
+                    text="Юзернейм получателя",
+                    default="",
+                    subtext="Например: @username",
+                )
+            )
+        elif destination == 2:
+            items.extend(
+                [
+                    Divider(text="Настройки бота"),
+                    Input(
+                        key="bot_token",
+                        text="Токен бота",
+                        default="",
+                        subtext="Получить у @BotFather",
+                    ),
+                    Input(
+                        key="bot_chat_id",
+                        text="Кому отправляет бот",
+                        default="",
+                        subtext=(
+                            "@username или числовой chat_id. "
+                            "Сначала напишите боту /start. "
+                            "ID можно узнать у @userinfobot"
+                        ),
+                    ),
+                ]
+            )
+
+        return items
+
+    def _hidden_chats_settings(self):
+        enabled = bool(self.get_setting("hidden_enabled", False))
+        code = str(self.get_setting("hidden_code", "") or "")
+        stored = self._load_hidden_ids()
+        self._hidden_ids = stored
+        count = len(stored)
+
+        items = [
+            Header(text="Скрытые чаты"),
+            Switch(
+                key="hidden_enabled",
+                text="Скрытые чаты",
+                default=False,
+                subtext="Убрать выбранные чаты из общего списка",
+                on_change=self._on_hidden_enabled_change,
+            ),
+        ]
+
+        if enabled:
+            items.append(
+                Text(
+                    text=(
+                        "Изменить пароль" if code else "Задать пароль"
+                    ),
+                    subtext=(
+                        "Пароль скрыт и вводится один раз. "
+                        "Его нельзя посмотреть"
+                    ),
+                    icon="msg_archive_hide",
+                    on_click=self._on_hidden_password_click,
+                )
+            )
+            if code:
+                items.append(
+                    Divider(
+                        text=(
+                            "Скрыто чатов: "
+                            + str(count)
+                            + ". Чтобы скрыть или вернуть чат: профиль → "
+                            "три точки → Плагины → Скрыть/Вернуть. "
+                            "Чтобы найти скрытый чат в поиске Telegram, "
+                            "наберите свой пароль."
+                        )
+                    )
+                )
+            else:
+                items.append(
+                    Divider(
+                        text=(
+                            "Задайте пароль — без него скрытые чаты "
+                            "не появятся в поиске."
+                        )
+                    )
+                )
+        else:
+            items.append(
+                Divider(
+                    text=(
+                        "Включите функцию и задайте пароль. Скрытые чаты "
+                        "исчезнут из общего списка и появятся в поиске "
+                        "по этому паролю."
+                    )
+                )
+            )
+
+        return items
