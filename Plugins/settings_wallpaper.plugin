@@ -7,20 +7,26 @@ from client_utils import get_last_fragment
 
 from ui.settings import Header, Text, Selector, Divider
 
-from java import jclass
+from java import jclass, jarray, jint
 from android.content import Intent
 from android.net import Uri
 from android.app import Activity
 from android.graphics import Color, Bitmap, BitmapFactory, PorterDuff, PorterDuffColorFilter, ColorMatrix, ColorMatrixColorFilter
 from android.widget import ImageView, FrameLayout
-from android.view import View, ViewGroup
+from android.view import View, ViewGroup, TextureView, Surface
+from android.media import MediaPlayer, MediaMetadataRetriever
+from threading import Thread
+from java import dynamic_proxy
+import time
+from java.lang import System
+from android.graphics import Matrix
 from org.telegram.messenger import Utilities
 
 __id__ = "settings_wallpaper"
 __name__ = "Pro Wallpaper"
-__description__ = "Фото на фоне настроек и контактов, затемнение, размытие и прозрачные блоки"
+__description__ = "Фото или видео на фоне списка чатов, настроек и контактов, затемнение, размытие и прозрачные блоки"
 __author__ = "@Kcharter"
-__version__ = "1.2.2"
+__version__ = "1.3.38"
 __icon__ = "Tagsforsaved_by_TgEmodziBot/36"
 __min_version__ = "12.10.6"
 __category__ = ["appearance"]
@@ -36,6 +42,8 @@ TARGETS = {
         "icon": "msg_discussion",
         "alias": "sub_dialogs_screen",
         "search_only": True,
+        "menu_label": "Непрозрачность меню и поиска",
+        "menu_hint": "Влияет на поиск (строка, вкладки, фон) и на меню «три точки».",
     },
     "settings": {
         "title": "Настройки",
@@ -47,7 +55,7 @@ TARGETS = {
         "icon": "msg_settings",
         "alias": "sub_settings_screen",
         "opacity_label": "Непрозрачность блоков",
-        "opacity_hint": "0% непрозрачности — блоки полностью прозрачные.",
+        "opacity_hint": "0% непрозрачности — блоки и меню «три точки» полностью прозрачные.",
         "search_only": False,
     },
     "contacts": {
@@ -74,9 +82,18 @@ class SettingsWallpaperPlugin(BasePlugin):
         self._hook_refs = []
         self._frags = {}
         self._bitmaps = {}
+        self._videos = {}
         self._bar_state = {}
         self._scrim_state = {}
         self._bar_views = {}
+        self._fields_cache = {}
+        self._ui_last = {}
+        self._tracked_blur = set()
+        self._gray_color = 0xFF000000 - (1 << 32)
+        self._in_alpha = False
+        self._footer_state = {}
+        self._logged = set()
+        self._search_rows = {}
         self._flt_cache = {}
         self._list_state = {}
         self._search_state = {}
@@ -139,7 +156,7 @@ class SettingsWallpaperPlugin(BasePlugin):
         items = [
             Header(text=f"Обои: {TARGETS[t]['title'].lower()}"),
             Text(
-                text="Заменить изображение" if self._is_active(t) else "Выбрать изображение",
+                text="Заменить медиа" if self._is_active(t) else "Выбрать медиа",
                 accent=True,
                 on_click=on_pick,
             ),
@@ -155,14 +172,24 @@ class SettingsWallpaperPlugin(BasePlugin):
             ),
             Selector(
                 key=self._key(t, "dimming"),
-                text="Затемнение фото",
+                text="Затемнение",
                 default=self._int(t, "dimming", 3),
                 items=percents,
                 on_change=changed,
                 icon="msg_edit",
             ),
         ]
-        if not TARGETS[t]["search_only"]:
+        if TARGETS[t]["search_only"]:
+            items.append(Selector(
+                key=self._key(t, "menu_opacity"),
+                text=TARGETS[t]["menu_label"],
+                default=self._int(t, "menu_opacity", 5),
+                items=percents,
+                on_change=changed,
+                icon="msg_edit",
+            ))
+            items.append(Divider(text=TARGETS[t]["menu_hint"]))
+        else:
             items.append(Selector(
                 key=self._key(t, "card_opacity"),
                 text=TARGETS[t]["opacity_label"],
@@ -188,9 +215,14 @@ class SettingsWallpaperPlugin(BasePlugin):
             self._hook_activity_result()
         except Exception as e:
             log(f"SettingsWallpaper: hook onActivityResult failed: {e}")
+        try:
+            self._hook_popups()
+        except Exception as e:
+            log(f"SettingsWallpaper: hook popups failed: {e}")
         self._running = True
         run_on_ui_thread(self._tick, 500)
         run_on_ui_thread(self._bar_tick, 500)
+        run_on_ui_thread(self._prewarm, 1)
 
     def on_plugin_unload(self):
         self._running = False
@@ -201,6 +233,20 @@ class SettingsWallpaperPlugin(BasePlugin):
         except Exception:
             pass
         run_on_ui_thread(self._remove_all)
+
+    def _prewarm(self):
+        for t in TARGETS:
+            try:
+                uri = self._uri(t)
+                if not uri or t in self._videos or not self._is_video(uri):
+                    continue
+                ctx = self._get_activity()
+                if ctx is None:
+                    from org.telegram.messenger import ApplicationLoader
+                    ctx = ApplicationLoader.applicationContext
+                self._videos[t] = _VideoBg(uri, TARGETS[t]["tag"] + "_video", ctx, self._int(t, "blur_radius", 0) * 5)
+            except Exception as e:
+                log(f"SettingsWallpaper: prewarm error: {e}")
 
     def _hook_on_resume(self, t: str):
         cls = find_class(TARGETS[t]["cls"])
@@ -280,10 +326,27 @@ class SettingsWallpaperPlugin(BasePlugin):
             return
         for t, frag in list(self._frags.items()):
             try:
-                if self._is_active(t) and self._visible(frag):
+                visible = self._is_active(t) and self._visible(frag)
+                overlay = visible and self._overlay_open(t)
+                vb = self._videos.get(t)
+                if vb is not None:
+                    root = frag.getFragmentView()
+                    vb.step(visible and root is not None and root.getWindowVisibility() == View.VISIBLE)
+                if visible:
                     self._sync_bar(t, frag)
-            except Exception:
-                pass
+                    if t == "dialogs":
+                        now = int(time.time() * 1000)
+                        alpha = self._menu_alpha(t)
+                        if now - self._ui_last.get(t, 0) >= (80 if overlay else 400):
+                            self._ui_last[t] = now
+                            self._tint_search_ui(t, frag.getFragmentView(), alpha)
+                        if overlay:
+                            self._tint_search_rows(t, alpha)
+                        if now - self._ui_last.get("footer", 0) >= 100:
+                            self._ui_last["footer"] = now
+                            self._tint_list_footer(frag, alpha)
+            except Exception as e:
+                self._note("bar_tick", e)
         try:
             run_on_ui_thread(self._bar_tick, 40)
         except Exception:
@@ -297,6 +360,262 @@ class SettingsWallpaperPlugin(BasePlugin):
         m.setAccessible(True)
         self._hook_refs.append(self.hook_method(m, _ResultHook(self)))
 
+    def _hook_back_alpha(self):
+        int_cls = jclass("java.lang.Integer").TYPE
+        cls = find_class("org.telegram.ui.ActionBar.ActionBarPopupWindow$ActionBarPopupWindowLayout")
+        m = cls.getClass().getDeclaredMethod("setBackAlpha", int_cls)
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _BackAlphaHook(self)))
+
+    def _hook_popups(self):
+        try:
+            self._hook_blur_alpha()
+        except Exception as e:
+            self._note("hook_blur_alpha", e)
+        try:
+            self._hook_back_alpha()
+        except Exception as e:
+            self._note("hook_back_alpha", e)
+        int_cls = jclass("java.lang.Integer").TYPE
+        view_cls = jclass("android.view.View")
+        variants = (
+            ("showAtLocation", (view_cls, int_cls, int_cls, int_cls)),
+            ("showAsDropDown", (view_cls, int_cls, int_cls, int_cls)),
+            ("showAsDropDown", (view_cls, int_cls, int_cls)),
+            ("showAsDropDown", (view_cls,)),
+        )
+        for cname in ("android.widget.PopupWindow", "org.telegram.ui.ActionBar.ActionBarPopupWindow"):
+            try:
+                cls = find_class(cname)
+            except Exception:
+                continue
+            for name, params in variants:
+                try:
+                    m = cls.getClass().getDeclaredMethod(name, *params)
+                    m.setAccessible(True)
+                    self._hook_refs.append(self.hook_method(m, _PopupHook(self)))
+                except Exception:
+                    pass
+
+    def _note(self, where: str, e: Exception):
+        msg = f"{where}: {type(e).__name__}: {e}"
+        if msg not in self._logged and len(self._logged) < 50:
+            self._logged.add(msg)
+            log(f"SettingsWallpaper: {msg}")
+
+    def _popup_target(self):
+        for t in ("dialogs", "settings"):
+            frag = self._frags.get(t)
+            if frag is not None and self._is_active(t) and self._visible(frag):
+                return t
+        return None
+
+    def _menu_alpha(self, t: str) -> int:
+        if t == "dialogs":
+            return int(255 * (self._int(t, "menu_opacity", 5) * 10) / 100)
+        return self._card_alpha(t)
+
+    def _style_popup(self, content: Any):
+        if content is None:
+            return
+        try:
+            t = self._popup_target()
+            if t is None:
+                return
+            alpha = self._menu_alpha(t)
+            self._alpha_popup(content, alpha, 0)
+            for d in (120, 400):
+                run_on_ui_thread(lambda c=content, a=alpha: self._alpha_popup(c, a, 0), d)
+        except Exception as e:
+            self._note("style_popup", e)
+
+    _POPUP_KEYS = ("ActionBarPopupWindow", "PopupSwipeBackLayout", "ItemOptions")
+
+    def _alpha_popup(self, v: Any, alpha: int, depth: int):
+        try:
+            name = str(v.getClass().getName())
+            if any(k in name for k in self._POPUP_KEYS):
+                for f in self._iter_fields(v):
+                    try:
+                        fname = str(f.getName())
+                        if fname == "backAlpha":
+                            f.set(v, jint(int(alpha)))
+                            continue
+                        if "shadow" in fname.lower():
+                            continue
+                        val = f.get(v)
+                        if val is not None and self._is_drawable(val):
+                            val.setAlpha(alpha)
+                    except Exception as e:
+                        self._note("alpha_popup.field", e)
+                if "GapView" in name:
+                    bg = v.getBackground()
+                    if bg is not None:
+                        bg.setAlpha(alpha)
+                v.invalidate()
+            if depth < 6 and isinstance(v, ViewGroup):
+                for i in range(v.getChildCount()):
+                    self._alpha_popup(v.getChildAt(i), alpha, depth + 1)
+        except Exception as e:
+            self._note("alpha_popup", e)
+
+    _SEARCH_UI = ("SearchTabsAndFiltersLayout", "FragmentSearchField", "SearchViewPager", "FilteredSearchView")
+    _SEARCH_PRUNE = ("RecyclerView", "ViewPage", "DialogCell", "FilterTabsView")
+
+    def _collect_search_ui(self, v: Any, depth: int, out: list):
+        try:
+            name = str(v.getClass().getName())
+            if any(k in name for k in self._SEARCH_UI):
+                out.append(v)
+                return
+            if isinstance(v, ViewGroup) and depth > 0:
+                for i in range(v.getChildCount()):
+                    if "FragmentSearchField" in str(v.getChildAt(i).getClass().getName()):
+                        out.append(v)
+                        return
+            if depth < 4 and isinstance(v, ViewGroup) and not any(k in name for k in self._SEARCH_PRUNE):
+                for i in range(v.getChildCount()):
+                    self._collect_search_ui(v.getChildAt(i), depth + 1, out)
+        except Exception:
+            pass
+
+    def _tint_search_ui(self, t: str, root: Any, alpha: int):
+        if root is None:
+            return
+        flt = self._alpha_filter(alpha)
+        found = []
+        self._collect_search_ui(root, 0, found)
+        rows = []
+        for v in found:
+            try:
+                name = str(v.getClass().getName())
+                if "SearchTabsAndFiltersLayout" in name or not any(k in name for k in ("SearchViewPager", "FilteredSearchView", "FragmentSearchField")):
+                    self._set_drawables_alpha(v, alpha)
+                elif "FragmentSearchField" in name:
+                    pass
+                else:
+                    rows.append(v)
+            except Exception as e:
+                self._note("tint_search_ui", e)
+        self._search_rows[t] = rows
+        self._tint_search_fields(root, alpha, flt)
+        self._tint_root_blur(root, alpha, flt)
+
+    def _blur_alpha(self, val: Any, alpha: int):
+        self._tracked_blur.add(int(System.identityHashCode(val)))
+        if int(val.getAlpha()) == alpha:
+            return
+        self._in_alpha = True
+        try:
+            val.setAlpha(alpha)
+        finally:
+            self._in_alpha = False
+
+    def _set_drawables_alpha(self, v: Any, alpha: int):
+        for f in self._iter_fields(v):
+            try:
+                if "shadow" in str(f.getName()).lower():
+                    continue
+                val = f.get(v)
+                if val is None or not self._is_drawable(val):
+                    continue
+                if "Blurred" in str(val.getClass().getName()):
+                    self._blur_alpha(val, alpha)
+                    v.invalidate()
+                elif int(val.getAlpha()) != alpha:
+                    val.setAlpha(alpha)
+                    v.invalidate()
+            except Exception as e:
+                self._note("drawables_alpha", e)
+        bg = v.getBackground()
+        if bg is not None and "Blurred" in str(bg.getClass().getName()):
+            self._blur_alpha(bg, alpha)
+
+    def _hook_blur_alpha(self):
+        int_cls = jclass("java.lang.Integer").TYPE
+        c = find_class("org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawableRenderNode").getClass()
+        m = None
+        while c is not None and m is None:
+            try:
+                m = c.getDeclaredMethod("setAlpha", int_cls)
+            except Exception:
+                c = c.getSuperclass()
+        if m is None:
+            raise RuntimeError("setAlpha not found")
+        m.setAccessible(True)
+        self._hook_refs.append(self.hook_method(m, _BlurAlphaHook(self)))
+
+    def _tint_list_footer(self, frag: Any, alpha: int):
+        lv = self._list_view(frag, frag.getFragmentView())
+        if lv is None or lv.getVisibility() != 0:
+            return
+        n = lv.getChildCount()
+        for i in range(n - 1, max(-1, n - 4), -1):
+            c = lv.getChildAt(i)
+            if "DialogsAdapter$" not in str(c.getClass().getName()):
+                continue
+            bg = c.getBackground()
+            if bg is None:
+                continue
+            key = c.hashCode()
+            now = int(time.time() * 1000)
+            last = self._footer_state.get(key)
+            if last is not None and last[0] == alpha and now - last[1] < 1000:
+                continue
+            self._footer_state[key] = (alpha, now)
+            bg.setAlpha(alpha)
+            c.invalidate()
+
+    def _overlay_open(self, t: str) -> bool:
+        if t == "dialogs":
+            for v in self._search_rows.get(t, []):
+                try:
+                    if v.getWidth() > 0 and v.getVisibility() == 0 and v.isShown():
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _tint_search_rows(self, t: str, alpha: int):
+        rows = self._search_rows.get(t)
+        if not rows:
+            return
+        flt = self._alpha_filter(alpha)
+        self._gray_color = self._backdrop_color(t)
+        for v in rows:
+            try:
+                if v.getWidth() <= 0 or v.getVisibility() != 0:
+                    continue
+                self._filter_color_bg(v, flt, alpha)
+                if isinstance(v, ViewGroup):
+                    for i in range(v.getChildCount()):
+                        c = v.getChildAt(i)
+                        self._filter_color_bg(c, flt, alpha)
+                        if isinstance(c, ViewGroup) and "Cell" not in str(c.getClass().getName()):
+                            for k in range(c.getChildCount()):
+                                self._filter_color_bg(c.getChildAt(k), flt, alpha)
+            except Exception as e:
+                self._note("search_rows", e)
+
+    def _filter_color_bg(self, v: Any, flt: Any, alpha: int = 255):
+        bg = v.getBackground()
+        if bg is None or str(bg.getClass().getSimpleName()) != "ColorDrawable":
+            return
+        if "GraySectionCell" in str(v.getClass().getName()):
+            if alpha < 255:
+                c = self._gray_color
+                new = Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+                if bg.getColor() != new:
+                    v.setBackgroundColor(new)
+            return
+        cf = bg.getColorFilter()
+        if flt is None:
+            if cf is not None:
+                bg.setColorFilter(None)
+        elif cf is None or not cf.equals(flt):
+            bg.mutate()
+            bg.setColorFilter(flt)
+
     def _open_picker(self, t: str):
         def _run():
             try:
@@ -305,7 +624,8 @@ class SettingsWallpaperPlugin(BasePlugin):
                     return
                 intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
                 intent.addCategory(Intent.CATEGORY_OPENABLE)
-                intent.setType("image/*")
+                intent.setType("*/*")
+                intent.putExtra(Intent.EXTRA_MIME_TYPES, jarray(jclass("java.lang.String"))(["image/*", "video/*"]))
                 intent.addFlags(
                     Intent.FLAG_GRANT_READ_URI_PERMISSION
                     | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
@@ -378,6 +698,9 @@ class SettingsWallpaperPlugin(BasePlugin):
             self._set_pinned_overlay(t, self._is_active(t))
             if not self._is_active(t):
                 self._tint_views(t, frag, 255)
+                if t == "dialogs":
+                    self._tint_search_ui(t, root, 255)
+                    self._tint_search_rows(t, 255)
                 self._sync_bar(t, frag, True)
                 self._remove_bg(t, root)
                 self._restore_backgrounds(t, root, lv)
@@ -477,6 +800,8 @@ class SettingsWallpaperPlugin(BasePlugin):
             try:
                 if self._is_active(t) and self._visible(frag):
                     self._tint_views(t, frag)
+                    if t == "dialogs":
+                        pass
             except Exception as e:
                 log(f"SettingsWallpaper: tick error: {e}")
         try:
@@ -514,6 +839,8 @@ class SettingsWallpaperPlugin(BasePlugin):
         self._tint_root_blur(root, alpha, flt)
 
     def _is_drawable(self, val: Any) -> bool:
+        if isinstance(val, (int, float, bool, str)):
+            return False
         c = val.getClass()
         while c is not None:
             if str(c.getName()) == "android.graphics.drawable.Drawable":
@@ -628,10 +955,20 @@ class SettingsWallpaperPlugin(BasePlugin):
 
     def _iter_fields(self, obj: Any):
         c = obj.getClass()
-        while c is not None and str(c.getName()) not in ("android.view.ViewGroup", "java.lang.Object"):
-            for f in c.getDeclaredFields():
-                yield f
-            c = c.getSuperclass()
+        key = str(c.getName())
+        fs = self._fields_cache.get(key)
+        if fs is None:
+            fs = []
+            while c is not None and str(c.getName()) not in ("android.view.ViewGroup", "java.lang.Object"):
+                for f in c.getDeclaredFields():
+                    try:
+                        f.setAccessible(True)
+                    except Exception:
+                        pass
+                    fs.append(f)
+                c = c.getSuperclass()
+            self._fields_cache[key] = fs
+        return fs
 
     def _set_paint_filters(self, lv: Any, alpha):
         key = 255 if alpha is None else alpha
@@ -664,7 +1001,59 @@ class SettingsWallpaperPlugin(BasePlugin):
         except Exception:
             pass
 
+    def _backdrop_color(self, t: str) -> int:
+        try:
+            Theme = find_class("org.telegram.ui.ActionBar.Theme")
+            return Theme.getColor(getattr(Theme, TARGETS[t]["restore_key"])) | 0xFF000000
+        except Exception:
+            return Color.BLACK
+
+    def _is_video(self, uri_str: str) -> bool:
+        try:
+            act = self._get_activity()
+            mime = act.getContentResolver().getType(Uri.parse(uri_str)) if act is not None else None
+            if mime:
+                return str(mime).startswith("video/")
+        except Exception:
+            pass
+        low = uri_str.lower()
+        return low.endswith((".mp4", ".mkv", ".webm", ".3gp", ".mov"))
+
+    def _ensure_video(self, t: str, container: Any, uri_str: str):
+        try:
+            vb = self._videos.get(t)
+            if vb is not None and vb.uri != uri_str:
+                vb.release()
+                vb = None
+            if vb is None:
+                vb = _VideoBg(uri_str, TARGETS[t]["tag"] + "_video", self._get_activity(), self._int(t, "blur_radius", 0) * 5)
+                self._videos[t] = vb
+            blur = self._int(t, "blur_radius", 0) * 5
+            if vb.blur_applied is not None and vb.blur_applied != blur:
+                vb._detach_view()
+            vb.attach(container, self._backdrop_color(t))
+            vb.set_dimming(self._int(t, "dimming", 3) * 10)
+            vb.set_blur(blur)
+            vb.step(True)
+            for d in (1, 16, 33, 50, 80):
+                run_on_ui_thread(lambda v=vb: v.step(True) if v.holder is not None and v.holder.getParent() is not None else None, d)
+        except Exception as e:
+            log(f"SettingsWallpaper: ensure video error: {e}")
+
+    def _remove_video(self, t: str):
+        vb = self._videos.pop(t, None)
+        if vb is not None:
+            vb.release()
+
     def _ensure_bg(self, t: str, container: Any, uri_str: str):
+        if self._is_video(uri_str):
+            self._remove_image(t, container)
+            self._ensure_video(t, container, uri_str)
+            return
+        self._remove_video(t)
+        self._ensure_image(t, container, uri_str)
+
+    def _ensure_image(self, t: str, container: Any, uri_str: str):
         try:
             tag = TARGETS[t]["tag"]
             blur = self._int(t, "blur_radius", 0) * 5
@@ -681,6 +1070,7 @@ class SettingsWallpaperPlugin(BasePlugin):
             if iv is None:
                 iv = ImageView(container.getContext())
                 iv.setTag(tag)
+                iv.setBackgroundColor(self._backdrop_color(t))
                 try:
                     container.addView(iv, 0, FrameLayout.LayoutParams(-1, -1))
                 except Exception:
@@ -703,6 +1093,10 @@ class SettingsWallpaperPlugin(BasePlugin):
             log(f"SettingsWallpaper: ensure bg error: {e}")
 
     def _remove_bg(self, t: str, container: Any):
+        self._remove_video(t)
+        self._remove_image(t, container)
+
+    def _remove_image(self, t: str, container: Any):
         try:
             if container is None:
                 return
@@ -765,6 +1159,324 @@ class SettingsWallpaperPlugin(BasePlugin):
             return None
 
 
+class _KeepListener(dynamic_proxy(jclass("android.view.TextureView$SurfaceTextureListener"))):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def onSurfaceTextureAvailable(self, st, w, h):
+        try:
+            if self.owner.keep_st is None:
+                self.owner.keep_st = st
+        except Exception:
+            pass
+
+    def onSurfaceTextureSizeChanged(self, st, w, h):
+        pass
+
+    def onSurfaceTextureDestroyed(self, st):
+        try:
+            self.owner.keep_st = st
+            return True
+        except Exception:
+            return False
+
+    def onSurfaceTextureUpdated(self, st):
+        pass
+
+
+class _VideoBg:
+    def __init__(self, uri_str: str, tag: str, activity: Any, blur: int = 0):
+        self.uri = uri_str
+        self.tag = tag
+        self.activity = activity
+        self.container = None
+        self.holder = None
+        self.tv = None
+        self.dim = None
+        self.mp = None
+        self.surface = None
+        self.bound = False
+        self.bound_st = None
+        self.hidden_since = None
+        self.keep_st = None
+        self.keep_listener = None
+        self.poster = None
+        self.poster_view = None
+        self.poster_last = 0
+        self.last_matrix = None
+        self.loop_guard = 0
+        self.loop_check = 0
+        self.last_full = 0
+        self.playing = False
+        self.duration = 0
+        self.poster_crop = False
+        self.blur_hint = blur
+        self.failed = False
+        self.released = False
+        self.fit_key = None
+        self.blur_applied = None
+        Thread(target=self._prepare_player, daemon=True).start()
+
+    def _first_frame(self):
+        try:
+            r = MediaMetadataRetriever()
+            r.setDataSource(self.activity, Uri.parse(self.uri))
+            bmp = r.getFrameAtTime(0)
+            r.release()
+            if bmp is None or self.poster is not None:
+                return
+            w, h = bmp.getWidth(), bmp.getHeight()
+            if w > 360:
+                bmp = Bitmap.createScaledBitmap(bmp, 360, max(8, int(360 * h / w)), True)
+            if not bmp.isMutable():
+                bmp = bmp.copy(Bitmap.Config.ARGB_8888, True)
+            if self.blur_hint > 0:
+                Utilities.stackBlurBitmap(bmp, max(1, min(25, int(self.blur_hint) // 10)))
+            if self.poster is None:
+                self.poster = bmp
+                self.poster_crop = True
+                run_on_ui_thread(self._show_poster)
+        except Exception as e:
+            log(f"SettingsWallpaper: first frame error: {e}")
+
+    def _show_poster(self):
+        try:
+            if self.poster_view is not None and self.poster is not None:
+                self.poster_view.setScaleType(ImageView.ScaleType.CENTER_CROP if self.poster_crop else ImageView.ScaleType.FIT_XY)
+                self.poster_view.setImageBitmap(self.poster)
+        except Exception:
+            pass
+
+    def _prepare_player(self):
+        self._first_frame()
+        try:
+            mp = MediaPlayer()
+            mp.setDataSource(self.activity, Uri.parse(self.uri))
+            mp.setLooping(True)
+            mp.setVolume(0.0, 0.0)
+            mp.prepare()
+            if self.released:
+                mp.release()
+                return
+            try:
+                self.duration = int(mp.getDuration())
+            except Exception:
+                self.duration = 0
+            self.mp = mp
+        except Exception as e:
+            self.failed = True
+            log(f"SettingsWallpaper: video prepare error: {e}")
+
+    def attach(self, container: Any, backdrop: int):
+        if container is self.container and self.holder is not None and self.holder.getParent() is not None:
+            return
+        self._detach_view()
+        ctx = container.getContext()
+        self.holder = FrameLayout(ctx)
+        self.holder.setTag(self.tag)
+        self.holder.setBackgroundColor(backdrop)
+        self.tv = TextureView(ctx)
+        try:
+            if self.keep_listener is None:
+                self.keep_listener = _KeepListener(self)
+            self.tv.setSurfaceTextureListener(self.keep_listener)
+            if self.keep_st is not None:
+                self.tv.setSurfaceTexture(self.keep_st)
+        except Exception as e:
+            self.keep_listener = None
+            self.keep_st = None
+            log(f"SettingsWallpaper: keep surface error: {e}")
+        self.tv.setAlpha(0.0)
+        self.dim = View(ctx)
+        self.poster_view = ImageView(ctx)
+        self._show_poster()
+        if self.keep_st is not None and self.last_matrix is not None:
+            self.poster_view.setVisibility(View.GONE)
+            self.tv.setTransform(self.last_matrix)
+            self.tv.setAlpha(1.0)
+        self.holder.addView(self.poster_view, FrameLayout.LayoutParams(-1, -1))
+        self.holder.addView(self.tv, FrameLayout.LayoutParams(-1, -1))
+        self.holder.addView(self.dim, FrameLayout.LayoutParams(-1, -1))
+        container.addView(self.holder, 0, FrameLayout.LayoutParams(-1, -1))
+        self.container = container
+        self.fit_key = None
+        self.blur_applied = None
+        self.bound = False
+
+    def _detach_view(self, final: bool = False):
+        if self.keep_st is None or final:
+            try:
+                if self.mp is not None and self.bound:
+                    self.mp.setSurface(None)
+            except Exception:
+                pass
+            self.bound = False
+            self.bound_st = None
+            try:
+                if self.surface is not None:
+                    self.surface.release()
+            except Exception:
+                pass
+            self.surface = None
+        try:
+            if self.holder is not None:
+                parent = self.holder.getParent()
+                if parent is not None:
+                    parent.removeView(self.holder)
+        except Exception:
+            pass
+        self.holder = None
+        self.tv = None
+        self.dim = None
+        self.poster_view = None
+        self.container = None
+
+    def set_dimming(self, percent: int):
+        if self.dim is not None:
+            self.dim.setBackgroundColor(Color.argb(int(percent * 2.55), 0, 0, 0))
+
+    def set_blur(self, radius: int):
+        if self.tv is None or self.blur_applied == radius:
+            return
+        self.blur_applied = radius
+        try:
+            from android.os import Build
+            if radius <= 0:
+                return
+            if Build.VERSION.SDK_INT < 31:
+                log(f"SettingsWallpaper: video blur needs Android 12+, sdk={Build.VERSION.SDK_INT}")
+                return
+            from android.graphics import RenderEffect, Shader
+            r = float(radius) * 2.0
+            self.tv.setRenderEffect(RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP))
+        except Exception as e:
+            log(f"SettingsWallpaper: video blur error: {e}")
+
+    def _capture_poster(self):
+        if self.keep_st is not None:
+            return
+        now = int(time.time() * 1000)
+        if now - self.poster_last < 5000:
+            return
+        self.poster_last = now
+        vw, vh = self.tv.getWidth(), self.tv.getHeight()
+        if vw <= 0 or vh <= 0 or not self.bound:
+            return
+        bw = 216
+        bh = max(8, int(bw * vh / vw))
+        bmp = self.tv.getBitmap(bw, bh)
+        if bmp is None:
+            return
+        if self.blur_applied:
+            Utilities.stackBlurBitmap(bmp, max(1, min(25, int(self.blur_applied) // 10)))
+        self.poster = bmp
+        self.poster_crop = False
+        self._show_poster()
+
+    def _early_loop(self, now: int):
+        if self.duration <= 0 or now - self.loop_check < 100:
+            return
+        self.loop_check = now
+        pos = int(self.mp.getCurrentPosition())
+        if pos >= self.duration - 250 and now - self.loop_guard > 800:
+            self.loop_guard = now
+            self.mp.seekTo(0, 2)
+
+    def _fit(self):
+        vw, vh = self.tv.getWidth(), self.tv.getHeight()
+        w, h = self.mp.getVideoWidth(), self.mp.getVideoHeight()
+        if vw <= 0 or vh <= 0 or w <= 0 or h <= 0:
+            return
+        key = (vw, vh, w, h)
+        if key == self.fit_key:
+            return
+        self.fit_key = key
+        self.tv.setAlpha(1.0)
+        video_aspect = w / h
+        view_aspect = vw / vh
+        sx, sy = 1.0, 1.0
+        if video_aspect > view_aspect:
+            sx = video_aspect / view_aspect
+        else:
+            sy = view_aspect / video_aspect
+        m = Matrix()
+        m.setScale(sx, sy, vw / 2.0, vh / 2.0)
+        self.tv.setTransform(m)
+        self.last_matrix = m
+
+    def step(self, visible: bool):
+        if self.failed or self.released or self.mp is None or self.tv is None:
+            return
+        try:
+            now = int(time.time() * 1000)
+            if not visible:
+                if self.hidden_since is None:
+                    self.hidden_since = time.time()
+                elif time.time() - self.hidden_since > 20 and self.playing:
+                    self.mp.pause()
+                    self.playing = False
+                return
+            self.hidden_since = None
+            if self.bound and self.playing and now - self.last_full < 300:
+                self._early_loop(now)
+                return
+            self.last_full = now
+            if not self.tv.isAvailable():
+                if self.bound and self.keep_st is None:
+                    try:
+                        self.mp.setSurface(None)
+                    except Exception:
+                        pass
+                    self.bound = False
+                    self.bound_st = None
+                return
+            st = self.tv.getSurfaceTexture()
+            if st is None:
+                return
+            sid = int(System.identityHashCode(st))
+            if not self.bound or sid != self.bound_st:
+                old = self.surface
+                self.surface = Surface(st)
+                self.mp.setSurface(self.surface)
+                self.bound_st = sid
+                self.bound = True
+                if old is not None:
+                    try:
+                        old.release()
+                    except Exception:
+                        pass
+            self._fit()
+            if not self.playing:
+                self.mp.start()
+                self.playing = True
+            else:
+                self._capture_poster()
+        except Exception as e:
+            self.failed = True
+            log(f"SettingsWallpaper: video error: {e}")
+
+    def release(self):
+        self.released = True
+        self._detach_view(True)
+        try:
+            if self.keep_st is not None:
+                self.keep_st.release()
+        except Exception:
+            pass
+        self.keep_st = None
+        try:
+            if self.mp is not None:
+                try:
+                    self.mp.stop()
+                except Exception:
+                    pass
+                self.mp.release()
+        except Exception:
+            pass
+        self.mp = None
+
+
 class _ApplyHook:
     def __init__(self, plugin: SettingsWallpaperPlugin, target: str):
         self.plugin = plugin
@@ -774,9 +1486,59 @@ class _ApplyHook:
         try:
             frag = param.thisObject
             if frag is not None:
-                run_on_ui_thread(lambda: self.plugin._apply(self.target, frag))
+                from android.os import Looper
+                if Looper.myLooper() == Looper.getMainLooper() and frag.getFragmentView() is not None:
+                    self.plugin._apply(self.target, frag)
+                else:
+                    run_on_ui_thread(lambda: self.plugin._apply(self.target, frag))
         except Exception:
             pass
+
+
+class _PopupHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            pw = param.thisObject
+            if pw is not None:
+                self.plugin._style_popup(pw.getContentView())
+        except Exception as e:
+            self.plugin._note("popup_hook", e)
+
+
+class _BlurAlphaHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            pl = self.plugin
+            if pl._in_alpha:
+                return
+            if int(System.identityHashCode(param.thisObject)) not in pl._tracked_blur:
+                return
+            if not pl._is_active("dialogs"):
+                return
+            param.args[0] = jint(int(int(param.args[0]) * pl._menu_alpha("dialogs") // 255))
+        except Exception as e:
+            self.plugin._note("blur_alpha_hook", e)
+
+
+class _BackAlphaHook:
+    def __init__(self, plugin: SettingsWallpaperPlugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            t = self.plugin._popup_target()
+            if t is None:
+                return
+            a = self.plugin._menu_alpha(t)
+            param.args[0] = jint(int(int(param.args[0]) * a // 255))
+        except Exception as e:
+            self.plugin._note("back_alpha_hook", e)
 
 
 class _ResultHook:
