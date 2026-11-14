@@ -1,0 +1,3897 @@
+"""Local, offline archive of selected exteraGram cloud chats."""
+
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime
+from hashlib import sha256
+from html import escape
+from io import BufferedWriter, RawIOBase
+import json
+from math import ceil
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+from tempfile import TemporaryFile
+from threading import Thread
+import time
+import unicodedata
+from urllib.parse import urlsplit
+import zipfile
+
+from base_plugin import AppEvent, BasePlugin, HookResult, MenuItemData, MenuItemType
+
+
+__id__ = "local_chat_archive"
+__name__ = "Локальный архив чатов"
+__description__ = "Архив выбранных чатов с перепиской и вложениями офлайн. Сохранённые копии остаются после удаления в Telegram."
+__author__ = "@my_hinodere"
+__version__ = "0.3.3"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["chats", "tools"]
+
+PAGE = 30
+HISTORY_PAGE = 100
+HISTORY_VERSION = 2
+SHARED_PAGE = 36
+SEARCH_PAGE = 25
+SHARED_TABS = (("media", "Медиа"), ("files", "Файлы"), ("links", "Ссылки"), ("voice", "Голосовые"))
+DECOMPRESSED_MIME_TYPES = ("application/x-tgsticker", "application/x-tgwallpattern")
+EXPORT_REQUEST = 48173
+MESSAGE_UPDATES = (
+    "TL_updateNewMessage", "TL_updateNewChannelMessage",
+    "TL_updateEditMessage", "TL_updateEditChannelMessage",
+)
+DELETE_UPDATES = ("TL_updateDeleteMessages", "TL_updateDeleteChannelMessages")
+READ_UPDATES = ("TL_updateReadHistoryOutbox", "TL_updateReadChannelOutbox")
+
+
+@dataclass(frozen=True)
+class Asset:
+    key: str
+    name: str
+    mime: str
+    size: int
+    payload: bytes
+    file_key: str
+
+
+@dataclass(frozen=True)
+class Message:
+    id: int
+    date: int
+    edited: int
+    author: str
+    text: str
+    reply: int
+    entities: str
+    album: int
+    kind: str
+    asset: Asset | None
+    outgoing: bool | None = None
+    media_type: str = ""
+    duration: int = 0
+    width: int = 0
+    height: int = 0
+    reply_quote: str = ""
+    forwarded: str = ""
+    read: bool | None = None
+    pinned: bool = False
+    reactions: str = ""
+
+
+def normalized(text):
+    return unicodedata.normalize("NFKC", text or "").casefold()
+
+
+def entity_ranges(text, entities):
+    try:
+        items = json.loads(entities or "[]")
+    except (TypeError, ValueError):
+        return
+    if not isinstance(items, list) or not items:
+        return
+    units = 0
+    offsets = {0: 0}
+    for index, char in enumerate(text, 1):
+        units += 2 if ord(char) > 0xffff else 1
+        offsets[units] = index
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        start, size = item.get("offset"), item.get("length")
+        if isinstance(start, int) and isinstance(size, int) and size > 0:
+            end = start + size
+            if start in offsets and end in offsets:
+                yield item, start, end, text[offsets[start]:offsets[end]]
+
+
+WEB_LINK = re.compile(r"(?:https?://|www\.|(?:t|telegram)\.me/)[^\s<>]+", re.IGNORECASE)
+
+
+def web_url(value):
+    value = str(value or "").strip()
+    if not value or any(char.isspace() or ord(char) < 32 for char in value):
+        return None
+    if "://" not in value and re.match(r"[\w-]+\.[^\s]+", value):
+        value = "https://" + value
+    try:
+        parts = urlsplit(value)
+        return value if parts.scheme.lower() in ("http", "https") and parts.hostname else None
+    except ValueError:
+        return None
+
+
+def message_links(text, entities):
+    links = {}
+    for item, start, end, part in entity_ranges(text, entities):
+        kind = item.get("type", "")
+        if kind.endswith("TextUrl") or kind.endswith("EntityUrl"):
+            url = web_url(item.get("url") or part)
+            if url:
+                links[url] = None
+    for match in WEB_LINK.finditer(text):
+        url = web_url(match.group().rstrip(".,!?;:)]}»"))
+        if url:
+            links[url] = None
+    return list(links)
+
+
+MESSAGE_VIEW = """
+    SELECT msg.*, reply.author AS reply_author,
+           coalesce(nullif(reply.text, ''), reply.kind, '') AS reply_preview,
+           media.key AS media_key, media.name AS media_name, media.mime AS media_mime,
+           media.status AS media_status, media.size AS media_size
+    FROM messages AS msg
+    LEFT JOIN messages AS reply ON reply.owner=msg.owner AND reply.dialog=msg.dialog AND reply.id=msg.reply
+    LEFT JOIN assets AS media ON media.owner=msg.owner AND media.dialog=msg.dialog AND media.key=msg.asset
+"""
+
+
+
+def next_cursor(cursor, ids):
+    return min((mid for mid in ids if mid > 0 and (not cursor or mid < cursor)), default=None)
+
+
+def stamp(value):
+    return datetime.fromtimestamp(value).strftime("%d.%m.%Y %H:%M:%S") if value else ""
+
+
+def asset_path(root, key, row):
+    suffix = Path(row["name"]).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,12}", suffix):
+        suffix = ".bin"
+    return Path(root) / "media" / str(key[0]) / str(key[1]) / (row["key"] + suffix)
+
+
+class Archive:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.root / "archive.sqlite3", timeout=10)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS chats (
+                owner INTEGER, dialog INTEGER, title TEXT NOT NULL, channel INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1, cursor INTEGER NOT NULL DEFAULT 0,
+                head INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0,
+                cleared INTEGER NOT NULL DEFAULT 0, peer BLOB, history_version INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(owner, dialog)
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                owner INTEGER, dialog INTEGER, id INTEGER, date INTEGER NOT NULL,
+                edited INTEGER NOT NULL, author TEXT NOT NULL, text TEXT NOT NULL,
+                reply INTEGER NOT NULL, entities TEXT NOT NULL, album INTEGER NOT NULL,
+                kind TEXT NOT NULL, asset TEXT, live INTEGER NOT NULL, deleted INTEGER NOT NULL, outgoing INTEGER,
+                media_type TEXT NOT NULL DEFAULT '', duration INTEGER NOT NULL DEFAULT 0,
+                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0,
+                reply_quote TEXT NOT NULL DEFAULT '', forwarded TEXT NOT NULL DEFAULT '', is_read INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0, reactions TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(owner, dialog, id)
+            );
+            CREATE TABLE IF NOT EXISTS revisions (
+                owner INTEGER, dialog INTEGER, id INTEGER, edited INTEGER, digest TEXT,
+                text TEXT NOT NULL, entities TEXT NOT NULL, asset TEXT, kind TEXT NOT NULL,
+                PRIMARY KEY(owner, dialog, id, edited, digest)
+            );
+            CREATE TABLE IF NOT EXISTS deletions (
+                owner INTEGER, channel INTEGER, id INTEGER, PRIMARY KEY(owner, channel, id)
+            );
+            CREATE TABLE IF NOT EXISTS assets (
+                owner INTEGER, dialog INTEGER, key TEXT, name TEXT NOT NULL, mime TEXT NOT NULL,
+                size INTEGER NOT NULL, payload BLOB NOT NULL, file_key TEXT NOT NULL,
+                status INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                retry_after INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner, dialog, key)
+            );
+            CREATE INDEX IF NOT EXISTS pending_assets ON assets(status, owner, dialog, retry_after);
+        """)
+        columns = {column["name"] for column in self.db.execute("PRAGMA table_info(messages)")}
+        with self.db:
+            for name, definition in (
+                ("outgoing", "INTEGER"), ("media_type", "TEXT NOT NULL DEFAULT ''"),
+                ("duration", "INTEGER NOT NULL DEFAULT 0"), ("width", "INTEGER NOT NULL DEFAULT 0"),
+                ("height", "INTEGER NOT NULL DEFAULT 0"), ("reply_quote", "TEXT NOT NULL DEFAULT ''"),
+                ("forwarded", "TEXT NOT NULL DEFAULT ''"), ("is_read", "INTEGER"),
+                ("pinned", "INTEGER NOT NULL DEFAULT 0"), ("reactions", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+            if "history_version" not in {row["name"] for row in self.db.execute("PRAGMA table_info(chats)")}:
+                self.db.execute("ALTER TABLE chats ADD COLUMN history_version INTEGER NOT NULL DEFAULT 0")
+        self.db.create_function("archive_fold", 1, normalized, deterministic=True)
+        self.db.create_function("archive_has_links", 2, lambda text, entities: bool(message_links(text, entities)),
+                                deterministic=True)
+        self.prepare_history()
+
+    def prepare_history(self):
+        with self.db:
+            self.db.execute("""
+                UPDATE assets SET status=0, attempts=0, retry_after=0
+                WHERE status<>1 AND (owner, dialog) IN (
+                    SELECT owner, dialog FROM chats WHERE history_version<?
+                )
+            """, (HISTORY_VERSION,))
+            self.db.execute("""
+                UPDATE chats SET cursor=0, complete=0, history_version=?
+                WHERE history_version<?
+            """, (HISTORY_VERSION, HISTORY_VERSION))
+
+    def restart_history(self, key):
+        with self.db:
+            self.db.execute("UPDATE chats SET cursor=0, complete=0 WHERE owner=? AND dialog=?", key)
+
+    def oldest(self, key):
+        return self.db.execute("SELECT min(id) FROM messages WHERE owner=? AND dialog=?", key).fetchone()[0]
+
+    def close(self):
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        self.close()
+
+    def chat(self, key):
+        return self.db.execute("SELECT * FROM chats WHERE owner=? AND dialog=?", key).fetchone()
+
+    def archive_index(self, owner):
+        return self.db.execute("""
+            SELECT chat.owner, chat.dialog, chat.title, chat.active, chat.complete,
+                   latest.date, coalesce(nullif(latest.text, ''), latest.kind, '') AS preview
+            FROM chats AS chat
+            LEFT JOIN messages AS latest ON latest.owner=chat.owner AND latest.dialog=chat.dialog AND latest.id=(
+                SELECT id FROM messages WHERE owner=chat.owner AND dialog=chat.dialog ORDER BY id DESC LIMIT 1
+            )
+            WHERE chat.owner=? ORDER BY latest.date DESC, chat.title COLLATE NOCASE, chat.dialog
+        """, (owner,)).fetchall()
+
+    def enable(self, key, title, channel, peer=None):
+        with self.db:
+            self.db.execute("""
+                INSERT INTO chats(owner, dialog, title, channel, peer, history_version) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner, dialog) DO UPDATE SET active=1, title=excluded.title,
+                    peer=coalesce(excluded.peer, chats.peer)
+            """, (*key, title, channel, peer, HISTORY_VERSION))
+
+    def pause(self, key):
+        with self.db:
+            self.db.execute("UPDATE chats SET active=0 WHERE owner=? AND dialog=?", key)
+
+    def save(self, key, messages, live, cursor=None, head=None, complete=False):
+        chat = self.chat(key)
+        if not chat or not chat["active"]:
+            return
+        with self.db:
+            for message in messages:
+                asset = message.asset
+                asset_key = asset.key if asset else None
+                if asset:
+                    self.db.execute("""
+                        INSERT INTO assets(owner, dialog, key, name, mime, size, payload, file_key)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(owner, dialog, key) DO UPDATE SET name=excluded.name, mime=excluded.mime,
+                            size=excluded.size, payload=excluded.payload, file_key=excluded.file_key,
+                            status=0, attempts=0, retry_after=0
+                        WHERE status<>1
+                            AND (assets.payload<>excluded.payload OR assets.file_key<>excluded.file_key
+                                 OR assets.size<>excluded.size OR assets.name<>excluded.name OR assets.mime<>excluded.mime)
+                    """, (*key, asset.key, asset.name, asset.mime, asset.size, asset.payload, asset.file_key))
+                deleted = message.id <= chat["cleared"] or self.db.execute("""
+                    SELECT 1 FROM deletions WHERE owner=? AND channel=? AND id=?
+                """, (key[0], chat["channel"], message.id)).fetchone() is not None
+                saved = self.db.execute("""
+                    INSERT INTO messages(owner, dialog, id, date, edited, author, text, reply, entities,
+                                         album, kind, asset, live, deleted, outgoing, media_type, duration,
+                                         width, height, reply_quote, forwarded, is_read, pinned, reactions)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner, dialog, id) DO UPDATE SET
+                        edited=excluded.edited, author=excluded.author, text=excluded.text,
+                        reply=excluded.reply, entities=excluded.entities, album=excluded.album,
+                        kind=excluded.kind, asset=coalesce(excluded.asset, messages.asset), live=excluded.live,
+                        deleted=max(messages.deleted, excluded.deleted),
+                        outgoing=coalesce(excluded.outgoing, messages.outgoing),
+                        media_type=CASE WHEN excluded.asset IS NULL THEN messages.media_type ELSE excluded.media_type END,
+                        duration=CASE WHEN excluded.asset IS NULL THEN messages.duration ELSE excluded.duration END,
+                        width=CASE WHEN excluded.asset IS NULL THEN messages.width ELSE excluded.width END,
+                        height=CASE WHEN excluded.asset IS NULL THEN messages.height ELSE excluded.height END,
+                        reply_quote=excluded.reply_quote, forwarded=excluded.forwarded,
+                        is_read=CASE WHEN messages.is_read=1 THEN 1 ELSE coalesce(excluded.is_read, messages.is_read) END,
+                        pinned=excluded.pinned,
+                        reactions=excluded.reactions
+                    WHERE excluded.edited>messages.edited
+                       OR (excluded.edited=messages.edited AND excluded.live>=messages.live)
+                """, (*key, message.id, message.date, message.edited, message.author, message.text,
+                      message.reply, message.entities, message.album, message.kind, asset_key, int(live), int(deleted),
+                      message.outgoing, message.media_type, message.duration, message.width, message.height,
+                      message.reply_quote, message.forwarded, message.read, int(message.pinned), message.reactions))
+                if saved.rowcount == 0 and message.outgoing is not None:
+                    self.db.execute("""
+                        UPDATE messages SET outgoing=coalesce(outgoing, :outgoing),
+                            is_read=CASE WHEN :read=1 THEN 1 ELSE coalesce(is_read, :read) END,
+                            reply_quote=CASE WHEN outgoing IS NULL AND edited=:edited THEN :quote ELSE reply_quote END,
+                            forwarded=CASE WHEN outgoing IS NULL AND edited=:edited THEN :forwarded ELSE forwarded END,
+                            pinned=CASE WHEN outgoing IS NULL AND edited=:edited THEN :pinned ELSE pinned END,
+                            reactions=CASE WHEN outgoing IS NULL AND edited=:edited THEN :reactions ELSE reactions END
+                        WHERE owner=:owner AND dialog=:dialog AND id=:id
+                        AND (outgoing IS NULL OR (:read=1 AND coalesce(is_read,0)=0))
+                    """, {"owner": key[0], "dialog": key[1], "id": message.id, "edited": message.edited,
+                          "outgoing": message.outgoing, "read": message.read, "quote": message.reply_quote,
+                          "forwarded": message.forwarded, "pinned": int(message.pinned), "reactions": message.reactions})
+                if saved.rowcount == 0 and asset:
+                    self.db.execute("""
+                        UPDATE messages SET asset=?, media_type=?, duration=?, width=?, height=?,
+                            kind=CASE WHEN kind='Вложение недоступно' THEN ? ELSE kind END
+                        WHERE owner=? AND dialog=? AND id=?
+                          AND ((asset IS NULL AND edited=?) OR (asset=? AND media_type=''))
+                    """, (asset_key, message.media_type, message.duration, message.width, message.height, message.kind,
+                          *key, message.id, message.edited, asset_key))
+                content = json.dumps((message.text, message.entities, asset_key, message.kind), ensure_ascii=False)
+                digest = sha256(content.encode()).hexdigest()
+                self.db.execute("""
+                    INSERT OR IGNORE INTO revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (*key, message.id, message.edited, digest, message.text, message.entities, asset_key, message.kind))
+            if cursor is not None or head is not None or complete:
+                self.db.execute("""
+                    UPDATE chats SET cursor=coalesce(?,cursor), head=max(head,coalesce(?,0)),
+                        complete=max(complete,?) WHERE owner=? AND dialog=?
+                """, (cursor, head, int(complete), *key))
+
+    def mark_deleted(self, owner, channel, ids):
+        ids = [mid for mid in ids if mid > 0]
+        if not ids:
+            return
+        with self.db:
+            if self.db.execute("SELECT 1 FROM chats WHERE owner=? AND channel=? LIMIT 1", (owner, channel)).fetchone():
+                self.db.executemany("INSERT OR IGNORE INTO deletions VALUES (?, ?, ?)",
+                                    ((owner, channel, mid) for mid in ids))
+                self.db.executemany("""
+                    UPDATE messages SET deleted=1 WHERE owner=? AND id=? AND dialog IN
+                        (SELECT dialog FROM chats WHERE owner=? AND channel=?)
+                """, ((owner, mid, owner, channel) for mid in ids))
+
+    def mark_cleared(self, key, through):
+        if through <= 0:
+            return
+        with self.db:
+            self.db.execute("UPDATE chats SET cleared=max(cleared,?) WHERE owner=? AND dialog=?", (through, *key))
+            self.db.execute("UPDATE messages SET deleted=1 WHERE owner=? AND dialog=? AND id<=?", (*key, through))
+
+    def conversation(self, key, before, *, since=None):
+        rows = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id<? AND msg.id>=?
+            ORDER BY msg.id DESC LIMIT ?
+        """, (*key, before if before is not None else 9223372036854775807, since or 0,
+              -1 if since is not None else PAGE + 1)).fetchall()
+        if since is not None:
+            older = self.db.execute("""
+                SELECT 1 FROM messages WHERE owner=? AND dialog=? AND id<? LIMIT 1
+            """, (*key, since)).fetchone()
+            return list(reversed(rows)), since if older else None
+        return list(reversed(rows[:PAGE])), rows[PAGE - 1]["id"] if len(rows) > PAGE else None
+
+    def conversation_newer(self, key, after, limit=PAGE):
+        rows = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id>? ORDER BY msg.id LIMIT ?
+        """, (*key, after, limit + 1)).fetchall()
+        return rows[:limit], rows[limit - 1]["id"] if len(rows) > limit else None
+
+    def conversation_around(self, key, mid):
+        center = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id=?
+        """, (*key, mid)).fetchone()
+        if center is None:
+            return None
+        half = PAGE // 2
+        older = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id<? ORDER BY msg.id DESC LIMIT ?
+        """, (*key, mid, half + 1)).fetchall()
+        newer, after = self.conversation_newer(key, mid, PAGE - half - 1)
+        rows = list(reversed(older[:half])) + [center] + newer
+        return rows, rows[0]["id"] if len(older) > half else None, after
+
+    def search_messages(self, key, query, before=None):
+        terms = normalized(query).strip().split()
+        if not terms:
+            return [], None
+        clause = " AND ".join("""
+            instr(archive_fold(msg.text || ' ' || msg.author || ' ' || coalesce(media.name, '')), ?) > 0
+        """ for term in terms)
+        rows = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id<? AND
+        """ + clause + " ORDER BY msg.id DESC LIMIT ?",
+            (*key, before or 9223372036854775807, *terms, SEARCH_PAGE + 1)).fetchall()
+        return rows[:SEARCH_PAGE], rows[SEARCH_PAGE - 1]["id"] if len(rows) > SEARCH_PAGE else None
+
+    def shared(self, key, tab, before=None, limit=SHARED_PAGE):
+        clauses = {
+            "media": """msg.asset IS NOT NULL AND (msg.media_type IN ('photo','video','animation','round')
+                OR (msg.media_type='' AND (media.mime LIKE 'image/%' OR media.mime LIKE 'video/%')))""",
+            "voice": """msg.asset IS NOT NULL AND (msg.media_type IN ('voice','round')
+                OR (msg.media_type='' AND lower(media.name) GLOB '*.ogg'))""",
+            "files": """msg.asset IS NOT NULL AND (msg.media_type IN ('file','audio','sticker') OR
+                (msg.media_type='' AND media.mime NOT LIKE 'image/%' AND media.mime NOT LIKE 'video/%'
+                AND lower(media.name) NOT GLOB '*.ogg'))""",
+            "links": "archive_has_links(msg.text, msg.entities)",
+        }
+        rows = self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.id<? AND
+        """ + clauses[tab] + " ORDER BY msg.id DESC LIMIT ?",
+            (*key, before or 9223372036854775807, limit + 1)).fetchall()
+        return rows[:limit], rows[limit - 1]["id"] if len(rows) > limit else None
+
+    def pinned(self, key):
+        return self.db.execute(MESSAGE_VIEW + """
+            WHERE msg.owner=? AND msg.dialog=? AND msg.pinned=1 AND msg.deleted=0 ORDER BY msg.id DESC
+        """, key).fetchall()
+
+    def mark_read_outbox(self, key, through):
+        with self.db:
+            self.db.execute("""
+                UPDATE messages SET is_read=1 WHERE owner=? AND dialog=? AND id<=? AND outgoing=1
+                AND coalesce(is_read,0)=0
+            """, (*key, through))
+
+
+    def revisions(self, key, mid):
+        return self.db.execute("""
+            SELECT * FROM revisions WHERE owner=? AND dialog=? AND id=? ORDER BY edited DESC, rowid DESC
+        """, (*key, mid)).fetchall()
+
+    def asset(self, key, asset_key):
+        return self.db.execute("SELECT * FROM assets WHERE owner=? AND dialog=? AND key=?",
+                               (*key, asset_key)).fetchone()
+
+    def stats(self, key):
+        messages = self.db.execute("SELECT count(*), coalesce(sum(deleted),0) FROM messages WHERE owner=? AND dialog=?", key)
+        assets = self.db.execute("""
+            SELECT count(*), coalesce(sum(status=1),0), coalesce(sum(status=2),0)
+            FROM assets WHERE owner=? AND dialog=?
+        """, key)
+        return tuple(messages.fetchone()) + tuple(assets.fetchone())
+
+    def pending_assets(self, owner, dialog):
+        return self.db.execute("""
+            SELECT * FROM assets WHERE owner=? AND dialog=? AND status=0 AND retry_after<=?
+            ORDER BY rowid DESC LIMIT 24
+        """, (owner, dialog, int(time.time()))).fetchall()
+
+    def asset_status(self, key, asset_key, status, attempts, retry_after=0):
+        with self.db:
+            self.db.execute("""
+                UPDATE assets SET status=?, attempts=?, retry_after=? WHERE owner=? AND dialog=? AND key=?
+            """, (status, attempts, retry_after, *key, asset_key))
+
+    def retry_assets(self, key):
+        with self.db:
+            self.db.execute("""
+                UPDATE assets SET status=0, attempts=0, retry_after=0
+                WHERE owner=? AND dialog=? AND status<>1
+            """, key)
+
+    def copy_asset(self, key, asset_key, source):
+        return self.publish_asset(key, asset_key, source)
+
+    def publish_asset(self, key, asset_key, source=None, content=None):
+        row = self.asset(key, asset_key)
+        if not row:
+            return False
+        target = asset_path(self.root, key, row)
+
+        def complete(path):
+            info = path.stat() if path.is_file() else None
+            if info is None or info.st_size <= 0:
+                return False
+            if row["size"] <= 0 or row["mime"] in DECOMPRESSED_MIME_TYPES:
+                return True
+            return info.st_size == row["size"]
+
+        if not complete(target):
+            if content is None and (source is None or not complete(source)):
+                return False
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(".part")
+            try:
+                with partial.open("wb") as dst:
+                    if content is None:
+                        with source.open("rb") as src:
+                            shutil.copyfileobj(src, dst, 1024 * 1024)
+                    else:
+                        dst.write(content)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                if not complete(partial):
+                    return False
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
+        self.asset_status(key, asset_key, 1, row["attempts"])
+        return True
+
+
+def export_archive(root, key, destination):
+    with closing(sqlite3.connect(Path(root) / "archive.sqlite3", timeout=10)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")
+        chat = db.execute("SELECT title FROM chats WHERE owner=? AND dialog=?", key).fetchone()
+        if chat is None:
+            raise ValueError("Archive chat does not exist")
+        with zipfile.ZipFile(destination, "w", allowZip64=True) as archive:
+            links = {}
+            for asset in db.execute("SELECT * FROM assets WHERE owner=? AND dialog=? AND status=1", key):
+                path = asset_path(root, key, asset)
+                if path.is_file():
+                    name = "media/" + path.name
+                    archive.write(path, name)
+                    links[asset["key"]] = (name, asset["name"])
+
+            def attachment_metadata(asset_key):
+                if asset_key is None:
+                    return None
+                path, name = links.get(asset_key, (None, None))
+                return {"key": asset_key, "file": path, "name": name}
+
+            def media_link(asset_key):
+                if asset_key in links:
+                    name, label = links[asset_key]
+                    return f'<p><a href="{escape(name)}">{escape(label)}</a></p>'
+                return "<p>Вложение не сохранено</p>" if asset_key else ""
+
+            # A ZIP permits only one open member for writing. Spool the JSON in a
+            # temporary file to keep memory bounded for large histories.
+            with TemporaryFile(dir=root) as metadata:
+                write_archive_html(db, key, chat, archive, metadata, media_link, attachment_metadata)
+                metadata.seek(0)
+                with archive.open("messages.json", "w", force_zip64=True) as json_file:
+                    shutil.copyfileobj(metadata, json_file, 1024 * 1024)
+
+
+def write_archive_html(db, key, chat, archive, metadata, media_link, attachment_metadata):
+    with archive.open("index.html", "w", force_zip64=True) as html_file:
+        def write(html):
+            html_file.write(html.encode("utf-8"))
+
+        header = json.dumps({"format": 1, "title": chat["title"], "dialog_id": key[1]}, ensure_ascii=False)
+        metadata.write((header[:-1] + ',"messages":[').encode("utf-8"))
+        first = True
+        title = escape(chat["title"])
+        write('<!doctype html><html lang="ru"><meta charset="utf-8">'
+              '<meta name="viewport" content="width=device-width, initial-scale=1">'
+              f"<title>{title}</title>"
+              "<style>body{font:16px system-ui;max-width:780px;margin:2rem auto;padding:0 1rem}"
+              "article{border-top:1px solid #9996;padding:1rem 0}p{white-space:pre-wrap;"
+              "overflow-wrap:anywhere}small{opacity:.8}</style>"
+              f"<h1>{title}</h1>")
+        for row in db.execute("SELECT * FROM messages WHERE owner=? AND dialog=? ORDER BY id", key):
+            deleted = " · Удалено в Telegram" if row["deleted"] else ""
+            write(f'<article id="m{row["id"]}"><strong>{escape(row["author"])}</strong> '
+                  f'<small>{stamp(row["date"])}{deleted}</small>')
+            if row["reply"]:
+                write(f'<p>Ответ на <a href="#m{row["reply"]}">#{row["reply"]}</a></p>')
+            write(f'<p>{escape(row["text"] or row["kind"])}</p>{media_link(row["asset"])}')
+            revisions = db.execute("""
+                SELECT * FROM revisions WHERE owner=? AND dialog=? AND id=? ORDER BY edited, rowid
+            """, (*key, row["id"])).fetchall()
+            record = {field: row[field] for field in
+                      ("id", "date", "edited", "author", "text", "reply", "album", "kind")}
+            record["deleted"] = bool(row["deleted"])
+            record["outgoing"] = bool(row["outgoing"]) if row["outgoing"] is not None else None
+            record["entities"] = json.loads(row["entities"])
+            record["attachment"] = attachment_metadata(row["asset"])
+            record["versions"] = [
+                {"edited": rev["edited"], "text": rev["text"], "kind": rev["kind"],
+                 "entities": json.loads(rev["entities"]), "attachment": attachment_metadata(rev["asset"])}
+                for rev in revisions
+            ]
+            if not first:
+                metadata.write(b",")
+            first = False
+            metadata.write(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+            if len(revisions) > 1:
+                write("<details><summary>Версии сообщения</summary>")
+                for revision in revisions:
+                    write(f'<small>{stamp(revision["edited"]) or "Исходная версия"}</small>'
+                          f'<p>{escape(revision["text"] or revision["kind"])}</p>'
+                          f'{media_link(revision["asset"])}')
+                write("</details>")
+            write("</article>")
+        write("</html>")
+        metadata.write(b"]}")
+
+
+class AndroidOutput(RawIOBase):
+    def __init__(self, stream):
+        self.stream = stream
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        data = bytes(data)
+        self.stream.write(data, 0, len(data))
+        return len(data)
+
+    def close(self):
+        if not self.closed:
+            try:
+                self.stream.close()
+            finally:
+                super().close()
+
+
+def number(value):
+    if hasattr(value, "longValue"):
+        return int(value.longValue())
+    return int(value)
+
+
+def java_boolean(value):
+    return bool(value.booleanValue()) if hasattr(value, "booleanValue") else bool(value)
+
+
+def java_items(values):
+    if values is None:
+        return ()
+    if hasattr(values, "size") and hasattr(values, "get"):
+        return (values.get(index) for index in range(values.size()))
+    return iter(values)
+
+
+def serialize(value):
+    from org.telegram.tgnet import SerializedData
+
+    data = SerializedData()
+    try:
+        value.serializeToStream(data)
+        return bytes(data.toByteArray())
+    finally:
+        data.cleanup()
+
+
+def deserialize(payload, tl_class, owner=None):
+    from org.telegram.tgnet import SerializedData
+
+    data = SerializedData(payload)
+    try:
+        value = tl_class.TLdeserialize(data, data.readInt32(True), True)
+        if owner is not None and hasattr(value, "readAttachPath") and data.remaining() > 0:
+            value.readAttachPath(data, owner)
+        return value
+    finally:
+        data.cleanup()
+
+
+def local_file(value):
+    if hasattr(value, "getAbsolutePath"):
+        value = value.getAbsolutePath()
+    if isinstance(value, str) and value.strip():
+        path = Path(value)
+        if path.is_absolute():
+            return path
+    return None
+
+
+def conversation_entries(messages, before, after=None):
+    entries = []
+    if before is not None:
+        entries.append(("older", None))
+    day = None
+    for message in messages:
+        current = datetime.fromtimestamp(message["date"]).date() if message["date"] else None
+        if current and current != day:
+            entries.append(("date", (message["id"], current.strftime("%d.%m.%Y"))))
+        entries.append(("message", message))
+        day = current
+    if after is not None:
+        entries.append(("newer", None))
+    return entries
+
+def avatar_view(screen, key, title, size):
+    from android.widget import ImageView
+
+    if key is not None:
+        try:
+            from org.telegram.messenger import MessagesController
+            from org.telegram.ui.Components import AvatarDrawable, BackupImageView
+
+            account = next((slot for slot, owner in screen.plugin.active_accounts() if owner == key[0]), None)
+            if account is not None:
+                controller = MessagesController.getInstance(account)
+                peer = controller.getUser(key[1]) if key[1] > 0 else controller.getChat(-key[1])
+                if peer is not None:
+                    avatar = AvatarDrawable()
+                    avatar.setInfo(account, peer)
+                    view = BackupImageView(screen.activity)
+                    view.setRoundRadius(screen.dp(size / 2))
+                    view.getImageReceiver().setCurrentAccount(account)
+                    view.setForUserOrChat(peer, avatar)
+                    view.setImportantForAccessibility(2)
+                    return view
+        except Exception:
+            screen.plugin.logger.debug("Could not use the chat avatar")
+    initials = "".join(word[0].upper() for word in title.split()[:2]) or "?"
+    colors = screen.theme.keys_avatar_background
+    dialog = key[1] if key else 0
+    background = screen.theme.getColor(colors[abs(dialog) % len(colors)])
+    view = screen.label(initials, 16 if size >= 44 else 14,
+                        -1 if not screen.is_light(background) else -15655637, bold=True)
+    view.setGravity(17)
+    view.setBackground(screen.rounded(background, size / 2))
+    view.setImportantForAccessibility(ImageView.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    return view
+
+
+def displayed_size(size):
+    if size <= 0:
+        return ""
+    if size < 1024 ** 2:
+        return f"{max(1, size // 1024)} КБ"
+    if size < 1024 ** 3:
+        return f"{size / 1024 ** 2:.1f} МБ"
+    return f"{size / 1024 ** 3:.1f} ГБ"
+
+
+def clock_text(seconds):
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def apply_entities(view, text, raw, color):
+    from android.graphics import Typeface
+    from android.text import SpannableString
+    from android.text.style import ForegroundColorSpan, StrikethroughSpan, StyleSpan, TypefaceSpan, UnderlineSpan
+
+    spans = {
+        "Bold": lambda: StyleSpan(Typeface.BOLD),
+        "Italic": lambda: StyleSpan(Typeface.ITALIC),
+        "Underline": UnderlineSpan,
+        "Strike": StrikethroughSpan,
+        "Code": lambda: TypefaceSpan("monospace"),
+        "Pre": lambda: TypefaceSpan("monospace"),
+        "TextUrl": lambda: ForegroundColorSpan(color),
+        "Url": lambda: ForegroundColorSpan(color),
+    }
+    formatted = SpannableString(text)
+    for item, start, end, part in entity_ranges(text, raw):
+        name = str(item.get("type", "")).partition("Entity")[2]
+        make = spans.get(name)
+        if make:
+            formatted.setSpan(make(), start, end, 33)
+    view.setText(formatted)
+
+
+
+class ArchiveScreen:
+    """A full-screen Android window with a native scrolling list."""
+
+    def __init__(self, plugin, activity, title, subtitle, action=None, on_close=None,
+                 profile=None, profile_action=None, floating=False, centered=False):
+        from android.app import Dialog
+        from android.content import DialogInterface
+        from android.graphics.drawable import ColorDrawable
+        from android.view import Window
+        from android.widget import FrameLayout, LinearLayout, ListAdapter, ListView
+        from android.database import DataSetObservable
+        from java import dynamic_proxy
+        from org.telegram.ui.ActionBar import Theme
+
+        self.plugin = plugin
+        self.activity = activity
+        self.theme = Theme
+        self.entries = []
+        self.window = Dialog(activity)
+        self.window.setOwnerActivity(activity)
+        self.window.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        self.reload = None
+
+        self.surface = Theme.getColor(Theme.key_windowBackgroundWhite)
+        self.foreground = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        self.secondary = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)
+        self.accent = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText2)
+        self.bar_color = Theme.getColor(Theme.key_actionBarDefault)
+        self.bar_text = Theme.getColor(Theme.key_actionBarDefaultTitle)
+        self.bar_icon = Theme.getColor(Theme.key_actionBarDefaultIcon)
+        self.bar_secondary = Theme.getColor(Theme.key_actionBarDefaultSubtitle)
+
+        root = self.root = self.column()
+        root.setBackgroundColor(self.surface)
+        root.setFitsSystemWindows(True)
+        bar = self.bar = LinearLayout(activity)
+        bar.setGravity(16)
+        bar.setMinimumHeight(self.dp(56))
+        bar.setBackgroundColor(self.bar_color)
+        back = self.icon("msg_arrow_back", "Назад", "←", self.window.dismiss)
+        bar.addView(back, self.params(48, 48))
+        self.back = back
+        labels = self.column()
+        labels.setPadding(self.dp(4), self.dp(5), self.dp(4), self.dp(5))
+        heading = self.label(title, 19, self.bar_text, bold=True)
+        self.ellipsize(heading, 1)
+        if centered:
+            heading.setGravity(17)
+        labels.addView(heading, self.params(-1, -2))
+        if subtitle:
+            tagline = self.label(subtitle, 13, self.bar_secondary)
+            self.ellipsize(tagline, 1)
+            if centered:
+                tagline.setGravity(17)
+            labels.addView(tagline, self.params(-1, -2))
+        header = LinearLayout(activity)
+        header.setGravity(16)
+        if profile is not None:
+            photo = avatar_view(self, profile, title, 42)
+            avatar_params = self.params(42, 42)
+            avatar_params.leftMargin = self.dp(3)
+            avatar_params.rightMargin = self.dp(7)
+            header.addView(photo, avatar_params)
+        header.addView(labels, LinearLayout.LayoutParams(0, -2, 1.0))
+        header_params = LinearLayout.LayoutParams(0, -2, 1.0)
+        header_params.leftMargin = self.dp(5)
+        header_params.rightMargin = self.dp(5)
+        header.setMinimumHeight(self.dp(48))
+        bar.addView(header, header_params)
+        self.header = header
+        self.menu_button = None
+        if action is not None:
+            resource, description, fallback, callback = action
+            self.menu_button = self.icon(resource, description, fallback, callback)
+            bar.addView(self.menu_button, self.params(48, 48))
+        if floating:
+            bar.setBackgroundColor(0)
+            bar.setPadding(self.dp(7), self.dp(4), self.dp(7), self.dp(4))
+            for part in (back, header, self.menu_button):
+                if part is not None:
+                    part.setBackground(self.panel())
+        if profile_action is not None:
+            self.click(header, profile_action)
+        root.addView(bar, self.params(-1, -2))
+
+        self.body = FrameLayout(activity)
+        root.addView(self.body, LinearLayout.LayoutParams(-1, 0, 1.0))
+        self.list = ListView(activity)
+        self.list.setDivider(None)
+        self.list.setDividerHeight(0)
+        self.list.setCacheColorHint(0)
+        self.list.setScrollingCacheEnabled(False)
+        self.list.setSelector(ColorDrawable(0))
+        self.body.addView(self.list, FrameLayout.LayoutParams(-1, -1))
+        self.empty = self.column()
+        self.empty.setGravity(17)
+        self.empty.setPadding(self.dp(28), self.dp(24), self.dp(28), self.dp(24))
+        self.body.addView(self.empty, FrameLayout.LayoutParams(-1, -1))
+        self.window.setContentView(root)
+        self.window.setCancelable(True)
+
+        screen = self
+
+        class DismissListener(dynamic_proxy(DialogInterface.OnDismissListener)):
+            def onDismiss(self, dialog):
+                screen.plugin.archive_windows.discard(screen)
+                screen.list.setAdapter(None)
+                screen.entries = []
+                screen.on_dismiss()
+                if on_close is not None and screen.plugin.active:
+                    on_close()
+
+        class RowsAdapter(dynamic_proxy(ListAdapter)):
+            def getCount(self):
+                return len(screen.entries)
+
+            def getItem(self, position):
+                return None
+
+            def getAutofillOptions(self):
+                return None
+
+            def getItemId(self, position):
+                kind, entry = screen.entries[position]
+                if kind == "message":
+                    return entry["id"]
+                if kind == "date":
+                    return -entry[0] - 1
+                if kind == "chat":
+                    return entry["dialog"]
+                return -1
+
+            def hasStableIds(self):
+                return False
+
+            def isEmpty(self):
+                return not screen.entries
+
+            def getViewTypeCount(self):
+                return 1
+
+            def getItemViewType(self, position):
+                return -1
+
+            def areAllItemsEnabled(self):
+                return True
+
+            def isEnabled(self, position):
+                return True
+
+            def registerDataSetObserver(self, observer):
+                screen.observers.registerObserver(observer)
+
+            def unregisterDataSetObserver(self, observer):
+                screen.observers.unregisterObserver(observer)
+
+            def getView(self, position, old_view, parent):
+                return screen.render(*screen.entries[position])
+
+        self.observers = DataSetObservable()
+        self.adapter = RowsAdapter()
+        self.list.setAdapter(self.adapter)
+        self.list.setItemsCanFocus(True)
+        self.dismiss_listener = DismissListener()
+        self.window.setOnDismissListener(self.dismiss_listener)
+
+    def show(self):
+        from android.os import Build
+        from android.graphics.drawable import ColorDrawable
+        from android.view import View, WindowInsetsController, WindowManager
+
+        window = self.window.getWindow()
+        window.setBackgroundDrawable(ColorDrawable(self.surface))
+        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+        window.setStatusBarColor(self.surface)
+        window.setNavigationBarColor(self.surface)
+        if Build.VERSION.SDK_INT >= 29:
+            window.setNavigationBarContrastEnforced(False)
+            window.setStatusBarContrastEnforced(False)
+        flags = 0
+        if self.is_light(self.surface):
+            flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.getDecorView().setSystemUiVisibility(flags)
+        self.window.show()
+        if Build.VERSION.SDK_INT >= 30:
+            controller = window.getInsetsController()
+            if controller is not None:
+                mask = (WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS |
+                        WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS)
+                controller.setSystemBarsAppearance(mask if self.is_light(self.surface) else 0, mask)
+        window.setLayout(-1, -1)
+        self.plugin.archive_windows.add(self)
+
+    @staticmethod
+    def is_light(color):
+        return sum(((color >> shift) & 255) * weight for shift, weight in ((16, .299), (8, .587), (0, .114))) > 165
+
+    def showing(self):
+        return self.plugin.active and self.window.isShowing()
+
+    def on_dismiss(self):
+        pass
+
+    def dp(self, value):
+        from org.telegram.messenger import AndroidUtilities
+
+        return AndroidUtilities.dp(float(value))
+
+    def params(self, width, height):
+        from android.widget import LinearLayout
+
+        return LinearLayout.LayoutParams(self.dp(width) if width > 0 else width,
+                                         self.dp(height) if height > 0 else height)
+
+    def column(self):
+        from android.widget import LinearLayout
+
+        view = LinearLayout(self.activity)
+        view.setOrientation(LinearLayout.VERTICAL)
+        return view
+
+    def label(self, text, size, color, bold=False):
+        from android.graphics import Typeface
+        from android.widget import TextView
+
+        view = TextView(self.activity)
+        view.setText(str(text))
+        view.setTextSize(float(size))
+        view.setTextColor(color)
+        if bold:
+            view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+        return view
+
+    @staticmethod
+    def ellipsize(view, lines):
+        from android.text import TextUtils
+
+        view.setMaxLines(lines)
+        view.setEllipsize(TextUtils.TruncateAt.END)
+
+    def rounded(self, color, corners):
+        from android.graphics.drawable import GradientDrawable
+
+        shape = GradientDrawable()
+        shape.setColor(color)
+        if isinstance(corners, tuple):
+            shape.setCornerRadii([float(self.dp(radius)) for radius in corners for unused in range(2)])
+        else:
+            shape.setCornerRadius(float(self.dp(corners)))
+        return shape
+
+    def panel(self, radius=25):
+        from java import jint
+
+        shape = self.rounded(self.bar_color, radius)
+        shade = jint(0x1cffffff if not self.is_light(self.bar_color) else 0x18000000, truncate=True)
+        shape.setStroke(self.dp(0.65), shade)
+        return shape
+
+    def click(self, view, action):
+        from android_utils import OnClickListener
+
+        view.setForeground(self.theme.createSelectorDrawable(self.theme.getColor(self.theme.key_listSelector)))
+
+        def pressed(unused):
+            try:
+                action()
+            except Exception:
+                self.plugin.logger.exception("Archive screen action failed")
+                self.plugin.notice("Не удалось открыть этот раздел архива.", error=True)
+
+        view.setOnClickListener(OnClickListener(pressed))
+        view.setFocusable(True)
+
+    def icon(self, resource, description, fallback, action):
+        from android.widget import ImageView
+
+        resources = self.activity.getResources()
+        identifier = resources.getIdentifier(resource, "drawable", self.activity.getPackageName())
+        if identifier:
+            view = ImageView(self.activity)
+            view.setImageResource(identifier)
+            view.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+            view.setColorFilter(self.bar_icon)
+            view.setPadding(self.dp(12), self.dp(12), self.dp(12), self.dp(12))
+        else:
+            view = self.label(fallback, 28, self.bar_icon)
+            view.setGravity(17)
+        view.setContentDescription(description)
+        self.click(view, action)
+        return view
+
+    def empty_state(self, title, text="", button=None):
+        from android.view import View
+
+        self.empty.removeAllViews()
+        self.empty.setVisibility(View.VISIBLE)
+        heading = self.label(title, 20, self.foreground, bold=True)
+        heading.setGravity(17)
+        self.empty.addView(heading, self.params(-1, -2))
+        if text:
+            hint = self.label(text, 15, self.secondary)
+            hint.setPadding(0, self.dp(8), 0, self.dp(14))
+            hint.setGravity(17)
+            self.empty.addView(hint, self.params(-1, -2))
+        if button:
+            label, callback = button
+            self.empty.addView(self.action_text(label, callback), self.params(-2, -2))
+
+    def action_text(self, label, callback):
+        view = self.label(label, 15, self.accent, bold=True)
+        view.setGravity(17)
+        view.setMinimumHeight(self.dp(48))
+        view.setPadding(self.dp(16), self.dp(5), self.dp(16), self.dp(5))
+        self.click(view, callback)
+        return view
+
+    def popup(self, anchor, items):
+        from android.graphics.drawable import ColorDrawable
+        from android.widget import PopupWindow, ScrollView
+
+        if anchor is None or not anchor.isAttachedToWindow():
+            self.plugin.choices("Действия", "", items)
+            return
+        surface = self.theme.getColor(self.theme.key_actionBarDefaultSubmenuBackground)
+        foreground = self.theme.getColor(self.theme.key_actionBarDefaultSubmenuItem)
+        menu = self.column()
+        menu.setBackground(self.rounded(surface, 16))
+        menu.setPadding(self.dp(5), self.dp(5), self.dp(5), self.dp(5))
+        scroll = ScrollView(self.activity)
+        scroll.addView(menu)
+        max_height = max(128, self.activity.getResources().getConfiguration().screenHeightDp - 92)
+        height = self.dp(len(items) * 49 + 10)
+        window = PopupWindow(scroll, self.dp(262), min(height, self.dp(max_height)), True)
+        window.setBackgroundDrawable(ColorDrawable(0))
+        window.setOutsideTouchable(True)
+        window.setElevation(float(self.dp(8)))
+
+        for title, callback in items:
+            def select(action=callback):
+                window.dismiss()
+                action()
+
+            row = self.label(title, 15, foreground)
+            row.setGravity(16)
+            row.setMinHeight(self.dp(49))
+            row.setPadding(self.dp(14), self.dp(5), self.dp(12), self.dp(5))
+            self.click(row, select)
+            menu.addView(row, self.params(-1, -2))
+        window.showAsDropDown(anchor, 0, -self.dp(2), 5)
+
+
+    def replace(self, entries, *, end=False, anchor=None):
+        from android.view import View
+
+        self.entries = entries
+        self.empty.setVisibility(View.GONE if entries else View.VISIBLE)
+        self.observers.notifyChanged()
+        if entries and end:
+            self.list.setSelection(len(entries) - 1)
+        elif entries and anchor is not None:
+            self.position_message(*anchor)
+
+    def position_message(self, row_id, offset):
+        for position, (kind, row) in enumerate(self.entries):
+            if kind == "message" and row["id"] == row_id:
+                self.list.setSelectionFromTop(position, offset - self.list.getPaddingTop())
+                return True
+        return False
+
+    def render(self, kind, row):
+        return self.render_chat(row)
+
+    def render_chat(self, row):
+        from android.widget import LinearLayout
+
+        line = LinearLayout(self.activity)
+        line.setOrientation(LinearLayout.HORIZONTAL)
+        line.setGravity(16)
+        line.setMinimumHeight(self.dp(72))
+        line.setPadding(self.dp(14), self.dp(9), self.dp(16), self.dp(9))
+        avatar = avatar_view(self, (row["owner"], row["dialog"]), row["title"], 48)
+        line.addView(avatar, self.params(48, 48))
+
+        body = self.column()
+        body.setPadding(self.dp(12), 0, 0, 0)
+        top = LinearLayout(self.activity)
+        top.setGravity(16)
+        title = self.label(row["title"], 16, self.foreground, bold=True)
+        self.ellipsize(title, 1)
+        top.addView(title, LinearLayout.LayoutParams(0, -2, 1.0))
+        if row["date"]:
+            date = self.label(datetime.fromtimestamp(row["date"]).strftime("%d.%m.%y"), 12, self.secondary)
+            date.setPadding(self.dp(8), 0, 0, 0)
+            top.addView(date)
+        body.addView(top, self.params(-1, -2))
+        preview = " ".join(row["preview"].split())
+        if not preview:
+            preview = "Сохранение на паузе" if not row["active"] else (
+                "Нет сохранённых сообщений" if row["complete"] else "Загружается история"
+            )
+        snippet = self.label(preview, 14, self.secondary)
+        self.ellipsize(snippet, 2)
+        body.addView(snippet, self.params(-1, -2))
+        line.addView(body, LinearLayout.LayoutParams(0, -2, 1.0))
+        self.click(line, lambda: self.plugin.open_conversation((row["owner"], row["dialog"]), self))
+        return line
+
+
+class ConversationScreen(ArchiveScreen):
+    def __init__(self, plugin, activity, key, title, parent):
+        from android.widget import AbsListView, FrameLayout
+        from java import dynamic_proxy
+
+        self.key = key
+        self.title = title
+        self.rows = []
+        self.before = self.after = None
+        self.loading = self.ready = False
+        self.highlighted = None
+        self.thumbnails = {}
+        self.thumbnail_waiters = {}
+        self.owner_name = plugin.account_name(key[0])
+        super().__init__(plugin, activity, title, "Локальный архив",
+                         ("ic_ab_other", "Меню переписки", "⋮", self.open_menu),
+                         on_close=parent.reload if parent is not None else None,
+                         profile=key, profile_action=self.open_shared, floating=True)
+
+        self.set_chat_wallpaper()
+        self.list.setStackFromBottom(True)
+        self.list.setPadding(0, self.dp(5), 0, self.dp(7))
+        self.list.setClipToPadding(False)
+        self.list.setTranscriptMode(AbsListView.TRANSCRIPT_MODE_DISABLED)
+
+        self.bottom_button = self.icon("msg_go_down", "К последним сообщениям", "↓", self.jump_latest)
+        self.bottom_button.setBackground(self.panel())
+        params = FrameLayout.LayoutParams(self.dp(48), self.dp(48), 85)
+        params.setMargins(0, 0, self.dp(10), self.dp(12))
+        self.body.addView(self.bottom_button, params)
+        self.bottom_button.setVisibility(8)
+        self.build_bottom_bar()
+
+        screen = self
+
+        class ScrollListener(dynamic_proxy(AbsListView.OnScrollListener)):
+            def onScroll(self, view, first, visible, total):
+                screen.bottom_button.setVisibility(0 if screen.after is not None or first + visible < total - 1 else 8)
+                screen.position_bubbles()
+
+            def onScrollStateChanged(self, view, state):
+                if state == AbsListView.OnScrollListener.SCROLL_STATE_IDLE:
+                    if view.getFirstVisiblePosition() <= 1:
+                        screen.load_older()
+                    elif screen.after is not None and view.getLastVisiblePosition() >= len(screen.entries) - 2:
+                        screen.load_newer()
+
+        self.scroll_listener = ScrollListener()
+        self.list.setOnScrollListener(self.scroll_listener)
+
+    def on_dismiss(self):
+        self.list.setOnScrollListener(None)
+        self.thumbnail_waiters.clear()
+        self.thumbnails.clear()
+
+    def set_chat_wallpaper(self):
+        from android.graphics.drawable import BitmapDrawable
+
+        self.chat_theme = None
+        try:
+            from client_utils import get_last_fragment
+
+            fragment = get_last_fragment()
+            if (hasattr(fragment, "getDialogId") and number(fragment.getDialogId()) == self.key[1]
+                    and self.plugin.owner(number(fragment.getCurrentAccount())) == self.key[0]):
+                self.chat_theme = fragment.getResourceProvider()
+        except Exception:
+            self.plugin.logger.debug("Could not load the chat theme")
+        self.root.setBackgroundColor(self.chat_color(self.theme.key_chat_wallpaper))
+        try:
+            original = None
+            if hasattr(self.chat_theme, "getWallpaperDrawable"):
+                original = self.chat_theme.getWallpaperDrawable()
+            if original is None:
+                original = self.theme.getCachedWallpaper()
+            state = original.getConstantState() if original is not None else None
+            if state is not None:
+                wallpaper = state.newDrawable(self.activity.getResources()).mutate()
+            elif original is not None and hasattr(original, "getColors") and hasattr(original, "getPatternBitmap"):
+                from org.telegram.ui.Components import MotionBackgroundDrawable
+
+                colors = original.getColors()
+                wallpaper = MotionBackgroundDrawable(colors[0], colors[1], colors[2], colors[3], False)
+                pattern = original.getPatternBitmap()
+                if pattern is not None:
+                    wallpaper.setPatternBitmap(original.getIntensity(), pattern)
+                    if hasattr(wallpaper, "getPatternColor"):
+                        wallpaper.setPatternColorFilter(wallpaper.getPatternColor())
+            elif original is not None and hasattr(original, "getBitmap") and original.getBitmap() is not None:
+                wallpaper = BitmapDrawable(self.activity.getResources(), original.getBitmap())
+            else:
+                return
+            self.root.setBackground(wallpaper)
+        except Exception:
+            self.plugin.logger.debug("Could not copy the active chat wallpaper")
+
+    def chat_color(self, key):
+        return self.chat_theme.getColor(key) if self.chat_theme is not None else self.theme.getColor(key)
+
+    def build_bottom_bar(self):
+        from android.widget import LinearLayout
+
+        bar = LinearLayout(self.activity)
+        bar.setGravity(16)
+        bar.setBackground(self.panel())
+        search = LinearLayout(self.activity)
+        search.setGravity(16)
+        search.setMinimumHeight(self.dp(48))
+        search.addView(self.icon("msg_search", "Поиск по переписке", "⌕", self.open_search), self.params(43, 48))
+        text = self.label("Поиск по переписке", 16, self.bar_secondary)
+        self.ellipsize(text, 1)
+        search.addView(text, LinearLayout.LayoutParams(0, -2, 1.0))
+        self.click(search, self.open_search)
+        bar.addView(search, LinearLayout.LayoutParams(0, -2, 1.0))
+        bar.addView(self.icon("msg_media", "Медиа, файлы и ссылки", "▦", self.open_shared), self.params(48, 48))
+        bar.addView(self.icon("msg_openin", "Открыть оригинальный чат", "↗", self.open_live), self.params(48, 48))
+        params = self.params(-1, -2)
+        params.setMargins(self.dp(7), self.dp(3), self.dp(7), self.dp(7))
+        self.root.addView(bar, params)
+
+    def open_menu(self):
+        self.popup(self.menu_button, [
+            ("Поиск", self.open_search),
+            ("Медиа, файлы и ссылки", self.open_shared),
+            ("Закреплённые сообщения", self.open_pinned),
+            ("К началу переписки", self.jump_start),
+            ("Открыть оригинальный чат", self.open_live),
+            ("Сохранение и экспорт", lambda: self.plugin.open_archive(self.key)),
+        ])
+
+    def open_search(self):
+        screen = ArchiveSearchScreen(self)
+        screen.show()
+
+    def open_shared(self):
+        screen = ArchiveSharedScreen(self)
+        screen.show()
+        screen.load_tab("media")
+
+    def open_pinned(self):
+        screen = ArchiveSearchScreen(self, pinned=True)
+        screen.show()
+        screen.find("")
+
+    def open_live(self, mid=0):
+        self.plugin.open_live_chat(self.key, mid)
+
+    def load(self):
+        if self.loading or not self.showing():
+            return
+        self.loading = True
+
+        def read():
+            chat = self.plugin.db.chat(self.key)
+            if chat is None:
+                self.plugin.ui(self.window.dismiss)
+                return
+            rows, before = self.plugin.db.conversation(self.key, None)
+            status = self.plugin.archive_status(self.key, chat)
+            self.plugin.ui(lambda: self.show_latest(rows, before, status))
+
+        self.plugin.queue(read)
+
+    def show_latest(self, rows, before, status):
+        if not self.showing():
+            return
+        self.loading = False
+        self.ready = True
+        self.rows, self.before, self.after = rows, before, None
+        self.replace(conversation_entries(rows, before), end=True)
+        if not rows:
+            self.empty_state("Пока нет сообщений", status, ("Сохранение и экспорт", lambda: self.plugin.open_archive(self.key)))
+
+    def refresh_visible(self):
+        if not self.showing() or not self.ready:
+            return
+        if self.loading:
+            self.plugin.ui(self.refresh_visible, 300)
+            return
+        if not self.rows:
+            self.load()
+            return
+        self.loading = True
+        since = self.rows[0]["id"]
+        after = getattr(self, "after", None)
+        upper = self.rows[-1]["id"] + 1 if after is not None else None
+
+        def read():
+            rows, before = self.plugin.db.conversation(self.key, upper, since=since)
+
+            def show():
+                if not self.showing():
+                    return
+                self.loading = False
+                if rows != self.rows or before != self.before:
+                    anchor = self.visible_anchor()
+                    end = after is None and self.at_bottom()
+                    self.rows, self.before = rows, before
+                    self.replace(conversation_entries(rows, before, after), end=end, anchor=anchor)
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def at_bottom(self):
+        return not self.list.canScrollVertically(1)
+
+    def load_older(self):
+        if not self.ready or self.before is None or self.loading or not self.showing():
+            return
+        self.loading = True
+        cursor = self.before
+
+        def read():
+            rows, before = self.plugin.db.conversation(self.key, cursor)
+            self.plugin.ui(lambda: self.add_page(rows, before, older=True))
+
+        self.plugin.queue(read)
+
+    def load_newer(self):
+        if not self.ready or self.after is None or self.loading or not self.showing():
+            return
+        self.loading = True
+        cursor = self.after
+
+        def read():
+            rows, after = self.plugin.db.conversation_newer(self.key, cursor)
+            self.plugin.ui(lambda: self.add_page(rows, after, older=False))
+
+        self.plugin.queue(read)
+
+    def visible_anchor(self):
+        first = self.list.getFirstVisiblePosition()
+        for index in range(min(self.list.getChildCount(), len(self.entries) - first)):
+            kind, row = self.entries[first + index]
+            if kind == "message":
+                return row["id"], self.list.getChildAt(index).getTop()
+        return None
+
+    def add_page(self, rows, cursor, older):
+        if not self.showing():
+            return
+        anchor = self.visible_anchor()
+        self.loading = False
+        if older:
+            self.rows, self.before = rows + self.rows, cursor
+        else:
+            self.rows, self.after = self.rows + rows, cursor
+        self.replace(conversation_entries(self.rows, self.before, self.after), anchor=anchor)
+
+    def jump_latest(self):
+        self.highlighted = None
+        self.load()
+
+    def jump_start(self):
+        self.jump_to(0)
+
+    def jump_to(self, mid):
+        if not self.showing():
+            return
+        if self.loading:
+            self.plugin.ui(lambda: self.jump_to(mid), 200)
+            return
+        self.loading = True
+
+        def read():
+            target = mid or self.plugin.db.oldest(self.key)
+            result = self.plugin.db.conversation_around(self.key, target) if target else None
+
+            def show():
+                if not self.showing():
+                    return
+                self.loading = False
+                if result is None:
+                    self.plugin.screen_notice(self.activity, "Сообщение пока недоступно в архиве.")
+                    return
+                self.rows, self.before, self.after = result
+                self.highlighted = target
+                self.replace(conversation_entries(self.rows, self.before, self.after),
+                             anchor=(target, self.dp(48) if mid else self.dp(32)))
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def render(self, kind, row):
+        if kind == "older":
+            return self.history_button("Предыдущие сообщения", self.load_older)
+        if kind == "newer":
+            return self.history_button("Следующие сообщения", self.load_newer)
+        if kind == "date":
+            return self.service_chip(row[1])
+        if row["kind"] == "Служебное сообщение":
+            return self.service_chip(row["text"] or row["kind"])
+        return self.render_message(row)
+
+    def service_chip(self, value):
+        container = self.column()
+        container.setGravity(17)
+        container.setPadding(self.dp(18), self.dp(5), self.dp(18), self.dp(5))
+        color = self.chat_color(self.theme.key_chat_serviceText)
+        surface = self.chat_color(self.theme.key_chat_serviceBackground)
+        chip = self.label(value, 13, color, bold=True)
+        chip.setGravity(17)
+        chip.setPadding(self.dp(12), self.dp(4), self.dp(12), self.dp(4))
+        chip.setBackground(self.rounded(surface, 14))
+        container.addView(chip, self.params(-2, -2))
+        return container
+
+    def history_button(self, title, action):
+        from android.widget import LinearLayout
+
+        box = self.column()
+        box.setGravity(17)
+        button = self.action_text(title, action)
+        button.setBackground(self.panel(22))
+        box.setPadding(0, self.dp(3), 0, self.dp(5))
+        box.addView(button, LinearLayout.LayoutParams(-2, -2))
+        return box
+
+    def outgoing(self, row):
+        if row["outgoing"] is not None:
+            return row["outgoing"] == 1
+        return bool(self.owner_name and normalized(self.owner_name) != normalized(self.title)
+                    and normalized(row["author"]) == normalized(self.owner_name))
+
+    def bubble_background(self, outgoing, color, selected):
+        try:
+            from org.telegram.ui.ActionBar import MessageDrawable
+
+            bubble = MessageDrawable(MessageDrawable.TYPE_TEXT, outgoing, selected)
+            if self.chat_theme is not None:
+                bubble.setResourceProvider(self.chat_theme)
+            bubble.setDrawFullBubble(True)
+            bubble.setTop(0, max(self.list.getWidth(), self.dp(320)),
+                          max(self.list.getHeight(), self.dp(560)), False, False)
+            return bubble
+        except Exception:
+            corners = (16, 16, 5, 16) if outgoing else (16, 16, 16, 5)
+            if selected:
+                name = "key_chat_outBubbleSelected" if outgoing else "key_chat_inBubbleSelected"
+                key = getattr(self.theme, name, None)
+                if key is not None:
+                    color = self.chat_color(key)
+            return self.rounded(color, corners)
+
+    def position_bubbles(self):
+        height, width = self.list.getHeight(), self.list.getWidth()
+        if height <= 0 or width <= 0:
+            return
+        for index in range(self.list.getChildCount()):
+            row = self.list.getChildAt(index)
+            if not hasattr(row, "getChildCount") or not row.getChildCount():
+                continue
+            bubble = row.getChildAt(0)
+            drawable = bubble.getBackground()
+            if hasattr(drawable, "setTop"):
+                drawable.setTop(row.getTop(), width, height, False, False)
+                if hasattr(drawable, "hasGradient") and drawable.hasGradient():
+                    bubble.invalidate()
+
+    def render_message(self, row):
+        from android.view import View
+        from android.widget import AbsListView, FrameLayout, LinearLayout
+
+        theme = self.theme
+        outgoing = self.outgoing(row)
+        color = self.chat_color(theme.key_chat_outBubble if outgoing else theme.key_chat_inBubble)
+        text_color = self.chat_color(theme.key_chat_messageTextOut if outgoing else theme.key_chat_messageTextIn)
+        meta_color = self.chat_color(theme.key_chat_outTimeText if outgoing else theme.key_chat_inTimeText)
+        reply_color = self.chat_color(theme.key_chat_outReplyLine if outgoing else theme.key_chat_inReplyLine)
+        container = FrameLayout(self.activity)
+        container.setLayoutParams(AbsListView.LayoutParams(-1, -2))
+        container.setPadding(self.dp(6), self.dp(1.5), self.dp(6), self.dp(1.5))
+        bubble = self.column()
+        left, right = (11, 16) if outgoing else (16, 11)
+        bubble.setBackground(self.bubble_background(outgoing, color, self.highlighted == row["id"]))
+        bubble.setPadding(self.dp(left), self.dp(6), self.dp(right), self.dp(6))
+        width = self.list.getWidth() or self.activity.getResources().getDisplayMetrics().widthPixels
+        maximum = max(self.dp(105), min(self.dp(520), width - self.dp(38)))
+        inner = maximum - self.dp(left + right)
+        wrap = self.params(-2, -2)
+
+        try:
+            from org.telegram.messenger import SharedConfig
+
+            text_size = max(13, min(28, number(SharedConfig.fontSize)))
+        except (AttributeError, ImportError, TypeError):
+            text_size = 16
+        content = row["text"] or (row["kind"] if row["media_key"] is None else "")
+        content_view = self.label(content, text_size, text_color)
+        apply_entities(content_view, content, row["entities"], reply_color)
+        self.click(content_view, lambda: self.message_menu(row, content_view))
+        details = []
+        if row["deleted"]:
+            details.append("Удалено в Telegram")
+        if row["edited"]:
+            details.append("изменено")
+        if row["date"]:
+            details.append(datetime.fromtimestamp(row["date"]).strftime("%H:%M"))
+        meta = self.label(" · ".join(details), 11, meta_color)
+        measure_limit = View.MeasureSpec.makeMeasureSpec(inner, View.MeasureSpec.AT_MOST)
+        meta.measure(measure_limit, 0)
+        check = self.read_check(row, outgoing)
+        meta_width = meta.getMeasuredWidth() + (self.dp(17) if check is not None else 0)
+        if not content:
+            content_width = 0
+        elif "\n" not in content:
+            content_width = ceil(content_view.getPaint().measureText(content))
+        else:
+            content_width = inner
+        inline = bool(content and content_width + meta_width + self.dp(8) <= inner)
+        header_width = self.dp(30)
+        if row["forwarded"]:
+            forward = self.label(f'Переслано от {row["forwarded"]}', 13, reply_color, bold=True)
+            forward.setMaxWidth(inner)
+            self.ellipsize(forward, 1)
+            forward.measure(measure_limit, 0)
+            header_width = max(header_width, forward.getMeasuredWidth())
+            bubble.addView(forward, wrap)
+        if self.key[1] < 0 and not outgoing and row["author"]:
+            author = self.label(row["author"], 13, reply_color, bold=True)
+            author.setMaxWidth(inner)
+            self.ellipsize(author, 1)
+            author.measure(measure_limit, 0)
+            header_width = max(header_width, author.getMeasuredWidth())
+            bubble.addView(author, wrap)
+        if row["reply"] or row["reply_quote"]:
+            quote = self.reply_view(row, text_color, reply_color, inner)
+            quote.measure(measure_limit, 0)
+            header_width = max(header_width, quote.getMeasuredWidth(), min(inner, self.dp(130)))
+            bubble.addView(quote, wrap)
+        if row["media_key"] is not None:
+            header_width = max(header_width, self.add_media(bubble, row, text_color, meta_color, inner))
+
+        meta_line = LinearLayout(self.activity)
+        meta_line.setGravity(80)
+        meta_line.addView(meta, wrap)
+        if check is not None:
+            dimensions = self.params(14, 14)
+            dimensions.leftMargin = self.dp(3)
+            meta_line.addView(check, dimensions)
+        if inline and content:
+            line = LinearLayout(self.activity)
+            line.setGravity(80)
+            line.addView(content_view, wrap)
+            spacing = self.params(-2, -2)
+            spacing.leftMargin = self.dp(8)
+            spacing.bottomMargin = self.dp(1)
+            line.addView(meta_line, spacing)
+            bubble.addView(line, wrap)
+        else:
+            overlay = None
+            if content:
+                content_view.setMaxWidth(inner)
+                content_view.measure(measure_limit, 0)
+                content_width = content_view.getMeasuredWidth()
+                layout = content_view.getLayout()
+                if layout is not None and layout.getLineCount() > 1:
+                    last = layout.getLineCount() - 1
+                    if (layout.getParagraphDirection(last) == 1 and
+                            layout.getLineRight(last) + self.dp(8) + meta_width <= content_width):
+                        overlay = FrameLayout(self.activity)
+                        overlay.addView(content_view, FrameLayout.LayoutParams(content_width, -2))
+                        corner = FrameLayout.LayoutParams(-2, -2, 85)
+                        corner.bottomMargin = self.dp(1)
+                        overlay.addView(meta_line, corner)
+                        bubble.addView(overlay, wrap)
+            if overlay is None:
+                if content:
+                    bubble.addView(content_view, wrap)
+                end = self.params(-2, -2)
+                end.gravity = 5
+                end.topMargin = self.dp(1)
+                bubble.addView(meta_line, end)
+        if row["reactions"]:
+            reaction = self.label(row["reactions"], 13, reply_color, bold=True)
+            reaction.setMaxWidth(inner)
+            self.ellipsize(reaction, 1)
+            reaction.measure(measure_limit, 0)
+            header_width = max(header_width, reaction.getMeasuredWidth())
+            bubble.addView(reaction, wrap)
+
+        desired = content_width + meta_width + self.dp(8) if inline else max(content_width, meta_width)
+        bubble_width = min(maximum, max(header_width, desired) + self.dp(left + right))
+        self.click(bubble, lambda: self.message_menu(row, bubble))
+        from android_utils import OnLongClickListener
+
+        def hold(view):
+            self.message_menu(row, view)
+            return True
+
+        for target in (bubble, content_view):
+            target.setOnLongClickListener(OnLongClickListener(hold))
+        container.addView(bubble, FrameLayout.LayoutParams(bubble_width, -2, 5 if outgoing else 3))
+        return container
+
+    def read_check(self, row, outgoing):
+        if not outgoing:
+            return None
+        from android.widget import FrameLayout, ImageView
+
+        read = row["is_read"] == 1
+        check_color = getattr(self.theme, "key_chat_outSentCheckRead", self.theme.key_chat_outSentCheck)
+        color = self.chat_color(check_color if read else self.theme.key_chat_outSentCheck)
+        view = FrameLayout(self.activity)
+        view.setContentDescription("Прочитано" if read else "Отправлено")
+        full = getattr(self.theme, "chat_msgOutCheckReadDrawable" if read else "chat_msgOutCheckDrawable", None)
+        half = getattr(self.theme, "chat_msgOutHalfCheckDrawable", None) if read else None
+        for drawable, offset in ((full, 3 if read else 0), (half, 0)):
+            state = drawable.getConstantState() if drawable is not None else None
+            if state is not None:
+                icon = ImageView(self.activity)
+                icon.setImageDrawable(state.newDrawable(self.activity.getResources()).mutate())
+                icon.setColorFilter(color)
+                icon.setScaleType(ImageView.ScaleType.FIT_CENTER)
+                where = FrameLayout.LayoutParams(self.dp(11), -1)
+                where.leftMargin = self.dp(offset)
+                view.addView(icon, where)
+        if not view.getChildCount():
+            text = self.label("✓✓" if read else "✓", 10, color)
+            text.setGravity(17)
+            view.addView(text, FrameLayout.LayoutParams(-1, -1))
+        return view
+
+    def reply_view(self, row, color, accent, width):
+        from android.view import View
+        from android.widget import LinearLayout
+        from java import jint
+
+        quote = LinearLayout(self.activity)
+        quote.setGravity(16)
+        quote.setPadding(self.dp(4), self.dp(3), 0, self.dp(4))
+        quote.setBackground(self.rounded(jint((accent & 0xffffff) | 0x24000000, truncate=True), 7))
+        stripe = View(self.activity)
+        stripe.setBackground(self.rounded(accent, 2))
+        quote.addView(stripe, self.params(3, 30))
+        body = self.column()
+        body.setPadding(self.dp(8), 0, self.dp(5), 0)
+        author = row["reply_author"] or "Ответ"
+        preview = " ".join((row["reply_quote"] or row["reply_preview"]).split()) or "Сообщение недоступно"
+        for line in (self.label(author, 13, accent, bold=True), self.label(preview, 13, color)):
+            line.setMaxWidth(max(self.dp(60), width - self.dp(16)))
+            self.ellipsize(line, 1)
+            body.addView(line, self.params(-2, -2))
+        quote.addView(body, self.params(-2, -2))
+        if row["reply"]:
+            quote.setContentDescription(f"Перейти к сообщению от {author}")
+            self.click(quote, lambda: self.jump_to(row["reply"]))
+        return quote
+
+    def message_menu(self, row, anchor):
+        from android_utils import copy_to_clipboard
+
+        items = []
+        if row["text"]:
+            items.extend([
+                ("Копировать", lambda: copy_to_clipboard(row["text"])),
+                ("Выделить текст", lambda: self.plugin.show_selectable_text(self.activity, row["text"])),
+                ("Поделиться текстом", lambda: self.plugin.share_text(self.activity, row["text"])),
+            ])
+        if row["media_key"] and row["media_status"] == 1:
+            items.append(("Открыть вложение", lambda: self.open_media(row)))
+            items.append(("Поделиться файлом", lambda: self.open_media(row, share=True)))
+        links = message_links(row["text"], row["entities"])
+        if links:
+            items.append(("Открыть ссылку", lambda: self.choose_links(links)))
+        if row["reply"]:
+            items.append(("К сообщению, на которое ответили", lambda: self.jump_to(row["reply"])))
+        if row["edited"]:
+            items.append(("История изменений", lambda: self.plugin.show_message_versions(self.key, row)))
+        if not row["deleted"]:
+            items.append(("Ответить в оригинальном чате",
+                          lambda: self.plugin.open_live_chat(self.key, row["id"], reply=True)))
+            items.append(("Показать в оригинальном чате", lambda: self.open_live(row["id"])))
+        if items:
+            self.popup(anchor, items)
+
+    def choose_links(self, links):
+        if len(links) == 1:
+            self.plugin.open_link(self.activity, links[0])
+        else:
+            self.plugin.choices("Ссылки", "", [(link, lambda link=link: self.plugin.open_link(self.activity, link))
+                                               for link in links])
+
+    def asset_info(self, row):
+        if not row["media_key"]:
+            return None, None
+        asset = {"key": row["media_key"], "name": row["media_name"], "mime": row["media_mime"]}
+        return asset_path(self.plugin.root, self.key, asset), asset
+
+    def open_media(self, row, share=False):
+        source, asset = self.asset_info(row)
+        if not source or row["media_status"] != 1 or not source.is_file():
+            self.plugin.screen_notice(self.activity, "Вложение ещё не сохранено.")
+            return
+        if share:
+            self.plugin.open_asset(source, asset, share=True)
+        elif asset["mime"].startswith("image/"):
+            self.preview_image(source, asset)
+        elif row["media_type"] in ("voice", "audio") or asset["mime"].startswith("audio/"):
+            self.plugin.play_audio(self.activity, source, row)
+        elif asset["mime"].startswith("video/"):
+            self.plugin.play_video(self.activity, source, asset)
+        else:
+            self.plugin.open_asset(source, asset)
+
+    def add_media(self, bubble, row, color, secondary, width):
+        from android.widget import FrameLayout, ImageView, LinearLayout
+
+        source, asset = self.asset_info(row)
+        available = row["media_status"] == 1 and source.is_file()
+        visual = asset["mime"].startswith(("image/", "video/"))
+        if visual:
+            round_video = row["media_type"] == "round"
+            media_width = min(width, self.dp(212 if round_video else 280))
+            ratio = row["height"] / row["width"] if row["width"] and row["height"] else .74
+            height = media_width if round_video else int(min(self.dp(320), max(media_width * .49, media_width * ratio)))
+            frame = FrameLayout(self.activity)
+            frame.setBackground(self.rounded(self.surface, 14 if not round_video else 110))
+            frame.setClipToOutline(True)
+            image = ImageView(self.activity)
+            image.setScaleType(ImageView.ScaleType.CENTER_CROP)
+            frame.addView(image, FrameLayout.LayoutParams(-1, -1))
+            overlay = "▶" if available and asset["mime"].startswith("video/") else (
+                "Загружается" if row["media_status"] == 0 else "Недоступно" if not available else ""
+            )
+            if overlay:
+                badge = self.label(overlay, 16 if available else 12, -1, bold=True)
+                badge.setGravity(17)
+                badge.setPadding(self.dp(11), self.dp(6), self.dp(11), self.dp(6))
+                badge.setBackground(self.rounded(-14737377, 16))
+                frame.addView(badge, FrameLayout.LayoutParams(-2, -2, 17))
+            frame.setContentDescription("Открыть вложение" if available else overlay)
+            self.click(frame, lambda: self.open_media(row))
+            if available:
+                self.load_thumbnail(image, source, asset["mime"])
+            bubble.addView(frame, LinearLayout.LayoutParams(media_width, height))
+            return media_width
+        is_audio = asset["mime"].startswith("audio/") or row["media_type"] in ("voice", "audio")
+        media_width = min(width, self.dp(253))
+        item = LinearLayout(self.activity)
+        item.setGravity(16)
+        item.setMinimumHeight(self.dp(54))
+        icon = self.label("▶" if is_audio else "↓", 16, -1, bold=True)
+        icon.setGravity(17)
+        icon.setBackground(self.rounded(self.accent, 20))
+        item.addView(icon, self.params(39, 39))
+        captions = self.column()
+        captions.setPadding(self.dp(9), 0, 0, 0)
+        title = self.label("Голосовое сообщение" if row["media_type"] == "voice" else asset["name"],
+                           14, color, bold=True)
+        self.ellipsize(title, 1)
+        captions.addView(title)
+        size = clock_text(row["duration"]) if is_audio and row["duration"] else displayed_size(row["media_size"])
+        if not available:
+            size = "Загружается" if row["media_status"] == 0 else "Недоступно"
+        captions.addView(self.label(size, 12, secondary))
+        item.addView(captions, LinearLayout.LayoutParams(0, -2, 1.0))
+        self.click(item, lambda: self.open_media(row))
+        bubble.addView(item, LinearLayout.LayoutParams(media_width, -2))
+        return media_width
+
+    @staticmethod
+    def decode_image(source, max_side):
+        from android.graphics import BitmapFactory
+
+        options = BitmapFactory.Options()
+        options.inJustDecodeBounds = True
+        BitmapFactory.decodeFile(str(source), options)
+        if options.outWidth <= 0 or options.outHeight <= 0:
+            return None
+        scale = 1
+        while max(options.outWidth, options.outHeight) / scale > max_side * 1.5:
+            scale *= 2
+        options.inSampleSize = scale
+        options.inJustDecodeBounds = False
+        return BitmapFactory.decodeFile(str(source), options)
+
+    @staticmethod
+    def decode_video_thumbnail(source, max_side):
+        from android.media import MediaMetadataRetriever
+
+        reader = MediaMetadataRetriever()
+        try:
+            reader.setDataSource(str(source))
+            width = int(reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH) or 0)
+            height = int(reader.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) or 0)
+            if width <= 0 or height <= 0:
+                return None
+            scale = min(1.0, max_side / max(width, height))
+            return reader.getScaledFrameAtTime(-1, MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                               max(1, int(width * scale)), max(1, int(height * scale)))
+        finally:
+            reader.release()
+
+    def load_thumbnail(self, image, source, mime):
+        cached = self.thumbnails.get(source)
+        if cached is not None:
+            image.setImageBitmap(cached)
+            return
+        if source in self.thumbnail_waiters:
+            self.thumbnail_waiters[source].append(image)
+            return
+        self.thumbnail_waiters[source] = [image]
+
+        def read():
+            try:
+                decode = self.decode_video_thumbnail if mime.startswith("video/") else self.decode_image
+                bitmap = decode(source, 420)
+            except Exception:
+                bitmap = None
+
+            def show():
+                waiters = self.thumbnail_waiters.pop(source, ())
+                if not self.showing() or bitmap is None:
+                    return
+                if len(self.thumbnails) >= 28:
+                    self.thumbnails.pop(next(iter(self.thumbnails)))
+                self.thumbnails[source] = bitmap
+                for target in waiters:
+                    target.setImageBitmap(bitmap)
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def preview_image(self, source, asset):
+        def read():
+            bitmap = self.decode_image(source, 1900)
+            if bitmap is None:
+                self.plugin.ui(lambda: self.plugin.open_asset(source, asset))
+                return
+
+            def show():
+                if self.showing():
+                    self.plugin.photo_viewer(self.activity, bitmap, source, asset)
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+
+
+class ArchiveSearchScreen(ArchiveScreen):
+    def __init__(self, conversation, pinned=False):
+        from android.content import Context
+        from android.text import TextWatcher
+        from android.view import WindowManager
+        from android.view.inputmethod import EditorInfo
+        from android.widget import EditText, TextView
+        from java import dynamic_proxy
+
+        self.conversation = conversation
+        self.pinned = pinned
+        self.query = ""
+        self.loading = False
+        self.request = 0
+        self.before = None
+        self.results = []
+        super().__init__(conversation.plugin, conversation.activity,
+                         "Закреплённые сообщения" if pinned else "", "")
+        self.input = None
+        if pinned:
+            self.empty_state("Нет закреплённых сообщений")
+            return
+        field = self.input = EditText(self.activity)
+        field.setSingleLine(True)
+        field.setTextColor(self.bar_text)
+        field.setHintTextColor(self.bar_secondary)
+        field.setTextSize(17.0)
+        field.setPadding(self.dp(4), 0, self.dp(6), 0)
+        field.setBackgroundColor(0)
+        field.setHint("Поиск по переписке")
+        field.setContentDescription("Поиск по переписке")
+        field.setImeOptions(EditorInfo.IME_ACTION_SEARCH)
+        self.header.removeAllViews()
+        self.header.addView(field, self.params(-1, 49))
+        self.window.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        screen = self
+
+        class Watcher(dynamic_proxy(TextWatcher)):
+            def beforeTextChanged(self, text, start, count, after):
+                pass
+
+            def onTextChanged(self, text, start, before, count):
+                screen.request += 1
+                request = screen.request
+                value = str(text)
+                screen.plugin.ui(lambda: screen.find(value) if request == screen.request else None, 240)
+
+            def afterTextChanged(self, text):
+                pass
+
+        class Editor(dynamic_proxy(TextView.OnEditorActionListener)):
+            def onEditorAction(self, view, action, event):
+                if action != EditorInfo.IME_ACTION_SEARCH:
+                    return False
+                keyboard = screen.activity.getSystemService(Context.INPUT_METHOD_SERVICE)
+                keyboard.hideSoftInputFromWindow(field.getWindowToken(), 0)
+                screen.find(str(field.getText()))
+                return True
+
+        self.watcher = Watcher()
+        self.editor = Editor()
+        field.addTextChangedListener(self.watcher)
+        field.setOnEditorActionListener(self.editor)
+        self.empty_state("Поиск в архиве", "Введите текст, имя автора или название файла.")
+
+    def show(self):
+        super().show()
+        if self.input is not None:
+            from android.content import Context
+            from android.view.inputmethod import InputMethodManager
+
+            self.input.requestFocus()
+            self.plugin.ui(
+                lambda: self.activity.getSystemService(Context.INPUT_METHOD_SERVICE).showSoftInput(
+                    self.input, InputMethodManager.SHOW_IMPLICIT
+                ) if self.showing() else None, 160,
+            )
+
+    def on_dismiss(self):
+        if self.input is not None:
+            self.input.removeTextChangedListener(self.watcher)
+            self.input.setOnEditorActionListener(None)
+
+    def find(self, query, more=False):
+        if not self.showing() or (more and self.loading):
+            return
+        self.request += 1
+        request = self.request
+        self.loading = True
+        self.query = query.strip()
+        query = self.query
+        before = self.before if more else None
+        if not more:
+            self.results, self.before = [], None
+            self.replace([])
+            if not query and not self.pinned:
+                self.loading = False
+                self.empty_state("Поиск в архиве", "Введите текст, имя автора или название файла.")
+                return
+            self.empty_state("Поиск…")
+
+        def read():
+            key = self.conversation.key
+            if self.pinned:
+                rows, cursor = self.plugin.db.pinned(key), None
+            else:
+                rows, cursor = self.plugin.db.search_messages(key, query, before)
+
+            def show():
+                if request != self.request or not self.showing():
+                    return
+                self.loading = False
+                self.results.extend(rows)
+                self.before = cursor
+                entries = [("result", row) for row in self.results]
+                if cursor is not None:
+                    entries.append(("more", None))
+                self.replace(entries)
+                if not self.results:
+                    self.empty_state("Нет закреплённых сообщений" if self.pinned else "Ничего не найдено")
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def open_result(self, row):
+        self.window.dismiss()
+        self.conversation.jump_to(row["id"])
+
+    def render(self, kind, row):
+        if kind == "more":
+            return self.action_text("Ещё результаты", lambda: self.find(self.query, more=True))
+        from android.widget import LinearLayout
+
+        result = self.column()
+        result.setPadding(self.dp(17), self.dp(10), self.dp(17), self.dp(11))
+        result.setMinimumHeight(self.dp(68))
+        name = LinearLayout(self.activity)
+        name.setGravity(16)
+        author = self.label(row["author"], 15, self.foreground, bold=True)
+        self.ellipsize(author, 1)
+        name.addView(author, LinearLayout.LayoutParams(0, -2, 1.0))
+        date = self.label(stamp(row["date"]), 12, self.secondary)
+        name.addView(date)
+        result.addView(name, self.params(-1, -2))
+        preview = row["text"] or row["media_name"] or row["kind"] or "Сообщение"
+        label = self.label(preview, 15, self.foreground)
+        self.ellipsize(label, 3)
+        result.addView(label, self.params(-1, -2))
+        if row["deleted"]:
+            result.addView(self.label("Удалено в Telegram", 12, self.secondary))
+        self.click(result, lambda: self.open_result(row))
+        return result
+
+
+class ArchiveSharedScreen(ArchiveScreen):
+    def __init__(self, conversation):
+        from android.widget import HorizontalScrollView, LinearLayout
+
+        self.conversation = conversation
+        self.tab = "media"
+        self.rows = []
+        self.before = None
+        self.request = 0
+        self.loading = False
+        super().__init__(conversation.plugin, conversation.activity, conversation.title, "Локальный архив",
+                         ("msg_search", "Поиск в переписке", "⌕", self.open_search),
+                         floating=True, centered=True)
+        self.tabs = HorizontalScrollView(self.activity)
+        self.tabs.setHorizontalScrollBarEnabled(False)
+        self.tabs.setFillViewport(True)
+        self.tabs.setBackground(self.panel())
+        self.tab_line = LinearLayout(self.activity)
+        self.tab_line.setGravity(16)
+        self.tab_line.setPadding(self.dp(3), self.dp(3), self.dp(3), self.dp(3))
+        self.tabs.addView(self.tab_line)
+        params = self.params(-1, -2)
+        params.setMargins(self.dp(10), self.dp(9), self.dp(10), self.dp(10))
+        self.root.addView(self.tabs, 1, params)
+        self.render_tabs()
+        self.reload = self.refresh_tab
+
+    def open_search(self):
+        self.window.dismiss()
+        self.conversation.open_search()
+
+    def render_tabs(self):
+        from android.widget import LinearLayout
+
+        self.tab_line.removeAllViews()
+        for key, title in SHARED_TABS:
+            selected = key == self.tab
+            button = self.label(title, 15, self.accent if selected else self.secondary, bold=selected)
+            button.setGravity(17)
+            button.setMinHeight(self.dp(43))
+            button.setPadding(self.dp(8), 0, self.dp(8), 0)
+            button.setSelected(selected)
+            if selected:
+                button.setBackground(self.rounded(self.theme.getColor(self.theme.key_listSelector), 22))
+            self.click(button, lambda tab=key: self.load_tab(tab))
+            self.tab_line.addView(button, LinearLayout.LayoutParams(-2, -2, 1.0))
+
+    def load_tab(self, tab, more=False):
+        if not self.showing() or (more and self.loading):
+            return
+        self.loading = True
+        self.request += 1
+        request = self.request
+        self.tab = tab
+        before = self.before if more else None
+        if not more:
+            self.rows, self.before = [], None
+            self.render_tabs()
+            self.replace([])
+            self.empty_state("Загрузка из архива…")
+
+        def read():
+            rows, cursor = self.plugin.db.shared(self.conversation.key, tab, before)
+
+            def show():
+                if not self.showing() or request != self.request:
+                    return
+                self.loading = False
+                self.rows.extend(rows)
+                self.before = cursor
+                self.render_rows()
+                if not self.rows:
+                    names = {"media": "Нет сохранённых фото и видео", "files": "Нет сохранённых файлов",
+                             "links": "Нет сохранённых ссылок", "voice": "Нет голосовых сообщений"}
+                    self.empty_state(names[tab])
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def render_rows(self):
+        if self.tab == "media":
+            entries = [("grid", self.rows[index:index + 3]) for index in range(0, len(self.rows), 3)]
+        else:
+            entries = [(self.tab, row) for row in self.rows]
+        if self.before is not None:
+            entries.append(("more", None))
+        self.replace(entries)
+
+    def refresh_tab(self):
+        if self.loading or not self.showing() or self.tab == "links":
+            return
+        self.loading = True
+        request, tab = self.request, self.tab
+        limit = max(SHARED_PAGE, len(self.rows))
+
+        def read():
+            rows, cursor = self.plugin.db.shared(self.conversation.key, tab, limit=limit)
+
+            def show():
+                if request != self.request or not self.showing():
+                    return
+                self.loading = False
+                if rows == self.rows and cursor == self.before:
+                    return
+                first = self.list.getFirstVisiblePosition()
+                child = self.list.getChildAt(0)
+                offset = child.getTop() - self.list.getPaddingTop() if child is not None else 0
+                self.rows, self.before = rows, cursor
+                self.render_rows()
+                if child is not None and self.entries:
+                    self.list.setSelectionFromTop(min(first, len(self.entries) - 1), offset)
+
+            self.plugin.ui(show)
+
+        self.plugin.queue(read)
+
+    def render(self, kind, row):
+        if kind == "more":
+            return self.action_text("Загрузить ещё", lambda: self.load_tab(self.tab, more=True))
+        if kind == "grid":
+            return self.grid(row)
+        return self.shared_row(kind, row)
+
+    def grid(self, rows):
+        from android.widget import FrameLayout, ImageView, LinearLayout
+
+        strip = LinearLayout(self.activity)
+        width = self.list.getWidth() or self.activity.getResources().getDisplayMetrics().widthPixels
+        size = max(self.dp(72), int(width / 3))
+        for row in rows:
+            source, asset = self.conversation.asset_info(row)
+            available = row["media_status"] == 1 and source.is_file()
+            tile = FrameLayout(self.activity)
+            tile.setBackgroundColor(self.theme.getColor(self.theme.key_windowBackgroundGray))
+            tile.setPadding(self.dp(1), self.dp(1), self.dp(1), self.dp(1))
+            image = ImageView(self.activity)
+            image.setScaleType(ImageView.ScaleType.CENTER_CROP)
+            tile.addView(image, FrameLayout.LayoutParams(-1, -1))
+            if available:
+                self.conversation.load_thumbnail(image, source, asset["mime"])
+            video = asset["mime"].startswith("video/")
+            if video or not available:
+                info = ("▶ " + clock_text(row["duration"]) if available and row["duration"] else "▶") if available else (
+                    "Загружается" if row["media_status"] == 0 else "Недоступно")
+                badge = self.label(info, 11, -1, bold=True)
+                badge.setPadding(self.dp(6), self.dp(3), self.dp(6), self.dp(3))
+                badge.setBackground(self.rounded(-14737377, 8))
+                where = FrameLayout.LayoutParams(-2, -2, 85)
+                where.setMargins(0, 0, self.dp(4), self.dp(4))
+                tile.addView(badge, where)
+            tile.setContentDescription(("Видео" if video else "Фото") + (" · удалено в Telegram" if row["deleted"] else ""))
+            self.click(tile, lambda saved=row: self.conversation.open_media(saved))
+            self.shared_long_press(tile, row)
+            strip.addView(tile, LinearLayout.LayoutParams(size, size))
+        return strip
+
+    def shared_row(self, kind, row):
+        from android.widget import LinearLayout
+
+        line = LinearLayout(self.activity)
+        line.setGravity(16)
+        line.setPadding(self.dp(16), self.dp(7), self.dp(16), self.dp(7))
+        line.setMinimumHeight(self.dp(65))
+        glyph = {"links": "↗", "files": "↓", "voice": "▶"}[kind]
+        icon = self.label(glyph, 17, self.accent, bold=True)
+        icon.setBackground(self.rounded(self.theme.getColor(self.theme.key_windowBackgroundGray), 14))
+        icon.setGravity(17)
+        line.addView(icon, self.params(44, 44))
+        info = self.column()
+        info.setPadding(self.dp(12), 0, 0, 0)
+        links = message_links(row["text"], row["entities"]) if kind == "links" else []
+        name = links[0] if links else (row["text"] or "Голосовое сообщение") if kind == "voice" else row["media_name"]
+        label = self.label(name or "Ссылка", 15, self.foreground, bold=True)
+        self.ellipsize(label, 1)
+        info.addView(label)
+        duration = clock_text(row["duration"]) if kind == "voice" and row["duration"] else ""
+        description = " · ".join(part for part in (duration or displayed_size(row["media_size"] or 0),
+                                                    row["author"], stamp(row["date"])) if part)
+        secondary = self.label(description, 12, self.secondary)
+        self.ellipsize(secondary, 1)
+        info.addView(secondary)
+        line.addView(info, LinearLayout.LayoutParams(0, -2, 1.0))
+        self.click(line, lambda: self.conversation.choose_links(links) if links else self.conversation.open_media(row))
+        self.shared_long_press(line, row)
+        return line
+
+    def shared_long_press(self, view, row):
+        from android_utils import OnLongClickListener
+
+        def show_message():
+            self.window.dismiss()
+            self.conversation.jump_to(row["id"])
+
+        def hold(anchor):
+            self.popup(anchor, [("Показать в переписке", show_message)])
+            return True
+
+        view.setOnLongClickListener(OnLongClickListener(hold))
+
+
+class LocalChatArchive(BasePlugin):
+
+
+
+    def on_plugin_load(self):
+        from android_utils import run_on_ui_thread
+        from client_utils import run_on_queue
+        from hook_utils import find_class
+        from org.telegram.messenger import ApplicationLoader
+
+        self.active = True
+        self.generation = object()
+        self.ui = run_on_ui_thread
+        self.run = run_on_queue
+        self.context = ApplicationLoader.applicationContext
+        self.root = Path(str(self.context.getNoBackupFilesDir().getAbsolutePath())) / __id__
+        self.enabled_chats = frozenset()
+        self.archived_owners = frozenset()
+        self.syncs = {}
+        self.sync_due = {}
+        self.sync_status = {}
+        self.flood_until = {}
+        self.archive_windows = set()
+        self.screen_refresh_pending = False
+        self.stop_playback = None
+        self.transfers = {}
+        self.export_choice = None
+        self.exporting = False
+        self.media_wake = False
+        self.listener = None
+        self.centers = []
+        self.db = None
+        self.export_ready = False
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU, text="Локальный архив",
+            on_click=self.chat_menu, icon="msg_archive",
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU, text="Архив чатов",
+            on_click=lambda ctx: self.ui(self.open_list), icon="msg_archive",
+        ))
+        for name in (*MESSAGE_UPDATES, *DELETE_UPDATES, *READ_UPDATES):
+            self.add_hook(name)
+        try:
+            controller = find_class("org.telegram.messenger.BaseController")
+            self.account_field = controller.getDeclaredField("currentAccount")
+            self.account_field.setAccessible(True)
+            storage = find_class("org.telegram.messenger.MessagesStorage")
+            self.hook_all_methods(storage, "putMessages", before=self.before_storage)
+        except Exception:
+            self.logger.exception("Could not register archive message capture")
+        try:
+            activity = find_class("org.telegram.ui.LaunchActivity")
+            self.export_ready = bool(self.hook_all_methods(activity, "onActivityResult", after=self.after_picker))
+        except Exception:
+            self.logger.exception("Could not register archive export picker")
+        self.ui(self.observe_notifications)
+        self.queue(self.tick)
+
+    def on_plugin_unload(self):
+        self.active = False
+        self.generation = None
+        from org.telegram.messenger import NotificationCenter
+
+        listener, centers, db = self.listener, self.centers, self.db
+        windows = self.archive_windows
+        self.db = None
+
+        def detach():
+            if self.stop_playback is not None:
+                self.stop_playback()
+            for screen in tuple(windows):
+                screen.window.dismiss()
+            for center in centers:
+                for event in self.events(NotificationCenter):
+                    center.removeObserver(listener, event)
+
+        self.ui(detach)
+        if db is not None:
+            self.run(db.close)
+
+    def on_app_event(self, event_type):
+        if event_type == AppEvent.RESUME and getattr(self, "active", False):
+            self.queue(self.refresh)
+        elif event_type == AppEvent.PAUSE and getattr(self, "stop_playback", None) is not None:
+            self.ui(self.stop_playback)
+
+    def on_update_hook(self, update_name, account, update):
+        if getattr(self, "active", False) and update_name in (*MESSAGE_UPDATES, *DELETE_UPDATES, *READ_UPDATES):
+            try:
+                account = number(account)
+                owner = self.owner(account)
+                if owner in self.archived_owners:
+                    if update_name in MESSAGE_UPDATES:
+                        self.capture(account, owner, (update.message,))
+                    elif update_name in DELETE_UPDATES:
+                        channel = number(getattr(update, "channel_id", 0))
+                        ids = [number(value) for value in java_items(update.messages)]
+                        self.queue(lambda: self.record_deletion(owner, channel, ids))
+                    else:
+                        from org.telegram.messenger import MessageObject
+
+                        if update_name == "TL_updateReadChannelOutbox":
+                            dialog = -number(update.channel_id)
+                        else:
+                            dialog = number(MessageObject.getPeerId(update.peer))
+                        through = number(update.max_id)
+
+                        def mark_read():
+                            self.db.mark_read_outbox((owner, dialog), through)
+                            self.refresh_screens()
+
+                        self.queue(mark_read)
+            except Exception:
+                self.logger.exception("Could not archive a Telegram update")
+        return HookResult()
+
+    def create_settings(self):
+        from ui.settings import Text
+
+        return [
+            Text(text="Выбрать чат для сохранения", icon="msg_archive",
+                 on_click=lambda view: self.ui(self.pick_chat)),
+            Text(text="Открыть архив чатов", icon="msg_archive", on_click=lambda view: self.ui(self.open_list)),
+        ]
+
+    def queue(self, task, delay=0):
+        generation = self.generation
+
+        def work():
+            if generation is None or generation is not self.generation:
+                return
+            try:
+                if self.db is None:
+                    self.db = Archive(self.root)
+                    self.reload_selection()
+                task()
+            except Exception:
+                self.logger.exception("Local archive operation failed")
+                self.notice("Ошибка локального архива. Проверьте свободное место и повторите.", error=True)
+
+        self.run(work, delay=delay)
+
+    def reload_selection(self):
+        rows = self.db.db.execute("SELECT owner, dialog, active FROM chats").fetchall()
+        self.enabled_chats = frozenset((row["owner"], row["dialog"]) for row in rows if row["active"])
+        self.archived_owners = frozenset(row["owner"] for row in rows)
+
+    def active_accounts(self):
+        from org.telegram.messenger import UserConfig
+
+        for account in range(UserConfig.MAX_ACCOUNT_COUNT):
+            owner = self.owner(account)
+            if owner:
+                yield account, owner
+
+    def owner(self, account):
+        from org.telegram.messenger import UserConfig
+
+        config = UserConfig.getInstance(account)
+        return int(config.getClientUserId()) if config.isClientActivated() else 0
+
+    def account_name(self, owner):
+        from org.telegram.messenger import UserConfig
+
+        slot = next((account for account, uid in self.active_accounts() if uid == owner), None)
+        if slot is None:
+            return ""
+        user = UserConfig.getInstance(slot).getCurrentUser()
+        if user is None:
+            return ""
+        return " ".join(str(part) for part in (user.first_name, user.last_name) if part) or str(user.username or "")
+
+    @staticmethod
+    def screen_notice(activity, text):
+        from android.widget import Toast
+
+        Toast.makeText(activity, text, Toast.LENGTH_SHORT).show()
+
+    def show_selectable_text(self, activity, text):
+        from android.widget import ScrollView, TextView
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        from ui.alert import AlertDialogBuilder
+
+        view = TextView(activity)
+        padding = AndroidUtilities.dp(18.0)
+        view.setPadding(padding, padding, padding, padding)
+        view.setText(text)
+        view.setTextSize(16.0)
+        view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        view.setTextIsSelectable(True)
+        scroll = ScrollView(activity)
+        scroll.addView(view)
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Текст сообщения")
+        dialog.set_view(scroll, AndroidUtilities.dp(285.0))
+        dialog.set_negative_button("Закрыть")
+        dialog.show()
+
+    @staticmethod
+    def share_text(activity, text):
+        from android.content import Intent
+
+        share = Intent(Intent.ACTION_SEND)
+        share.setType("text/plain")
+        share.putExtra(Intent.EXTRA_TEXT, text)
+        activity.startActivity(Intent.createChooser(share, "Поделиться текстом"))
+
+    @staticmethod
+    def open_link(activity, link):
+        from android.content import Intent
+        from android.net import Uri
+
+        valid = web_url(link)
+        if valid:
+            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(valid)))
+
+    def open_live_chat(self, key, mid=0, reply=False):
+        from android.os import Bundle
+        from client_utils import get_last_fragment
+        from org.telegram.messenger import MessagesController
+        from org.telegram.ui import ChatActivity
+
+        account = next((slot for slot, owner in self.active_accounts() if owner == key[0]), None)
+        fragment = get_last_fragment()
+        if account is None or fragment is None:
+            activity = self.activity()
+            if activity is not None:
+                self.screen_notice(activity, "Войдите в аккаунт, чтобы открыть оригинальный чат.")
+            return
+        args = Bundle()
+        args.putLong("user_id" if key[1] > 0 else "chat_id", abs(key[1]))
+        if mid > 0:
+            args.putInt("message_id", mid)
+            if reply:
+                args.putInt("reply_to", mid)
+        controller = MessagesController.getInstance(account)
+        if hasattr(controller, "checkCanOpenChat") and not controller.checkCanOpenChat(args, fragment):
+            return
+        original = ChatActivity(args)
+        original.setCurrentAccount(account)
+        if fragment.presentFragment(original):
+            for screen in tuple(self.archive_windows):
+                screen.window.dismiss()
+        elif self.activity() is not None:
+            self.screen_notice(self.activity(), "Не удалось открыть оригинальный чат.")
+
+    def photo_viewer(self, activity, bitmap, source, asset):
+        from android.graphics.drawable import ColorDrawable
+        from android.view import MotionEvent, ScaleGestureDetector, View
+        from android.widget import FrameLayout, ImageView
+        from java import dynamic_proxy
+
+        screen = ArchiveScreen(self, activity, asset["name"], "",
+                               ("msg_share", "Поделиться фото", "↗", lambda: self.open_asset(source, asset, share=True)))
+        screen.surface = -16777216
+        screen.root.setBackgroundColor(screen.surface)
+        screen.body.setBackgroundColor(screen.surface)
+        screen.empty.setVisibility(View.GONE)
+        screen.list.setVisibility(View.GONE)
+        photo = ImageView(activity)
+        photo.setScaleType(ImageView.ScaleType.FIT_CENTER)
+        photo.setImageBitmap(bitmap)
+        photo.setContentDescription("Сохранённое фото")
+        photo.setBackground(ColorDrawable(screen.surface))
+        screen.body.addView(photo, FrameLayout.LayoutParams(-1, -1))
+        gesture = {"scale": 1.0, "x": 0.0, "y": 0.0, "down_x": 0.0, "down_y": 0.0, "tap": 0.0}
+
+        class Scale(dynamic_proxy(ScaleGestureDetector.OnScaleGestureListener)):
+            def onScale(self, detector):
+                scale = max(1.0, min(4.0, gesture["scale"] * detector.getScaleFactor()))
+                gesture["scale"] = scale
+                photo.setScaleX(scale)
+                photo.setScaleY(scale)
+                if scale == 1.0:
+                    photo.setTranslationX(0.0)
+                    photo.setTranslationY(0.0)
+                return True
+
+            def onScaleBegin(self, detector):
+                return True
+
+            def onScaleEnd(self, detector):
+                pass
+
+        detector = ScaleGestureDetector(activity, Scale())
+
+        class Touch(dynamic_proxy(View.OnTouchListener)):
+            def onTouch(self, view, event):
+                detector.onTouchEvent(event)
+                action = event.getActionMasked()
+                x, y = event.getRawX(), event.getRawY()
+                if action == MotionEvent.ACTION_DOWN:
+                    gesture.update(x=x, y=y, down_x=x, down_y=y)
+                elif action == MotionEvent.ACTION_MOVE and event.getPointerCount() == 1 and not detector.isInProgress():
+                    scale = gesture["scale"]
+                    if scale > 1:
+                        xmax, ymax = photo.getWidth() * (scale - 1) / 2, photo.getHeight() * (scale - 1) / 2
+                        photo.setTranslationX(max(-xmax, min(xmax, photo.getTranslationX() + x - gesture["x"])))
+                        photo.setTranslationY(max(-ymax, min(ymax, photo.getTranslationY() + y - gesture["y"])))
+                    gesture.update(x=x, y=y)
+                elif action == MotionEvent.ACTION_UP:
+                    if abs(x - gesture["down_x"]) < screen.dp(10) and abs(y - gesture["down_y"]) < screen.dp(10):
+                        now = time.monotonic()
+                        if now - gesture["tap"] < .35:
+                            scale = 2.25 if gesture["scale"] == 1.0 else 1.0
+                            gesture.update(scale=scale, tap=0.0)
+                            photo.setScaleX(scale)
+                            photo.setScaleY(scale)
+                            photo.setTranslationX(0.0)
+                            photo.setTranslationY(0.0)
+                        else:
+                            gesture["tap"] = now
+                return True
+
+        touch = Touch()
+        photo.setOnTouchListener(touch)
+        screen.show()
+
+    def play_audio(self, activity, source, row):
+        from android.media import MediaPlayer
+        from android.widget import LinearLayout, SeekBar, TextView
+        from android_utils import OnClickListener
+        from java import dynamic_proxy
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        from ui.alert import AlertDialogBuilder
+
+        if self.stop_playback is not None:
+            self.stop_playback()
+        player = MediaPlayer()
+        state = {"ready": False, "closed": False, "seeking": False}
+        container = LinearLayout(activity)
+        container.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(22.0)
+        container.setPadding(pad, pad, pad, pad)
+        toggle = TextView(activity)
+        toggle.setTextSize(16.0)
+        toggle.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText2))
+        toggle.setGravity(17)
+        toggle.setMinimumHeight(AndroidUtilities.dp(48.0))
+        toggle.setText("Загрузка…")
+        seek = SeekBar(activity)
+        position = TextView(activity)
+        position.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+        position.setText("0:00")
+        for widget in (toggle, seek, position):
+            container.addView(widget, LinearLayout.LayoutParams(-1, -2))
+
+        def update():
+            if state["closed"] or not state["ready"]:
+                return
+            if not state["seeking"]:
+                current = player.getCurrentPosition()
+                seek.setProgress(current)
+                position.setText(clock_text(current // 1000) + " / " + clock_text(player.getDuration() // 1000))
+            self.ui(update, 300)
+
+        def stop():
+            if not state["closed"]:
+                state["closed"] = True
+                player.release()
+                if self.stop_playback is stop:
+                    self.stop_playback = None
+
+        class Prepared(dynamic_proxy(MediaPlayer.OnPreparedListener)):
+            def onPrepared(self, media):
+                if state["closed"]:
+                    return
+                state["ready"] = True
+                seek.setMax(max(1, media.getDuration()))
+                toggle.setText("Пауза")
+                media.start()
+                update()
+
+        class Completion(dynamic_proxy(MediaPlayer.OnCompletionListener)):
+            def onCompletion(self, media):
+                if not state["closed"]:
+                    toggle.setText("Воспроизвести")
+
+        class Error(dynamic_proxy(MediaPlayer.OnErrorListener)):
+            def onError(self, media, what, extra):
+                toggle.setText("Не удалось воспроизвести")
+                stop()
+                return True
+
+        class Seek(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
+            def onProgressChanged(self, slider, progress, from_user):
+                if from_user and state["ready"] and not state["closed"]:
+                    position.setText(clock_text(progress // 1000) + " / " + clock_text(player.getDuration() // 1000))
+
+            def onStartTrackingTouch(self, slider):
+                state["seeking"] = True
+
+            def onStopTrackingTouch(self, slider):
+                if state["ready"] and not state["closed"]:
+                    player.seekTo(slider.getProgress())
+                state["seeking"] = False
+
+        def switch(unused):
+            if state["closed"] or not state["ready"]:
+                return
+            if player.isPlaying():
+                player.pause()
+                toggle.setText("Продолжить")
+            else:
+                player.start()
+                toggle.setText("Пауза")
+
+        self.stop_playback = stop
+        toggle.setOnClickListener(OnClickListener(switch))
+        seek.setOnSeekBarChangeListener(Seek())
+        player.setOnPreparedListener(Prepared())
+        player.setOnCompletionListener(Completion())
+        player.setOnErrorListener(Error())
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Голосовое сообщение" if row["media_type"] == "voice" else row["media_name"])
+        dialog.set_view(container)
+        dialog.set_negative_button("Закрыть")
+        dialog.set_on_dismiss_listener(lambda builder: stop())
+        try:
+            dialog.show()
+            player.setDataSource(str(source))
+            player.prepareAsync()
+        except Exception:
+            stop()
+            toggle.setText("Не удалось воспроизвести")
+
+    def play_video(self, activity, source, asset):
+        from android.view import View
+        from android.widget import FrameLayout, MediaController, VideoView
+
+        screen = ArchiveScreen(self, activity, asset["name"], "",
+                               ("msg_share", "Поделиться видео", "↗", lambda: self.open_asset(source, asset, share=True)))
+        screen.surface = -16777216
+        screen.root.setBackgroundColor(screen.surface)
+        screen.body.setBackgroundColor(screen.surface)
+        screen.list.setVisibility(View.GONE)
+        screen.empty.setVisibility(View.GONE)
+        video = VideoView(activity)
+        screen.body.addView(video, FrameLayout.LayoutParams(-1, -1, 17))
+        controls = MediaController(activity)
+        video.setMediaController(controls)
+        screen.on_dismiss = lambda: (controls.hide(), video.stopPlayback())
+        screen.show()
+        video.setVideoPath(str(source))
+        video.start()
+
+
+    def notice(self, message, error=False):
+        from ui.bulletin import BulletinHelper
+
+        def show():
+            if self.active:
+                method = BulletinHelper.show_error if error else BulletinHelper.show_info
+                method(message)
+
+        self.ui(show)
+
+    def is_protected(self, account, dialog):
+        from org.telegram.messenger import MessagesController
+
+        controller = MessagesController.getInstance(account)
+        if hasattr(controller, "isPeerNoForwards"):
+            return bool(controller.isPeerNoForwards(dialog))
+        if dialog < 0:
+            chat = controller.getChat(-dialog)
+            return bool(getattr(chat, "noforwards", False))
+        info = controller.getUserFull(dialog)
+        return bool(getattr(info, "noforwards_peer_enabled", False) or
+                    getattr(info, "noforwards_my_enabled", False))
+
+    def before_storage(self, param):
+        if not self.active or not self.enabled_chats:
+            return
+        args = param.args
+        if len(args) not in (7, 8) or args[0] is None:
+            return
+        if number(args[-2]) != 0:
+            return
+        try:
+            account = self.account_field.getInt(param.thisObject)
+            owner = self.owner(account)
+            if not any(key[0] == owner for key in self.enabled_chats):
+                return
+            collection = args[0]
+            if hasattr(collection, "messages"):
+                dialog = number(args[1])
+                if (owner, dialog) not in self.enabled_chats:
+                    return
+                collection = collection.messages
+            self.capture(account, owner, java_items(collection))
+        except Exception:
+            self.logger.exception("Could not capture a Telegram storage batch")
+
+    def capture(self, account, owner, messages):
+        from org.telegram.messenger import MessageObject
+
+        batches = {}
+        for original in messages:
+            if original is None or original.id <= 0:
+                continue
+            dialog = int(MessageObject.getDialogId(original))
+            key = (owner, dialog)
+            if key not in self.enabled_chats:
+                continue
+            try:
+                row = self.snapshot(account, owner, original)
+                if row is not None:
+                    batches.setdefault(key, []).append(row)
+            except Exception:
+                self.logger.exception("Could not archive a message snapshot")
+        if batches:
+            def persist():
+                for key, rows in batches.items():
+                    self.db.save(key, rows, live=True)
+                self.wake_media()
+                self.refresh_screens()
+
+            self.queue(persist)
+
+    def snapshot(self, account, owner, original, names=None):
+        from org.telegram.messenger import MessageObject
+        from org.telegram.tgnet import TLRPC
+
+        if original.id <= 0 or isinstance(original, TLRPC.TL_messageEmpty):
+            return None
+        media = original.media
+        if (getattr(original, "noforwards", False) or getattr(original, "ttl_period", 0) or
+                getattr(original, "ttl", 0) or getattr(media, "ttl_seconds", 0) or
+                self.is_protected(account, int(MessageObject.getDialogId(original)))):
+            return None
+        author_id = int(MessageObject.getPeerId(original.from_id)) if original.from_id is not None else 0
+        author_id = author_id or (owner if original.out else int(MessageObject.getDialogId(original)))
+        author = str(getattr(original, "post_author", None) or "") or (names or {}).get(author_id) or self.peer_name(account, author_id)
+        text = str(original.message or "")
+        kind = ""
+        if original.action is not None:
+            kind = "Служебное сообщение"
+            try:
+                text = str(MessageObject(account, original, False, False).messageText or "")
+            except Exception:
+                self.logger.debug("Could not format a Telegram service message")
+        elif isinstance(media, TLRPC.TL_messageMediaPoll):
+            kind = "Опрос"
+            poll = media.poll
+            if poll is not None:
+                question = poll.question
+                parts = [str(getattr(question, "text", question) or "")]
+                for answer in java_items(poll.answers):
+                    label = answer.text
+                    parts.append("• " + str(getattr(label, "text", label) or ""))
+                text = "\n".join(parts)
+        elif isinstance(media, TLRPC.TL_messageMediaContact):
+            kind = "Контакт"
+            text = " ".join(str(value) for value in (media.first_name, media.last_name, media.phone_number) if value)
+        elif media is not None and getattr(media, "geo", None) is not None:
+            kind = "Геопозиция"
+            text = f"{media.geo.lat}, {media.geo._long}"
+        elif media is not None and getattr(media, "webpage", None) is not None:
+            kind = "Ссылка"
+            text = text or str(getattr(media.webpage, "url", None) or "")
+        elif media is not None and not isinstance(media, TLRPC.TL_messageMediaEmpty):
+            kind = "Вложение"
+        reply = original.reply_to
+        entities = []
+        for entity in java_items(original.entities):
+            entities.append({
+                "type": str(entity.getClass().getSimpleName()),
+                "offset": int(entity.offset),
+                "length": int(entity.length),
+                "url": str(getattr(entity, "url", None) or ""),
+            })
+        try:
+            asset = self.snapshot_asset(original)
+        except Exception:
+            self.logger.exception("Could not prepare an attachment")
+            asset = None
+        media_type, duration, width, height = "", 0, 0, 0
+        if asset is not None:
+            try:
+                media_type, duration, width, height = self.media_details(original)
+            except Exception:
+                self.logger.exception("Could not read attachment dimensions or duration")
+        if kind == "Вложение" and asset is None and not text:
+            kind = "Вложение недоступно"
+        reply_peer = getattr(reply, "reply_to_peer_id", None)
+        same_chat = reply_peer is None or number(MessageObject.getPeerId(reply_peer)) == number(MessageObject.getDialogId(original))
+        reply_id = number(getattr(reply, "reply_to_msg_id", 0)) if same_chat else 0
+        quote = str(getattr(reply, "quote_text", None) or "")
+        fwd = getattr(original, "fwd_from", None)
+        forwarded = ""
+        if fwd is not None:
+            forwarded = str(getattr(fwd, "from_name", None) or getattr(fwd, "post_author", None) or "")
+            fwd_peer = getattr(fwd, "from_id", None)
+            if not forwarded and fwd_peer is not None:
+                peer_id = number(MessageObject.getPeerId(fwd_peer))
+                forwarded = (names or {}).get(peer_id) or self.peer_name(account, peer_id)
+            forwarded = forwarded or "Пересланное сообщение"
+        outgoing = java_boolean(original.out)
+        is_read = None
+        if outgoing:
+            try:
+                from java import jlong
+                from org.telegram.messenger import MessagesController
+
+                dialog_id = number(MessageObject.getDialogId(original))
+                cached = MessagesController.getInstance(account).dialogs_read_outbox_max.get(jlong(dialog_id))
+                if cached is not None:
+                    is_read = number(original.id) <= number(cached)
+            except Exception:
+                self.logger.debug("Could not read the current outgoing message status")
+        reactions = []
+        for item in java_items(getattr(getattr(original, "reactions", None), "results", None)):
+            emoji = str(getattr(getattr(item, "reaction", None), "emoticon", None) or "")
+            if emoji:
+                reactions.append(f"{emoji} {item.count}")
+        return Message(number(original.id), number(original.date), number(getattr(original, "edit_date", 0)), author, text,
+                       reply_id, json.dumps(entities, ensure_ascii=False), number(getattr(original, "grouped_id", 0)),
+                       kind, asset, outgoing, media_type, duration, width, height, quote, forwarded, is_read,
+                       java_boolean(getattr(original, "pinned", False)), "   ".join(reactions))
+
+    def media_details(self, original):
+        attachment, photo = self.media_parts(original)
+        if photo is not None:
+            return "photo", 0, number(attachment.w), number(attachment.h)
+        if attachment is None:
+            return "", 0, 0, 0
+        media = original.media
+        mime = str(getattr(attachment, "mime_type", None) or "")
+        kind = "video" if mime.startswith("video/") else "audio" if mime.startswith("audio/") else "file"
+        duration, width, height = 0, 0, 0
+        for attribute in java_items(getattr(attachment, "attributes", None)):
+            name = str(attribute.getClass().getSimpleName())
+            if "Sticker" in name or "CustomEmoji" in name:
+                kind = "sticker"
+            elif "Animated" in name and kind != "sticker":
+                kind = "animation"
+            elif "Video" in name:
+                if java_boolean(getattr(attribute, "round_message", False)):
+                    kind = "round"
+                elif kind not in ("sticker", "animation"):
+                    kind = "video"
+                duration = int(getattr(attribute, "duration", 0))
+                width, height = number(getattr(attribute, "w", 0)), number(getattr(attribute, "h", 0))
+            elif "Audio" in name:
+                kind = "voice" if java_boolean(getattr(attribute, "voice", False)) else "audio"
+                duration = int(getattr(attribute, "duration", 0))
+        if java_boolean(getattr(media, "voice", False)):
+            kind = "voice"
+        elif java_boolean(getattr(media, "round", False)):
+            kind = "round"
+        return kind, duration, width, height
+
+
+    def peer_name(self, account, peer):
+        from org.telegram.messenger import MessagesController
+
+        controller = MessagesController.getInstance(account)
+        if peer < 0:
+            chat = controller.getChat(-peer)
+            if chat is not None:
+                return str(chat.title or peer)
+        elif peer > 0:
+            user = controller.getUser(peer)
+            if user is not None:
+                name = " ".join(str(part) for part in (user.first_name, user.last_name) if part)
+                return name or str(user.username or peer)
+        return str(peer) if peer else "Telegram"
+
+    def media_parts(self, original):
+        from org.telegram.messenger import FileLoader
+        from org.telegram.tgnet import TLRPC
+
+        media = original.media
+        if isinstance(media, TLRPC.TL_messageMediaDocument) and isinstance(media.document, TLRPC.TL_document):
+            return media.document, None
+        if isinstance(media, TLRPC.TL_messageMediaPhoto) and isinstance(media.photo, TLRPC.TL_photo):
+            size = FileLoader.getClosestPhotoSizeWithSize(media.photo.sizes, 100000, False, None, True)
+            if size is not None and (size.location is not None or size.bytes is not None):
+                return size, media.photo
+        return None, None
+
+    def snapshot_asset(self, original):
+        from org.telegram.messenger import FileLoader
+
+        attachment, photo = self.media_parts(original)
+        if attachment is None:
+            return None
+        file_key = str(FileLoader.getAttachFileName(attachment) or "")
+        if not file_key and (photo is None or attachment.bytes is None):
+            return None
+        if photo is not None:
+            mime = "image/jpeg"
+            name = f"photo_{photo.id}.jpg"
+            identity = f"photo/{photo.id}/{attachment.type}"
+        else:
+            mime = str(attachment.mime_type or "application/octet-stream")
+            name = str(FileLoader.getDocumentFileName(attachment) or file_key)
+            identity = f"document/{attachment.id}/{attachment.dc_id}"
+        archive_key = sha256(identity.encode()).hexdigest()[:32]
+        size = len(attachment.bytes) if photo is not None and attachment.bytes is not None else int(attachment.size)
+        return Asset(archive_key, name, mime, max(0, size), serialize(original), file_key)
+
+    @staticmethod
+    def events(notifications):
+        names = ("messagesDeleted", "historyCleared", "messageReceivedByServer", "fileLoaded",
+                 "fileLoadFailed", "didReceiveNewMessages", "replaceMessagesObjects")
+        return tuple(getattr(notifications, name) for name in names if hasattr(notifications, name))
+
+    def observe_notifications(self):
+        from client_utils import NotificationCenterDelegate
+        from org.telegram.messenger import NotificationCenter, UserConfig
+
+        if not self.active:
+            return
+        plugin, generation = self, self.generation
+
+        class Listener(NotificationCenterDelegate):
+            def didReceivedNotification(self, event, account, args):
+                try:
+                    if generation is plugin.generation:
+                        plugin.notification(event, account, args)
+                except Exception:
+                    plugin.logger.exception("Could not read a Telegram archive event")
+
+        self.listener = Listener()
+        for account in range(UserConfig.MAX_ACCOUNT_COUNT):
+            center = NotificationCenter.getInstance(account)
+            for event in self.events(NotificationCenter):
+                center.addObserver(self.listener, event)
+            self.centers.append(center)
+
+    def notification(self, event, account, args):
+        from org.telegram.messenger import NotificationCenter as N
+
+        if not self.active:
+            return
+        owner = self.owner(account)
+        if event in (N.fileLoaded, N.fileLoadFailed) and len(args) > 0:
+            file_key = str(args[0])
+            if not any(t[0] == account and t[1][0] == owner and t[3] == file_key
+                       for t in tuple(self.transfers)):
+                return
+            failed = event == N.fileLoadFailed
+            path = local_file(args[1]) if not failed and len(args) > 1 else None
+            self.queue(lambda: self.file_event(account, owner, file_key, path, failed))
+            return
+        if owner not in self.archived_owners:
+            return
+        if event == N.messagesDeleted:
+            if len(args) > 2 and java_boolean(args[2]):
+                return
+            ids = [number(value) for value in java_items(args[0])]
+            channel = number(args[1]) if len(args) > 1 else 0
+            self.queue(lambda: self.record_deletion(owner, channel, ids))
+        elif event == N.historyCleared:
+            key, through = (owner, number(args[0])), number(args[1])
+            def clear():
+                self.db.mark_cleared(key, through)
+                self.refresh_screens()
+
+            self.queue(clear)
+        elif event == N.messageReceivedByServer:
+            if len(args) > 2 and args[2] is not None and not (len(args) > 6 and java_boolean(args[6])):
+                self.capture(account, owner, (args[2],))
+        elif event in (getattr(N, "didReceiveNewMessages", None), getattr(N, "replaceMessagesObjects", None)):
+            if len(args) < 2 or (owner, number(args[0])) not in self.enabled_chats:
+                return
+            if event == getattr(N, "didReceiveNewMessages", None):
+                if (len(args) > 2 and java_boolean(args[2])) or (len(args) > 3 and number(args[3]) != 0):
+                    return
+            self.capture(account, owner, (
+                getattr(item, "messageOwner", None)
+                for item in java_items(args[1])
+                if not java_boolean(getattr(item, "scheduled", False))
+            ))
+
+    def tick(self):
+        try:
+            self.refresh()
+        finally:
+            if self.active:
+                self.queue(self.tick, delay=15000)
+
+    def record_deletion(self, owner, channel, ids):
+        self.db.mark_deleted(owner, channel, ids)
+        self.refresh_screens()
+
+    def refresh_screens(self):
+        if not getattr(self, "archive_windows", None) or self.screen_refresh_pending:
+            return
+        self.screen_refresh_pending = True
+        generation = self.generation
+
+        def show():
+            if generation is not self.generation:
+                return
+            self.screen_refresh_pending = False
+            for screen in tuple(self.archive_windows):
+                if isinstance(screen, ConversationScreen):
+                    screen.refresh_visible()
+                elif screen.reload is not None:
+                    screen.reload()
+
+        self.ui(show, 400)
+
+    def refresh(self):
+        accounts = dict(self.active_accounts())
+        self.check_transfers(accounts)
+        now = time.monotonic()
+        for account, owner in accounts.items():
+            for key in self.enabled_chats:
+                if key[0] == owner and now >= self.sync_due.get(key, 0):
+                    self.start_sync(account, key)
+        self.wake_media()
+
+    def selected_account(self, fragment):
+        from org.telegram.messenger import UserConfig
+
+        if hasattr(fragment, "getCurrentAccount"):
+            return number(fragment.getCurrentAccount())
+        return number(UserConfig.selectedAccount)
+
+    def activity(self, fragment=None):
+        from client_utils import get_last_fragment
+
+        fragment = fragment if fragment is not None else get_last_fragment()
+        return fragment.getParentActivity() if hasattr(fragment, "getParentActivity") else None
+
+    def choices(self, title, message, items):
+        from ui.alert import AlertDialogBuilder
+
+        activity = self.activity()
+        if activity is None:
+            return
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title(title)
+        if message:
+            dialog.set_message(message)
+
+        def select(builder, index):
+            builder.dismiss()
+            items[index][1]()
+
+        if items:
+            dialog.set_items([label for label, action in items], select)
+        dialog.set_negative_button("Закрыть")
+        dialog.show()
+        return dialog
+
+    def confirm(self, title, message, button, action, activity=None):
+        from ui.alert import AlertDialogBuilder
+
+        activity = activity if activity is not None else self.activity()
+        if activity is None:
+            return
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title(title)
+        dialog.set_message(message)
+        dialog.set_positive_button(button, lambda builder, index: action())
+        dialog.set_negative_button("Отмена")
+        dialog.show()
+
+    def chat_menu(self, ctx):
+        self.ui(lambda: self.open_chat_menu(ctx))
+
+    def open_chat_menu(self, ctx):
+        from client_utils import get_last_fragment
+
+        try:
+            fragment = ctx.get("fragment")
+            if fragment is None:
+                fragment = get_last_fragment()
+            account = ctx.get("account")
+            if account is None:
+                account = self.selected_account(fragment)
+            dialog = ctx.get("dialog_id")
+            if dialog is None and hasattr(fragment, "getDialogId"):
+                dialog = fragment.getDialogId()
+            if dialog is None:
+                user_id, chat_id = ctx.get("userId"), ctx.get("chatId")
+                dialog = number(user_id) if user_id else -abs(number(chat_id)) if chat_id else 0
+            if ctx.get("encryptedChat") is not None:
+                self.notice("Архив доступен для обычных облачных чатов.", error=True)
+                return
+            account, dialog = number(account), number(dialog)
+            activity = self.activity(fragment)
+        except Exception:
+            self.logger.exception("Could not resolve archive menu context")
+            self.notice("Не удалось определить открытый чат. Выберите его в настройках плагина.", error=True)
+            return
+        if not dialog:
+            self.pick_chat()
+            return
+        self.select_chat(account, dialog, fragment=fragment, chat=ctx.get("chat"), activity=activity)
+
+    def select_chat(self, account, dialog, fragment=None, chat=None, activity=None, parent=None):
+        from org.telegram.messenger import ChatObject, DialogObject, MessagesController
+
+        try:
+            owner = self.owner(account)
+            if not owner or not dialog or DialogObject.isEncryptedDialog(dialog):
+                self.notice("Архив доступен для обычных облачных чатов.", error=True)
+                return
+            if chat is None and dialog < 0:
+                if hasattr(fragment, "getCurrentChat"):
+                    chat = fragment.getCurrentChat()
+                if chat is None:
+                    chat = MessagesController.getInstance(account).getChat(-dialog)
+            channel = -dialog if chat is not None and ChatObject.isChannel(chat) else 0
+            title = "Избранное" if owner == dialog else self.peer_name(account, dialog)
+            protected = self.is_protected(account, dialog)
+            if hasattr(fragment, "isPeerNoForwards"):
+                protected = protected or java_boolean(fragment.isPeerNoForwards())
+        except Exception:
+            self.logger.exception("Could not prepare the selected archive chat")
+            self.notice("Не удалось открыть этот чат для архивации. Попробуйте выбрать его в настройках.", error=True)
+            return
+        key = (owner, dialog)
+
+        def choose():
+            if self.db.chat(key):
+                self.ui(lambda: self.open_conversation(key, parent))
+            elif protected:
+                self.notice("В чате включена защита контента.", error=True)
+            else:
+                self.ui(lambda: self.confirm(
+                    "Архивировать чат?",
+                    "История и вложения займут место на устройстве. Удаление сообщений в Telegram "
+                    "не удалит копии из архива.",
+                    "Начать",
+                    lambda: self.queue(lambda: self.enable_chat(account, key, title, channel, parent)),
+                    activity=activity,
+                ))
+
+        self.queue(choose)
+
+    def pick_chat(self, parent=None):
+        from client_utils import get_last_fragment
+        from org.telegram.messenger import DialogObject, MessagesController
+
+        try:
+            account = self.selected_account(get_last_fragment())
+            owner = self.owner(account)
+            if not owner:
+                self.notice("Откройте список чатов своего аккаунта и повторите.", error=True)
+                return
+            controller = MessagesController.getInstance(account)
+            ids = {owner: None}
+            for row in java_items(controller.getAllDialogs()):
+                dialog = number(row.id)
+                if dialog and not DialogObject.isEncryptedDialog(dialog) and not DialogObject.isFolderDialogId(dialog):
+                    ids[dialog] = None
+            items = [
+                ("Избранное" if dialog == owner else self.peer_name(account, dialog),
+                 lambda dialog=dialog: self.select_chat(account, dialog, parent=parent))
+                for dialog in ids
+            ]
+        except Exception:
+            self.logger.exception("Could not list the available archive chats")
+            self.notice("Не удалось загрузить список. Откройте нужный чат и выберите «Локальный архив».", error=True)
+            return
+        self.choices("Выбрать чат", "", items)
+
+    def enable_chat(self, account, key, title, channel, parent=None):
+        from org.telegram.messenger import MessagesController
+
+        if self.owner(account) != key[0] or self.is_protected(account, key[1]):
+            self.notice("Чат сейчас недоступен для архивации.", error=True)
+            return
+        peer_data = None
+        try:
+            peer = MessagesController.getInstance(account).getInputPeer(key[1])
+            peer_data = serialize(peer)
+        except Exception:
+            self.logger.exception("Could not store the archive chat reference")
+        self.db.enable(key, title, channel, peer_data)
+        self.reload_selection()
+        self.sync_due.pop(key, None)
+        self.refresh_screens()
+        self.start_sync(account, key)
+        self.wake_media()
+        self.notice("Архивирование началось")
+        self.ui(lambda: self.open_conversation(key, parent))
+
+    def open_list(self):
+        from client_utils import get_last_fragment
+
+        fragment = get_last_fragment()
+        account = self.selected_account(fragment)
+        activity = self.activity(fragment)
+        if activity is None:
+            return
+        def choose_chat():
+            self.pick_chat(parent=screen)
+
+        screen = ArchiveScreen(self, activity, "Архив чатов", "",
+                               ("msg_add", "Сохранить чат", "+", choose_chat))
+        screen.empty_state("Открывается архив")
+
+        def reload():
+            if not screen.showing():
+                return
+
+            def read():
+                owner = self.owner(account)
+                rows = self.db.archive_index(owner) if owner else []
+
+                def show():
+                    if not screen.showing():
+                        return
+                    entries = [("chat", row) for row in rows]
+                    if entries != screen.entries:
+                        screen.replace(entries)
+                    if not rows:
+                        screen.empty_state("Пока нет сохранённых чатов",
+                                           "Выберите переписку, которую хотите читать офлайн.",
+                                           ("Сохранить чат", choose_chat))
+
+                self.ui(show)
+
+            self.queue(read)
+
+        screen.reload = reload
+        screen.show()
+        reload()
+
+    def open_conversation(self, key, parent=None):
+        activity = parent.activity if parent is not None else self.activity()
+        if activity is None:
+            return
+
+        def read():
+            chat = self.db.chat(key)
+            if chat is None:
+                return
+
+            def show():
+                if not self.active or activity.isFinishing() or (parent is not None and not parent.showing()):
+                    return
+                try:
+                    screen = ConversationScreen(self, activity, key, chat["title"], parent)
+                    screen.empty_state("Открывается переписка")
+                    screen.show()
+                    screen.load()
+                except Exception:
+                    self.logger.exception("Could not open the saved conversation screen")
+                    self.notice("Не удалось открыть экран переписки.", error=True)
+
+            self.ui(show)
+
+        self.queue(read)
+
+    def open_archive(self, key):
+        def read():
+            chat = self.db.chat(key)
+            if not chat:
+                return
+            status = self.archive_status(key, chat)
+            items = [
+                ("Экспортировать ZIP", lambda: self.pick_export(key)),
+            ]
+            if chat["active"]:
+                items.append(("Обновить и повторить загрузку", lambda: self.queue(lambda: self.retry_chat(key))))
+                items.append(("Сверить всю историю", lambda: self.queue(lambda: self.recheck_chat(key))))
+                items.append(("Приостановить сохранение", lambda: self.queue(lambda: self.pause_chat(key))))
+            else:
+                items.append(("Возобновить сохранение", lambda: self.queue(lambda: self.retry_chat(key))))
+
+            def show():
+                dialog = self.choices(chat["title"], status, items)
+                if dialog is not None:
+                    self.watch_status(key, dialog, status)
+
+            self.ui(show)
+
+        self.queue(read)
+
+    def archive_status(self, key, chat):
+        count, deleted, total, saved, failed = self.db.stats(key)
+        state = self.sync_status.get(key)
+        if not chat["active"]:
+            state = "Сохранение на паузе"
+        elif not state:
+            state = "Загружается история" if not chat["complete"] else "История загружена"
+        status = (f"{state}\nСообщений сохранено {count}, удалённых в Telegram {deleted}.\n"
+                  f"Вложений сохранено {saved} из {total}.")
+        if failed:
+            status += f" Не удалось скачать {failed}."
+        oldest = self.db.oldest(key)
+        if oldest is not None:
+            first = self.db.db.execute("SELECT date FROM messages WHERE owner=? AND dialog=? AND id=?",
+                                       (*key, oldest)).fetchone()
+            if first and first[0]:
+                status += "\nСамое раннее сохранённое: " + datetime.fromtimestamp(first[0]).strftime("%d.%m.%Y")
+        return status
+
+    def watch_status(self, key, dialog, previous):
+        current = dialog.get_dialog()
+        if not self.active or current is None or not current.isShowing() or not hasattr(current, "setMessage"):
+            return
+
+        def read():
+            chat = self.db.chat(key)
+            if not chat:
+                return
+            status = self.archive_status(key, chat)
+
+            def show():
+                window = dialog.get_dialog()
+                if window is None or not window.isShowing():
+                    return
+                if status != previous:
+                    window.setMessage(status)
+                self.watch_status(key, dialog, status)
+
+            self.ui(show)
+
+        self.queue(read, delay=2000)
+
+    def retry_chat(self, key):
+        account = next((slot for slot, owner in self.active_accounts() if owner == key[0]), None)
+        if account is None or self.is_protected(account, key[1]):
+            self.notice("Чат сейчас недоступен для архивации.", error=True)
+            return
+        chat = self.db.chat(key)
+        self.db.enable(key, chat["title"], chat["channel"])
+        self.reload_selection()
+        self.db.retry_assets(key)
+        if time.monotonic() >= self.flood_until.get(key, 0):
+            self.sync_due.pop(key, None)
+        self.start_sync(account, key)
+        self.wake_media()
+        self.ui(lambda: self.open_archive(key))
+
+    def recheck_chat(self, key):
+        state = self.syncs.pop(key, None)
+        if state is not None:
+            cancel = state.get("cancel")
+            if cancel is not None:
+                cancel()
+        self.db.restart_history(key)
+        self.retry_chat(key)
+
+    def pause_chat(self, key):
+        self.db.pause(key)
+        self.reload_selection()
+        state = self.syncs.pop(key, None)
+        if state is not None and state.get("cancel") is not None:
+            state["cancel"]()
+        self.refresh_screens()
+        self.ui(lambda: self.open_archive(key))
+
+    def show_message_versions(self, key, row):
+        def read():
+            revisions = self.db.revisions(key, row["id"])
+            def version(revision):
+                def details():
+                    items = []
+                    self.add_attachment_choice(key, revision["asset"], items)
+                    text = revision["text"] or revision["kind"] or "Сообщение"
+                    self.ui(lambda: self.choices("Сохранённая версия", text, items))
+
+                self.queue(details)
+
+            if len(revisions) <= 1:
+                self.ui(lambda: self.choices("Изменено в Telegram", stamp(row["edited"]), []))
+            else:
+                items = [(stamp(revision["edited"]) or "Исходная версия", lambda rev=revision: version(rev))
+                         for revision in revisions]
+                self.ui(lambda: self.choices("Версии сообщения", "", items))
+
+        self.queue(read)
+
+    def add_attachment_choice(self, key, asset_key, items):
+        if not asset_key:
+            return
+        row = self.db.asset(key, asset_key)
+        if not row:
+            return
+        path = asset_path(self.root, key, row)
+        if row["status"] == 1 and path.is_file():
+            items.append((f'Открыть {row["name"]}', lambda: self.open_asset(path, row)))
+        elif row["status"] == 0:
+            items.append(("Вложение ожидает загрузки", lambda: self.open_archive(key)))
+        else:
+            items.append(("Вложение недоступно", lambda: self.open_archive(key)))
+
+    def open_asset(self, source, row, share=False):
+        from java.io import File
+        from org.telegram.messenger import AndroidUtilities
+
+        def copy():
+            try:
+                cache = Path(str(self.context.getFilesDir().getAbsolutePath())) / "cache" / __id__
+                cache.mkdir(parents=True, exist_ok=True)
+                target = cache / source.name
+                if not target.is_file() or target.stat().st_size != source.stat().st_size:
+                    temporary = target.with_suffix(".part")
+                    try:
+                        shutil.copyfile(source, temporary)
+                        temporary.replace(target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+
+                def view():
+                    activity = self.activity()
+                    if not self.active or activity is None:
+                        return
+                    try:
+                        filename = row["name"] if Path(row["name"]).suffix else target.name
+                        if share:
+                            from android.content import Intent
+                            from androidx.core.content import FileProvider
+                            from org.telegram.messenger import ApplicationLoader
+
+                            uri = FileProvider.getUriForFile(activity, ApplicationLoader.getApplicationId() + ".provider",
+                                                             File(str(target)))
+                            intent = Intent(Intent.ACTION_SEND)
+                            intent.setType(row["mime"] or "application/octet-stream")
+                            intent.putExtra(Intent.EXTRA_STREAM, uri)
+                            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            activity.startActivity(Intent.createChooser(intent, "Поделиться файлом"))
+                        else:
+                            AndroidUtilities.openForView(File(str(target)), filename, row["mime"], activity, None, False)
+                    except Exception:
+                        self.logger.exception("Could not open a saved attachment")
+                        self.notice("Android не смог открыть файл. Он доступен в экспорте ZIP.", error=True)
+
+                self.ui(view)
+            except OSError:
+                self.logger.exception("Could not prepare a saved attachment for viewing")
+                self.notice("Не удалось подготовить файл для просмотра.", error=True)
+
+        self.queue(copy)
+
+    def pick_export(self, key):
+        from android.content import Intent
+
+        if not self.export_ready:
+            self.notice("Системный выбор файла недоступен на этой сборке exteraGram.", error=True)
+            return
+        if self.exporting:
+            self.notice("Экспорт уже выполняется")
+            return
+        activity = self.activity()
+        if activity is None:
+            return
+
+        def choose():
+            intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("application/zip")
+            intent.putExtra(Intent.EXTRA_TITLE, f"chat_{key[1]}_{datetime.now():%Y-%m-%d_%H-%M}.zip")
+            self.export_choice = key
+            try:
+                activity.startActivityForResult(intent, EXPORT_REQUEST)
+            except Exception:
+                self.export_choice = None
+                self.logger.exception("Could not open the Android document picker")
+                self.notice("Не удалось открыть выбор файла Android.", error=True)
+
+        self.confirm("Экспортировать архив?",
+                     "ZIP содержит переписку и сохранённые вложения. Для копии на устройстве выберите "
+                     "локальную папку, например «Загрузки».",
+                     "Выбрать файл", choose)
+
+    def after_picker(self, param):
+        from android.app import Activity
+
+        if not self.active or self.export_choice is None or number(param.args[0]) != EXPORT_REQUEST:
+            return
+        key = self.export_choice
+        self.export_choice = None
+        intent = param.args[2]
+        if number(param.args[1]) != Activity.RESULT_OK or intent is None or intent.getData() is None:
+            return
+        uri = intent.getData()
+        self.exporting = True
+        self.notice("Готовится ZIP с сохранённой историей и вложениями")
+
+        def export():
+            try:
+                stream = self.context.getContentResolver().openOutputStream(uri, "w")
+                if stream is None:
+                    raise OSError("Document provider did not open the selected file")
+                with BufferedWriter(AndroidOutput(stream), buffer_size=256 * 1024) as output:
+                    export_archive(self.root, key, output)
+                self.notice("ZIP сохранён. Распакуйте его и откройте index.html.")
+            except Exception:
+                self.logger.exception("Could not export the local archive")
+                self.notice("ZIP не записан полностью. Проверьте место и повторите экспорт.", error=True)
+            finally:
+                self.exporting = False
+
+        Thread(target=export, name="LocalChatArchiveExport", daemon=True).start()
+
+
+    def start_sync(self, account, key):
+        if key in self.syncs or key not in self.enabled_chats or self.owner(account) != key[0]:
+            return
+        if self.is_protected(account, key[1]):
+            self.sync_status[key] = "Архивация приостановлена настройками защиты чата"
+            self.sync_due[key] = time.monotonic() + 120
+            return
+        row = self.db.chat(key)
+        if self.sync_due.get(key, 0) > time.monotonic() and key in self.sync_status:
+            return
+        if row["complete"]:
+            state = {"mode": "new", "cursor": 0, "floor": row["head"], "head": row["head"]}
+        else:
+            state = {"mode": "history", "cursor": row["cursor"], "floor": 0, "head": row["head"]}
+        state["peer"] = row["peer"]
+        self.syncs[key] = state
+        self.sync_status.pop(key, None)
+        self.request_page(account, key, state)
+
+    def request_page(self, account, key, state):
+        if self.syncs.get(key) is not state:
+            return
+        if key not in self.enabled_chats or self.owner(account) != key[0]:
+            self.syncs.pop(key, None)
+            return
+        if self.is_protected(account, key[1]):
+            self.finish_sync(key, "Архивация приостановлена настройками защиты чата")
+            return
+        marker = object()
+        state["request"] = marker
+
+        def respond(response, error):
+            error_text = str(error.text) if error is not None else ""
+            def read():
+                try:
+                    self.receive_page(account, key, state, marker, response, error_text)
+                except Exception:
+                    self.logger.exception("Could not read the Telegram history page")
+                    self.finish_sync(key, "Не удалось сохранить страницу истории. Повторите загрузку.")
+
+            self.queue(read)
+
+        try:
+            from client_utils import send_request
+            from org.telegram.messenger import MessagesController
+            from org.telegram.tgnet import ConnectionsManager, TLRPC
+
+            request = TLRPC.TL_messages_getHistory()
+            if state["peer"]:
+                try:
+                    request.peer = deserialize(state["peer"], TLRPC.InputPeer)
+                except Exception:
+                    self.logger.exception("Could not decode the stored chat reference")
+            if request.peer is None:
+                request.peer = MessagesController.getInstance(account).getInputPeer(key[1])
+            request.limit = HISTORY_PAGE
+            request.offset_id = state["cursor"]
+            request.min_id = state["floor"]
+            manager = ConnectionsManager.getInstance(account)
+            try:
+                token = send_request(request, respond, account=account)
+            except TypeError:
+                # Older SDKs lack the account keyword. Bind the callback to the
+                # account's connection directly instead of using the visible account.
+                from client_utils import RequestCallback
+
+                token = manager.sendRequest(request, RequestCallback(respond))
+        except Exception:
+            self.logger.exception("Could not request a Telegram history page")
+            self.finish_sync(key, "Не удалось запустить запрос истории. Повторите загрузку.")
+            return
+
+        def cancel():
+            state["request"] = None
+            state.pop("cancel", None)
+            try:
+                manager.cancelRequest(token, True)
+            except Exception:
+                self.logger.debug("Could not cancel the history request")
+
+        if state.get("request") is marker:
+            state["cancel"] = cancel
+
+        def timeout():
+            if state.get("request") is marker:
+                cancel()
+                if self.syncs.get(key) is state:
+                    self.finish_sync(key, "Telegram не ответил на запрос истории")
+
+        self.queue(timeout, delay=90000)
+
+    def finish_sync(self, key, error=None, retry=120, rate_limited=False):
+        self.syncs.pop(key, None)
+        due = time.monotonic() + retry
+        self.sync_due[key] = due
+        if rate_limited:
+            self.flood_until[key] = due
+        if error:
+            self.sync_status[key] = error
+        else:
+            self.sync_status.pop(key, None)
+        self.refresh_screens()
+
+    def receive_page(self, account, key, state, marker, response, error):
+        if self.syncs.get(key) is not state or state.get("request") is not marker:
+            return
+        state["request"] = None
+        state.pop("cancel", None)
+        if key not in self.enabled_chats or self.owner(account) != key[0]:
+            self.syncs.pop(key, None)
+            return
+        if self.is_protected(account, key[1]):
+            self.finish_sync(key, "Архивация приостановлена настройками защиты чата")
+            return
+        if error or response is None or not hasattr(response, "messages"):
+            match = re.fullmatch(r"(?:FLOOD|FLOOD_PREMIUM)_WAIT_(\d+)", error)
+            retry = max(120, int(match.group(1))) if match else 120
+            detail = error if re.fullmatch(r"[A-Z0-9_]{1,80}", error) else ""
+            status = "Telegram временно ограничил загрузку" if match else "Telegram не вернул историю"
+            if detail and not match:
+                status += f" ({detail})"
+            self.finish_sync(key, status, retry, rate_limited=bool(match))
+            return
+
+        originals = list(java_items(response.messages))
+        candidates = [int(row.id) for row in originals if row.id > state["floor"]]
+        cursor = next_cursor(state["cursor"], candidates)
+        if cursor is None and candidates:
+            self.finish_sync(key, "Telegram вернул повторную страницу истории")
+            return
+        if cursor is None:
+            initial = state["mode"] == "history"
+            self.db.save(key, [], live=False, head=state["head"], complete=initial)
+            self.finish_sync(key)
+            if initial:
+                self.start_sync(account, key)
+            return
+
+        names = {-int(chat.id): str(chat.title) for chat in java_items(getattr(response, "chats", None)) if chat.title}
+        for user in java_items(getattr(response, "users", None)):
+            name = " ".join(str(part) for part in (user.first_name, user.last_name) if part)
+            if name:
+                names[int(user.id)] = name
+        rows = []
+        unreadable = 0
+        for original in originals:
+            if original.id <= state["floor"] or (state["cursor"] and original.id >= state["cursor"]):
+                continue
+            try:
+                row = self.snapshot(account, key[0], original, names)
+            except Exception:
+                unreadable += 1
+                self.logger.exception("Could not read a message in the history page")
+                continue
+            if row is not None:
+                rows.append(row)
+        if unreadable:
+            self.db.save(key, rows, live=False)
+            self.finish_sync(key, f"На странице истории не удалось сохранить {unreadable} сообщений. Повторите загрузку.")
+            return
+        state["head"] = max(state["head"], max(candidates))
+        initial = state["mode"] == "history"
+        self.db.save(key, rows, live=False, cursor=cursor if initial else None,
+                     head=state["head"] if initial else None)
+        state["cursor"] = cursor
+        self.wake_media()
+        self.refresh_screens()
+        self.queue(lambda: self.request_page(account, key, state), delay=350)
+
+    def wake_media(self):
+        if self.media_wake:
+            return
+        self.media_wake = True
+
+        def start():
+            self.media_wake = False
+            self.pump_media()
+
+        self.queue(start, delay=150)
+
+    def fail_asset(self, key, asset_key):
+        row = self.db.asset(key, asset_key)
+        if row and row["status"] == 0:
+            attempts = row["attempts"] + 1
+            self.db.asset_status(key, asset_key, 2 if attempts >= 3 else 0, attempts,
+                                 int(time.time()) + 30 * attempts)
+            if attempts >= 3:
+                self.refresh_screens()
+
+    def pump_media(self):
+        for account, owner in self.active_accounts():
+            for key in sorted(self.enabled_chats):
+                if key[0] != owner or self.is_protected(account, key[1]):
+                    continue
+                for row in self.db.pending_assets(*key):
+                    if len(self.transfers) >= 3:
+                        return
+                    transfer = (account, key, row["key"], row["file_key"])
+                    if not any(current[:3] == transfer[:3] for current in self.transfers):
+                        self.start_asset(transfer, row)
+
+    def start_asset(self, transfer, row):
+        from org.telegram.messenger import FileLoader, ImageLoader, ImageLocation, MessageObject
+        from org.telegram.tgnet import TLRPC
+
+        account, key, asset_key, _ = transfer
+        try:
+            original = deserialize(row["payload"], TLRPC.Message, owner=key[0])
+            attachment, photo = self.media_parts(original)
+            if attachment is None:
+                self.fail_asset(key, asset_key)
+                return
+            if photo is not None and attachment.bytes is not None:
+                if not self.db.publish_asset(key, asset_key, content=bytes(attachment.bytes)):
+                    self.fail_asset(key, asset_key)
+                else:
+                    self.refresh_screens()
+                self.wake_media()
+                return
+            ImageLoader.getInstance()
+            loader = FileLoader.getInstance(account)
+            paths = []
+            for value in (getattr(original, "attachPath", None), getattr(attachment, "localPath", None)):
+                path = local_file(value)
+                if path is not None and path not in paths:
+                    paths.append(path)
+            for force_cache in (True, False):
+                try:
+                    path = local_file(loader.getPathToAttach(attachment, force_cache))
+                    if path is not None and path not in paths:
+                        paths.append(path)
+                except Exception:
+                    self.logger.debug("Could not resolve a Telegram attachment cache path")
+            if self.copy_completed_asset(key, asset_key, paths):
+                self.wake_media()
+                return
+            location = ImageLocation.getForPhoto(attachment, photo) if photo is not None else None
+            target = location.location if location is not None else attachment
+            file_key = str(FileLoader.getAttachFileName(target) or "")
+            if not file_key or (photo is not None and location is None):
+                self.fail_asset(key, asset_key)
+                return
+            transfer = (account, key, asset_key, file_key)
+            parent = MessageObject(account, original, False, False)
+            self.transfers[transfer] = (time.monotonic(), paths)
+            if photo is not None:
+                loader.loadFile(location, parent, None, FileLoader.PRIORITY_NORMAL, 1)
+            else:
+                loader.loadFile(attachment, parent, FileLoader.PRIORITY_NORMAL, 1)
+        except Exception:
+            self.transfers.pop(transfer, None)
+            self.fail_asset(key, asset_key)
+            self.logger.exception("Could not save a Telegram attachment")
+
+    def copy_completed_asset(self, key, asset_key, paths):
+        for path in paths:
+            try:
+                if self.db.copy_asset(key, asset_key, path):
+                    self.refresh_screens()
+                    return True
+            except OSError:
+                self.logger.exception("Could not copy a completed attachment into the archive")
+                break
+        return False
+
+    def check_transfers(self, accounts):
+        if not self.transfers:
+            return
+        from org.telegram.messenger import FileLoader
+
+        now = time.monotonic()
+        for transfer, (started, paths) in list(self.transfers.items()):
+            account, key, asset_key, file_key = transfer
+            if accounts.get(account) != key[0]:
+                self.transfers.pop(transfer, None)
+                continue
+            if self.copy_completed_asset(key, asset_key, paths):
+                self.transfers.pop(transfer, None)
+                continue
+            elapsed = now - started
+            loader = FileLoader.getInstance(account)
+            idle = elapsed >= 30 and hasattr(loader, "isLoadingFile") and not loader.isLoadingFile(file_key)
+            if idle or elapsed > 3600:
+                self.transfers.pop(transfer, None)
+                self.fail_asset(key, asset_key)
+
+    def file_event(self, account, owner, file_key, path, failed=False):
+        for transfer, (_, paths) in list(self.transfers.items()):
+            slot, key, asset_key, filename = transfer
+            if slot != account or key[0] != owner or filename != file_key:
+                continue
+            candidates = [path, *paths] if path is not None else paths
+            if self.copy_completed_asset(key, asset_key, candidates):
+                self.transfers.pop(transfer, None)
+            elif failed:
+                self.transfers.pop(transfer, None)
+                self.fail_asset(key, asset_key)
+        self.wake_media()
+
+
