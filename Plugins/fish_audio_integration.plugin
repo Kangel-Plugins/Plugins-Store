@@ -1,0 +1,939 @@
+__id__ = "fish_audio_integration"
+__name__ = "Fish Audio Integration"
+__description__ = (
+    "Озвучка сообщений голосами Fish Audio прямо из поля ввода: напишите «.v текст» — и вместо текста "
+    "уйдёт голосовое.\n\n"
+    "**Возможности:**\n"
+    "• избранные голоса с именами и своими командами (.v, .vm, …);\n"
+    "• ИИ-режиссёр через OpenRouter расставляет эмоции и звуки: добавьте «t» к команде (.vt, .vmt);\n"
+    "• .v без текста в ответ на сообщение озвучит текст этого сообщения;\n"
+    "• префикс, команды и суффикс ИИ настраиваются.\n\n"
+    "**Настройка:** вставьте API-ключ Fish Audio и добавьте голос (ID или ссылку с fish.audio)."
+)
+__author__ = "@kovidoff"
+__version__ = "1.1.0"
+__icon__ = "fish_audio_integration_by_niko_ocbot/0"
+__category__ = ["integrations", "chats"]
+__app_version__ = ">=13.1.1"
+__sdk_version__ = ">=1.4.3.3"
+
+import json
+import math
+import os
+import re
+import struct
+import threading
+import time
+
+import requests
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, get_last_fragment, get_messages_controller, get_send_messages_helper
+from android_utils import run_on_ui_thread, copy_to_clipboard
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Switch, Selector, Input, Text, Divider, EditText
+
+from android.widget import EditText as AndroidEditText, FrameLayout
+from android.text import InputType
+from android.view import Gravity, View
+from java import dynamic_proxy, jclass
+from java.lang import Runnable
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities, LocaleController, MediaController, UserConfig
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+
+FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+FISH_MODEL_URL = "https://api.fish.audio/model/{}"
+FISH_CREDIT_URL = "https://api.fish.audio/wallet/self/api-credit"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Order matters: the settings store the index. s1 is left out (retired by Fish Audio at the end of 2026).
+MODELS = ["s2.1-pro-free", "s2.1-pro", "s2-pro", "drama-3"]
+DEFAULT_MODEL = MODELS[0]
+SPEEDS = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
+DEFAULT_AI_MODEL = "google/gemini-3.1-flash-lite"
+ID_RE = re.compile(r"\b([0-9a-f]{32})\b", re.I)
+CMD_RE = re.compile(r"^[^\s]{1,16}$")
+
+# One paragraph: the settings text field drops line breaks, so the rules are separated by spaces.
+DEFAULT_PROMPT = " ".join([
+    "Ты — режиссёр озвучки. Подготовь текст пользователя для нейросети Text-to-Speech.",
+    "Теги эмоций и звуков пиши в квадратных скобках перед фразой, к которой они относятся, или между фразами.",
+    "Правила.",
+    "1) Если пользователь добавил в квадратных скобках инструкцию по языку или общему настроению "
+    "(например, [японский агрессивно] или [на английском грустно]), выполни её: переведи текст и подбери теги "
+    "в этом настроении. Саму инструкцию из ответа удали.",
+    "2) Теги и числа прописью пиши на языке итогового текста.",
+    "3) Не меняй слова (кроме перевода из п. 1), но все цифры и числа замени словами в правильном падеже.",
+    "4) Добавь хотя бы 1–2 уместных тега эмоций или голосовых звуков, чтобы текст не звучал сухо.",
+    "5) Нейросеть генерирует только голос: не используй теги окружения ([ветер], [шаги] и т. п.) — "
+    "только вокализации человека (смех, вздох, кашель) и эмоции.",
+    "6) Выведи только итоговый текст с тегами, без пояснений и кавычек.",
+])
+
+STRINGS = {
+    "ru": {
+        "fish_header": "Fish Audio",
+        "fish_key": "API-ключ",
+        "fish_key_sub": "fish.audio → Developers → API Keys",
+        "model": "Модель",
+        "model_other": "Другая…",
+        "custom_model": "ID модели",
+        "custom_model_sub": "Как на fish.audio → Developers → Models",
+        "speed": "Скорость речи",
+        "check": "Проверить ключ",
+        "voices_header": "Голоса",
+        "voices": "Избранные голоса",
+        "voices_none": "Пока пусто — добавьте голос",
+        "default_voice": "Основной: %s",
+        "ai_header": "ИИ-эмоции (OpenRouter)",
+        "ai_key": "API-ключ OpenRouter",
+        "ai_key_sub": "openrouter.ai → Keys",
+        "ai_model": "Модель ИИ",
+        "ai_prompt": "Инструкция для ИИ",
+        "ai_prompt_sub": "Как расставлять эмоции и теги",
+        "commands": "Команды",
+        "hint_main": "%s — основным голосом, %s — с ИИ-эмоциями. Команда в чат не отправляется. "
+                     "Без текста в ответ на сообщение — озвучит его текст.",
+        "add_voice": "Добавить голос",
+        "add_voice_hint": "ID голоса или ссылка с fish.audio",
+        "voices_hint": "Нажмите на голос, чтобы сделать его основным, переименовать, назначить команду или удалить.",
+        "voice_actions": ["Сделать основным", "Переименовать", "Команда вызова", "Скопировать ID", "Удалить"],
+        "main_mark": "основной",
+        "cmd_none": "без своей команды",
+        "rename": "Название голоса",
+        "set_cmd": "Команда для голоса",
+        "set_cmd_hint": "Например vm — вызов %svm, с ИИ %svm%s. Пусто — без команды.",
+        "prefix": "Префикс",
+        "prefix_sub": "Символ перед командой: . / ! и т. п.",
+        "main_cmd": "Основная команда",
+        "main_cmd_sub": "Голос по умолчанию",
+        "ai_suffix": "Суффикс ИИ",
+        "ai_suffix_sub": "Добавляется к любой команде голоса",
+        "commands_list": "Сейчас работают:",
+        "save": "Сохранить",
+        "cancel": "Отмена",
+        "close": "Закрыть",
+        "reset": "Сбросить по умолчанию",
+        "added": "Голос «%s» добавлен",
+        "bad_id": "Не нашёл ID голоса (32 символа) в «%s»",
+        "exists": "Этот голос уже в избранном",
+        "no_key": "Укажите API-ключ Fish Audio в настройках плагина",
+        "no_voice": "Добавьте голос в настройках плагина",
+        "no_text": "Нет текста для озвучки",
+        "no_ai_key": "Для %s нужен ключ OpenRouter в настройках плагина",
+        "cmd_taken": "Команда «%s» уже занята",
+        "cmd_clash": "«%s» совпадает с другой командой + суффиксом ИИ",
+        "cmd_bad": "Команда — без пробелов, до 16 символов",
+        "fish_error": "Fish Audio: %s",
+        "ai_error": "OpenRouter: %s",
+        "send_error": "Не удалось отправить голосовое: %s",
+        "copy_text": "Копировать",
+        "fish_401": "Fish Audio: неверный API-ключ — проверьте его в настройках плагина",
+        "fish_402": "Fish Audio: нет оплаты — закончился баланс API или модель %s стала платной. Пополните баланс или выберите другую модель в настройках плагина",
+        "fish_404": "Fish Audio: голос не найден — проверьте его ID в избранных голосах",
+        "fish_429": "Fish Audio: слишком много запросов, попробуйте чуть позже",
+        "fish_5xx": "Fish Audio сейчас перегружен, попробуйте чуть позже",
+        "ai_401": "OpenRouter: неверный API-ключ — проверьте его в настройках плагина",
+        "ai_402": "OpenRouter: закончились кредиты на аккаунте",
+        "ai_model_err": "OpenRouter: модель ИИ «%s» не найдена — проверьте название в настройках плагина",
+        "ai_429": "OpenRouter: превышен лимит запросов, попробуйте чуть позже",
+        "timeout": "%s не ответил вовремя, попробуйте ещё раз",
+        "offline": "Нет соединения с %s",
+        "key_ok": "Ключ работает. Баланс API: $%s",
+        "key_ok_free": "Ключ работает",
+        "checking": "Проверяю…",
+        "progress": "Показывать прогресс",
+        "progress_sub": "Плашка с этапом и кнопкой отмены, пока готовится голосовое",
+        "stage_ai": "ИИ расставляет эмоции…",
+        "stage_tts": "Озвучиваю…",
+
+        "key_none": "Не задан — нажмите, чтобы вставить",
+        "ai_tag": "ИИ",
+        "about": "Версия %s",
+    },
+    "en": {
+        "fish_header": "Fish Audio",
+        "fish_key": "API key",
+        "fish_key_sub": "fish.audio → Developers → API Keys",
+        "model": "Model",
+        "model_other": "Other…",
+        "custom_model": "Model ID",
+        "custom_model_sub": "As listed at fish.audio → Developers → Models",
+        "speed": "Speech speed",
+        "check": "Check key",
+        "voices_header": "Voices",
+        "voices": "Favourite voices",
+        "voices_none": "Empty — add a voice",
+        "default_voice": "Default: %s",
+        "ai_header": "AI emotions (OpenRouter)",
+        "ai_key": "OpenRouter API key",
+        "ai_key_sub": "openrouter.ai → Keys",
+        "ai_model": "AI model",
+        "ai_prompt": "AI instructions",
+        "ai_prompt_sub": "How to place emotions and tags",
+        "commands": "Commands",
+        "hint_main": "%s — default voice, %s — with AI emotions. The command itself is never sent. "
+                     "Without text, as a reply — voices the replied message.",
+        "add_voice": "Add voice",
+        "add_voice_hint": "Voice ID or fish.audio link",
+        "voices_hint": "Tap a voice to make it default, rename it, give it a command or delete it.",
+        "voice_actions": ["Make default", "Rename", "Command", "Copy ID", "Delete"],
+        "main_mark": "default",
+        "cmd_none": "no own command",
+        "rename": "Voice name",
+        "set_cmd": "Command for the voice",
+        "set_cmd_hint": "E.g. vm — call %svm, with AI %svm%s. Empty — no command.",
+        "prefix": "Prefix",
+        "prefix_sub": "Character before a command: . / ! etc.",
+        "main_cmd": "Main command",
+        "main_cmd_sub": "Default voice",
+        "ai_suffix": "AI suffix",
+        "ai_suffix_sub": "Appended to any voice command",
+        "commands_list": "Active now:",
+        "save": "Save",
+        "cancel": "Cancel",
+        "close": "Close",
+        "reset": "Reset to default",
+        "added": "Voice “%s” added",
+        "bad_id": "No voice ID (32 characters) found in “%s”",
+        "exists": "This voice is already in favourites",
+        "no_key": "Set the Fish Audio API key in the plugin settings",
+        "no_voice": "Add a voice in the plugin settings",
+        "no_text": "Nothing to voice",
+        "no_ai_key": "%s needs an OpenRouter key in the plugin settings",
+        "cmd_taken": "Command “%s” is already taken",
+        "cmd_clash": "“%s” equals another command + the AI suffix",
+        "cmd_bad": "A command has no spaces and up to 16 characters",
+        "fish_error": "Fish Audio: %s",
+        "ai_error": "OpenRouter: %s",
+        "send_error": "Could not send the voice message: %s",
+        "copy_text": "Copy",
+        "fish_401": "Fish Audio: invalid API key — check it in the plugin settings",
+        "fish_402": "Fish Audio: payment required — the API balance is empty or model %s is no longer free. Top up or pick another model in the plugin settings",
+        "fish_404": "Fish Audio: voice not found — check its ID in favourite voices",
+        "fish_429": "Fish Audio: too many requests, try again a bit later",
+        "fish_5xx": "Fish Audio is overloaded right now, try again a bit later",
+        "ai_401": "OpenRouter: invalid API key — check it in the plugin settings",
+        "ai_402": "OpenRouter: the account is out of credits",
+        "ai_model_err": "OpenRouter: AI model “%s” not found — check its name in the plugin settings",
+        "ai_429": "OpenRouter: rate limit reached, try again a bit later",
+        "timeout": "%s did not answer in time, try again",
+        "offline": "No connection to %s",
+        "key_ok": "Key works. API balance: $%s",
+        "key_ok_free": "Key works",
+        "checking": "Checking…",
+        "progress": "Show progress",
+        "progress_sub": "A bar with the current step and a cancel button while the voice is being made",
+        "stage_ai": "AI is adding emotions…",
+        "stage_tts": "Voicing…",
+
+        "key_none": "Not set — tap to paste",
+        "ai_tag": "AI",
+        "about": "Version %s",
+    },
+}
+
+
+class _Run(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception:
+            pass
+
+
+def tr(key):
+    try:
+        lang = str(LocaleController.getInstance().getCurrentLocaleInfo().pluralLangCode)
+    except Exception:
+        lang = "en"
+    return STRINGS["ru" if lang in ("ru", "uk", "be") else "en"][key]
+
+
+class FishAudioPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    # ------------------------------------------------------------------ settings storage
+
+    def _voices(self):
+        try:
+            data = json.loads(self.get_setting("voices", "[]"))
+            return [v for v in data if isinstance(v, dict) and v.get("id")]
+        except Exception:
+            return []
+
+    def _save_voices(self, voices, reload=True):
+        self.set_setting("voices", json.dumps(voices, ensure_ascii=False), reload_settings=reload)
+
+    def _default_voice(self, voices=None):
+        voices = self._voices() if voices is None else voices
+        want = self.get_setting("default_voice", "")
+        for v in voices:
+            if v["id"] == want:
+                return v
+        return voices[0] if voices else None
+
+    def _prefix(self):
+        return (self.get_setting("prefix", ".") or ".").strip() or "."
+
+    def _main_cmd(self):
+        return (self.get_setting("main_cmd", "v") or "v").strip() or "v"
+
+    def _ai_suffix(self):
+        return (self.get_setting("ai_suffix", "t") or "").strip()
+
+    def _commands(self):
+        """Command (lower-case) → voice dict."""
+        voices = self._voices()
+        table = {}
+        default = self._default_voice(voices)
+        if default:
+            table[self._main_cmd().lower()] = default
+        for v in voices:
+            cmd = (v.get("cmd") or "").strip().lower()
+            if cmd and cmd not in table:
+                table[cmd] = v
+        return table
+
+    # ------------------------------------------------------------------ command parsing
+
+    def _parse(self, text):
+        """Returns (voice, use_ai, text) for a command message, None for anything else."""
+        prefix = self._prefix()
+        if not text.startswith(prefix):
+            return None
+        m = re.match(r"(\S+)(?:\s+([\s\S]*))?$", text[len(prefix):])
+        if not m:
+            return None
+        head, rest = m.group(1).lower(), (m.group(2) or "").strip()
+        table = self._commands()
+        if not table:
+            # no voices yet: still swallow the main command so it is never sent by mistake
+            main = self._main_cmd().lower()
+            suffix = self._ai_suffix().lower()
+            if head == main or (suffix and head == main + suffix):
+                return (None, head != main, rest)
+            return None
+        if head in table:
+            return (table[head], False, rest)
+        suffix = self._ai_suffix().lower()
+        if suffix and head.endswith(suffix) and head[:-len(suffix)] in table:
+            return (table[head[:-len(suffix)]], True, rest)
+        return None
+
+    # ------------------------------------------------------------------ outgoing hook
+
+    def on_send_message_hook(self, account, params):
+        text = getattr(params, "message", None)
+        if not isinstance(text, str) or not text.startswith(self._prefix()):
+            return HookResult()
+        parsed = self._parse(text)
+        if parsed is None:
+            return HookResult()
+        voice, use_ai, body = parsed
+        reply = getattr(params, "replyToMsg", None)
+        if not body and reply is not None:
+            try:
+                body = str(reply.messageOwner.message or "").strip()
+            except Exception:
+                body = ""
+        error = None
+        if not self.get_setting("fish_key", "").strip():
+            error = tr("no_key")
+        elif voice is None:
+            error = tr("no_voice")
+        elif not body:
+            error = tr("no_text")
+        elif use_ai and not self.get_setting("ai_key", "").strip():
+            error = tr("no_ai_key") % (self._prefix() + self._main_cmd() + self._ai_suffix())
+        if error:
+            self._show_error(error)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        job = {"account": account, "params": params, "voice": voice, "ai": use_ai, "text": body, "original": text,
+               "cancelled": threading.Event(), "bulletin": None, "label": None}
+        if self.get_setting("show_progress", True):
+            self._progress_show(job, tr("stage_ai") if use_ai else tr("stage_tts"))
+        threading.Thread(target=self._run_job, args=(job,), daemon=True).start()
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # ------------------------------------------------------------------ job
+
+    def _run_job(self, job):
+        cancelled = job["cancelled"]
+        stop = threading.Event()
+        threading.Thread(target=self._recording_status, args=(job, stop), daemon=True).start()
+        try:
+            text = job["text"]
+            if job["ai"]:
+                try:
+                    text = self._ai_direct(text)
+                except Exception as e:
+                    if not cancelled.is_set():
+                        self._show_error(self._ai_problem(e), job["original"])
+                    return
+                if cancelled.is_set():
+                    return
+                self._progress_text(job, tr("stage_tts"))
+            try:
+                path = self._synthesize(text, job["voice"]["id"])
+            except Exception as e:
+                if not cancelled.is_set():
+                    self._show_error(self._fish_problem(e), job["original"])
+                return
+            if cancelled.is_set():
+                return
+            stop.set()
+
+            def send():
+                # the last moment Cancel still counts; after this Telegram shows its own upload progress
+                if cancelled.is_set():
+                    return
+                self._progress_hide(job)
+                self._send_voice(job, path)
+            job["handed_off"] = True
+            run_on_ui_thread(send)
+        finally:
+            stop.set()
+            if not job.get("handed_off"):
+                # error or cancel: the bar must not stay behind (an error bulletin follows right after)
+                run_on_ui_thread(lambda: self._progress_hide(job))
+
+    # ------------------------------------------------------------------ progress bulletin
+
+    def _progress_show(self, job, text):
+        """UI thread: a bulletin with a spinner, the current step and Cancel; hidden when the voice is sent."""
+        try:
+            fragment = get_last_fragment()
+            if fragment is None or fragment.getParentActivity() is None:
+                return
+            context = fragment.getParentActivity()
+            resources = fragment.getResourceProvider()
+            Bulletin = jclass("org.telegram.ui.Components.Bulletin")
+            LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+
+            layout = jclass("org.telegram.ui.Components.Bulletin$LottieLayout")(context, resources)
+            layout.textView.setText(text)
+            # a spinner in place of the icon: generation has no real percentage to show
+            layout.imageView.setVisibility(View.INVISIBLE)
+            spinner = jclass("org.telegram.ui.Components.RadialProgressView")(context, resources)
+            spinner.setSize(AndroidUtilities.dp(22))
+            spinner.setStrokeWidth(2.5)
+            spinner.setProgressColor(layout.textView.getCurrentTextColor())
+            layout.addView(spinner, LayoutHelper.createFrameRelatively(56, 48, Gravity.START | Gravity.CENTER_VERTICAL))
+
+            button = jclass("org.telegram.ui.Components.Bulletin$UndoButton")(context, True, resources)
+            button.setText(tr("cancel"))
+            button.setUndoAction(_Run(lambda: self._cancel_job(job, fragment)))
+            layout.setButton(button)
+
+            bulletin = Bulletin.make(fragment, layout, 3600 * 1000)
+            job["bulletin"] = bulletin
+            job["label"] = layout.textView
+            bulletin.show()
+        except Exception:
+            self.logger.exception("progress bulletin failed")
+
+    def _progress_text(self, job, text):
+        def update():
+            try:
+                if job["label"] is not None and not job["cancelled"].is_set():
+                    job["label"].setText(text)
+            except Exception:
+                pass
+        run_on_ui_thread(update)
+
+    @staticmethod
+    def _progress_hide(job):
+        """UI thread."""
+        try:
+            if job["bulletin"] is not None:
+                job["bulletin"].hide()
+        except Exception:
+            pass
+        job["bulletin"] = None
+
+    def _cancel_job(self, job, fragment):
+        """UI thread, Cancel on the progress bulletin: drop the job and give the command back for editing."""
+        job["cancelled"].set()
+        job["bulletin"] = None
+        try:
+            enter = fragment.getChatActivityEnterView()
+            field = enter.getFieldText() if enter is not None else None
+            if enter is not None and not (field is not None and str(field).strip()):
+                enter.setFieldText(job["original"])
+        except Exception:
+            pass
+    def _recording_status(self, job, stop):
+        """Shows "recording voice message…" in the chat while the audio is being made."""
+        params = job["params"]
+        thread_id = 0
+        try:
+            top = getattr(params, "replyToTopMsg", None)
+            if top is not None:
+                thread_id = int(top.getId())
+        except Exception:
+            pass
+        while not stop.is_set():
+            try:
+                get_messages_controller(job["account"]).sendTyping(params.peer, thread_id, 1, 0)
+            except Exception:
+                pass
+            stop.wait(4.5)
+        try:
+            get_messages_controller(job["account"]).cancelTyping(1, params.peer, thread_id)
+        except Exception:
+            pass
+
+    def _describe(self, e):
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            try:
+                body = e.response.json()
+                msg = body.get("message") or body.get("error", {}).get("message") or ""
+            except Exception:
+                msg = (e.response.text or "")[:120]
+            return ("%d %s" % (e.response.status_code, msg)).strip()
+        if isinstance(e, requests.Timeout):
+            return "timeout"
+        if isinstance(e, requests.ConnectionError):
+            return "no connection"
+        return str(e) or e.__class__.__name__
+
+    @staticmethod
+    def _status(e):
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            return e.response.status_code
+        return None
+
+    def _fish_problem(self, e):
+        """What went wrong with Fish Audio, in words a user can act on."""
+        code = self._status(e)
+        if code in (401, 403):
+            return tr("fish_401")
+        if code == 402:
+            return tr("fish_402") % self._model()
+        if code in (400, 404) and ("reference" in self._describe(e).lower() or code == 404):
+            return tr("fish_404")
+        if code == 429:
+            return tr("fish_429")
+        if code is not None and code >= 500:
+            return tr("fish_5xx")
+        if isinstance(e, requests.Timeout):
+            return tr("timeout") % "Fish Audio"
+        if isinstance(e, requests.ConnectionError):
+            return tr("offline") % "Fish Audio"
+        return tr("fish_error") % self._describe(e)
+
+    def _ai_problem(self, e):
+        """What went wrong with OpenRouter, in words a user can act on."""
+        code = self._status(e)
+        detail = self._describe(e).lower()
+        if code in (401, 403):
+            return tr("ai_401")
+        if code == 402:
+            return tr("ai_402")
+        if code in (400, 404) and "model" in detail:
+            return tr("ai_model_err") % self._ai_model()
+        if code == 429:
+            return tr("ai_429")
+        if isinstance(e, requests.Timeout):
+            return tr("timeout") % "OpenRouter"
+        if isinstance(e, requests.ConnectionError):
+            return tr("offline") % "OpenRouter"
+        return tr("ai_error") % self._describe(e)
+
+    def _model(self):
+        index = int(self.get_setting("model", 0))
+        if 0 <= index < len(MODELS):
+            return MODELS[index]
+        return self.get_setting("custom_model", "").strip() or DEFAULT_MODEL
+
+    def _ai_model(self):
+        return self.get_setting("ai_model", DEFAULT_AI_MODEL).strip() or DEFAULT_AI_MODEL
+
+    def _ai_direct(self, text):
+        prompt = self.get_setting("ai_prompt", "").strip() or DEFAULT_PROMPT
+        r = requests.post(OPENROUTER_URL, timeout=60, headers={
+            "Authorization": "Bearer " + self.get_setting("ai_key", "").strip(),
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://exteragram.app",
+            "X-Title": "Fish Audio Integration",
+        }, json={
+            "model": self._ai_model(),
+            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        })
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"].strip()
+        return out or text
+
+    def _synthesize(self, text, voice_id):
+        model = self._model()
+        speed = SPEEDS[min(int(self.get_setting("speed", 2)), len(SPEEDS) - 1)]
+        body = {"text": text, "reference_id": voice_id, "format": "opus"}
+        if speed != 1.0:
+            body["prosody"] = {"speed": speed}
+        r = requests.post(FISH_TTS_URL, timeout=120, json=body, headers={
+            "Authorization": "Bearer " + self.get_setting("fish_key", "").strip(),
+            "Content-Type": "application/json",
+            "model": model,
+        })
+        r.raise_for_status()
+        data = r.content
+        if len(data) < 64 or not data.startswith(b"OggS"):
+            raise RuntimeError("unexpected response")
+        folder = os.path.join(str(ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()), "fish_audio")
+        os.makedirs(folder, exist_ok=True)
+        now = time.time()
+        for name in os.listdir(folder):
+            p = os.path.join(folder, name)
+            try:
+                if now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+            except OSError:
+                pass
+        path = os.path.join(folder, "voice_%d.ogg" % int(now * 1000))
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    @staticmethod
+    def _ogg_duration(path):
+        """Length of an Ogg Opus file in seconds (last granule position minus pre-skip, 48 kHz)."""
+        with open(path, "rb") as f:
+            data = f.read()
+        pre_skip = 0
+        head = data.find(b"OpusHead")
+        if head >= 0 and len(data) >= head + 12:
+            pre_skip = struct.unpack_from("<H", data, head + 10)[0]
+        last = data.rfind(b"OggS")
+        if last < 0 or len(data) < last + 14:
+            return 0.0
+        granule = struct.unpack_from("<q", data, last + 6)[0]
+        return max(0.0, (granule - pre_skip) / 48000.0)
+
+    def _send_voice(self, job, path):
+        """UI thread: sends the file as a voice message, keeping the reply/topic of the command."""
+        try:
+            account = job["account"]
+            params = job["params"]
+            size = os.path.getsize(path)
+            # Telegram keeps whole seconds for voice messages: a 0.6 s "Привет" would show as 0:00.
+            duration = float(max(1, math.ceil(self._ogg_duration(path))))
+
+            doc = TLRPC.TL_document()
+            doc.file_reference = bytes()
+            doc.dc_id = -2147483648
+            doc.id = 0
+            doc.user_id = UserConfig.getInstance(account).getClientUserId()
+            doc.mime_type = "audio/ogg"
+            doc.date = ConnectionsManager.getInstance(account).getCurrentTime()
+            doc.size = size
+            attr = TLRPC.TL_documentAttributeAudio()
+            attr.voice = True
+            attr.duration = duration
+            try:
+                wave = MediaController.getWaveform(path)
+                if wave is not None:
+                    attr.waveform = wave
+                    attr.flags |= 4
+            except Exception:
+                pass
+            doc.attributes.add(attr)
+
+            # Reuse the original send parameters: peer, reply, topic, quote, silent, schedule...
+            params.message = None
+            params.caption = None
+            params.entities = None
+            params.document = doc
+            params.path = path
+            get_send_messages_helper(account).sendMessage(params)
+        except Exception as e:
+            self.logger.exception("send failed")
+            self._show_error(tr("send_error") % self._describe(e), job["original"])
+
+    # ------------------------------------------------------------------ UI helpers
+
+    def _show_error(self, message, original=None):
+        # a new bulletin in the same chat replaces the progress bar
+        def show():
+            try:
+                if original:
+                    BulletinHelper.show_with_button(message, self._raw("error"), tr("copy_text"),
+                                                    lambda: copy_to_clipboard(original))
+                else:
+                    BulletinHelper.show_error(message)
+            except Exception:
+                BulletinHelper.show_error(message)
+        run_on_ui_thread(show)
+
+    @staticmethod
+    def _raw(name):
+        """Lottie animation id: bulletins with a button animate an R.raw icon."""
+        try:
+            from java import jclass
+            return int(getattr(jclass("org.telegram.messenger.R$raw"), name))
+        except Exception:
+            return 0
+
+    def _activity(self):
+        fragment = get_last_fragment()
+        return fragment.getParentActivity() if fragment is not None else None
+
+    def _ask_text(self, title, value, hint, on_done, message=None):
+        activity = self._activity()
+        if activity is None:
+            return
+        field = AndroidEditText(activity)
+        field.setText(value or "")
+        field.setHint(hint or "")
+        field.setSingleLine(True)
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            field.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+        except Exception:
+            pass
+        container = FrameLayout(activity)
+        pad = AndroidUtilities.dp(22)
+        container.setPadding(pad, AndroidUtilities.dp(4), pad, 0)
+        container.addView(field)
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(title)
+        if message:
+            builder.set_message(message)
+        builder.set_view(container)
+        builder.set_positive_button(tr("save"), lambda b, w: (on_done(str(field.getText()).strip()), b.dismiss()))
+        builder.set_negative_button(tr("cancel"), lambda b, w: b.dismiss())
+        builder.show()
+        field.requestFocus()
+        field.setSelection(len(value or ""))
+        AndroidUtilities.showKeyboard(field)
+
+    # ------------------------------------------------------------------ voices
+
+    def _add_voice(self, raw):
+        m = ID_RE.search(raw or "")
+        if not m:
+            BulletinHelper.show_error(tr("bad_id") % (raw or ""))
+            return
+        voice_id = m.group(1).lower()
+        if any(v["id"] == voice_id for v in self._voices()):
+            BulletinHelper.show_error(tr("exists"))
+            return
+
+        def fetch():
+            name = None
+            try:
+                headers = {}
+                key = self.get_setting("fish_key", "").strip()
+                if key:
+                    headers["Authorization"] = "Bearer " + key
+                r = requests.get(FISH_MODEL_URL.format(voice_id), headers=headers, timeout=20)
+                if r.ok:
+                    name = (r.json().get("title") or "").strip() or None
+            except Exception:
+                pass
+
+            def save():
+                voices = self._voices()
+                if any(v["id"] == voice_id for v in voices):
+                    return
+                voices.append({"id": voice_id, "name": name or voice_id[:8], "cmd": ""})
+                if len(voices) == 1:
+                    self.set_setting("default_voice", voice_id)
+                self._save_voices(voices)
+                BulletinHelper.show_success(tr("added") % (name or voice_id[:8]))
+            run_on_ui_thread(save)
+
+        run_on_queue(fetch)
+
+    def _voice_menu(self, voice_id):
+        activity = self._activity()
+        if activity is None:
+            return
+        voice = next((v for v in self._voices() if v["id"] == voice_id), None)
+        if voice is None:
+            return
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(voice["name"])
+
+        def pick(b, which):
+            b.dismiss()
+            if which == 0:
+                self.set_setting("default_voice", voice_id, reload_settings=True)
+            elif which == 1:
+                self._ask_text(tr("rename"), voice["name"], "", lambda v: self._update_voice(voice_id, name=v))
+            elif which == 2:
+                p, s = self._prefix(), self._ai_suffix()
+                self._ask_text(tr("set_cmd"), voice.get("cmd", ""), "vm",
+                               lambda v: self._update_voice(voice_id, cmd=v),
+                               tr("set_cmd_hint") % (p, p, s))
+            elif which == 3:
+                copy_to_clipboard(voice_id)
+            elif which == 4:
+                voices = [v for v in self._voices() if v["id"] != voice_id]
+                self._save_voices(voices)
+
+        builder.set_items(tr("voice_actions"), pick)
+        builder.set_negative_button(tr("close"), lambda b, w: b.dismiss())
+        builder.show()
+
+    def _command_problem(self, cmd, owner_id=None):
+        """Why `cmd` cannot be used as a voice command, or None."""
+        if not CMD_RE.match(cmd):
+            return tr("cmd_bad")
+        low = cmd.lower()
+        suffix = self._ai_suffix().lower()
+        taken = {self._main_cmd().lower()}
+        for v in self._voices():
+            if v["id"] != owner_id and v.get("cmd"):
+                taken.add(v["cmd"].strip().lower())
+        if low in taken:
+            return tr("cmd_taken") % cmd
+        if suffix and (any(low == t + suffix for t in taken) or (low.endswith(suffix) and low[:-len(suffix)] in taken)
+                       or any(t == low + suffix for t in taken)):
+            return tr("cmd_clash") % cmd
+        return None
+
+    def _update_voice(self, voice_id, name=None, cmd=None):
+        voices = self._voices()
+        for v in voices:
+            if v["id"] != voice_id:
+                continue
+            if name is not None and name:
+                v["name"] = name[:64]
+            if cmd is not None:
+                cmd = cmd.strip().lstrip(self._prefix())
+                if cmd:
+                    problem = self._command_problem(cmd, voice_id)
+                    if problem:
+                        BulletinHelper.show_error(problem)
+                        return
+                v["cmd"] = cmd
+        self._save_voices(voices)
+
+    def _check_key(self, view=None):
+        key = self.get_setting("fish_key", "").strip()
+        if not key:
+            BulletinHelper.show_error(tr("no_key"))
+            return
+        BulletinHelper.show_info(tr("checking"))
+
+        def work():
+            try:
+                r = requests.get(FISH_CREDIT_URL, timeout=20, headers={"Authorization": "Bearer " + key})
+                r.raise_for_status()
+                credit = r.json().get("credit")
+                msg = tr("key_ok") % credit if credit is not None else tr("key_ok_free")
+                run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+            except Exception as e:
+                err = self._fish_problem(e)
+                run_on_ui_thread(lambda: BulletinHelper.show_error(err))
+        run_on_queue(work)
+
+    # ------------------------------------------------------------------ settings pages
+
+    def create_settings(self):
+        voices = self._voices()
+        default = self._default_voice(voices)
+        p, main, s = self._prefix(), self._main_cmd(), self._ai_suffix()
+        return [
+            Header(text=tr("fish_header")),
+            self._key_row("fish_key", tr("fish_key"), tr("fish_key_sub")),
+            Selector(key="model", text=tr("model"), default=0, items=MODELS + [tr("model_other")],
+                     icon="msg_premium_voice", on_change=lambda i: self._reload()),
+        ] + ([
+            Input(key="custom_model", text=tr("custom_model"), default="", subtext=tr("custom_model_sub"),
+                  icon="msg_edit"),
+        ] if int(self.get_setting("model", 0)) >= len(MODELS) else []) + [
+            Selector(key="speed", text=tr("speed"), default=2, items=["%gx" % v for v in SPEEDS], icon="msg_speed"),
+            Switch(key="show_progress", text=tr("progress"), default=True, subtext=tr("progress_sub"),
+                   icon="msg_stats"),
+            Text(text=tr("check"), icon="msg_text_check", accent=True, on_click=self._check_key),
+            Header(text=tr("voices_header")),
+            Text(text=tr("voices"),
+                 subtext=(tr("default_voice") % default["name"]) if default else tr("voices_none"),
+                 icon="msg_voice_unmuted", create_sub_fragment=self._voices_page),
+            Text(text=tr("commands"), subtext="%s%s · %s%s%s" % (p, main, p, main, s),
+                 icon="msg_bots", create_sub_fragment=self._commands_page),
+            Divider(text=tr("hint_main") % (p + main, p + main + s)),
+            Header(text=tr("ai_header")),
+            self._key_row("ai_key", tr("ai_key"), tr("ai_key_sub")),
+            Input(key="ai_model", text=tr("ai_model"), default=DEFAULT_AI_MODEL, icon="msg_bot"),
+            Text(text=tr("ai_prompt"), subtext=tr("ai_prompt_sub"), icon="msg_edit", create_sub_fragment=self._prompt_page),
+            Divider(text=tr("about") % __version__),
+        ]
+
+    def _key_row(self, key, title, hint):
+        """API key row: shows only the start and end of the key, edited in a dialog."""
+        value = self.get_setting(key, "").strip()
+        if len(value) > 16:
+            shown = value[:8] + "…" + value[-4:]
+        else:
+            shown = value or tr("key_none")
+        return Text(text=title, subtext=shown, icon="msg_permissions",
+                    on_click=lambda view: self._ask_text(title, value, hint,
+                                                         lambda new: self.set_setting(key, new.strip(), reload_settings=True),
+                                                         hint))
+
+    def _voices_page(self):
+        voices = self._voices()
+        default = self._default_voice(voices)
+        p = self._prefix()
+        items = [Header(text=tr("voices"))]
+        for v in voices:
+            parts = []
+            if default and v["id"] == default["id"]:
+                parts.append("%s · %s%s" % (tr("main_mark"), p, self._main_cmd()))
+            if v.get("cmd"):
+                parts.append(p + v["cmd"])
+            if not parts:
+                parts.append(tr("cmd_none"))
+            items.append(Text(text=v["name"], subtext=" · ".join(parts),
+                              icon="msg_voice_unmuted" if not (default and v["id"] == default["id"]) else "msg_fave",
+                              on_click=lambda view, vid=v["id"]: self._voice_menu(vid)))
+        items.append(Text(text=tr("add_voice"), icon="msg_add", accent=True,
+                          on_click=lambda view: self._ask_text(tr("add_voice"), "", tr("add_voice_hint"), self._add_voice)))
+        items.append(Divider(text=tr("voices_hint")))
+        return items
+
+    def _commands_page(self):
+        p, main, s = self._prefix(), self._main_cmd(), self._ai_suffix()
+        default = self._default_voice()
+        lines = ["%s%s — %s" % (p, main, default["name"] if default else "—")]
+        if s:
+            lines.append("%s%s%s — %s + %s" % (p, main, s, default["name"] if default else "—", tr("ai_tag")))
+        for v in self._voices():
+            if v.get("cmd"):
+                lines.append("%s%s — %s" % (p, v["cmd"], v["name"])
+                             + ("  ·  %s%s%s + %s" % (p, v["cmd"], s, tr("ai_tag")) if s else ""))
+        return [
+            Header(text=tr("commands")),
+            Input(key="prefix", text=tr("prefix"), default=".", subtext=tr("prefix_sub"), icon="msg_bots",
+                  on_change=lambda v: self._reload()),
+            Input(key="main_cmd", text=tr("main_cmd"), default="v", subtext=tr("main_cmd_sub"), icon="msg_voice_unmuted",
+                  on_change=lambda v: self._reload()),
+            Input(key="ai_suffix", text=tr("ai_suffix"), default="t", subtext=tr("ai_suffix_sub"), icon="msg_bot",
+                  on_change=lambda v: self._reload()),
+            Divider(text=tr("commands_list") + "\n" + "\n".join(lines)),
+        ]
+
+    def _prompt_page(self):
+        return [
+            Header(text=tr("ai_prompt")),
+            EditText(key="ai_prompt", hint=DEFAULT_PROMPT[:60] + "…", default=DEFAULT_PROMPT, multiline=True, max_length=4000),
+            Text(text=tr("reset"), icon="msg_reset", red=True,
+                 on_click=lambda view: self.set_setting("ai_prompt", DEFAULT_PROMPT, reload_settings=True)),
+        ]
+
+    def _reload(self):
+        try:
+            self.set_setting("_rev", int(self.get_setting("_rev", 0)) + 1, reload_settings=True)
+        except Exception:
+            pass
