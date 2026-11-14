@@ -44,6 +44,7 @@ from java.lang import Integer, Runnable
 from java.util import ArrayList
 from org.telegram.messenger import (
     ApplicationLoader,
+    MediaDataController,
     MessagesController,
     NotificationCenter,
 )
@@ -58,7 +59,7 @@ __id__ = "passguard"  # kept for settings compatibility with older versions
 __name__ = "Security Manager"
 __description__ = "Скрытые чаты: исчезают из общего списка и открываются только по секретному паролю в поиске. Экстренный выход из аккаунта по коду-приманке. Тихие уведомления с фото при неверном пароле."
 __author__ = "@xeate, @xeplagin"
-__version__ = "1.0.7"
+__version__ = "1.1.0"
 __icon__ = "zamokdliamoegoebanogonikomunenujnogoplagina/0"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -67,6 +68,7 @@ __category__ = ["privacy"]
 
 SHARED_CONFIG_CLASS = "org.telegram.messenger.SharedConfig"
 ALERT_COOLDOWN_SECONDS = 3.0
+SECRET_SEARCH_GRACE_SECONDS = 30.0
 
 
 class PasscodeHook(MethodHook):
@@ -201,6 +203,16 @@ class DialogItemClickHook(MethodHook):
         self.plugin.on_dialog_item_click(param)
 
 
+class SearchHintsHook(MethodHook):
+    """Before-hook for the ChatHints row adapter count."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.on_search_hints_count()
+
+
 class ProfileCellHook(MethodHook):
     """Before-hook for ProfileSearchCell.setData(...)."""
 
@@ -320,6 +332,15 @@ class PassGuardPlugin(BasePlugin):
     _shared_hidden_code = None
     _shared_hidden_ids = None
     _shared_hidden_ts = 0.0
+    # The hidden chat whose screen is really open. A ProfileActivity is
+    # allowed only while this chat is open, not because an old unlock is
+    # still stored somewhere.
+    _shared_open_chat_id = None
+    _shared_open_chat_ts = 0.0
+    # "Hide" closes the profile/chat it was invoked from. This short-lived
+    # token tells the resume guards that the close is intentional.
+    _shared_hide_exit_id = None
+    _shared_hide_exit_ts = 0.0
 
     def on_plugin_load(self):
         self._unhook = None
@@ -341,6 +362,9 @@ class PassGuardPlugin(BasePlugin):
         self._secret_unlock_ts = 0.0
         self._secret_tap_id = None
         self._secret_tap_ts = 0.0
+        self._closing_fragment_key = None
+        self._closing_fragment_ts = 0.0
+        self._hints_filter_ts = 0.0
         self._hidden_enabled = bool(self.get_setting("hidden_enabled", False))
         self._hidden_code = str(
             self.get_setting("hidden_code", "") or ""
@@ -361,6 +385,7 @@ class PassGuardPlugin(BasePlugin):
         self._install_passcode_hook()
         self._install_hidden_hooks()
         self._refresh_hidden_menu()
+        self._filter_search_hints()
 
     def on_plugin_unload(self):
         if self._unhook:
@@ -509,6 +534,48 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             self.logger.exception(
                 "Could not hook DialogsActivity.onItemClick"
+            )
+
+        # The ChatHints row at the top of search reads MediaDataController.hints
+        # directly. Prune hidden peers before that adapter reports its size,
+        # otherwise a hidden chat is visible and can be tapped without a code.
+        try:
+            class_loader = jclass("java.lang.Class")
+            search_class = class_loader.forName(
+                "org.telegram.ui.Adapters.DialogsSearchAdapter"
+            )
+            hooked_hints = 0
+            for inner_class in search_class.getDeclaredClasses():
+                if "CategoryAdapterRecycler" not in str(
+                    inner_class.getName()
+                ):
+                    continue
+                for method in inner_class.getDeclaredMethods():
+                    if (
+                        method.getName() == "getItemCount"
+                        and len(method.getParameterTypes()) == 0
+                    ):
+                        try:
+                            method.setAccessible(True)
+                        except Exception:
+                            pass
+                        unhook = self.hook_method(
+                            method, SearchHintsHook(self), priority=10
+                        )
+                        if unhook:
+                            self._hidden_unhooks.append(unhook)
+                            hooked_hints += 1
+                            self.logger.info(
+                                "Hooked ChatHints adapter getItemCount"
+                            )
+                        break
+            if not hooked_hints:
+                self.logger.info(
+                    "ChatHints adapter getItemCount not found"
+                )
+        except Exception:
+            self.logger.exception(
+                "Could not hook the ChatHints adapter"
             )
 
         # ProfileSearchCell is the row used by search results. Badging the
@@ -1045,6 +1112,33 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             pass
 
+        # ChatHints and other suggestion lists wrap the real peer in a
+        # TL_topPeer/Peer object. Resolve those wrappers before falling
+        # back to class-name matching.
+        try:
+            peer = getattr(obj, "peer", None)
+            if peer is not None:
+                user_id = int(getattr(peer, "user_id", 0) or 0)
+                if user_id:
+                    return user_id
+                channel_id = int(getattr(peer, "channel_id", 0) or 0)
+                if channel_id:
+                    return -channel_id
+                chat_id = int(getattr(peer, "chat_id", 0) or 0)
+                if chat_id:
+                    return -chat_id
+            user_id = int(getattr(obj, "user_id", 0) or 0)
+            if user_id:
+                return user_id
+            channel_id = int(getattr(obj, "channel_id", 0) or 0)
+            if channel_id:
+                return -channel_id
+            chat_id = int(getattr(obj, "chat_id", 0) or 0)
+            if chat_id:
+                return -chat_id
+        except Exception:
+            pass
+
         # Fallback for builds where isinstance() on a TLRPC subclass is
         # not reliable.
         try:
@@ -1064,6 +1158,45 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             pass
         return None
+
+    def _filter_search_hints(self):
+        """Remove hidden chats from the horizontal ChatHints suggestion row."""
+        try:
+            if not self._hidden_active():
+                return False
+            account = int(get_selected_account())
+            hints = MediaDataController.getInstance(account).hints
+            hidden_ids = self._hidden_ids
+            removed = False
+            for index in range(hints.size() - 1, -1, -1):
+                peer = hints.get(index)
+                dialog_id = self._object_dialog_id(peer)
+                if dialog_id is not None and dialog_id in hidden_ids:
+                    hints.remove(index)
+                    removed = True
+            if removed:
+                self.logger.info(
+                    "Removed hidden chats from search hints"
+                )
+            return removed
+        except Exception:
+            self.logger.exception(
+                "Failed to filter hidden chats from search hints"
+            )
+            return False
+
+    def on_search_hints_count(self):
+        """Prune the hints list before the ChatHints row reports its size."""
+        try:
+            now = time.time()
+            if now - self._hints_filter_ts < 1.0:
+                return
+            self._hints_filter_ts = now
+            self._filter_search_hints()
+        except Exception:
+            self.logger.exception(
+                "Failed to update the search hints filter"
+            )
 
     def _dialog_name(self, obj):
         try:
@@ -1413,7 +1546,15 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_ids.add(dialog_id)
             self._save_hidden_ids()
             self._publish_hidden_state()
-            self._schedule_hidden_menu_refresh(dialog_id)
+            self._filter_search_hints()
+            # The chat is hidden now, so the current screen must lose its
+            # authorization immediately. The actual close is deferred: a
+            # fragment must never be finished from inside onResume().
+            self._clear_unlock_state()
+            self._clear_search_authorization()
+            self._clear_open_chat()
+            self._mark_hide_exit(dialog_id)
+            self._schedule_hidden_screen_close(dialog_id)
             BulletinHelper.show_success(
                 "Чат успешно скрыт", get_last_fragment()
             )
@@ -1453,6 +1594,9 @@ class PassGuardPlugin(BasePlugin):
             self._schedule_hidden_menu_refresh(dialog_id)
             if self._current_unlock()[0] == dialog_id:
                 self._clear_unlock_state()
+            self._clear_hide_exit()
+            if PassGuardPlugin._shared_open_chat_id == dialog_id:
+                self._clear_open_chat()
 
             BulletinHelper.show_success(
                 "Чат возвращён в общий список", get_last_fragment()
@@ -1489,6 +1633,59 @@ class PassGuardPlugin(BasePlugin):
         PassGuardPlugin._shared_unlock_id = None
         PassGuardPlugin._shared_unlock_ts = 0.0
 
+    def _clear_search_authorization(self):
+        self._secret_search_ts = 0.0
+        PassGuardPlugin._shared_search_ts = 0.0
+        PassGuardPlugin._shared_search_ids = set()
+        self._secret_tap_id = None
+        self._secret_tap_ts = 0.0
+
+    def _remember_open_chat(self, dialog_id):
+        PassGuardPlugin._shared_open_chat_id = dialog_id
+        PassGuardPlugin._shared_open_chat_ts = time.time()
+
+    def _clear_open_chat(self):
+        PassGuardPlugin._shared_open_chat_id = None
+        PassGuardPlugin._shared_open_chat_ts = 0.0
+
+    def _mark_hide_exit(self, dialog_id):
+        PassGuardPlugin._shared_hide_exit_id = dialog_id
+        PassGuardPlugin._shared_hide_exit_ts = time.time()
+
+    def _hide_exit_active(self, dialog_id=None):
+        exit_id = PassGuardPlugin._shared_hide_exit_id
+        if exit_id is None:
+            return False
+        if time.time() - PassGuardPlugin._shared_hide_exit_ts >= 10:
+            self._clear_hide_exit()
+            return False
+        return dialog_id is None or exit_id == dialog_id
+
+    def _clear_hide_exit(self):
+        PassGuardPlugin._shared_hide_exit_id = None
+        PassGuardPlugin._shared_hide_exit_ts = 0.0
+
+    def _profile_allowed(self, profile_id):
+        """True only for the profile of the hidden chat that is open."""
+        unlock_id, unlock_ts = self._current_unlock()
+        if unlock_id is None or time.time() - unlock_ts >= 21600:
+            return False
+        # A stored unlock alone is not enough: the hidden chat must really
+        # be open. Otherwise an old unlock turns every profile into a key.
+        open_id = PassGuardPlugin._shared_open_chat_id
+        open_ts = PassGuardPlugin._shared_open_chat_ts
+        if open_id != unlock_id or time.time() - open_ts >= 21600:
+            return False
+        if profile_id == unlock_id:
+            return True
+        # Secret-chat profiles carry the peer's user id instead of the
+        # encrypted dialog id. Allow such a profile only while its hidden
+        # chat is genuinely open; any other hidden profile stays blocked.
+        hidden_ids = self._hidden_ids
+        return profile_id is None or (
+            hidden_ids is not None and profile_id not in hidden_ids
+        )
+
     def _hidden_unlock_active(self):
         unlock_id, unlock_ts = self._current_unlock()
         if unlock_id is None or time.time() - unlock_ts >= 21600:
@@ -1499,9 +1696,9 @@ class PassGuardPlugin(BasePlugin):
                 return False
             name = str(top.getClass().getName())
             if "ProfileActivity" in name:
-                # Profile of the hidden chat; its dialog id may differ
-                # because group profiles carry the group id.
-                return True
+                return self._profile_allowed(
+                    self._fragment_dialog_id(top)
+                )
             if "ChatActivity" in name:
                 return self._fragment_dialog_id(top) == unlock_id
         except Exception:
@@ -1550,14 +1747,19 @@ class PassGuardPlugin(BasePlugin):
         if not search_ts:
             return False
         age = time.time() - search_ts
+        if age >= SECRET_SEARCH_GRACE_SECONDS:
+            return False
         visible = dialog_id in PassGuardPlugin._shared_search_ids
-        if visible and age < 5:
-            # The row is on screen and was just tapped; top-fragment
-            # detection can briefly lag behind the search adapter.
+        if visible:
+            # The exact password result row is authorized even if top
+            # fragment detection briefly lags behind the transition.
             return True
         if not self._dialogs_on_top():
-            return False
-        return visible or age < 60
+            return self._secret_tap_active(dialog_id)
+        # A recent password search authorizes the hidden screen. The
+        # window is short and cleared when the dialog list returns, so a
+        # chat hidden earlier cannot be opened without entering the code.
+        return age < SECRET_SEARCH_GRACE_SECONDS
 
     def _secret_tap_from_list(self):
         """A hidden search row was tapped while the dialog list is on top."""
@@ -1591,7 +1793,12 @@ class PassGuardPlugin(BasePlugin):
                 return
             if (
                 not self._secret_search_ts
-                or time.time() - self._secret_search_ts > 60
+                or time.time()
+                - max(
+                    self._secret_search_ts,
+                    PassGuardPlugin._shared_search_ts,
+                )
+                > 60
             ):
                 return
             self._set_unlock(dialog_id)
@@ -1612,7 +1819,11 @@ class PassGuardPlugin(BasePlugin):
                 return
             if dialog_id not in self._hidden_ids:
                 return
-            if time.time() - self._secret_search_ts > 60:
+            search_ts = max(
+                self._secret_search_ts,
+                PassGuardPlugin._shared_search_ts,
+            )
+            if not search_ts or time.time() - search_ts > 60:
                 self.logger.info(
                     "Hidden chat %s opened without the secret search",
                     dialog_id,
@@ -1668,18 +1879,82 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             self.logger.exception("Could not show the hidden chat error")
 
-    def _close_fragment(self, fragment):
+    def _schedule_hidden_screen_close(self, dialog_id, delay=350):
+        """Close a just-hidden screen after the current UI callback ends."""
         try:
-            fragment.getFragmentView().setVisibility(View.INVISIBLE)
+            Handler(Looper.getMainLooper()).postDelayed(
+                UiRunnable(
+                    lambda: self._close_hidden_screen(dialog_id)
+                ),
+                delay,
+            )
         except Exception:
-            pass
+            self.logger.exception(
+                "Could not schedule closing hidden screen %s", dialog_id
+            )
+
+    def _finish_hidden_fragment(self, fragment, dialog_id):
+        """Finish one hidden fragment, never from inside its onResume."""
+        try:
+            name = str(fragment.getClass().getName())
+            key = (dialog_id, name)
+            now = time.time()
+            if (
+                self._closing_fragment_key == key
+                and now - self._closing_fragment_ts < 1.5
+            ):
+                return False
+            self._closing_fragment_key = key
+            self._closing_fragment_ts = now
+            fragment.finishFragment()
+            self.logger.info(
+                "Closed hidden screen %s (%s)", dialog_id, name
+            )
+            return True
+        except Exception:
+            self.logger.exception(
+                "Could not close hidden screen %s", dialog_id
+            )
+            return False
+
+    def _close_hidden_screen(self, dialog_id):
+        """Close the hidden screen on a fresh UI event, not inside onResume."""
+        try:
+            if dialog_id is None:
+                return
+            if not self._hidden_active() or dialog_id not in self._hidden_ids:
+                self._clear_hide_exit()
+                self._clear_open_chat()
+                return
+            top = get_last_fragment()
+            if top is None:
+                return
+            name = str(top.getClass().getName())
+            if "DialogsActivity" in name:
+                self._clear_hide_exit()
+                self._clear_open_chat()
+                return
+            if "ProfileActivity" in name:
+                top_id = self._fragment_dialog_id(top)
+                if top_id != dialog_id and not self._hide_exit_active():
+                    return
+                self._finish_hidden_fragment(top, dialog_id)
+                return
+            if (
+                "ChatActivity" in name
+                and self._fragment_dialog_id(top) == dialog_id
+            ):
+                self._finish_hidden_fragment(top, dialog_id)
+        except Exception:
+            self.logger.exception(
+                "Failed to close hidden screen %s", dialog_id
+            )
+
+    def _close_fragment(self, fragment):
+        # Kept for compatibility. Hiding the view left a blank screen when
+        # finishFragment() did not work, so only the fragment is finished.
         try:
             fragment.finishFragment()
-            return
-        except Exception:
-            pass
-        try:
-            fragment.getParentActivity().finish()
         except Exception:
             self.logger.exception("Could not close a hidden chat screen")
 
@@ -1690,11 +1965,13 @@ class PassGuardPlugin(BasePlugin):
                 return
             class_name = str(fragment.getClass().getName())
             # While a hidden chat is open, its profile must stay reachable.
-            # The dialog id in the profile arguments can differ from the
-            # chat id (for example, a group dialog id), so do not reject it
-            # by id during an active unlock.
-            if "ProfileActivity" in class_name and self._hidden_unlock_active():
-                return
+            # Secret-chat profiles carry the peer id instead of the
+            # encrypted dialog id, so allow them only through the open-chat
+            # check; another hidden profile must still be blocked.
+            if "ProfileActivity" in class_name:
+                profile_id = self._fragment_dialog_id(fragment)
+                if self._profile_allowed(profile_id):
+                    return
             dialog_id = self._fragment_dialog_id(fragment)
             if dialog_id is None:
                 return
@@ -1707,7 +1984,7 @@ class PassGuardPlugin(BasePlugin):
             # actually open. Returning to the dialog list must block avatar
             # and username opens immediately.
             if is_profile and not (
-                self._hidden_unlock_active()
+                self._profile_allowed(dialog_id)
                 or self._secret_tap_active(dialog_id)
                 or self._secret_tap_from_list()
                 or from_search
@@ -1832,7 +2109,7 @@ class PassGuardPlugin(BasePlugin):
                 self._persist_unlock(dialog_id)
                 return
             self._show_blocked_toast(dialog_id, profile=True)
-            self._close_fragment(activity)
+            self._schedule_hidden_screen_close(dialog_id)
             self.logger.info("Blocked hidden profile %s", dialog_id)
         except Exception:
             self.logger.exception("Failed to block a hidden profile")
@@ -1849,28 +2126,35 @@ class PassGuardPlugin(BasePlugin):
                 return
             if self._secret_unlocked(dialog_id):
                 self._persist_unlock(dialog_id)
+                self._remember_open_chat(dialog_id)
+                return
+            # A screen closed right after "Hide" must not be reopened or
+            # kept alive by a stale search authorization.
+            if self._hide_exit_active(dialog_id):
+                self._schedule_hidden_screen_close(dialog_id)
                 return
             # The native search-result callback is not always delivered
-            # before ChatActivity opens. If the password was searched
-            # moments ago, treat this hidden chat as the one opened from
-            # those search results and keep it unlocked while it is open.
+            # before ChatActivity opens. A password search from the last
+            # few seconds is enough for this exact hidden dialog; it is
+            # cleared as soon as the dialog list comes back.
             now = time.time()
             search_ts = max(
                 self._secret_search_ts,
                 PassGuardPlugin._shared_search_ts,
             )
-            if (
+            if self._secret_tap_active(dialog_id) or (
                 search_ts
-                and now - search_ts < 60
+                and now - search_ts < SECRET_SEARCH_GRACE_SECONDS
             ):
                 self._set_unlock(dialog_id, now)
+                self._remember_open_chat(dialog_id)
                 self.logger.info(
-                    "Hidden chat %s unlocked by the recent password search",
+                    "Hidden chat %s unlocked by the password search result",
                     dialog_id,
                 )
                 return
             self._show_blocked_toast(dialog_id)
-            self._close_fragment(activity)
+            self._schedule_hidden_screen_close(dialog_id)
             self.logger.info(
                 "Blocked hidden chat %s until the password is used",
                 dialog_id,
@@ -1905,11 +2189,11 @@ class PassGuardPlugin(BasePlugin):
                     return
             had_unlock = self._current_unlock()[0] is not None
             self._clear_unlock_state()
-            self._secret_search_ts = 0.0
-            PassGuardPlugin._shared_search_ts = 0.0
-            PassGuardPlugin._shared_search_ids = set()
-            self._secret_tap_id = None
-            self._secret_tap_ts = 0.0
+            self._clear_search_authorization()
+            self._clear_open_chat()
+            self._clear_hide_exit()
+            self._closing_fragment_key = None
+            self._closing_fragment_ts = 0.0
             self.logger.info(
                 "Hidden chat access locked again after returning to the list"
             )
