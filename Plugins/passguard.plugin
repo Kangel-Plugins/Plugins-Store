@@ -57,9 +57,9 @@ from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 __id__ = "passguard"  # kept for settings compatibility with older versions
 __name__ = "Security Manager"
-__description__ = "Скрытые чаты: исчезают из общего списка и открываются только по секретному паролю в поиске. Экстренный выход из аккаунта по коду-приманке. Тихие уведомления с фото при неверном пароле."
+__description__ = "Скрытые чаты: исчезают из общего списка и открываются только по секретному паролю в поиске. Динамический пароль приложения по времени телефона. Экстренный выход из аккаунта по коду-приманке. Тихие уведомления с фото при неверном пароле."
 __author__ = "@xeate, @xeplagin"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __icon__ = "zamokdliamoegoebanogonikomunenujnogoplagina/0"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -151,6 +151,16 @@ class ProfileResumeHook(MethodHook):
 
     def after_hooked_method(self, param):
         self.plugin.on_profile_resume(param)
+
+
+class AppStopHook(MethodHook):
+    """After-hook for LaunchActivity.onStop()."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.on_app_stop()
 
 
 class DialogsResumeHook(MethodHook):
@@ -341,6 +351,12 @@ class PassGuardPlugin(BasePlugin):
     # token tells the resume guards that the close is intentional.
     _shared_hide_exit_id = None
     _shared_hide_exit_ts = 0.0
+    # Exit a hidden chat when the app goes to the background. Shared so
+    # every plugin instance sees the setting changed in the UI.
+    _shared_hidden_exit_on_bg = None
+    # Dynamic password: use the phone's current HHMM instead of a stored
+    # code. Shared for the same reason as the other hidden-chat settings.
+    _shared_hidden_dynamic_password = None
 
     def on_plugin_load(self):
         self._unhook = None
@@ -369,6 +385,15 @@ class PassGuardPlugin(BasePlugin):
         self._hidden_code = str(
             self.get_setting("hidden_code", "") or ""
         ).strip()
+        self._hidden_exit_on_bg = bool(
+            self.get_setting("hidden_exit_on_background", True)
+        )
+        self._hidden_dynamic_password = bool(
+            self.get_setting("hidden_dynamic_password", False)
+        )
+        self._dynamic_app_password = bool(
+            self.get_setting("dynamic_app_password", False)
+        )
         self._hidden_ids = self._load_hidden_ids()
         self._publish_hidden_state()
 
@@ -685,6 +710,30 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             self.logger.exception("Could not hook ProfileActivity.onResume")
 
+        try:
+            class_loader = jclass("java.lang.Class")
+            launch_class = class_loader.forName(
+                "org.telegram.ui.LaunchActivity"
+            )
+            for method in launch_class.getDeclaredMethods():
+                if (
+                    method.getName() == "onStop"
+                    and len(method.getParameterTypes()) == 0
+                ):
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    unhook = self.hook_method(
+                        method, AppStopHook(self), priority=10
+                    )
+                    if unhook:
+                        self._hidden_unhooks.append(unhook)
+                        self.logger.info("Hooked LaunchActivity.onStop")
+                    break
+        except Exception:
+            self.logger.exception("Could not hook LaunchActivity.onStop")
+
         # Block navigation before a hidden chat or profile is shown.
         try:
             class_loader = jclass("java.lang.Class")
@@ -953,18 +1002,29 @@ class PassGuardPlugin(BasePlugin):
             # A deliberately wrong "duress" password logs this device out
             # of the current account without touching other sessions.
             # This works independently of the tracking switch.
+            try:
+                entered = str(param.args[0] or "")
+            except Exception:
+                entered = ""
+
             duress_password = self._get_duress_password()
             if (
                 bool(self.get_setting("duress_enabled", False))
                 and duress_password
             ):
-                try:
-                    entered = str(param.args[0] or "")
-                except Exception:
-                    entered = ""
                 if entered and entered == duress_password:
                     self._perform_emergency_logout()
                     return
+
+            # Dynamic app password: accept the phone's current time as an
+            # additional lock-screen passcode. Telegram checks the normal
+            # passcode first, so the old password keeps working.
+            if self._dynamic_app_password_matches(entered):
+                param.setResult(True)
+                self.logger.info(
+                    "Dynamic app password accepted on the lock screen"
+                )
+                return
 
             if not self.get_setting("enabled", True):
                 return
@@ -983,6 +1043,23 @@ class PassGuardPlugin(BasePlugin):
         value = str(self.get_setting("duress_password", "") or "")
         # Legacy builds stored "-" as a visual placeholder.
         return "" if value in ("", "-") else value
+
+    def _dynamic_app_password_matches(self, value):
+        """Check the phone's current HHMM as an extra app passcode."""
+        if not bool(getattr(self, "_dynamic_app_password", False)):
+            return False
+        entered = str(value or "").strip()
+        compact = "".join(
+            char for char in entered if char not in " :"
+        )
+        if not compact or not all(char in "0123456789" for char in compact):
+            return False
+        now = time.time()
+        for offset in (0, -60):
+            tm = time.localtime(now + offset)
+            if compact == "%02d%02d" % (tm.tm_hour, tm.tm_min):
+                return True
+        return False
 
     def _perform_emergency_logout(self):
         try:
@@ -1044,9 +1121,42 @@ class PassGuardPlugin(BasePlugin):
         )
 
     def _hidden_configured(self):
-        return bool(getattr(self, "_hidden_enabled", False)) and bool(
-            getattr(self, "_hidden_code", "")
+        return bool(getattr(self, "_hidden_enabled", False)) and (
+            bool(getattr(self, "_hidden_dynamic_password", False))
+            or bool(str(getattr(self, "_hidden_code", "") or "").strip())
         )
+
+    def _dynamic_hidden_codes(self, now=None):
+        """Return the current and previous minute as HHMM strings."""
+        try:
+            timestamp = time.time() if now is None else float(now)
+            codes = set()
+            for offset in (-60, 0):
+                local = time.localtime(timestamp + offset)
+                codes.add("%02d%02d" % (local.tm_hour, local.tm_min))
+            return codes
+        except Exception:
+            self.logger.exception(
+                "Could not build the dynamic hidden password"
+            )
+            return set()
+
+    def _hidden_query_matches(self, query):
+        """Check a search query against the active hidden-chat password."""
+        query = str(query or "").strip()
+        if not query:
+            return False
+        if bool(getattr(self, "_hidden_dynamic_password", False)):
+            compact = "".join(
+                char for char in query if char not in " :"
+            )
+            return (
+                bool(compact)
+                and all(char in "0123456789" for char in compact)
+                and compact in self._dynamic_hidden_codes()
+            )
+        code = str(getattr(self, "_hidden_code", "") or "").strip()
+        return bool(code) and query == code
 
     def _publish_hidden_state(self):
         """Share hidden-chat state with every plugin instance.
@@ -1063,6 +1173,12 @@ class PassGuardPlugin(BasePlugin):
         )
         PassGuardPlugin._shared_hidden_ids = self._hidden_ids
         PassGuardPlugin._shared_hidden_ts = time.time()
+        PassGuardPlugin._shared_hidden_exit_on_bg = bool(
+            getattr(self, "_hidden_exit_on_bg", True)
+        )
+        PassGuardPlugin._shared_hidden_dynamic_password = bool(
+            getattr(self, "_hidden_dynamic_password", False)
+        )
 
     def _refresh_hidden_state(self):
         try:
@@ -1072,6 +1188,12 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_code = str(
                 self.get_setting("hidden_code", "") or ""
             ).strip()
+            self._hidden_exit_on_bg = bool(
+                self.get_setting("hidden_exit_on_background", True)
+            )
+            self._hidden_dynamic_password = bool(
+                self.get_setting("hidden_dynamic_password", False)
+            )
             self._hidden_ids = self._load_hidden_ids()
             self._publish_hidden_state()
         except Exception:
@@ -1086,6 +1208,16 @@ class PassGuardPlugin(BasePlugin):
         else:
             self._hidden_enabled = PassGuardPlugin._shared_hidden_enabled
             self._hidden_code = PassGuardPlugin._shared_hidden_code
+            shared_exit_on_bg = (
+                PassGuardPlugin._shared_hidden_exit_on_bg
+            )
+            if shared_exit_on_bg is not None:
+                self._hidden_exit_on_bg = bool(shared_exit_on_bg)
+            shared_dynamic = (
+                PassGuardPlugin._shared_hidden_dynamic_password
+            )
+            if shared_dynamic is not None:
+                self._hidden_dynamic_password = bool(shared_dynamic)
             self._hidden_ids = shared_ids
 
         return self._hidden_configured() and bool(self._hidden_ids)
@@ -1950,6 +2082,79 @@ class PassGuardPlugin(BasePlugin):
                 "Failed to close hidden screen %s", dialog_id
             )
 
+    def on_app_stop(self):
+        """Leave a hidden chat when the app goes to the background."""
+        try:
+            if not self._hidden_active():
+                return
+            if not self._hidden_exit_on_bg:
+                return
+            unlock_id, unused_ts = self._current_unlock()
+            open_id = PassGuardPlugin._shared_open_chat_id or unlock_id
+            secret_profile = False
+            try:
+                secret_profile = (
+                    int(open_id) >= 4611686018427387904
+                )
+            except Exception:
+                pass
+
+            if unlock_id is not None:
+                self.logger.info(
+                    "Leaving hidden chat %s on app background", unlock_id
+                )
+            self._clear_unlock_state()
+            self._clear_search_authorization()
+            self._clear_open_chat()
+            self._clear_hide_exit()
+            handler = Handler(Looper.getMainLooper())
+            handler.post(
+                UiRunnable(
+                    lambda: self._close_hidden_background_layer(
+                        secret_profile
+                    )
+                )
+            )
+            handler.postDelayed(
+                UiRunnable(
+                    lambda: self._close_hidden_background_layer(
+                        secret_profile
+                    )
+                ),
+                300,
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to leave hidden chat on app background"
+            )
+
+    def _close_hidden_background_layer(self, secret_profile=False):
+        """Close the visible hidden chat/profile after backgrounding."""
+        try:
+            top = get_last_fragment()
+            if top is None:
+                return
+            name = str(top.getClass().getName())
+            if "DialogsActivity" in name:
+                return
+            dialog_id = self._fragment_dialog_id(top)
+            if "ChatActivity" in name:
+                if dialog_id is not None and dialog_id in self._hidden_ids:
+                    self._finish_hidden_fragment(top, dialog_id)
+                return
+            if "ProfileActivity" in name:
+                if (
+                    dialog_id is not None
+                    and dialog_id in self._hidden_ids
+                ) or secret_profile:
+                    self._finish_hidden_fragment(
+                        top, dialog_id if dialog_id is not None else 0
+                    )
+        except Exception:
+            self.logger.exception(
+                "Failed to close a hidden screen after backgrounding"
+            )
+
     def _close_fragment(self, fragment):
         # Kept for compatibility. Hiding the view left a blank screen when
         # finishFragment() did not work, so only the fragment is finished.
@@ -2474,9 +2679,8 @@ class PassGuardPlugin(BasePlugin):
             results_field, names_field, _recent, _recent_all, query_field = (
                 self._search_adapter_fields()
             )
-            code = str(getattr(self, "_hidden_code", "") or "").strip()
             query = str(query_field.get(adapter) or "").strip()
-            if query == code:
+            if self._hidden_query_matches(query):
                 self._secret_search_ts = time.time()
                 PassGuardPlugin._shared_search_ts = self._secret_search_ts
                 # The exact visible ids are filled by the adapter patch.
@@ -2521,10 +2725,9 @@ class PassGuardPlugin(BasePlugin):
             self._filter_recent_entries(_recent.get(adapter))
             self._filter_recent_entries(_recent_all.get(adapter))
 
-            code = str(getattr(self, "_hidden_code", "") or "").strip()
             query = str(query_field.get(adapter) or "").strip()
 
-            if query == code:
+            if self._hidden_query_matches(query):
                 self._secret_search_ts = time.time()
                 PassGuardPlugin._shared_search_ts = self._secret_search_ts
                 present = set()
@@ -3369,6 +3572,35 @@ class PassGuardPlugin(BasePlugin):
         self._publish_hidden_state()
         self._refresh_hidden_menu()
 
+    def _on_hidden_exit_on_background_change(self, value):
+        self._hidden_exit_on_bg = bool(value)
+        self.set_setting(
+            "hidden_exit_on_background",
+            self._hidden_exit_on_bg,
+            reload_settings=True,
+        )
+        self._publish_hidden_state()
+
+    def _on_hidden_dynamic_password_change(self, value):
+        self._hidden_dynamic_password = bool(value)
+        self.set_setting(
+            "hidden_dynamic_password",
+            self._hidden_dynamic_password,
+            reload_settings=True,
+        )
+        self._publish_hidden_state()
+        self._clear_unlock_state()
+        self._clear_search_authorization()
+        self._refresh_hidden_menu()
+
+    def _on_dynamic_app_password_change(self, value):
+        self._dynamic_app_password = bool(value)
+        self.set_setting(
+            "dynamic_app_password",
+            self._dynamic_app_password,
+            reload_settings=True,
+        )
+
     def _save_new_hidden_code(self, builder, field):
         try:
             code = str(field.getText().toString() or "").strip()
@@ -3379,7 +3611,9 @@ class PassGuardPlugin(BasePlugin):
                 return
 
             self._hidden_code = code
+            self._hidden_dynamic_password = False
             self.set_setting("hidden_code", code, reload_settings=True)
+            self.set_setting("hidden_dynamic_password", False)
             self._publish_hidden_state()
             self._clear_unlock_state()
             self._refresh_hidden_menu()
@@ -3770,8 +4004,18 @@ class PassGuardPlugin(BasePlugin):
 
         hidden_enabled = bool(self.get_setting("hidden_enabled", False))
         hidden_code = str(self.get_setting("hidden_code", "") or "")
+        hidden_dynamic = bool(
+            self.get_setting("hidden_dynamic_password", False)
+        )
+        app_dynamic = bool(
+            self.get_setting("dynamic_app_password", False)
+        )
+        if app_dynamic:
+            app_dynamic_status = "Включено · вход по времени телефона"
+        else:
+            app_dynamic_status = "Выключено"
         hidden_count = len(getattr(self, "_hidden_ids", set()))
-        if hidden_enabled and hidden_code:
+        if hidden_enabled and (hidden_code or hidden_dynamic):
             hidden_status = "Включено · скрыто " + str(hidden_count)
         elif hidden_enabled:
             hidden_status = "Включено, код не задан"
@@ -3791,6 +4035,12 @@ class PassGuardPlugin(BasePlugin):
                 subtext=tracking_status,
                 icon="msg2_secret",
                 create_sub_fragment=self._tracking_settings,
+            ),
+            Text(
+                text="Динамический пароль приложения",
+                subtext=app_dynamic_status,
+                icon="msg2_secret",
+                create_sub_fragment=self._app_dynamic_password_settings,
             ),
             Text(
                 text="Скрытые чаты",
@@ -3940,9 +4190,53 @@ class PassGuardPlugin(BasePlugin):
 
         return items
 
+    def _app_dynamic_password_settings(self):
+        enabled = bool(
+            self.get_setting("dynamic_app_password", False)
+        )
+        items = [
+            Header(text="Динамический пароль приложения"),
+            Switch(
+                key="dynamic_app_password",
+                text="Вход по времени телефона",
+                default=False,
+                subtext=(
+                    "На экране блокировки Telegram принимает текущее "
+                    "время телефона. Например, 09:11 → 0911. "
+                    "Обычный пароль продолжает работать"
+                ),
+                on_change=self._on_dynamic_app_password_change,
+            ),
+        ]
+        if enabled:
+            items.append(
+                Divider(
+                    text=(
+                        "Действует текущая и предыдущая минута. "
+                        "Динамический код дополнительный: обычный пароль "
+                        "приложения не меняется. Вход по времени менее "
+                        "безопасен, чем обычный пароль."
+                    )
+                )
+            )
+        else:
+            items.append(
+                Divider(
+                    text=(
+                        "Сначала включите пароль приложения в настройках "
+                        "Telegram. Динамический код будет работать вместе "
+                        "с обычным паролем."
+                    )
+                )
+            )
+        return items
+
     def _hidden_chats_settings(self):
         enabled = bool(self.get_setting("hidden_enabled", False))
         code = str(self.get_setting("hidden_code", "") or "")
+        dynamic = bool(
+            self.get_setting("hidden_dynamic_password", False)
+        )
         stored = self._load_hidden_ids()
         self._hidden_ids = stored
         count = len(stored)
@@ -3960,19 +4254,59 @@ class PassGuardPlugin(BasePlugin):
 
         if enabled:
             items.append(
-                Text(
-                    text=(
-                        "Изменить пароль" if code else "Задать пароль"
-                    ),
+                Switch(
+                    key="hidden_dynamic_password",
+                    text="Динамический пароль",
+                    default=False,
                     subtext=(
-                        "Пароль скрыт и вводится один раз. "
-                        "Его нельзя посмотреть"
+                        "Пароль — текущее время телефона. "
+                        "Например, 09:11 → 0911. Действует текущая и "
+                        "предыдущая минута"
                     ),
-                    icon="msg_archive_hide",
-                    on_click=self._on_hidden_password_click,
+                    on_change=self._on_hidden_dynamic_password_change,
                 )
             )
-            if code:
+            if not dynamic:
+                items.append(
+                    Text(
+                        text=(
+                            "Изменить пароль" if code else "Задать пароль"
+                        ),
+                        subtext=(
+                            "Пароль скрыт и вводится один раз. "
+                            "Его нельзя посмотреть"
+                        ),
+                        icon="msg_archive_hide",
+                        on_click=self._on_hidden_password_click,
+                    )
+                )
+            items.append(
+                Switch(
+                    key="hidden_exit_on_background",
+                    text="Выходить из скрытых в фоне",
+                    default=True,
+                    subtext=(
+                        "Закрывать скрытый чат, когда приложение уходит "
+                        "в фон. Для повторного входа снова нужен пароль"
+                    ),
+                    on_change=self._on_hidden_exit_on_background_change,
+                )
+            )
+            if dynamic:
+                items.append(
+                    Divider(
+                        text=(
+                            "Скрыто чатов: "
+                            + str(count)
+                            + ". Пароль сейчас — время телефона, например "
+                            "09:11 → 0911. Чтобы скрыть или вернуть чат: "
+                            "профиль → три точки → Плагины → "
+                            "Скрыть/Вернуть. Чтобы найти скрытый чат, "
+                            "наберите текущее время в поиске Telegram."
+                        )
+                    )
+                )
+            elif code:
                 items.append(
                     Divider(
                         text=(
