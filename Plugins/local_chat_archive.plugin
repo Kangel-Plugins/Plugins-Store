@@ -1,6 +1,7 @@
 """Local, offline archive of selected exteraGram cloud chats."""
 
-from contextlib import closing
+from collections.abc import Callable
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -14,7 +15,7 @@ import re
 import shutil
 import sqlite3
 from tempfile import TemporaryFile
-from threading import Thread
+from threading import Lock, Thread
 import time
 import unicodedata
 from urllib.parse import urlsplit
@@ -25,17 +26,25 @@ from base_plugin import AppEvent, BasePlugin, HookResult, MenuItemData, MenuItem
 
 __id__ = "local_chat_archive"
 __name__ = "Локальный архив чатов"
-__description__ = "Архив выбранных чатов с перепиской и вложениями офлайн. Сохранённые копии остаются после удаления в Telegram."
+__description__ = "Автосохранение выбранных чатов и вложений для просмотра офлайн. Сохранённые копии остаются после удаления в Telegram."
 __author__ = "@my_hinodere"
-__version__ = "0.3.3"
+__version__ = "0.4.6"
+__icon__ = "exteraPlugins/1"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.4.3"
 __category__ = ["chats", "tools"]
 
 PAGE = 30
-HISTORY_PAGE = 100
+HISTORY_PAGE = 64
+HISTORY_PAGE_DELAY = 600
 HISTORY_VERSION = 2
+CAPTURE_DELAY = 100
+PENDING_SEND_LIMIT = 64
+MEDIA_LIMIT = 4
+HISTORY_MEDIA_LIMIT = 3
+MEDIA_PROBE_DELAY = 750
+MEDIA_PROBE_WINDOW = 12
 SHARED_PAGE = 36
 SEARCH_PAGE = 25
 SHARED_TABS = (("media", "Медиа"), ("files", "Файлы"), ("links", "Ссылки"), ("voice", "Голосовые"))
@@ -45,7 +54,9 @@ MESSAGE_UPDATES = (
     "TL_updateNewMessage", "TL_updateNewChannelMessage",
     "TL_updateEditMessage", "TL_updateEditChannelMessage",
 )
+SHORT_MESSAGE_UPDATES = ("TL_updateShortMessage", "TL_updateShortChatMessage")
 DELETE_UPDATES = ("TL_updateDeleteMessages", "TL_updateDeleteChannelMessages")
+DELETE_REQUESTS = ("TL_messages_deleteMessages", "TL_channels_deleteMessages")
 READ_UPDATES = ("TL_updateReadHistoryOutbox", "TL_updateReadChannelOutbox")
 
 
@@ -57,6 +68,18 @@ class Asset:
     size: int
     payload: bytes
     file_key: str
+    preview: bytes | None = None
+    cache_variants: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class Transfer:
+    started: float
+    paths: list[Path]
+    urgent: bool
+    cached_variants: tuple[tuple[Path, int], ...] = ()
+    native: bool = False
+    refresh_paths: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -144,7 +167,8 @@ MESSAGE_VIEW = """
     SELECT msg.*, reply.author AS reply_author,
            coalesce(nullif(reply.text, ''), reply.kind, '') AS reply_preview,
            media.key AS media_key, media.name AS media_name, media.mime AS media_mime,
-           media.status AS media_status, media.size AS media_size
+           media.status AS media_status, media.size AS media_size,
+           CASE WHEN media.status<>1 THEN media.preview END AS media_preview
     FROM messages AS msg
     LEFT JOIN messages AS reply ON reply.owner=msg.owner AND reply.dialog=msg.dialog AND reply.id=msg.reply
     LEFT JOIN assets AS media ON media.owner=msg.owner AND media.dialog=msg.dialog AND media.key=msg.asset
@@ -160,16 +184,22 @@ def stamp(value):
     return datetime.fromtimestamp(value).strftime("%d.%m.%Y %H:%M:%S") if value else ""
 
 
+def chat_directory(root, key):
+    owner, dialog = key
+    return Path(root) / str(int(owner)) / str(int(dialog))
+
+
 def asset_path(root, key, row):
     suffix = Path(row["name"]).suffix.lower()
     if not re.fullmatch(r"\.[a-z0-9]{1,12}", suffix):
         suffix = ".bin"
-    return Path(root) / "media" / str(key[0]) / str(key[1]) / (row["key"] + suffix)
+    return chat_directory(Path(root) / "media", key) / (row["key"] + suffix)
 
 
 class Archive:
-    def __init__(self, root):
+    def __init__(self, root, shared_cache=None):
         self.root = Path(root)
+        self.shared_cache = shared_cache
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / "archive.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
@@ -181,6 +211,7 @@ class Archive:
                 active INTEGER NOT NULL DEFAULT 1, cursor INTEGER NOT NULL DEFAULT 0,
                 head INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0,
                 cleared INTEGER NOT NULL DEFAULT 0, peer BLOB, history_version INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(owner, dialog)
             );
             CREATE TABLE IF NOT EXISTS messages (
@@ -206,9 +237,29 @@ class Archive:
                 owner INTEGER, dialog INTEGER, key TEXT, name TEXT NOT NULL, mime TEXT NOT NULL,
                 size INTEGER NOT NULL, payload BLOB NOT NULL, file_key TEXT NOT NULL,
                 status INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
-                retry_after INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner, dialog, key)
+                retry_after INTEGER NOT NULL DEFAULT 0, urgent INTEGER NOT NULL DEFAULT 0,
+                preview BLOB, PRIMARY KEY(owner, dialog, key)
+            );
+            CREATE TABLE IF NOT EXISTS pending_archive_deletions (
+                owner INTEGER, dialog INTEGER, PRIMARY KEY(owner, dialog)
+            );
+            CREATE TABLE IF NOT EXISTS asset_cache_variants (
+                owner INTEGER, dialog INTEGER, asset_key TEXT, file_key TEXT, size INTEGER NOT NULL,
+                PRIMARY KEY(owner, dialog, asset_key, file_key)
             );
             CREATE INDEX IF NOT EXISTS pending_assets ON assets(status, owner, dialog, retry_after);
+            CREATE INDEX IF NOT EXISTS pending_asset_filename ON assets(file_key, owner) WHERE status<>1;
+            CREATE INDEX IF NOT EXISTS variant_filename ON asset_cache_variants(file_key, owner);
+            CREATE VIEW IF NOT EXISTS waiting_media_files AS
+                SELECT a.owner, a.dialog, a.key AS asset_key, a.file_key, a.size
+                FROM assets AS a JOIN chats AS c ON (a.owner, a.dialog)=(c.owner, c.dialog)
+                WHERE a.status<>1 AND c.active=1 AND a.file_key<>''
+                UNION ALL
+                SELECT v.owner, v.dialog, v.asset_key, v.file_key, v.size
+                FROM asset_cache_variants AS v
+                JOIN assets AS a ON (v.owner, v.dialog, v.asset_key)=(a.owner, a.dialog, a.key)
+                JOIN chats AS c ON (v.owner, v.dialog)=(c.owner, c.dialog)
+                WHERE a.status<>1 AND c.active=1;
         """)
         columns = {column["name"] for column in self.db.execute("PRAGMA table_info(messages)")}
         with self.db:
@@ -221,12 +272,25 @@ class Archive:
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
-            if "history_version" not in {row["name"] for row in self.db.execute("PRAGMA table_info(chats)")}:
+            chat_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(chats)")}
+            if "history_version" not in chat_columns:
                 self.db.execute("ALTER TABLE chats ADD COLUMN history_version INTEGER NOT NULL DEFAULT 0")
+            if "hidden" not in chat_columns:
+                self.db.execute("ALTER TABLE chats ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+            asset_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(assets)")}
+            if "urgent" not in asset_columns:
+                self.db.execute("ALTER TABLE assets ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0")
+            if "preview" not in asset_columns:
+                self.db.execute("ALTER TABLE assets ADD COLUMN preview BLOB")
+            self.db.execute("""
+                CREATE INDEX IF NOT EXISTS pending_assets_urgent ON assets(owner, dialog, urgent, retry_after)
+                WHERE status=0
+            """)
         self.db.create_function("archive_fold", 1, normalized, deterministic=True)
         self.db.create_function("archive_has_links", 2, lambda text, entities: bool(message_links(text, entities)),
                                 deterministic=True)
         self.prepare_history()
+        self.refresh_watched_files()
 
     def prepare_history(self):
         with self.db:
@@ -241,12 +305,19 @@ class Archive:
                 WHERE history_version<?
             """, (HISTORY_VERSION, HISTORY_VERSION))
 
-    def restart_history(self, key):
-        with self.db:
-            self.db.execute("UPDATE chats SET cursor=0, complete=0 WHERE owner=? AND dialog=?", key)
-
     def oldest(self, key):
         return self.db.execute("SELECT min(id) FROM messages WHERE owner=? AND dialog=?", key).fetchone()[0]
+
+    def latest_known(self, key):
+        row = self.db.execute("""
+            SELECT max(head, coalesce((SELECT max(id) FROM messages WHERE owner=? AND dialog=?), 0))
+            FROM chats WHERE owner=? AND dialog=?
+        """, (*key, *key)).fetchone()
+        return row[0] if row is not None else 0
+
+    def has_message(self, key, mid):
+        row = self.db.execute("SELECT 1 FROM messages WHERE owner=? AND dialog=? AND id=?", (*key, mid))
+        return row.fetchone() is not None
 
     def close(self):
         self.db.close()
@@ -260,48 +331,121 @@ class Archive:
     def chat(self, key):
         return self.db.execute("SELECT * FROM chats WHERE owner=? AND dialog=?", key).fetchone()
 
-    def archive_index(self, owner):
+    def archive_index(self, owner, *, hidden=False):
         return self.db.execute("""
-            SELECT chat.owner, chat.dialog, chat.title, chat.active, chat.complete,
+            SELECT chat.owner, chat.dialog, chat.title, chat.active, chat.complete, chat.hidden,
                    latest.date, coalesce(nullif(latest.text, ''), latest.kind, '') AS preview
             FROM chats AS chat
             LEFT JOIN messages AS latest ON latest.owner=chat.owner AND latest.dialog=chat.dialog AND latest.id=(
                 SELECT id FROM messages WHERE owner=chat.owner AND dialog=chat.dialog ORDER BY id DESC LIMIT 1
             )
-            WHERE chat.owner=? ORDER BY latest.date DESC, chat.title COLLATE NOCASE, chat.dialog
-        """, (owner,)).fetchall()
+            WHERE chat.owner=? AND chat.hidden=? ORDER BY latest.date DESC, chat.title COLLATE NOCASE, chat.dialog
+        """, (owner, int(hidden))).fetchall()
+
+    def has_hidden_chats(self, owner):
+        return self.db.execute("SELECT 1 FROM chats WHERE owner=? AND hidden=1 LIMIT 1", (owner,)).fetchone() is not None
+
+    def set_chat_hidden(self, key, hidden):
+        value = int(hidden)
+        with self.db:
+            updated = self.db.execute("UPDATE chats SET hidden=? WHERE owner=? AND dialog=? AND hidden<>?",
+                                      (value, *key, value))
+            return updated.rowcount == 1
 
     def enable(self, key, title, channel, peer=None):
+        self.purge_files(key)
         with self.db:
             self.db.execute("""
                 INSERT INTO chats(owner, dialog, title, channel, peer, history_version) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner, dialog) DO UPDATE SET active=1, title=excluded.title,
                     peer=coalesce(excluded.peer, chats.peer)
             """, (*key, title, channel, peer, HISTORY_VERSION))
+        self.refresh_watched_files()
 
     def pause(self, key):
         with self.db:
             self.db.execute("UPDATE chats SET active=0 WHERE owner=? AND dialog=?", key)
+        self.refresh_watched_files()
 
-    def save(self, key, messages, live, cursor=None, head=None, complete=False):
+    def remove_chat(self, key):
+        chat = self.chat(key)
+        if chat is None:
+            return False
+        owner, dialog = key
+        channel = chat["channel"]
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO pending_archive_deletions VALUES (?, ?)", key)
+            self.db.execute("""
+                DELETE FROM deletions WHERE owner=? AND channel=? AND (
+                    id IN (SELECT id FROM messages WHERE owner=? AND dialog=?) OR NOT EXISTS (
+                        SELECT 1 FROM chats WHERE owner=? AND channel=? AND dialog<>?
+                    )
+                )
+            """, (owner, channel, owner, dialog, owner, channel, dialog))
+            for table in ("revisions", "messages", "asset_cache_variants", "assets", "chats"):
+                self.db.execute(f"DELETE FROM {table} WHERE owner=? AND dialog=?", key)
+        self.refresh_watched_files()
+        return True
+
+    def purge_files(self, key):
+        pending = self.db.execute("SELECT 1 FROM pending_archive_deletions WHERE owner=? AND dialog=?", key)
+        if pending.fetchone() is None:
+            return
+        roots = (self.root / "media", self.shared_cache)
+        for root in roots:
+            if root is not None:
+                directory = chat_directory(root, key)
+                try:
+                    shutil.rmtree(directory)
+                except FileNotFoundError:
+                    if directory.exists():
+                        raise
+        with self.db:
+            self.db.execute("DELETE FROM pending_archive_deletions WHERE owner=? AND dialog=?", key)
+
+    def purge_pending_files(self):
+        for row in self.db.execute("SELECT owner, dialog FROM pending_archive_deletions").fetchall():
+            try:
+                self.purge_files((row["owner"], row["dialog"]))
+            except OSError:
+                continue
+
+    def save(self, key, messages, live, cursor=None, head=None, complete=False, *, urgent_media=False):
         chat = self.chat(key)
         if not chat or not chat["active"]:
             return
+        urgent = int(live or urgent_media)
+        watched_files = set()
         with self.db:
             for message in messages:
                 asset = message.asset
                 asset_key = asset.key if asset else None
                 if asset:
                     self.db.execute("""
-                        INSERT INTO assets(owner, dialog, key, name, mime, size, payload, file_key)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO assets(owner, dialog, key, name, mime, size, payload, file_key, urgent, preview)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(owner, dialog, key) DO UPDATE SET name=excluded.name, mime=excluded.mime,
                             size=excluded.size, payload=excluded.payload, file_key=excluded.file_key,
                             status=0, attempts=0, retry_after=0
                         WHERE status<>1
                             AND (assets.payload<>excluded.payload OR assets.file_key<>excluded.file_key
                                  OR assets.size<>excluded.size OR assets.name<>excluded.name OR assets.mime<>excluded.mime)
-                    """, (*key, asset.key, asset.name, asset.mime, asset.size, asset.payload, asset.file_key))
+                    """, (*key, asset.key, asset.name, asset.mime, asset.size, asset.payload, asset.file_key,
+                          urgent, asset.preview))
+                    if urgent or asset.preview is not None:
+                        self.db.execute("""
+                            UPDATE assets SET urgent=max(urgent, :urgent), preview=coalesce(preview, :preview)
+                            WHERE owner=:owner AND dialog=:dialog AND key=:key AND status<>1
+                              AND (urgent<:urgent OR (preview IS NULL AND :preview IS NOT NULL))
+                        """, {"owner": key[0], "dialog": key[1], "key": asset.key,
+                              "urgent": urgent, "preview": asset.preview})
+                    if self.db.execute("""
+                        SELECT 1 FROM assets WHERE owner=? AND dialog=? AND key=? AND status<>1
+                    """, (*key, asset.key)).fetchone():
+                        if asset.file_key:
+                            watched_files.add(asset.file_key)
+                        self.write_cache_variants(key, asset.key, asset.cache_variants)
+                        watched_files.update(name for name, _ in asset.cache_variants)
                 deleted = message.id <= chat["cleared"] or self.db.execute("""
                     SELECT 1 FROM deletions WHERE owner=? AND channel=? AND id=?
                 """, (key[0], chat["channel"], message.id)).fetchone() is not None
@@ -361,6 +505,7 @@ class Archive:
                     UPDATE chats SET cursor=coalesce(?,cursor), head=max(head,coalesce(?,0)),
                         complete=max(complete,?) WHERE owner=? AND dialog=?
                 """, (cursor, head, int(complete), *key))
+        self.watched_files.update(watched_files)
 
     def mark_deleted(self, owner, channel, ids):
         ids = [mid for mid in ids if mid > 0]
@@ -467,6 +612,26 @@ class Archive:
         return self.db.execute("SELECT * FROM assets WHERE owner=? AND dialog=? AND key=?",
                                (*key, asset_key)).fetchone()
 
+    def refresh_watched_files(self):
+        self.watched_files = {row[0] for row in self.db.execute("SELECT DISTINCT file_key FROM waiting_media_files")}
+
+    def write_cache_variants(self, key, asset_key, variants):
+        if variants:
+            self.db.executemany("""
+                INSERT INTO asset_cache_variants VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(owner, dialog, asset_key, file_key) DO UPDATE SET size=excluded.size
+                WHERE size<>excluded.size
+            """, ((*key, asset_key, name, size) for name, size in variants))
+
+    def remember_cache_variants(self, key, asset_key, variants):
+        with self.db:
+            self.write_cache_variants(key, asset_key, variants)
+        self.watched_files.update(name for name, _ in variants)
+
+    def waiting_for_file(self, owner, file_key):
+        return self.db.execute("SELECT * FROM waiting_media_files WHERE owner=? AND file_key=?",
+                               (owner, file_key)).fetchall()
+
     def stats(self, key):
         messages = self.db.execute("SELECT count(*), coalesce(sum(deleted),0) FROM messages WHERE owner=? AND dialog=?", key)
         assets = self.db.execute("""
@@ -475,11 +640,12 @@ class Archive:
         """, key)
         return tuple(messages.fetchone()) + tuple(assets.fetchone())
 
-    def pending_assets(self, owner, dialog):
+    def pending_assets(self, owner, dialog, urgent=None):
+        condition = "AND urgent=?" if urgent is not None else ""
+        args = (owner, dialog, int(time.time()))
         return self.db.execute("""
             SELECT * FROM assets WHERE owner=? AND dialog=? AND status=0 AND retry_after<=?
-            ORDER BY rowid DESC LIMIT 24
-        """, (owner, dialog, int(time.time()))).fetchall()
+        """ + condition + " ORDER BY rowid LIMIT 24", args + ((int(urgent),) if urgent is not None else ())).fetchall()
 
     def asset_status(self, key, asset_key, status, attempts, retry_after=0):
         with self.db:
@@ -497,40 +663,70 @@ class Archive:
     def copy_asset(self, key, asset_key, source):
         return self.publish_asset(key, asset_key, source)
 
-    def publish_asset(self, key, asset_key, source=None, content=None):
+    def publish_asset(self, key, asset_key, source=None, content=None, *, stream=None, expected_size=None):
         row = self.asset(key, asset_key)
         if not row:
             return False
         target = asset_path(self.root, key, row)
+        required = row["size"] if expected_size is None else expected_size
 
-        def complete(path):
-            info = path.stat() if path.is_file() else None
-            if info is None or info.st_size <= 0:
-                return False
-            if row["size"] <= 0 or row["mime"] in DECOMPRESSED_MIME_TYPES:
-                return True
-            return info.st_size == row["size"]
+        def complete_size(size):
+            return size > 0 and (size == required or required <= 0 or row["mime"] in DECOMPRESSED_MIME_TYPES)
 
-        if not complete(target):
-            if content is None and (source is None or not complete(source)):
-                return False
-            target.parent.mkdir(parents=True, exist_ok=True)
-            partial = target.with_suffix(".part")
-            try:
-                with partial.open("wb") as dst:
-                    if content is None:
-                        with source.open("rb") as src:
-                            shutil.copyfileobj(src, dst, 1024 * 1024)
-                    else:
-                        dst.write(content)
-                    dst.flush()
-                    os.fsync(dst.fileno())
-                if not complete(partial):
+        saved_size = target.stat().st_size if target.is_file() else 0
+        if row["status"] == 1 and saved_size > 0 and saved_size == row["size"]:
+            return True
+        complete_target = complete_size(saved_size)
+        if saved_size > 0 and not complete_target:
+            complete_target = self.db.execute("""
+                SELECT 1 FROM asset_cache_variants WHERE owner=? AND dialog=? AND asset_key=? AND size=?
+            """, (*key, asset_key, saved_size)).fetchone() is not None
+        if not complete_target:
+            if content is not None:
+                if not complete_size(len(content)):
                     return False
-                partial.replace(target)
-            finally:
-                partial.unlink(missing_ok=True)
-        self.asset_status(key, asset_key, 1, row["attempts"])
+                reader = nullcontext()
+            elif stream is not None:
+                reader = nullcontext(stream)
+            elif source is not None and source.is_file():
+                try:
+                    reader = source.open("rb")
+                except FileNotFoundError:
+                    return False
+            else:
+                return False
+            with reader as src:
+                if src is not None:
+                    if not complete_size(os.fstat(src.fileno()).st_size):
+                        return False
+                    src.seek(0)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                partial = target.with_suffix(".part")
+                try:
+                    with partial.open("wb") as dst:
+                        if src is not None:
+                            shutil.copyfileobj(src, dst, 1024 * 1024)
+                        else:
+                            dst.write(content)
+                        if not complete_size(dst.tell()):
+                            return False
+                        saved_size = dst.tell()
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                    partial.replace(target)
+                finally:
+                    partial.unlink(missing_ok=True)
+        with self.db:
+            self.db.execute("""
+                UPDATE assets SET status=1, size=?, retry_after=0 WHERE owner=? AND dialog=? AND key=?
+            """, (saved_size, *key, asset_key))
+        variants = self.db.execute("""
+            SELECT file_key FROM asset_cache_variants WHERE owner=? AND dialog=? AND asset_key=?
+        """, (*key, asset_key))
+        for name in {row["file_key"], *(variant[0] for variant in variants)}:
+            still_waiting = self.db.execute("SELECT 1 FROM waiting_media_files WHERE file_key=? LIMIT 1", (name,))
+            if still_waiting.fetchone() is None:
+                self.watched_files.discard(name)
         return True
 
 
@@ -758,6 +954,15 @@ def displayed_size(size):
 
 def clock_text(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def chat_text_size():
+    try:
+        from org.telegram.messenger import SharedConfig
+
+        return max(13, min(28, number(SharedConfig.fontSize)))
+    except (AttributeError, ImportError, TypeError):
+        return 16
 
 
 def apply_entities(view, text, raw, color):
@@ -1160,13 +1365,15 @@ class ArchiveScreen:
 
     def render_chat(self, row):
         from android.widget import LinearLayout
+        from android_utils import OnLongClickListener
 
+        key = (row["owner"], row["dialog"])
         line = LinearLayout(self.activity)
         line.setOrientation(LinearLayout.HORIZONTAL)
         line.setGravity(16)
         line.setMinimumHeight(self.dp(72))
         line.setPadding(self.dp(14), self.dp(9), self.dp(16), self.dp(9))
-        avatar = avatar_view(self, (row["owner"], row["dialog"]), row["title"], 48)
+        avatar = avatar_view(self, key, row["title"], 48)
         line.addView(avatar, self.params(48, 48))
 
         body = self.column()
@@ -1190,7 +1397,18 @@ class ArchiveScreen:
         self.ellipsize(snippet, 2)
         body.addView(snippet, self.params(-1, -2))
         line.addView(body, LinearLayout.LayoutParams(0, -2, 1.0))
-        self.click(line, lambda: self.plugin.open_conversation((row["owner"], row["dialog"]), self))
+        self.click(line, lambda: self.plugin.open_conversation(key, self))
+
+        def hold(view):
+            hide = not row["hidden"]
+            title = "Скрыть чат" if hide else "Вернуть в список"
+            self.popup(view, [
+                (title, lambda: self.plugin.set_chat_hidden(key, hide, self.activity)),
+                ("Удалить архив чата", lambda: self.plugin.confirm_delete(key, row["title"], self.activity)),
+            ])
+            return True
+
+        line.setOnLongClickListener(OnLongClickListener(hold))
         return line
 
 
@@ -1267,8 +1485,8 @@ class ConversationScreen(ArchiveScreen):
             original = None
             if hasattr(self.chat_theme, "getWallpaperDrawable"):
                 original = self.chat_theme.getWallpaperDrawable()
-            if original is None:
-                original = self.theme.getCachedWallpaper()
+            if original is None and hasattr(self.theme, "getCachedWallpaperNonBlocking"):
+                original = self.theme.getCachedWallpaperNonBlocking()
             state = original.getConstantState() if original is not None else None
             if state is not None:
                 wallpaper = state.newDrawable(self.activity.getResources()).mutate()
@@ -1322,6 +1540,7 @@ class ConversationScreen(ArchiveScreen):
             ("К началу переписки", self.jump_start),
             ("Открыть оригинальный чат", self.open_live),
             ("Сохранение и экспорт", lambda: self.plugin.open_archive(self.key)),
+            ("Удалить архив чата", lambda: self.plugin.confirm_delete(self.key, self.title, self.activity)),
         ])
 
     def open_search(self):
@@ -1352,8 +1571,9 @@ class ConversationScreen(ArchiveScreen):
                 self.plugin.ui(self.window.dismiss)
                 return
             rows, before = self.plugin.db.conversation(self.key, None)
-            status = self.plugin.archive_status(self.key, chat)
+            status = self.plugin.archive_status(self.key, chat) if not rows else ""
             self.plugin.ui(lambda: self.show_latest(rows, before, status))
+            self.plugin.reuse_visible_media(self.key, rows)
 
         self.plugin.queue(read)
 
@@ -1410,6 +1630,7 @@ class ConversationScreen(ArchiveScreen):
         def read():
             rows, before = self.plugin.db.conversation(self.key, cursor)
             self.plugin.ui(lambda: self.add_page(rows, before, older=True))
+            self.plugin.reuse_visible_media(self.key, rows)
 
         self.plugin.queue(read)
 
@@ -1422,6 +1643,7 @@ class ConversationScreen(ArchiveScreen):
         def read():
             rows, after = self.plugin.db.conversation_newer(self.key, cursor)
             self.plugin.ui(lambda: self.add_page(rows, after, older=False))
+            self.plugin.reuse_visible_media(self.key, rows)
 
         self.plugin.queue(read)
 
@@ -1487,7 +1709,10 @@ class ConversationScreen(ArchiveScreen):
         if kind == "date":
             return self.service_chip(row[1])
         if row["kind"] == "Служебное сообщение":
-            return self.service_chip(row["text"] or row["kind"])
+            text = row["text"] or row["kind"]
+            if row["deleted"]:
+                text += "\nУдалено в Telegram"
+            return self.service_chip(text)
         return self.render_message(row)
 
     def service_chip(self, value):
@@ -1577,14 +1802,8 @@ class ConversationScreen(ArchiveScreen):
         inner = maximum - self.dp(left + right)
         wrap = self.params(-2, -2)
 
-        try:
-            from org.telegram.messenger import SharedConfig
-
-            text_size = max(13, min(28, number(SharedConfig.fontSize)))
-        except (AttributeError, ImportError, TypeError):
-            text_size = 16
         content = row["text"] or (row["kind"] if row["media_key"] is None else "")
-        content_view = self.label(content, text_size, text_color)
+        content_view = self.label(content, chat_text_size(), text_color)
         apply_entities(content_view, content, row["entities"], reply_color)
         self.click(content_view, lambda: self.message_menu(row, content_view))
         details = []
@@ -1764,7 +1983,7 @@ class ConversationScreen(ArchiveScreen):
         if row["reply"]:
             items.append(("К сообщению, на которое ответили", lambda: self.jump_to(row["reply"])))
         if row["edited"]:
-            items.append(("История изменений", lambda: self.plugin.show_message_versions(self.key, row)))
+            items.append(("История изменений", lambda: self.plugin.show_message_versions(self, row)))
         if not row["deleted"]:
             items.append(("Ответить в оригинальном чате",
                           lambda: self.plugin.open_live_chat(self.key, row["id"], reply=True)))
@@ -1788,7 +2007,7 @@ class ConversationScreen(ArchiveScreen):
     def open_media(self, row, share=False):
         source, asset = self.asset_info(row)
         if not source or row["media_status"] != 1 or not source.is_file():
-            self.plugin.screen_notice(self.activity, "Вложение ещё не сохранено.")
+            self.plugin.screen_notice(self.activity, self.pending_media_label(row))
             return
         if share:
             self.plugin.open_asset(source, asset, share=True)
@@ -1801,6 +2020,13 @@ class ConversationScreen(ArchiveScreen):
         else:
             self.plugin.open_asset(source, asset)
 
+    @staticmethod
+    def pending_media_label(row):
+        pending = row["media_status"] == 0
+        if row["media_preview"]:
+            return "Превью · загружается" if pending and not row["deleted"] else "Сохранено превью"
+        return "Загружается" if pending else "Вложение недоступно"
+
     def add_media(self, bubble, row, color, secondary, width):
         from android.widget import FrameLayout, ImageView, LinearLayout
 
@@ -1808,6 +2034,7 @@ class ConversationScreen(ArchiveScreen):
         available = row["media_status"] == 1 and source.is_file()
         visual = asset["mime"].startswith(("image/", "video/"))
         if visual:
+            preview = row["media_preview"]
             round_video = row["media_type"] == "round"
             media_width = min(width, self.dp(212 if round_video else 280))
             ratio = row["height"] / row["width"] if row["width"] and row["height"] else .74
@@ -1818,19 +2045,22 @@ class ConversationScreen(ArchiveScreen):
             image = ImageView(self.activity)
             image.setScaleType(ImageView.ScaleType.CENTER_CROP)
             frame.addView(image, FrameLayout.LayoutParams(-1, -1))
-            overlay = "▶" if available and asset["mime"].startswith("video/") else (
-                "Загружается" if row["media_status"] == 0 else "Недоступно" if not available else ""
-            )
+            overlay = "▶" if asset["mime"].startswith("video/") else ""
+            if not available:
+                overlay = self.pending_media_label(row)
             if overlay:
                 badge = self.label(overlay, 16 if available else 12, -1, bold=True)
                 badge.setGravity(17)
                 badge.setPadding(self.dp(11), self.dp(6), self.dp(11), self.dp(6))
                 badge.setBackground(self.rounded(-14737377, 16))
-                frame.addView(badge, FrameLayout.LayoutParams(-2, -2, 17))
+                where = FrameLayout.LayoutParams(-2, -2, 85 if preview else 17)
+                if preview:
+                    where.setMargins(0, 0, self.dp(7), self.dp(7))
+                frame.addView(badge, where)
             frame.setContentDescription("Открыть вложение" if available else overlay)
             self.click(frame, lambda: self.open_media(row))
-            if available:
-                self.load_thumbnail(image, source, asset["mime"])
+            if available or preview:
+                self.load_thumbnail(image, source, asset["mime"], preview=preview)
             bubble.addView(frame, LinearLayout.LayoutParams(media_width, height))
             return media_width
         is_audio = asset["mime"].startswith("audio/") or row["media_type"] in ("voice", "audio")
@@ -1890,30 +2120,36 @@ class ConversationScreen(ArchiveScreen):
         finally:
             reader.release()
 
-    def load_thumbnail(self, image, source, mime):
-        cached = self.thumbnails.get(source)
+    def load_thumbnail(self, image, source, mime, *, preview=None):
+        cache_key = (source, bool(preview))
+        cached = self.thumbnails.get(cache_key)
         if cached is not None:
             image.setImageBitmap(cached)
             return
-        if source in self.thumbnail_waiters:
-            self.thumbnail_waiters[source].append(image)
+        if cache_key in self.thumbnail_waiters:
+            self.thumbnail_waiters[cache_key].append(image)
             return
-        self.thumbnail_waiters[source] = [image]
+        self.thumbnail_waiters[cache_key] = [image]
 
         def read():
             try:
-                decode = self.decode_video_thumbnail if mime.startswith("video/") else self.decode_image
-                bitmap = decode(source, 420)
+                if preview:
+                    from org.telegram.messenger import ImageLoader
+
+                    bitmap = ImageLoader.getStrippedPhotoBitmap(preview, None)
+                else:
+                    decode = self.decode_video_thumbnail if mime.startswith("video/") else self.decode_image
+                    bitmap = decode(source, 420)
             except Exception:
                 bitmap = None
 
             def show():
-                waiters = self.thumbnail_waiters.pop(source, ())
+                waiters = self.thumbnail_waiters.pop(cache_key, ())
                 if not self.showing() or bitmap is None:
                     return
                 if len(self.thumbnails) >= 28:
                     self.thumbnails.pop(next(iter(self.thumbnails)))
-                self.thumbnails[source] = bitmap
+                self.thumbnails[cache_key] = bitmap
                 for target in waiters:
                     target.setImageBitmap(bitmap)
 
@@ -2170,6 +2406,7 @@ class ArchiveSharedScreen(ArchiveScreen):
                     self.empty_state(names[tab])
 
             self.plugin.ui(show)
+            self.plugin.reuse_visible_media(self.conversation.key, rows)
 
         self.plugin.queue(read)
 
@@ -2226,18 +2463,19 @@ class ArchiveSharedScreen(ArchiveScreen):
         for row in rows:
             source, asset = self.conversation.asset_info(row)
             available = row["media_status"] == 1 and source.is_file()
+            preview = row["media_preview"]
             tile = FrameLayout(self.activity)
             tile.setBackgroundColor(self.theme.getColor(self.theme.key_windowBackgroundGray))
             tile.setPadding(self.dp(1), self.dp(1), self.dp(1), self.dp(1))
             image = ImageView(self.activity)
             image.setScaleType(ImageView.ScaleType.CENTER_CROP)
             tile.addView(image, FrameLayout.LayoutParams(-1, -1))
-            if available:
-                self.conversation.load_thumbnail(image, source, asset["mime"])
+            if available or preview:
+                self.conversation.load_thumbnail(image, source, asset["mime"], preview=preview)
             video = asset["mime"].startswith("video/")
             if video or not available:
                 info = ("▶ " + clock_text(row["duration"]) if available and row["duration"] else "▶") if available else (
-                    "Загружается" if row["media_status"] == 0 else "Недоступно")
+                    "Превью" if preview else "Загружается" if row["media_status"] == 0 else "Недоступно")
                 badge = self.label(info, 11, -1, bold=True)
                 badge.setPadding(self.dp(6), self.dp(3), self.dp(6), self.dp(3))
                 badge.setBackground(self.rounded(-14737377, 8))
@@ -2310,8 +2548,12 @@ class LocalChatArchive(BasePlugin):
         self.run = run_on_queue
         self.context = ApplicationLoader.applicationContext
         self.root = Path(str(self.context.getNoBackupFilesDir().getAbsolutePath())) / __id__
-        self.enabled_chats = frozenset()
+        self.shared_cache = Path(str(self.context.getFilesDir().getAbsolutePath())) / "cache" / __id__
+        self.enabled_chats = {}
         self.archived_owners = frozenset()
+        self.capture_lock = Lock()
+        self.pending_captures = {}
+        self.pending_sends = {}
         self.syncs = {}
         self.sync_due = {}
         self.sync_status = {}
@@ -2320,8 +2562,9 @@ class LocalChatArchive(BasePlugin):
         self.screen_refresh_pending = False
         self.stop_playback = None
         self.transfers = {}
+        self.media_probe_pending = False
         self.export_choice = None
-        self.exporting = False
+        self.exporting = None
         self.media_wake = False
         self.listener = None
         self.centers = []
@@ -2336,16 +2579,8 @@ class LocalChatArchive(BasePlugin):
             menu_type=MenuItemType.DRAWER_MENU, text="Архив чатов",
             on_click=lambda ctx: self.ui(self.open_list), icon="msg_archive",
         ))
-        for name in (*MESSAGE_UPDATES, *DELETE_UPDATES, *READ_UPDATES):
+        for name in (*MESSAGE_UPDATES, *SHORT_MESSAGE_UPDATES, *DELETE_UPDATES, *DELETE_REQUESTS, *READ_UPDATES):
             self.add_hook(name)
-        try:
-            controller = find_class("org.telegram.messenger.BaseController")
-            self.account_field = controller.getDeclaredField("currentAccount")
-            self.account_field.setAccessible(True)
-            storage = find_class("org.telegram.messenger.MessagesStorage")
-            self.hook_all_methods(storage, "putMessages", before=self.before_storage)
-        except Exception:
-            self.logger.exception("Could not register archive message capture")
         try:
             activity = find_class("org.telegram.ui.LaunchActivity")
             self.export_ready = bool(self.hook_all_methods(activity, "onActivityResult", after=self.after_picker))
@@ -2382,8 +2617,25 @@ class LocalChatArchive(BasePlugin):
         elif event_type == AppEvent.PAUSE and getattr(self, "stop_playback", None) is not None:
             self.ui(self.stop_playback)
 
+    def pre_request_hook(self, request_name, account, request):
+        if request_name in DELETE_REQUESTS and getattr(self, "active", False) and self.archived_owners:
+            try:
+                owner = self.owner(number(account))
+                if owner in self.archived_owners:
+                    channel = 0
+                    if request_name == "TL_channels_deleteMessages":
+                        channel = number(getattr(getattr(request, "channel", None), "channel_id", 0))
+                        if channel <= 0:
+                            return HookResult()
+                    self.queue_deletion(owner, channel, request.id)
+            except Exception:
+                self.logger.exception("Could not record the local Telegram delete action")
+        return HookResult()
+
     def on_update_hook(self, update_name, account, update):
-        if getattr(self, "active", False) and update_name in (*MESSAGE_UPDATES, *DELETE_UPDATES, *READ_UPDATES):
+        if update_name in SHORT_MESSAGE_UPDATES:
+            return self.on_updates_hook(update_name, account, update)
+        if getattr(self, "active", False) and self.archived_owners:
             try:
                 account = number(account)
                 owner = self.owner(account)
@@ -2392,15 +2644,16 @@ class LocalChatArchive(BasePlugin):
                         self.capture(account, owner, (update.message,))
                     elif update_name in DELETE_UPDATES:
                         channel = number(getattr(update, "channel_id", 0))
-                        ids = [number(value) for value in java_items(update.messages)]
-                        self.queue(lambda: self.record_deletion(owner, channel, ids))
-                    else:
+                        self.queue_deletion(owner, channel, update.messages)
+                    elif update_name in READ_UPDATES and self.enabled_chats:
                         from org.telegram.messenger import MessageObject
 
                         if update_name == "TL_updateReadChannelOutbox":
                             dialog = -number(update.channel_id)
                         else:
                             dialog = number(MessageObject.getPeerId(update.peer))
+                        if (owner, dialog) not in self.enabled_chats:
+                            return HookResult()
                         through = number(update.max_id)
 
                         def mark_read():
@@ -2410,6 +2663,20 @@ class LocalChatArchive(BasePlugin):
                         self.queue(mark_read)
             except Exception:
                 self.logger.exception("Could not archive a Telegram update")
+        return HookResult()
+
+    def on_updates_hook(self, container_name, account, updates):
+        if (container_name in SHORT_MESSAGE_UPDATES and getattr(self, "active", False)
+                and self.enabled_chats and updates is not None):
+            try:
+                account = number(account)
+                owner = self.owner(account)
+                dialog = (-number(updates.chat_id) if container_name == "TL_updateShortChatMessage"
+                          else number(updates.user_id))
+                if dialog:
+                    self.capture(account, owner, (updates,), dialog=dialog, compact=True)
+            except Exception:
+                self.logger.exception("Could not archive a compact Telegram message")
         return HookResult()
 
     def create_settings(self):
@@ -2429,7 +2696,7 @@ class LocalChatArchive(BasePlugin):
                 return
             try:
                 if self.db is None:
-                    self.db = Archive(self.root)
+                    self.db = Archive(self.root, self.shared_cache)
                     self.reload_selection()
                 task()
             except Exception:
@@ -2440,7 +2707,9 @@ class LocalChatArchive(BasePlugin):
 
     def reload_selection(self):
         rows = self.db.db.execute("SELECT owner, dialog, active FROM chats").fetchall()
-        self.enabled_chats = frozenset((row["owner"], row["dialog"]) for row in rows if row["active"])
+        previous = getattr(self, "enabled_chats", {})
+        selected = ((row["owner"], row["dialog"]) for row in rows if row["active"])
+        self.enabled_chats = {key: previous[key] if key in previous else object() for key in selected}
         self.archived_owners = frozenset(row["owner"] for row in rows)
 
     def active_accounts(self):
@@ -2768,65 +3037,122 @@ class LocalChatArchive(BasePlugin):
         return bool(getattr(info, "noforwards_peer_enabled", False) or
                     getattr(info, "noforwards_my_enabled", False))
 
-    def before_storage(self, param):
-        if not self.active or not self.enabled_chats:
+    def capture(self, account, owner, messages, *, dialog=None, compact=False, confirmed_id=None):
+        selected = self.enabled_chats
+        if not selected:
             return
-        args = param.args
-        if len(args) not in (7, 8) or args[0] is None:
+        known_key = (owner, dialog) if dialog else None
+        if known_key is not None and known_key not in selected:
             return
-        if number(args[-2]) != 0:
-            return
-        try:
-            account = self.account_field.getInt(param.thisObject)
-            owner = self.owner(account)
-            if not any(key[0] == owner for key in self.enabled_chats):
-                return
-            collection = args[0]
-            if hasattr(collection, "messages"):
-                dialog = number(args[1])
-                if (owner, dialog) not in self.enabled_chats:
-                    return
-                collection = collection.messages
-            self.capture(account, owner, java_items(collection))
-        except Exception:
-            self.logger.exception("Could not capture a Telegram storage batch")
+        if known_key is None:
+            from org.telegram.messenger import MessageObject
 
-    def capture(self, account, owner, messages):
-        from org.telegram.messenger import MessageObject
-
-        batches = {}
+        selected_messages = []
+        drafts = []
         for original in messages:
-            if original is None or original.id <= 0:
+            mid = number(getattr(original, "id", 0))
+            draft = (mid < 0 and confirmed_id is None and known_key is not None and not compact
+                     and java_boolean(getattr(original, "out", False)))
+            if mid <= 0 and not draft and confirmed_id is None:
                 continue
-            dialog = int(MessageObject.getDialogId(original))
-            key = (owner, dialog)
-            if key not in self.enabled_chats:
+            if known_key is not None and not compact:
+                cached_dialog = number(getattr(original, "dialog_id", 0))
+                if cached_dialog and cached_dialog != dialog:
+                    continue
+            key = known_key or (owner, number(MessageObject.getDialogId(original)))
+            session = selected.get(key)
+            if session is not None:
+                if draft:
+                    drafts.append(((account, key, session, mid), original))
+                else:
+                    selected_messages.append((key, session, original))
+        if not selected_messages and not drafts:
+            return
+        with self.capture_lock:
+            if drafts:
+                self.pending_sends.update(drafts)
+                while len(self.pending_sends) > PENDING_SEND_LIMIT:
+                    self.pending_sends.pop(next(iter(self.pending_sends)))
+            schedule = bool(selected_messages) and not self.pending_captures
+            for key, session, original in selected_messages:
+                batch = self.pending_captures.setdefault((account, key, session), {})
+                batch[(id(original), confirmed_id)] = (original, compact, confirmed_id)
+        if schedule:
+            self.queue(self.flush_captures, delay=CAPTURE_DELAY)
+
+    def flush_captures(self):
+        with self.capture_lock:
+            batches, self.pending_captures = self.pending_captures, {}
+        if not batches:
+            return
+        attachments = False
+        changed = False
+        for (account, key, session), originals in batches.items():
+            if (self.enabled_chats.get(key) is not session or self.owner(account) != key[0]
+                    or self.is_protected(account, key[1])):
                 continue
-            try:
-                row = self.snapshot(account, owner, original)
-                if row is not None:
-                    batches.setdefault(key, []).append(row)
-            except Exception:
-                self.logger.exception("Could not archive a message snapshot")
-        if batches:
-            def persist():
-                for key, rows in batches.items():
-                    self.db.save(key, rows, live=True)
-                self.wake_media()
-                self.refresh_screens()
+            full_ids = {number(raw.id) for raw, compact, confirmed_id in originals.values()
+                        if not compact and confirmed_id is None and not getattr(raw, "edit_date", 0)}
+            rows = []
+            for original, compact, confirmed_id in originals.values():
+                try:
+                    if compact:
+                        if number(original.id) in full_ids:
+                            continue
+                        original = self.expand_compact_message(key, original)
+                    if confirmed_id is None:
+                        row = self.snapshot(account, key[0], original)
+                    elif confirmed_id in full_ids or self.db.has_message(key, confirmed_id):
+                        continue
+                    else:
+                        row = self.snapshot(account, key[0], original, confirmed_id=confirmed_id)
+                    if row is not None:
+                        rows.append(row)
+                except Exception:
+                    self.logger.exception("Could not archive a message snapshot")
+            if rows:
+                self.db.save(key, rows, live=True)
+                changed = True
+                attachments = attachments or any(row.asset is not None for row in rows)
+        if attachments:
+            self.wake_media()
+        if changed:
+            self.refresh_screens()
 
-            self.queue(persist)
+    @staticmethod
+    def expand_compact_message(key, update):
+        from org.telegram.tgnet import TLRPC
 
-    def snapshot(self, account, owner, original, names=None):
+        owner, dialog = key
+        message = TLRPC.TL_message()
+        message.id = number(update.id)
+        message.dialog_id = dialog
+        message.date = number(update.date)
+        message.out = java_boolean(update.out) or dialog == owner
+        message.from_id = TLRPC.TL_peerUser()
+        if dialog < 0:
+            message.from_id.user_id = number(update.from_id)
+        else:
+            message.from_id.user_id = owner if message.out else dialog
+        message.message = update.message
+        message.fwd_from = getattr(update, "fwd_from", None)
+        message.reply_to = getattr(update, "reply_to", None)
+        message.entities = getattr(update, "entities", None)
+        message.ttl_period = number(getattr(update, "ttl_period", 0))
+        message.action = None
+        message.media = None
+        return message
+
+    def snapshot(self, account, owner, original, names=None, *, confirmed_id=None):
         from org.telegram.messenger import MessageObject
         from org.telegram.tgnet import TLRPC
 
-        if original.id <= 0 or isinstance(original, TLRPC.TL_messageEmpty):
+        mid = number(original.id) if confirmed_id is None else confirmed_id
+        if mid <= 0 or isinstance(original, TLRPC.TL_messageEmpty):
             return None
         media = original.media
         if (getattr(original, "noforwards", False) or getattr(original, "ttl_period", 0) or
-                getattr(original, "ttl", 0) or getattr(media, "ttl_seconds", 0) or
-                self.is_protected(account, int(MessageObject.getDialogId(original)))):
+                getattr(original, "ttl", 0) or getattr(media, "ttl_seconds", 0)):
             return None
         author_id = int(MessageObject.getPeerId(original.from_id)) if original.from_id is not None else 0
         author_id = author_id or (owner if original.out else int(MessageObject.getDialogId(original)))
@@ -2905,7 +3231,7 @@ class LocalChatArchive(BasePlugin):
                 dialog_id = number(MessageObject.getDialogId(original))
                 cached = MessagesController.getInstance(account).dialogs_read_outbox_max.get(jlong(dialog_id))
                 if cached is not None:
-                    is_read = number(original.id) <= number(cached)
+                    is_read = mid <= number(cached)
             except Exception:
                 self.logger.debug("Could not read the current outgoing message status")
         reactions = []
@@ -2913,7 +3239,7 @@ class LocalChatArchive(BasePlugin):
             emoji = str(getattr(getattr(item, "reaction", None), "emoticon", None) or "")
             if emoji:
                 reactions.append(f"{emoji} {item.count}")
-        return Message(number(original.id), number(original.date), number(getattr(original, "edit_date", 0)), author, text,
+        return Message(mid, number(original.date), number(getattr(original, "edit_date", 0)), author, text,
                        reply_id, json.dumps(entities, ensure_ascii=False), number(getattr(original, "grouped_id", 0)),
                        kind, asset, outgoing, media_type, duration, width, height, quote, forwarded, is_read,
                        java_boolean(getattr(original, "pinned", False)), "   ".join(reactions))
@@ -2998,7 +3324,74 @@ class LocalChatArchive(BasePlugin):
             identity = f"document/{attachment.id}/{attachment.dc_id}"
         archive_key = sha256(identity.encode()).hexdigest()[:32]
         size = len(attachment.bytes) if photo is not None and attachment.bytes is not None else int(attachment.size)
-        return Asset(archive_key, name, mime, max(0, size), serialize(original), file_key)
+        preview = None
+        if mime.startswith(("image/", "video/")):
+            try:
+                preview = self.embedded_media_preview(attachment, photo)
+            except Exception:
+                self.logger.debug("Could not read an embedded Telegram thumbnail", exc_info=True)
+        variants = tuple((name, length) for _, name, length in self.cache_variants(original, attachment, photo, file_key))
+        return Asset(archive_key, name, mime, max(0, size), serialize(original), file_key, preview, variants)
+
+    def cache_variants(self, original, attachment, photo, primary_key):
+        if photo is not None:
+            return self.photo_cache_variants(photo, primary_key)
+        mime = str(getattr(attachment, "mime_type", ""))
+        if not mime.startswith("video/"):
+            return ()
+
+        from org.telegram.messenger import FileLoader
+
+        media = getattr(original, "media", None)
+        variants = {}
+        for document in java_items(getattr(media, "alt_documents", None)):
+            size = number(getattr(document, "size", 0))
+            if size <= 0 or str(getattr(document, "mime_type", "")) != mime:
+                continue
+            name = str(FileLoader.getAttachFileName(document) or "")
+            if name and name != primary_key:
+                variants.setdefault(name, (document, name, size))
+        return tuple(variants.values())
+
+    @staticmethod
+    def photo_cache_variants(photo, primary_key):
+        if photo is None:
+            return ()
+        try:
+            from org.telegram.messenger import AndroidUtilities, FileLoader
+
+            limits = [AndroidUtilities.getPhotoSize()]
+            try:
+                limits.insert(0, AndroidUtilities.getPhotoSize(True))
+            except (AttributeError, TypeError):
+                pass
+        except (ImportError, AttributeError, TypeError):
+            return ()
+        variants = {}
+        try:
+            for limit in dict.fromkeys(limits):
+                part = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, limit, False, None, True)
+                if part is None or part.location is None or str(part.type) in ("s", "i", "j") or part.size <= 0:
+                    continue
+                name = str(FileLoader.getAttachFileName(part) or "")
+                if name and name != primary_key:
+                    variants.setdefault(name, (part, name, int(part.size)))
+        except (AttributeError, TypeError):
+            pass
+        return tuple(variants.values())
+
+    @staticmethod
+    def embedded_media_preview(attachment, photo):
+        from org.telegram.tgnet import TLRPC
+
+        sizes = photo.sizes if photo is not None else getattr(attachment, "thumbs", None)
+        stripped = getattr(TLRPC, "TL_photoStrippedSize", ())
+        for size in java_items(sizes):
+            if isinstance(size, stripped) and size.bytes is not None and 3 < len(size.bytes) <= 4096:
+                data = bytes(size.bytes)
+                if data[0] == 1 and data[1] and data[2]:
+                    return data
+        return None
 
     @staticmethod
     def events(notifications):
@@ -3034,24 +3427,41 @@ class LocalChatArchive(BasePlugin):
 
         if not self.active:
             return
-        owner = self.owner(account)
-        if event in (N.fileLoaded, N.fileLoadFailed) and len(args) > 0:
-            file_key = str(args[0])
-            if not any(t[0] == account and t[1][0] == owner and t[3] == file_key
-                       for t in tuple(self.transfers)):
+        if event in (N.fileLoaded, N.fileLoadFailed):
+            if not args:
                 return
+            file_key = str(args[0])
             failed = event == N.fileLoadFailed
+            db = getattr(self, "db", None)
+            watched = not failed and db is not None and file_key in db.watched_files
+            if not watched and not any(t[0] == account and t[3] == file_key for t in tuple(self.transfers)):
+                return
+            owner = self.owner(account)
             path = local_file(args[1]) if not failed and len(args) > 1 else None
-            self.queue(lambda: self.file_event(account, owner, file_key, path, failed))
+            stream = None
+            if path is not None:
+                try:
+                    # Keep completed bytes readable if Telegram unlinks the cache before the worker runs.
+                    stream = path.open("rb")
+                except OSError:
+                    pass
+
+            def publish():
+                with (stream if stream is not None else nullcontext()):
+                    self.file_event(account, owner, file_key, path, failed, stream)
+
+            self.queue(publish)
             return
+        if not self.archived_owners:
+            return
+        owner = self.owner(account)
         if owner not in self.archived_owners:
             return
         if event == N.messagesDeleted:
-            if len(args) > 2 and java_boolean(args[2]):
+            if not args or (len(args) > 2 and java_boolean(args[2])):
                 return
-            ids = [number(value) for value in java_items(args[0])]
             channel = number(args[1]) if len(args) > 1 else 0
-            self.queue(lambda: self.record_deletion(owner, channel, ids))
+            self.queue_deletion(owner, channel, args[0])
         elif event == N.historyCleared:
             key, through = (owner, number(args[0])), number(args[1])
             def clear():
@@ -3060,19 +3470,43 @@ class LocalChatArchive(BasePlugin):
 
             self.queue(clear)
         elif event == N.messageReceivedByServer:
-            if len(args) > 2 and args[2] is not None and not (len(args) > 6 and java_boolean(args[6])):
-                self.capture(account, owner, (args[2],))
+            if len(args) < 3 or (len(args) > 6 and java_boolean(args[6])):
+                return
+            dialog = number(args[3]) if len(args) > 3 else 0
+            old_id, mid = number(args[0]), number(args[1])
+            original = getattr(args[2], "messageOwner", args[2])
+            if mid <= 0:
+                return
+            key = (owner, dialog)
+            session = self.enabled_chats.get(key)
+            draft = None
+            if old_id < 0 and session is not None:
+                with self.capture_lock:
+                    draft = self.pending_sends.pop((account, key, session, old_id), None)
+            original_id = number(getattr(original, "id", 0))
+            if original_id == mid:
+                self.capture(account, owner, (original,), dialog=dialog)
+            elif session is not None:
+                if draft is None and original_id == old_id < 0 and java_boolean(getattr(original, "out", False)):
+                    draft = original
+                if draft is not None:
+                    self.capture(account, owner, (draft,), dialog=dialog, confirmed_id=mid)
+                else:
+                    self.queue(lambda: self.catch_up_sent_message(account, key, mid, session), delay=250)
         elif event in (getattr(N, "didReceiveNewMessages", None), getattr(N, "replaceMessagesObjects", None)):
-            if len(args) < 2 or (owner, number(args[0])) not in self.enabled_chats:
+            if len(args) < 2:
+                return
+            dialog = number(args[0])
+            if (owner, dialog) not in self.enabled_chats:
                 return
             if event == getattr(N, "didReceiveNewMessages", None):
                 if (len(args) > 2 and java_boolean(args[2])) or (len(args) > 3 and number(args[3]) != 0):
                     return
             self.capture(account, owner, (
-                getattr(item, "messageOwner", None)
+                getattr(item, "messageOwner", item)
                 for item in java_items(args[1])
                 if not java_boolean(getattr(item, "scheduled", False))
-            ))
+            ), dialog=dialog)
 
     def tick(self):
         try:
@@ -3080,6 +3514,11 @@ class LocalChatArchive(BasePlugin):
         finally:
             if self.active:
                 self.queue(self.tick, delay=15000)
+
+    def queue_deletion(self, owner, channel, messages):
+        ids = [number(value) for value in java_items(messages)]
+        if ids:
+            self.queue(lambda: self.record_deletion(owner, channel, ids))
 
     def record_deletion(self, owner, channel, ids):
         self.db.mark_deleted(owner, channel, ids)
@@ -3104,14 +3543,40 @@ class LocalChatArchive(BasePlugin):
         self.ui(show, 400)
 
     def refresh(self):
+        self.db.purge_pending_files()
+        if not self.enabled_chats and not self.transfers:
+            return
         accounts = dict(self.active_accounts())
         self.check_transfers(accounts)
         now = time.monotonic()
         for account, owner in accounts.items():
             for key in self.enabled_chats:
-                if key[0] == owner and now >= self.sync_due.get(key, 0):
+                if key[0] != owner or key in self.syncs:
+                    continue
+                if now >= self.sync_due.get(key, 0) or (
+                    key not in self.sync_status and self.client_has_gap(account, key)
+                ):
                     self.start_sync(account, key)
         self.wake_media()
+
+    def client_has_gap(self, account, key):
+        from org.telegram.messenger import MessagesController
+
+        controller = MessagesController.getInstance(account)
+        dialog = controller.getDialog(key[1]) if hasattr(controller, "getDialog") else None
+        latest = number(getattr(dialog, "top_message", 0))
+        return latest > 0 and latest > self.db.latest_known(key)
+
+    def catch_up_sent_message(self, account, key, mid, session):
+        if (self.enabled_chats.get(key) is not session or self.owner(account) != key[0]
+                or time.monotonic() < self.flood_until.get(key, 0) or self.db.has_message(key, mid)):
+            return
+        state = self.syncs.get(key)
+        if state is not None:
+            state["pending_sent_id"] = min(mid, state.get("pending_sent_id", mid))
+            return
+        self.sync_due.pop(key, None)
+        self.start_sync(account, key, since=mid - 1)
 
     def selected_account(self, fragment):
         from org.telegram.messenger import UserConfig
@@ -3147,7 +3612,7 @@ class LocalChatArchive(BasePlugin):
         dialog.show()
         return dialog
 
-    def confirm(self, title, message, button, action, activity=None):
+    def confirm(self, title, message, button, action, activity=None, *, destructive=False):
         from ui.alert import AlertDialogBuilder
 
         activity = activity if activity is not None else self.activity()
@@ -3159,6 +3624,8 @@ class LocalChatArchive(BasePlugin):
         dialog.set_positive_button(button, lambda builder, index: action())
         dialog.set_negative_button("Отмена")
         dialog.show()
+        if destructive and hasattr(dialog, "make_button_red"):
+            dialog.make_button_red(dialog.BUTTON_POSITIVE)
 
     def chat_menu(self, ctx):
         self.ui(lambda: self.open_chat_menu(ctx))
@@ -3225,8 +3692,8 @@ class LocalChatArchive(BasePlugin):
             else:
                 self.ui(lambda: self.confirm(
                     "Архивировать чат?",
-                    "История и вложения займут место на устройстве. Удаление сообщений в Telegram "
-                    "не удалит копии из архива.",
+                    "На устройство сохранятся история, вложения и новые сообщения этого чата. "
+                    "Копии останутся в архиве после удаления сообщений в Telegram.",
                     "Начать",
                     lambda: self.queue(lambda: self.enable_chat(account, key, title, channel, parent)),
                     activity=activity,
@@ -3279,7 +3746,7 @@ class LocalChatArchive(BasePlugin):
         self.refresh_screens()
         self.start_sync(account, key)
         self.wake_media()
-        self.notice("Архивирование началось")
+        self.notice("Автосохранение включено")
         self.ui(lambda: self.open_conversation(key, parent))
 
     def open_list(self):
@@ -3288,13 +3755,27 @@ class LocalChatArchive(BasePlugin):
         fragment = get_last_fragment()
         account = self.selected_account(fragment)
         activity = self.activity(fragment)
-        if activity is None:
+        if activity is not None:
+            self.show_archive_list(activity, account)
+
+    def show_archive_list(self, activity, account, *, hidden=False, parent=None):
+        if parent is not None and not parent.showing():
             return
+
         def choose_chat():
             self.pick_chat(parent=screen)
 
-        screen = ArchiveScreen(self, activity, "Архив чатов", "",
-                               ("msg_add", "Сохранить чат", "+", choose_chat))
+        def open_hidden_chats():
+            self.show_archive_list(activity, account, hidden=True, parent=screen)
+
+        title = "Скрытые чаты" if hidden else "Архив чатов"
+        add = None if hidden else ("msg_add", "Сохранить чат", "+", choose_chat)
+        screen = ArchiveScreen(self, activity, title, "", add,
+                               on_close=parent.reload if parent is not None else None)
+        if not hidden:
+            menu = screen.icon("ic_ab_other", "Меню архива", "⋮",
+                               lambda: screen.popup(menu, [("Скрытые чаты", open_hidden_chats)]))
+            screen.bar.addView(menu, screen.params(48, 48))
         screen.empty_state("Открывается архив")
 
         def reload():
@@ -3303,7 +3784,8 @@ class LocalChatArchive(BasePlugin):
 
             def read():
                 owner = self.owner(account)
-                rows = self.db.archive_index(owner) if owner else []
+                rows = self.db.archive_index(owner, hidden=hidden) if owner else []
+                all_hidden = bool(owner and not rows and not hidden and self.db.has_hidden_chats(owner))
 
                 def show():
                     if not screen.showing():
@@ -3311,7 +3793,13 @@ class LocalChatArchive(BasePlugin):
                     entries = [("chat", row) for row in rows]
                     if entries != screen.entries:
                         screen.replace(entries)
-                    if not rows:
+                    if rows:
+                        return
+                    if hidden:
+                        screen.empty_state("Скрытых чатов нет")
+                    elif all_hidden:
+                        screen.empty_state("Все чаты скрыты", "", ("Скрытые чаты", open_hidden_chats))
+                    else:
                         screen.empty_state("Пока нет сохранённых чатов",
                                            "Выберите переписку, которую хотите читать офлайн.",
                                            ("Сохранить чат", choose_chat))
@@ -3323,6 +3811,15 @@ class LocalChatArchive(BasePlugin):
         screen.reload = reload
         screen.show()
         reload()
+
+    def set_chat_hidden(self, key, hidden, activity):
+        def save():
+            if self.db.set_chat_hidden(key, hidden):
+                self.refresh_screens()
+                text = "Чат скрыт. Его можно вернуть из раздела «Скрытые чаты»." if hidden else "Чат возвращён в список."
+                self.ui(lambda: self.screen_notice(activity, text) if not activity.isFinishing() else None)
+
+        self.queue(save)
 
     def open_conversation(self, key, parent=None):
         activity = parent.activity if parent is not None else self.activity()
@@ -3360,11 +3857,10 @@ class LocalChatArchive(BasePlugin):
                 ("Экспортировать ZIP", lambda: self.pick_export(key)),
             ]
             if chat["active"]:
-                items.append(("Обновить и повторить загрузку", lambda: self.queue(lambda: self.retry_chat(key))))
-                items.append(("Сверить всю историю", lambda: self.queue(lambda: self.recheck_chat(key))))
-                items.append(("Приостановить сохранение", lambda: self.queue(lambda: self.pause_chat(key))))
+                items.append(("Повторить загрузку вложений", lambda: self.queue(lambda: self.retry_attachments(key))))
+                items.append(("Приостановить автосохранение", lambda: self.queue(lambda: self.pause_chat(key))))
             else:
-                items.append(("Возобновить сохранение", lambda: self.queue(lambda: self.retry_chat(key))))
+                items.append(("Возобновить автосохранение", lambda: self.queue(lambda: self.retry_chat(key))))
 
             def show():
                 dialog = self.choices(chat["title"], status, items)
@@ -3381,7 +3877,9 @@ class LocalChatArchive(BasePlugin):
         if not chat["active"]:
             state = "Сохранение на паузе"
         elif not state:
-            state = "Загружается история" if not chat["complete"] else "История загружена"
+            state = "Автосохранение включено"
+            if not chat["complete"]:
+                state += "\nЗагружается история"
         status = (f"{state}\nСообщений сохранено {count}, удалённых в Telegram {deleted}.\n"
                   f"Вложений сохранено {saved} из {total}.")
         if failed:
@@ -3423,6 +3921,8 @@ class LocalChatArchive(BasePlugin):
             self.notice("Чат сейчас недоступен для архивации.", error=True)
             return
         chat = self.db.chat(key)
+        if chat is None:
+            return
         self.db.enable(key, chat["title"], chat["channel"])
         self.reload_selection()
         self.db.retry_assets(key)
@@ -3432,58 +3932,172 @@ class LocalChatArchive(BasePlugin):
         self.wake_media()
         self.ui(lambda: self.open_archive(key))
 
-    def recheck_chat(self, key):
-        state = self.syncs.pop(key, None)
-        if state is not None:
-            cancel = state.get("cancel")
-            if cancel is not None:
-                cancel()
-        self.db.restart_history(key)
-        self.retry_chat(key)
+    def retry_attachments(self, key):
+        self.db.retry_assets(key)
+        self.wake_media()
+        self.ui(lambda: self.open_archive(key))
 
     def pause_chat(self, key):
         self.db.pause(key)
         self.reload_selection()
-        state = self.syncs.pop(key, None)
-        if state is not None and state.get("cancel") is not None:
-            state["cancel"]()
+        self.cancel_sync(key)
         self.refresh_screens()
         self.ui(lambda: self.open_archive(key))
 
-    def show_message_versions(self, key, row):
+    def cancel_sync(self, key):
+        state = self.syncs.pop(key, None)
+        if state and state.get("cancel") is not None:
+            state["cancel"]()
+
+    def confirm_delete(self, key, title, activity):
+        self.confirm(
+            "Удалить архив чата?",
+            f"Локальная копия чата «{title}» и её вложения будут удалены. Автосохранение этого чата остановится.",
+            "Удалить архив",
+            lambda: self.queue(lambda: self.delete_archive(key, activity)),
+            activity=activity,
+            destructive=True,
+        )
+
+    def delete_archive(self, key, activity):
+        if self.exporting == key:
+            self.queue(lambda: self.delete_archive(key, activity), delay=500)
+            return
+        if not self.db.remove_chat(key):
+            return
+        self.reload_selection()
+        self.cancel_sync(key)
+        for state in (self.sync_due, self.sync_status, self.flood_until):
+            state.pop(key, None)
+        for transfer in tuple(self.transfers):
+            if transfer[1] == key:
+                self.transfers.pop(transfer, None)
+        if self.export_choice == key:
+            self.export_choice = None
+        result = "Архив чата удалён."
+        try:
+            self.db.purge_files(key)
+        except OSError:
+            self.logger.exception("Could not remove archived attachment files")
+            result = "Архив удалён. Очистка файлов будет повторена."
+
+        def close():
+            for screen in tuple(self.archive_windows):
+                conversation = getattr(screen, "conversation", screen)
+                if getattr(conversation, "key", None) == key:
+                    screen.window.dismiss()
+            if activity is not None and not activity.isFinishing():
+                self.screen_notice(activity, result)
+
+        self.ui(close)
+        self.refresh_screens()
+        if self.enabled_chats:
+            self.wake_media()
+
+    def show_message_versions(self, conversation, row):
+        key = conversation.key
+
         def read():
             revisions = self.db.revisions(key, row["id"])
-            def version(revision):
-                def details():
-                    items = []
-                    self.add_attachment_choice(key, revision["asset"], items)
-                    text = revision["text"] or revision["kind"] or "Сообщение"
-                    self.ui(lambda: self.choices("Сохранённая версия", text, items))
-
-                self.queue(details)
-
-            if len(revisions) <= 1:
-                self.ui(lambda: self.choices("Изменено в Telegram", stamp(row["edited"]), []))
-            else:
-                items = [(stamp(revision["edited"]) or "Исходная версия", lambda rev=revision: version(rev))
-                         for revision in revisions]
-                self.ui(lambda: self.choices("Версии сообщения", "", items))
+            versions = []
+            for revision in revisions or [row]:
+                asset_key = revision["asset"]
+                attachment = self.db.asset(key, asset_key) if asset_key else None
+                source = None
+                if attachment is not None and attachment["status"] == 1:
+                    path = asset_path(self.root, key, attachment)
+                    if path.is_file():
+                        source = path
+                versions.append((revision, attachment, source))
+            self.ui(lambda: self.render_message_versions(conversation, row, versions))
 
         self.queue(read)
 
-    def add_attachment_choice(self, key, asset_key, items):
-        if not asset_key:
+    def render_message_versions(self, conversation, row, versions):
+        from android.widget import LinearLayout
+        from ui.alert import AlertDialogBuilder
+
+        if not conversation.showing():
             return
-        row = self.db.asset(key, asset_key)
-        if not row:
-            return
-        path = asset_path(self.root, key, row)
-        if row["status"] == 1 and path.is_file():
-            items.append((f'Открыть {row["name"]}', lambda: self.open_asset(path, row)))
-        elif row["status"] == 0:
-            items.append(("Вложение ожидает загрузки", lambda: self.open_archive(key)))
-        else:
-            items.append(("Вложение недоступно", lambda: self.open_archive(key)))
+        activity = conversation.activity
+        dp = conversation.dp
+        params = conversation.params
+        tv = conversation.label
+        theme = conversation.theme
+        outgoing = conversation.outgoing(row)
+        surface = conversation.chat_color(theme.key_chat_outBubble if outgoing else theme.key_chat_inBubble)
+        foreground = conversation.chat_color(theme.key_chat_messageTextOut if outgoing else theme.key_chat_messageTextIn)
+        secondary = conversation.chat_color(theme.key_chat_outTimeText if outgoing else theme.key_chat_inTimeText)
+        link = conversation.chat_color(theme.key_chat_outReplyLine if outgoing else theme.key_chat_inReplyLine)
+        contents = conversation.column()
+        contents.setPadding(dp(14), 0, dp(14), dp(6))
+        width = activity.getResources().getDisplayMetrics().widthPixels
+        max_body = max(dp(100), min(dp(300), width - dp(110)))
+        day = None
+
+        for revision, attachment, source in reversed(versions):
+            when = revision["edited"] or row["date"]
+            moment = datetime.fromtimestamp(when) if when else None
+            if moment is not None and day != moment.date():
+                day = moment.date()
+                contents.addView(conversation.service_chip(day.strftime("%d.%m.%Y")), params(-1, -2))
+
+            alignment = LinearLayout(activity)
+            alignment.setGravity(5 if outgoing else 3)
+            alignment.setPadding(0, dp(2), 0, dp(2))
+            contents.addView(alignment, params(-1, -2))
+            bubble = conversation.column()
+            bubble.setBackground(conversation.bubble_background(outgoing, surface, False))
+            left, right = (10, 15) if outgoing else (15, 10)
+            bubble.setPadding(dp(left), dp(4), dp(right), dp(5))
+            alignment.addView(bubble, params(-2, -2))
+
+            time_label = moment.strftime("%H:%M:%S") if moment is not None else ""
+            if not revision["edited"]:
+                time_label = "Исходное · " + time_label if time_label else "Исходное"
+            timestamp = tv(time_label, 11, secondary)
+            text = revision["text"] or ((revision["kind"] or "Сообщение") if attachment is None else "")
+            body = None
+            if text:
+                body = tv(text, chat_text_size(), foreground)
+                body.setMaxWidth(max_body)
+                body.setTextIsSelectable(True)
+                apply_entities(body, text, revision["entities"], link)
+
+            if attachment is not None:
+                if source is not None:
+                    file_label = tv(f'Открыть {attachment["name"]}', 14, link)
+                    file_label.setMinHeight(dp(40))
+                    file_label.setGravity(16)
+                    conversation.click(file_label, lambda path=source, asset=attachment: self.open_asset(path, asset))
+                else:
+                    status = "Ожидает загрузки" if attachment["status"] == 0 else "Недоступно"
+                    file_label = tv(f'{attachment["name"]} · {status}', 14, secondary)
+                file_label.setMaxWidth(max_body)
+                bubble.addView(file_label, params(-2, -2))
+
+            if (body is not None and attachment is None and "\n" not in text
+                    and body.getPaint().measureText(text) + timestamp.getPaint().measureText(time_label) + dp(8) <= max_body):
+                line = LinearLayout(activity)
+                line.setGravity(80)
+                line.addView(body, params(-2, -2))
+                beside = params(-2, -2)
+                beside.leftMargin = dp(8)
+                beside.bottomMargin = dp(1)
+                line.addView(timestamp, beside)
+                bubble.addView(line, params(-2, -2))
+            else:
+                if body is not None:
+                    bubble.addView(body, params(-2, -2))
+                footer = params(-2, -2)
+                footer.gravity = 5
+                bubble.addView(timestamp, footer)
+
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("История изменений")
+        dialog.set_view(contents)
+        dialog.set_negative_button("Закрыть")
+        dialog.show()
 
     def open_asset(self, source, row, share=False):
         from java.io import File
@@ -3491,9 +4105,8 @@ class LocalChatArchive(BasePlugin):
 
         def copy():
             try:
-                cache = Path(str(self.context.getFilesDir().getAbsolutePath())) / "cache" / __id__
-                cache.mkdir(parents=True, exist_ok=True)
-                target = cache / source.name
+                target = self.shared_cache / source.relative_to(self.root / "media")
+                target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.is_file() or target.stat().st_size != source.stat().st_size:
                     temporary = target.with_suffix(".part")
                     try:
@@ -3575,7 +4188,7 @@ class LocalChatArchive(BasePlugin):
         if number(param.args[1]) != Activity.RESULT_OK or intent is None or intent.getData() is None:
             return
         uri = intent.getData()
-        self.exporting = True
+        self.exporting = key
         self.notice("Готовится ZIP с сохранённой историей и вложениями")
 
         def export():
@@ -3590,12 +4203,12 @@ class LocalChatArchive(BasePlugin):
                 self.logger.exception("Could not export the local archive")
                 self.notice("ZIP не записан полностью. Проверьте место и повторите экспорт.", error=True)
             finally:
-                self.exporting = False
+                self.exporting = None
 
         Thread(target=export, name="LocalChatArchiveExport", daemon=True).start()
 
 
-    def start_sync(self, account, key):
+    def start_sync(self, account, key, *, since=None):
         if key in self.syncs or key not in self.enabled_chats or self.owner(account) != key[0]:
             return
         if self.is_protected(account, key[1]):
@@ -3603,10 +4216,14 @@ class LocalChatArchive(BasePlugin):
             self.sync_due[key] = time.monotonic() + 120
             return
         row = self.db.chat(key)
+        if row is None:
+            return
         if self.sync_due.get(key, 0) > time.monotonic() and key in self.sync_status:
             return
-        if row["complete"]:
-            state = {"mode": "new", "cursor": 0, "floor": row["head"], "head": row["head"]}
+        if row["complete"] or (since is not None and row["head"]):
+            floor = row["head"] if since is None else min(row["head"], since)
+            state = {"mode": "new", "cursor": 0, "floor": floor, "head": row["head"],
+                     "resume_history": not row["complete"]}
         else:
             state = {"mode": "history", "cursor": row["cursor"], "floor": 0, "head": row["head"]}
         state["peer"] = row["peer"]
@@ -3729,7 +4346,9 @@ class LocalChatArchive(BasePlugin):
             initial = state["mode"] == "history"
             self.db.save(key, [], live=False, head=state["head"], complete=initial)
             self.finish_sync(key)
-            if initial:
+            if state.get("pending_sent_id"):
+                self.catch_up_sent_message(account, key, state["pending_sent_id"], self.enabled_chats.get(key))
+            if (initial or state.get("resume_history")) and key not in self.syncs:
                 self.start_sync(account, key)
             return
 
@@ -3751,18 +4370,23 @@ class LocalChatArchive(BasePlugin):
                 continue
             if row is not None:
                 rows.append(row)
+        initial = state["mode"] == "history"
         if unreadable:
-            self.db.save(key, rows, live=False)
+            self.db.save(key, rows, live=False, urgent_media=not initial)
             self.finish_sync(key, f"На странице истории не удалось сохранить {unreadable} сообщений. Повторите загрузку.")
             return
         state["head"] = max(state["head"], max(candidates))
-        initial = state["mode"] == "history"
         self.db.save(key, rows, live=False, cursor=cursor if initial else None,
-                     head=state["head"] if initial else None)
+                     head=state["head"] if initial else None, urgent_media=not initial)
         state["cursor"] = cursor
         self.wake_media()
         self.refresh_screens()
-        self.queue(lambda: self.request_page(account, key, state), delay=350)
+        pending_sent = state.get("pending_sent_id")
+        if initial and pending_sent and not self.db.has_message(key, pending_sent):
+            self.finish_sync(key)
+            self.catch_up_sent_message(account, key, pending_sent, self.enabled_chats[key])
+            return
+        self.queue(lambda: self.request_page(account, key, state), delay=HISTORY_PAGE_DELAY)
 
     def wake_media(self):
         if self.media_wake:
@@ -3773,7 +4397,7 @@ class LocalChatArchive(BasePlugin):
             self.media_wake = False
             self.pump_media()
 
-        self.queue(start, delay=150)
+        self.queue(start)
 
     def fail_asset(self, key, asset_key):
         row = self.db.asset(key, asset_key)
@@ -3785,18 +4409,61 @@ class LocalChatArchive(BasePlugin):
                 self.refresh_screens()
 
     def pump_media(self):
-        for account, owner in self.active_accounts():
-            for key in sorted(self.enabled_chats):
-                if key[0] != owner or self.is_protected(account, key[1]):
-                    continue
-                for row in self.db.pending_assets(*key):
-                    if len(self.transfers) >= 3:
-                        return
+        if not self.enabled_chats:
+            return
+        chats = sorted(self.enabled_chats)
+        eligible = [(account, key) for account, owner in self.active_accounts() for key in chats
+                    if key[0] == owner and not self.is_protected(account, key[1])]
+        for urgent in (True, False):
+            limit = MEDIA_LIMIT
+            if not urgent:
+                # Historical downloads leave room for a new message even during a long backlog.
+                limit = min(limit, HISTORY_MEDIA_LIMIT + sum(item.urgent for item in self.transfers.values()))
+            for account, key in eligible:
+                if not urgent and len(self.transfers) >= limit:
+                    return
+                for row in self.db.pending_assets(*key, urgent):
                     transfer = (account, key, row["key"], row["file_key"])
                     if not any(current[:3] == transfer[:3] for current in self.transfers):
-                        self.start_asset(transfer, row)
+                        self.start_asset(transfer, row, cache_only=len(self.transfers) >= limit)
+                    if not urgent and len(self.transfers) >= limit:
+                        return
 
-    def start_asset(self, transfer, row):
+    def reuse_visible_media(self, key, rows):
+        pending = dict.fromkeys(row["media_key"] for row in rows if row["media_key"] and row["media_status"] != 1)
+        if not pending or key not in self.enabled_chats:
+            return
+        account = next((slot for slot, owner in self.active_accounts() if owner == key[0]), None)
+        if account is None or self.is_protected(account, key[1]):
+            return
+        for asset_key in pending:
+            asset = self.db.asset(key, asset_key)
+            if asset is not None and asset["status"] != 1:
+                self.start_asset((account, key, asset_key, asset["file_key"]), asset, cache_only=True)
+        self.schedule_media_probe()
+
+    def schedule_media_probe(self):
+        if not getattr(self, "active", False) or not self.transfers or getattr(self, "media_probe_pending", False):
+            return
+        now = time.monotonic()
+        if not getattr(self, "archive_windows", None) and not any(
+            item.urgent and now - item.started < MEDIA_PROBE_WINDOW for item in self.transfers.values()
+        ):
+            return
+        self.media_probe_pending = True
+
+        def probe():
+            self.media_probe_pending = False
+            before = len(self.transfers)
+            if before:
+                self.check_transfers(dict(self.active_accounts()))
+                if len(self.transfers) < before:
+                    self.wake_media()
+                self.schedule_media_probe()
+
+        self.queue(probe, delay=MEDIA_PROBE_DELAY)
+
+    def start_asset(self, transfer, row, *, cache_only=False):
         from org.telegram.messenger import FileLoader, ImageLoader, ImageLocation, MessageObject
         from org.telegram.tgnet import TLRPC
 
@@ -3805,59 +4472,131 @@ class LocalChatArchive(BasePlugin):
             original = deserialize(row["payload"], TLRPC.Message, owner=key[0])
             attachment, photo = self.media_parts(original)
             if attachment is None:
-                self.fail_asset(key, asset_key)
+                if not cache_only:
+                    self.fail_asset(key, asset_key)
                 return
             if photo is not None and attachment.bytes is not None:
-                if not self.db.publish_asset(key, asset_key, content=bytes(attachment.bytes)):
-                    self.fail_asset(key, asset_key)
-                else:
+                if self.db.publish_asset(key, asset_key, content=bytes(attachment.bytes)):
+                    self.complete_media(account, key, asset_key, cache_only)
                     self.refresh_screens()
-                self.wake_media()
+                elif not cache_only:
+                    self.fail_asset(key, asset_key)
                 return
-            ImageLoader.getInstance()
             loader = FileLoader.getInstance(account)
-            paths = []
-            for value in (getattr(original, "attachPath", None), getattr(attachment, "localPath", None)):
-                path = local_file(value)
-                if path is not None and path not in paths:
-                    paths.append(path)
-            for force_cache in (True, False):
-                try:
-                    path = local_file(loader.getPathToAttach(attachment, force_cache))
-                    if path is not None and path not in paths:
-                        paths.append(path)
-                except Exception:
-                    self.logger.debug("Could not resolve a Telegram attachment cache path")
-            if self.copy_completed_asset(key, asset_key, paths):
-                self.wake_media()
-                return
             location = ImageLocation.getForPhoto(attachment, photo) if photo is not None else None
             target = location.location if location is not None else attachment
             file_key = str(FileLoader.getAttachFileName(target) or "")
+            variants = self.cache_variants(original, attachment, photo, file_key)
+
+            def refresh_paths():
+                return self.media_cache_paths(loader, original, attachment, photo, location, variants)
+
+            paths, cached_variants = refresh_paths()
+            variant_names = tuple((name, size) for _, name, size in variants)
+            if variant_names:
+                self.db.remember_cache_variants(key, asset_key, variant_names)
+            if self.copy_completed_asset(key, asset_key, paths, cached_variants=cached_variants):
+                self.complete_media(account, key, asset_key, cache_only)
+                return
+            if cache_only:
+                return
             if not file_key or (photo is not None and location is None):
                 self.fail_asset(key, asset_key)
                 return
-            transfer = (account, key, asset_key, file_key)
-            parent = MessageObject(account, original, False, False)
-            self.transfers[transfer] = (time.monotonic(), paths)
-            if photo is not None:
-                loader.loadFile(location, parent, None, FileLoader.PRIORITY_NORMAL, 1)
-            else:
-                loader.loadFile(attachment, parent, FileLoader.PRIORITY_NORMAL, 1)
+            urgent = bool(row["urgent"])
+            is_loading = getattr(loader, "isLoadingFile", None)
+            active_file = next((name for name in (file_key, *(name for name, _ in variant_names))
+                                if is_loading is not None and is_loading(name)), None)
+            transfer = (account, key, asset_key, active_file or file_key)
+            native = active_file is not None
+            self.transfers[transfer] = Transfer(time.monotonic(), paths, urgent, cached_variants, native, refresh_paths)
+            if not native:
+                ImageLoader.getInstance()
+                parent = MessageObject(account, original, False, False)
+                priority = getattr(FileLoader, "PRIORITY_HIGH", FileLoader.PRIORITY_NORMAL) if urgent else FileLoader.PRIORITY_NORMAL
+                if photo is not None:
+                    loader.loadFile(location, parent, None, priority, 1)
+                else:
+                    loader.loadFile(attachment, parent, priority, 1)
+            self.schedule_media_probe()
         except Exception:
-            self.transfers.pop(transfer, None)
-            self.fail_asset(key, asset_key)
+            if not cache_only:
+                self.transfers.pop(transfer, None)
+                self.fail_asset(key, asset_key)
             self.logger.exception("Could not save a Telegram attachment")
 
-    def copy_completed_asset(self, key, asset_key, paths):
-        for path in paths:
+    def complete_media(self, account, key, asset_key, cache_only):
+        completed = [transfer for transfer in self.transfers if transfer[:3] == (account, key, asset_key)]
+        for transfer in completed:
+            self.transfers.pop(transfer, None)
+        if completed or not cache_only:
+            self.wake_media()
+
+    def media_cache_paths(self, loader, original, attachment, photo, location, variants):
+        paths = self.cache_paths(loader, attachment, photo, location)
+        message_path = None
+        get_message_path = getattr(loader, "getPathToMessage", None)
+        if get_message_path is not None:
             try:
-                if self.db.copy_asset(key, asset_key, path):
-                    self.refresh_screens()
-                    return True
-            except OSError:
-                self.logger.exception("Could not copy a completed attachment into the archive")
-                break
+                message_path = local_file(get_message_path(original))
+            except Exception:
+                self.logger.debug("Could not resolve the cached file for a Telegram message")
+        for path in (local_file(getattr(original, "attachPath", None)), message_path):
+            if path is not None and path not in paths:
+                paths.insert(0, path)
+        cached_variants = tuple(dict.fromkeys(
+            (path, size) for part, _, size in variants
+            for path in [*self.cache_paths(loader, part, photo), message_path] if path is not None
+        ))
+        return paths, cached_variants
+
+    def cache_paths(self, loader, attachment, photo, location=None):
+        from org.telegram.messenger import ImageLocation
+
+        paths = []
+        local_path = local_file(getattr(attachment, "localPath", None))
+        if local_path is not None:
+            paths.append(local_path)
+        get_local_file = getattr(loader, "getLocalFile", None)
+        if get_local_file is not None:
+            try:
+                if location is None:
+                    location = (ImageLocation.getForPhoto(attachment, photo) if photo is not None
+                                else ImageLocation.getForDocument(attachment))
+                path = local_file(get_local_file(location)) if location is not None else None
+                if path is not None and path not in paths:
+                    paths.append(path)
+            except Exception:
+                self.logger.debug("Could not look up the local Telegram media file")
+        for cache in (True, False):
+            try:
+                path = local_file(loader.getPathToAttach(attachment, cache))
+                if path is not None and path not in paths:
+                    paths.append(path)
+            except Exception:
+                self.logger.debug("Could not resolve a Telegram attachment cache path")
+        return paths
+
+    def copy_transfer_cache(self, key, asset_key, download):
+        if self.copy_completed_asset(key, asset_key, download.paths, cached_variants=download.cached_variants):
+            return True
+        if download.refresh_paths is not None:
+            paths, variants = download.refresh_paths()
+            if paths != download.paths or variants != download.cached_variants:
+                return self.copy_completed_asset(key, asset_key, paths, cached_variants=variants)
+        return False
+
+    def copy_completed_asset(self, key, asset_key, paths, stream=None, *, expected_size=None, cached_variants=()):
+        try:
+            candidates = [(path, expected_size) for path in paths]
+            candidates.extend(cached_variants)
+            if ((stream is not None and self.db.publish_asset(key, asset_key, stream=stream, expected_size=expected_size))
+                    or any(path.is_file() and self.db.publish_asset(key, asset_key, source=path, expected_size=size)
+                           for path, size in candidates)):
+                self.refresh_screens()
+                return True
+        except OSError:
+            self.logger.exception("Could not copy a completed attachment into the archive")
         return False
 
     def check_transfers(self, accounts):
@@ -3866,32 +4605,50 @@ class LocalChatArchive(BasePlugin):
         from org.telegram.messenger import FileLoader
 
         now = time.monotonic()
-        for transfer, (started, paths) in list(self.transfers.items()):
+        for transfer, download in list(self.transfers.items()):
             account, key, asset_key, file_key = transfer
             if accounts.get(account) != key[0]:
                 self.transfers.pop(transfer, None)
                 continue
-            if self.copy_completed_asset(key, asset_key, paths):
+            if self.copy_transfer_cache(key, asset_key, download):
                 self.transfers.pop(transfer, None)
                 continue
-            elapsed = now - started
+            elapsed = now - download.started
             loader = FileLoader.getInstance(account)
-            idle = elapsed >= 30 and hasattr(loader, "isLoadingFile") and not loader.isLoadingFile(file_key)
+            idle = (download.native or elapsed >= 30) and hasattr(loader, "isLoadingFile") and not loader.isLoadingFile(file_key)
             if idle or elapsed > 3600:
                 self.transfers.pop(transfer, None)
-                self.fail_asset(key, asset_key)
+                if not download.native:
+                    self.fail_asset(key, asset_key)
 
-    def file_event(self, account, owner, file_key, path, failed=False):
-        for transfer, (_, paths) in list(self.transfers.items()):
+    def file_event(self, account, owner, file_key, path, failed=False, stream=None):
+        changed = False
+        if not failed:
+            for source in self.db.waiting_for_file(owner, file_key):
+                key = (owner, source["dialog"])
+                if self.is_protected(account, key[1]):
+                    continue
+                asset_key = source["asset_key"]
+                if self.copy_completed_asset(key, asset_key, [path] if path is not None else [], stream,
+                                             expected_size=source["size"]):
+                    changed = True
+                    for transfer in tuple(self.transfers):
+                        if transfer[:3] == (account, key, asset_key):
+                            self.transfers.pop(transfer, None)
+        for transfer, download in list(self.transfers.items()):
             slot, key, asset_key, filename = transfer
             if slot != account or key[0] != owner or filename != file_key:
                 continue
-            candidates = [path, *paths] if path is not None else paths
-            if self.copy_completed_asset(key, asset_key, candidates):
+            candidates = [path, *download.paths] if path is not None else download.paths
+            if self.copy_completed_asset(key, asset_key, candidates, stream, cached_variants=download.cached_variants):
                 self.transfers.pop(transfer, None)
+                changed = True
             elif failed:
                 self.transfers.pop(transfer, None)
-                self.fail_asset(key, asset_key)
-        self.wake_media()
+                if not self.copy_transfer_cache(key, asset_key, download) and not download.native:
+                    self.fail_asset(key, asset_key)
+                changed = True
+        if changed:
+            self.wake_media()
 
 
