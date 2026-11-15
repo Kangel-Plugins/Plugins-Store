@@ -12,6 +12,7 @@ import ssl
 import struct
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -33,7 +34,7 @@ from android.view import (
     ViewConfiguration,
     ViewGroup,
 )
-from android.widget import EditText, FrameLayout, ImageView, LinearLayout, ScrollView, TextView
+from android.widget import CheckBox, EditText, FrameLayout, ImageView, LinearLayout, ScrollView, TextView
 
 from android_utils import OnClickListener, log, run_on_ui_thread
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
@@ -48,7 +49,7 @@ from client_utils import (
 from file_utils import get_cache_dir, write_file
 from hook_utils import find_class, get_private_field
 from java import dynamic_proxy, jarray, jclass
-from java.lang import Runnable, String, System
+from java.lang import Integer, Runnable, String, System
 from java.lang.reflect import Modifier
 from java.util import ArrayList
 
@@ -58,6 +59,7 @@ from org.telegram.messenger import (
     FileLoader,
     ImageLocation,
     MediaDataController,
+    ChatObject,
     MessagesController,
     NotificationCenter,
     R as R_tg,
@@ -65,9 +67,9 @@ from org.telegram.messenger import (
     UserConfig,
     Utilities,
 )
-from org.telegram.tgnet import ConnectionsManager, TLRPC
+from org.telegram.tgnet import ConnectionsManager, RequestDelegate, TLRPC
 from org.telegram.ui import DialogsActivity
-from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.ActionBar import AlertDialog, BottomSheet, Theme
 from org.telegram.ui.Components import BackupImageView, LayoutHelper, UItem
 
 from ui.bulletin import BulletinHelper
@@ -90,7 +92,7 @@ __description__ = (
     "GeoIP-флаги, DPI-инспектор, Failover при смене сети и умная очистка."
 )
 __author__ = "@EvilHotDead"
-__version__ = "1.0.0"
+__version__ = "1.1"
 __icon__ = "pk_5199573_by_Ctikerubot/65"
 __min_version__ = "12.10.6"
 
@@ -101,7 +103,13 @@ MAX_PER_HOST_LIMITS = (0, 1, 2, 3, 5, 10)
 STRIKE_LIMITS = (1, 2, 3, 4, 5)
 DEAD_TTL_HOURS = (0, 6, 12, 24, 48, 72)
 MAX_REDIRECT_CHECKS_PER_MSG = 4
+MAX_BACKFILL_PAGES = 80
+CONFIG_BACKUP_KEYS = ('enabled', 'interval_min', 'scan_limit', 'max_per_host', 'collect_mtproto', 'collect_socks5', 'collect_web', 'only_faketls', 'parse_attachments', 'realtime_enabled', 'adaptive_timer', 'skip_when_screen_off', 'mark_read_after_collect', 'show_msg_menu', 'show_chat_menu', 'show_proxy_bar_btn', 'show_edit_menu_btn', 'header_tools_order', 'header_tools_disabled', 'real_handshake_ping', 'ping_before_save', 'auto_failover', 'network_switch_failover', 'auto_sort_after_check', 'strikes_limit', 'dead_ttl_hours', 'auto_clean_on_limit', 'max_proxy_limit', 'trim_slowest_on_limit', 'show_geo_flags', 'geo_remote_lookup', 'show_dpi_badges', 'show_ping_color', 'show_local_label', 'show_bulletin',
+ 'periodic_health_check', 'import_ignore_dead_cache', 'export_batch_size', 'export_only_working')
+MAX_PING_AGE_MS = 60 * 60 * 1000
 MAX_ATTACHMENT_BYTES = 512 * 1024
+MAX_SOURCE_BYTES = 1024 * 1024
+MAX_GEO_RESPONSE_BYTES = 256 * 1024
 
 MENU_TOOLS_ID = 999_201
 
@@ -118,11 +126,11 @@ DEFAULT_HEADER_TOOLS = [
 
 HEADER_TOOLS_META = {
     "collect": ("Собрать прокси из источников", "msg_retry", False),
-    "random": ("Случайный рабочий прокси", "msg_media_shuffle", False),
+    "random": ("Подключить лучший доступный", "msg_media_shuffle", False),
     "import": ("Импорт прокси", "msg_download", False),
     "export": ("Экспорт прокси", "msg_share", False),
     "sort": ("Сортировать по пингу", "msg_list", False),
-    "country": ("Фильтр по стране", "msg_location", False),
+    "country": ("Прокси по странам", "msg_location", False),
     "dedup": ("Удалить дубликаты", "msg_clear", False),
     "clean": ("Очистить мёртвые прокси", "msg_delete", True),
 }
@@ -170,25 +178,152 @@ _DETAILS_CACHE: Dict[int, Tuple[str, str, str, int, str, str, str]] = {}
 _UNVERIFIED_SSL_CTX = ssl._create_unverified_context()
 
 
+# Older versions could save special collect.proxy URLs as sources.  Reject
+# these safely; the virtual domain is never fetched as an HTTP subscription.
+def _is_collect_proxy_url(raw: str) -> bool:
+    try:
+        p = urllib.parse.urlsplit(str(raw).strip().rstrip(").,\"'»]"))
+        return p.scheme.lower() in ("http", "https") and (p.hostname or "").lower() == "collect.proxy"
+    except Exception:
+        return False
+
+
+
+
+
+
+def _read_http_text(response: Any, limit: int = MAX_SOURCE_BYTES) -> str:
+    # Read at most limit+1 bytes to detect oversized subscriptions/imports.
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"Источник слишком большой (максимум {limit // 1024} КБ)")
+    return data.decode("utf-8", errors="ignore")
+
+
+def _utf16_slice(value: str, offset: int, length: int) -> str:
+    data = value.encode("utf-16-le")
+    start = max(0, offset) * 2
+    stop = start + max(0, length) * 2
+    return data[start:stop].decode("utf-16-le", errors="ignore")
+
+
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _proxy_quality_label(pings: List[int], working: List[bool]) -> str:
+    measured = [int(p) for p in pings if int(p) > 0]
+    if not measured:
+        return "Без проверки"
+    if len(measured) != len(pings):
+        return "Без проверки"
+    if working and not all(working):
+        return "Сойдёт"
+    worst = max(measured)
+    if worst <= 80:
+        return "Идеально"
+    if worst <= 150:
+        return "Стабильно"
+    if worst <= 250:
+        return "Хорошо"
+    if worst <= 400:
+        return "Нормально"
+    return "Сойдёт"
+
+
+def _build_proxy_post(
+    links: List[str], start_number: int, pings: List[int], working: List[bool],
+):
+    """Build clickable Proxy# references with correct UTF-16 ranges."""
+    prefix = "🔗Telegram Proxy\n"
+    measured = [int(p) for p in pings if int(p) > 0]
+    ping_label = f"от {min(measured)}мс до {max(measured)} мс" if measured else "нет данных"
+    prefix += f"🏓Пинг: {ping_label}\n🛠Оценка задержки: {_proxy_quality_label(pings, working)}\n"
+    quote = ""
+    link_entities = []
+    for i, url in enumerate(links):
+        if i:
+            quote += "\n" if (i % 5 == 0) else " "
+        label = f"Proxy#{start_number + i}"
+        off = _utf16_len(prefix) + _utf16_len(quote)
+        link_entities.append((off, _utf16_len(label), url))
+        quote += label
+    return prefix + quote, _utf16_len(prefix), _utf16_len(quote), link_entities
+
+
+def _plan_proxy_export_chunks(
+    entries: List[Tuple[str, int, bool]], start_number: int, requested_batch: int,
+) -> List[Tuple[int, int]]:
+    """Plan ordered (start, count) chunks, accounting for hidden URL entity bytes.
+
+    The server's actual entity limit is not published, so failed chunks are
+    split again in the sender based on Telegram's actual RPC response.
+    """
+    if requested_batch < 1:
+        raise ValueError("Размер пачки должен быть положительным")
+    chunks: List[Tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(entries):
+        max_count = min(requested_batch, EXPORT_MAX_LINKS_PER_POST, len(entries) - cursor)
+        count = 0
+        url_bytes = 0
+        for index in range(max_count):
+            url = entries[cursor + index][0]
+            size = len(url.encode("utf-8"))
+            if index and url_bytes + size > EXPORT_MAX_URL_BYTES_PER_POST:
+                break
+            url_bytes += size
+            count += 1
+            # One very long URL is still queued as a single item; the sender
+            # can fall back to displaying the URL literally if textUrl fails.
+            if url_bytes > EXPORT_MAX_URL_BYTES_PER_POST:
+                break
+        while count > 0:
+            chosen = entries[cursor:cursor + count]
+            text, quote_offset, quote_length, links = _build_proxy_post(
+                [p[0] for p in chosen], start_number + cursor,
+                [p[1] for p in chosen], [p[2] for p in chosen],
+            )
+            text_size = _utf16_len(text)
+            if text_size <= EXPORT_MAX_TEXT_UTF16:
+                if quote_length <= 0 or quote_offset + quote_length != text_size:
+                    raise ValueError("Ошибка диапазона цитаты Proxy#")
+                previous_end = quote_offset
+                for offset, length, _url in links:
+                    if length <= 0 or offset < previous_end or offset + length > text_size:
+                        raise ValueError("Ошибка UTF-16 диапазона ссылки Proxy#")
+                    previous_end = offset + length
+                chunks.append((cursor, count))
+                cursor += count
+                break
+            count -= 1
+        if count <= 0:
+            raise ValueError("Не удалось сформировать сообщение допустимой длины")
+    return chunks
+
+
 def _plog(msg: str):
     log(f"[ProxyCollector] {msg}")
 
 
 def _resolve_jclass(cls_or_name: Any):
-    c = find_class(cls_or_name) if isinstance(cls_or_name, str) else cls_or_name
-    if c is None:
-        return None
-    if hasattr(c, "getDeclaredMethods"):
-        return c
-    if hasattr(c, "getClass"):
+    if isinstance(cls_or_name, str):
         try:
-            c2 = c.getClass()
-            if hasattr(c2, "getDeclaredMethods"):
-                return c2
+            return jclass("java.lang.Class").forName(
+                cls_or_name, False, ApplicationLoader.applicationContext.getClassLoader()
+            )
         except Exception:
-            pass
-    return c
-
+            try:
+                obj = find_class(cls_or_name)
+                if obj is not None and hasattr(obj, "getDeclaredMethods"):
+                    return obj
+            except Exception:
+                pass
+            return None
+    try:
+        return cls_or_name if hasattr(cls_or_name, "getDeclaredMethods") else None
+    except Exception:
+        return None
 
 def _get_cached_classes() -> Tuple[Any, Any, Any]:
     SharedConfig.loadProxyList()
@@ -611,6 +746,18 @@ def _get_proxy_ping_and_avail(info: Any) -> Tuple[bool, int]:
             except Exception:
                 pass
     return av, ping
+
+
+def _is_fresh_working(info: Any, max_age_ms: int = MAX_PING_AGE_MS) -> bool:
+    available, ping = _get_proxy_ping_and_avail(info)
+    if not available or ping <= 0:
+        return False
+    try:
+        checked_at = int(getattr(info, "availableCheckTime", 0) or 0)
+        now = _elapsed_ms()
+        return checked_at > 0 and 0 <= now - checked_at <= max_age_ms
+    except Exception:
+        return False
 
 
 def _extract_proxy_details(info_or_settings: Any) -> Tuple[str, str, str, int, str, str, str]:
@@ -1277,6 +1424,8 @@ def _parse_proxy_url(url: str) -> Optional[ParsedProxy]:
 
 def _resolve_redirect_url(url: str) -> List[ParsedProxy]:
     results: List[ParsedProxy] = []
+    if _is_collect_proxy_url(url):
+        return results
     direct = _parse_proxy_url(url)
     if direct is not None:
         results.append(direct)
@@ -1336,6 +1485,8 @@ def extract_proxies_from_text(
 
     def _add(p: Optional[ParsedProxy]):
         if p is None or not p.server or "." not in p.host_only or not (1 <= p.port <= 65535):
+            return
+        if only_faketls and (p.kind != "mtproto" or not _is_faketls_secret(p.secret)):
             return
         if p.kind == "mtproto":
             if not allow_mtproto:
@@ -1415,6 +1566,13 @@ def extract_proxies_from_text(
     return found
 
 
+def _read_attachment_text(path: str) -> str:
+    if os.path.getsize(path) > MAX_ATTACHMENT_BYTES:
+        return ""
+    with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+        return fp.read(MAX_ATTACHMENT_BYTES + 1)
+
+
 def _download_and_read_attachment(msg: Any, account_id: int) -> str:
     try:
         media = getattr(msg, "media", None)
@@ -1451,8 +1609,7 @@ def _download_and_read_attachment(msg: Any, account_id: int) -> str:
         if f_obj is not None:
             p_str = str(f_obj.getAbsolutePath())
             if os.path.isfile(p_str):
-                with open(p_str, "r", encoding="utf-8", errors="ignore") as fp:
-                    return fp.read()
+                return _read_attachment_text(p_str)
 
         ev_loaded = getattr(NotificationCenter, "fileLoaded", None)
         ev_failed = getattr(NotificationCenter, "fileLoadFailed", None)
@@ -1500,8 +1657,7 @@ def _download_and_read_attachment(msg: Any, account_id: int) -> str:
         )
 
         if result_path[0] and os.path.isfile(result_path[0]):
-            with open(result_path[0], "r", encoding="utf-8", errors="ignore") as fp:
-                return fp.read()
+            return _read_attachment_text(result_path[0])
     except Exception:
         pass
     return ""
@@ -1521,6 +1677,8 @@ def extract_proxies_from_message(
 
     def _add(p: Optional[ParsedProxy]):
         if p is None or not p.server or "." not in p.host_only or not (1 <= p.port <= 65535):
+            return
+        if only_faketls and (p.kind != "mtproto" or not _is_faketls_secret(p.secret)):
             return
         if p.kind == "mtproto":
             if not allow_mtproto:
@@ -1549,7 +1707,7 @@ def extract_proxies_from_message(
             ent_url = str(getattr(ent, "url", "") or "").strip()
             offset = int(getattr(ent, "offset", 0) or 0)
             length = int(getattr(ent, "length", 0) or 0)
-            label = text[offset : offset + length] if (0 <= offset < len(text) and length > 0) else ""
+            label = _utf16_slice(text, offset, length) if (offset >= 0 and length > 0) else ""
             if ent_url:
                 url_candidates.append((ent_url, label))
 
@@ -1629,6 +1787,27 @@ def _mtp_sort_key(e: dict):
     return (ip_key, e["port"], len(e["secret"]), e["secret"])
 
 
+def _retain_view_listener(view: Any, listener: Any) -> Any:
+    """Keep Python Java proxies alive for precisely the lifetime of their view."""
+    try:
+        bag = view.getTag()
+        if not isinstance(bag, ArrayList):
+            previous = bag
+            bag = ArrayList()
+            if previous is not None:
+                bag.add(previous)
+            view.setTag(bag)
+        bag.add(listener)
+    except Exception:
+        # Standard View listener setters still retain the Java-side reference.
+        pass
+    return listener
+
+
+def _set_view_click(view: Any, listener: Any):
+    view.setOnClickListener(_retain_view_listener(view, listener))
+
+
 def _apply_press_scale(view: Any, scale_to: float = 0.96):
     try:
         class _TouchAnim(dynamic_proxy(View.OnTouchListener)):
@@ -1643,7 +1822,7 @@ def _apply_press_scale(view: Any, scale_to: float = 0.96):
                     pass
                 return False
 
-        view.setOnTouchListener(_TouchAnim())
+        view.setOnTouchListener(_retain_view_listener(view, _TouchAnim()))
     except Exception:
         pass
 
@@ -1775,7 +1954,7 @@ def _show_action_sheet(
 
                 row.addView(inner, FrameLayout.LayoutParams(-1, -2))
                 row.setClickable(True)
-                row.setOnClickListener(OnClickListener(lambda _v, fn=cb: (sheet.dismiss(), fn())))
+                _set_view_click(row, OnClickListener(lambda _v, fn=cb: (sheet.dismiss(), fn())))
                 _apply_press_scale(row, 0.97)
 
                 lp = LayoutHelper.createLinear(-1, -2, 0, 0 if idx == 0 else 6, 0, 0)
@@ -1796,7 +1975,7 @@ def _show_action_sheet(
             btn_bg.setColor(Theme.getColor(Theme.key_featuredStickers_addButton))
             btn_close.setBackground(btn_bg)
             btn_close.setClickable(True)
-            btn_close.setOnClickListener(OnClickListener(lambda _v: sheet.dismiss()))
+            _set_view_click(btn_close, OnClickListener(lambda _v: sheet.dismiss()))
             _apply_press_scale(btn_close, 0.97)
             root.addView(btn_close, LayoutHelper.createLinear(-1, -2, 0, 12, 0, 0))
 
@@ -1895,13 +2074,14 @@ def _show_input_sheet(
                 p_bg.setColor(0x20808080)
             btn_paste.setBackground(p_bg)
             btn_paste.setClickable(True)
-            btn_paste.setOnClickListener(
+            _set_view_click(
+                btn_paste,
                 OnClickListener(
                     lambda _v: (
                         edit.setText(_read_clipboard_text()),
                         edit.setSelection(edit.getText().length()),
                     )
-                )
+                ),
             )
             _apply_press_scale(btn_paste, 0.97)
             row_btns.addView(btn_paste, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0))
@@ -1928,7 +2108,7 @@ def _show_input_sheet(
                 if val:
                     on_submit(val)
 
-            btn_ok.setOnClickListener(OnClickListener(do_ok))
+            _set_view_click(btn_ok, OnClickListener(do_ok))
             _apply_press_scale(btn_ok, 0.97)
             row_btns.addView(btn_ok, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2))
 
@@ -2013,6 +2193,54 @@ class SlideCallback(dynamic_proxy(Utilities.Callback)):
             pass
 
 
+# Telegram's own AlertDialog.Builder expects this inner interface,
+# NOT android.content.DialogInterface.OnClickListener.
+_AlertDialogButtonClick = jclass("org.telegram.ui.ActionBar.AlertDialog$OnButtonClickListener")
+
+
+class _ProxyDialogClick(dynamic_proxy(_AlertDialogButtonClick)):
+    def __init__(self, callback: Callable[[Any, int], None]):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, dialog, which):
+        try:
+            self.callback(dialog, int(which))
+        except Exception as exc:
+            _plog(f"dialog button callback: {exc}\n{traceback.format_exc()}")
+            try:
+                BulletinHelper.show_error(f"Ошибка действия: {exc}")
+            except Exception:
+                pass
+
+
+class _ProxyRpcDelegate(dynamic_proxy(RequestDelegate)):
+    """Strongly retained per-request Java callback for Telegram ConnectionsManager."""
+
+    def __init__(self, callback: Callable[[Any, Any], None]):
+        super().__init__()
+        self.callback = callback
+
+    def run(self, response, error):
+        try:
+            self.callback(response, error)
+        except Exception as exc:
+            _plog(f"RPC delegate callback: {exc}")
+
+
+def _run_ui_logged(context: str, callback: Callable[[], None], delay_ms: int = 0):
+    def safe_callback():
+        try:
+            callback()
+        except Exception as exc:
+            _plog(f"{context}: {exc}\n{traceback.format_exc()}")
+            BulletinHelper.show_error(f"Proxy Collector: {exc}")
+
+    run_on_ui_thread(safe_callback, delay_ms)
+
+
+
+
 class RealtimeMessagesHook(MethodHook):
     def __init__(self, plugin: "AutoProxyCollectorPlugin"):
         super().__init__()
@@ -2032,7 +2260,11 @@ class RealtimeMessagesHook(MethodHook):
             if dialog_id == 0 or messages_list is None or not hasattr(messages_list, "size"):
                 return
 
-            sources = self.plugin._get_sources()
+            account = int(getattr(param.thisObject, "currentAccount", UserConfig.selectedAccount))
+            # updateInterfaceWithMessages fires for background accounts as well.
+            if account != int(UserConfig.selectedAccount):
+                return
+            sources = self.plugin._get_sources(account)
             if not sources:
                 return
 
@@ -2052,14 +2284,16 @@ class RealtimeMessagesHook(MethodHook):
                 if owner is None or not hasattr(owner, "id"):
                     continue
 
-                if whole_key in sources and not sources[whole_key].get("paused", False):
-                    self.plugin.enqueue_realtime_message(whole_key, owner)
+                if (whole_key in sources and not sources[whole_key].get("paused", False)
+                        and int(owner.id) > int(sources[whole_key].get("last_msg_id", 0) or 0)):
+                    self.plugin.enqueue_realtime_message(whole_key, owner, account)
 
                 if is_forum:
                     tid = _get_message_topic_id(owner, mo)
                     t_key = _make_source_key(dialog_id, tid)
-                    if tid > 0 and t_key in sources and not sources[t_key].get("paused", False):
-                        self.plugin.enqueue_realtime_message(t_key, owner)
+                    if (tid > 0 and t_key in sources and not sources[t_key].get("paused", False)
+                            and int(owner.id) > int(sources[t_key].get("last_msg_id", 0) or 0)):
+                        self.plugin.enqueue_realtime_message(t_key, owner, account)
         except Exception:
             pass
 
@@ -2070,10 +2304,18 @@ class ProxyListScreenHook(MethodHook):
         self.plugin = plugin
 
     def after_hooked_method(self, param):
-        obj = param.thisObject
-        if obj and "ProxyListActivity" in obj.getClass().getName():
-            self.plugin._inject_proxy_screen_button(obj)
-
+        try:
+            if not self.plugin._alive:
+                return
+            fragment = param.thisObject
+            if fragment is None or "ProxyListActivity" not in str(fragment.getClass().getName()):
+                return
+            if str(param.method.getName()) == "onFragmentDestroy":
+                self.plugin._toolbar_listeners.pop(int(System.identityHashCode(fragment)), None)
+            else:
+                self.plugin._inject_proxy_screen_button(fragment)
+        except Exception as exc:
+            _plog(f"proxy screen hook: {exc}")
 
 class CellSetProxyHook(MethodHook):
     def __init__(self, plugin: "AutoProxyCollectorPlugin"):
@@ -2207,6 +2449,13 @@ class SettingsHeaderHook(MethodHook):
             pass
 
 
+
+
+
+
+
+
+
 class AutoProxyCollectorPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -2219,11 +2468,15 @@ class AutoProxyCollectorPlugin(BasePlugin):
         self._msg_menu_item = None
         self._picker_delegate = None
         self._conn_observer = None
+        self._conn_observer_account = None
         self._timer_token = 0
+        self._resume_scan_at = 0.0
         self._lock = threading.Lock()
 
-        self._rt_queue: Dict[str, List[Any]] = {}
+        self._rt_queue: Dict[Tuple[int, str], List[Any]] = {}
         self._rt_worker_running = False
+        self._rt_seen_ids: Set[Tuple[int, str, int]] = set()
+        self._rt_generation = 0
 
         self._dead_cache: Dict[str, float] = {}
         self._strikes: Dict[str, int] = {}
@@ -2232,38 +2485,115 @@ class AutoProxyCollectorPlugin(BasePlugin):
         self._inflight_geo: Set[str] = set()
         self._geo_running = False
         self._geo_lock = threading.Lock()
+        self._geo_generation = 0
 
         self._last_net_sig = ""
         self._last_net_check_ts = 0.0
+        self._last_health_check_ts = 0.0
+        self._export_posts_in_progress = False
+        self._dialog_callbacks: List[Any] = []
+        self._rpc_lock = threading.Lock()
+        self._pending_rpc: Dict[int, Any] = {}
+        self._toolbar_listeners: Dict[int, Any] = {}
+
+    def _dialog_click(self, callback: Callable[[Any, int], None]):
+        listener = _ProxyDialogClick(callback)
+        self._dialog_callbacks.append(listener)
+        return listener
 
     def on_plugin_load(self):
         self._alive = True
+        with self._lock:
+            self._rt_generation += 1
+            self._rt_queue.clear()
+            self._rt_seen_ids.clear()
+            self._rt_worker_running = False
+        with self._geo_lock:
+            self._geo_generation += 1
+            self._pending_geo.clear()
+            self._inflight_geo.clear()
+            self._geo_running = False
         self._load_caches()
         self._last_net_sig = _get_network_signature()
 
-        mc_class = find_class("org.telegram.messenger.MessagesController")
-        if mc_class:
-            refs = self.hook_all_methods(
-                mc_class, "updateInterfaceWithMessages", RealtimeMessagesHook(self)
-            )
-            if refs:
-                self._hooks.extend(refs)
+        try:
+            mc_class = _resolve_jclass("org.telegram.messenger.MessagesController")
+            if mc_class is not None:
+                refs = self.hook_all_methods(
+                    mc_class, "updateInterfaceWithMessages", RealtimeMessagesHook(self)
+                )
+                if refs:
+                    self._hooks.extend(refs)
+        except Exception as exc:
+            _plog(f"hook MessagesController: {exc}")
 
         self._hook_proxy_list_and_cells()
         self._hook_settings_header()
         self._register_connection_observer()
 
         self._sync_chat_menu(bool(self.get_setting("show_chat_menu", True)))
-        self._sync_msg_menu(bool(self.get_setting("show_msg_menu", True)))
+        self._sync_msg_menu(bool(self.get_setting("show_msg_menu", False)))
         self._start_periodic_timer()
         _plog("loaded v" + __version__)
+
+    def on_app_event(self, event_type):
+        # Only attempt an in-app catch-up. Do not claim Android can wake Python
+        # while the process is killed or suspended by battery optimization.
+        try:
+            event = str(getattr(event_type, "name", event_type)).upper()
+            now = time.monotonic()
+            if ("RESUME" in event and self._alive and self.get_setting("enabled", True)
+                    and now - self._resume_scan_at >= 20):
+                self._resume_scan_at = now
+                run_on_ui_thread(lambda: self._scan_sources_async(manual=False))
+        except Exception as exc:
+            _plog(f"resume scan: {exc}")
 
     def on_plugin_unload(self):
         self._alive = False
         self._timer_token += 1
-        self._sync_chat_menu(False)
-        self._sync_msg_menu(False)
-        self._unregister_connection_observer()
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                def hide_tools():
+                    try:
+                        menu = _get_action_bar(fragment).createMenu()
+                        item = menu.getItem(MENU_TOOLS_ID) if menu else None
+                        if item is not None:
+                            item.setVisibility(View.GONE)
+                    except Exception:
+                        pass
+                run_on_ui_thread(hide_tools)
+        except Exception:
+            pass
+        with self._lock:
+            self._rt_generation += 1
+            self._rt_queue.clear()
+            self._rt_seen_ids.clear()
+            self._rt_worker_running = False
+        with self._geo_lock:
+            self._geo_generation += 1
+            self._pending_geo.clear()
+            self._inflight_geo.clear()
+            self._geo_running = False
+        with self._rpc_lock:
+            pending = list(self._pending_rpc.values())
+        for _delegate, account_id, request_id, completed in pending:
+            completed.set()  # Wake blocked worker threads immediately.
+            if request_id is not None:
+                try:
+                    ConnectionsManager.getInstance(account_id).cancelRequest(request_id, True)
+                except Exception as exc:
+                    _plog(f"RPC cancel on unload: {exc}")
+        for cleanup in (
+            lambda: self._sync_chat_menu(False),
+            lambda: self._sync_msg_menu(False),
+            self._unregister_connection_observer,
+        ):
+            try:
+                cleanup()
+            except Exception as exc:
+                _plog(f"unload cleanup: {exc}")
 
         for h in self._hooks:
             try:
@@ -2272,9 +2602,92 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 pass
         self._hooks.clear()
         self._keep_callbacks.clear()
+        self._toolbar_listeners.clear()
+        self._dialog_callbacks.clear()
         self._rt_queue.clear()
         _DETAILS_CACHE.clear()
         self._picker_delegate = None
+
+
+
+
+
+
+
+
+    def _request_sync(self, req: Any, account_id: int, timeout: float = 18.0) -> Any:
+        """Wait for a native Telegram RPC on a WORKER thread, retaining its delegate.
+
+        The Java side invokes RequestDelegate on its stage queue. Do not depend
+        on the lifetime of a short-lived SDK Python callback wrapper here.
+        """
+        if not self._alive:
+            raise RuntimeError("Плагин выгружен")
+        completed = threading.Event()
+        result: List[Any] = [None, None]
+        started = time.monotonic()
+        acc = int(account_id)
+        request_name = type(req).__name__
+        request_id = None
+
+        def on_result(resp, err):
+            try:
+                result[0] = resp
+                result[1] = err
+            finally:
+                completed.set()
+
+        delegate = _ProxyRpcDelegate(on_result)
+        callback_key = id(delegate)
+        # Retain the *Java interface proxy*, not only the Python callback.
+        with self._rpc_lock:
+            self._pending_rpc[callback_key] = (delegate, acc, None, completed)
+        try:
+            if not self._alive:
+                raise RuntimeError("Плагин выгружен")
+            request_id = int(ConnectionsManager.getInstance(acc).sendRequest(req, delegate))
+            with self._rpc_lock:
+                if callback_key in self._pending_rpc:
+                    self._pending_rpc[callback_key] = (delegate, acc, request_id, completed)
+            _plog(f"RPC sent {request_name}: account={acc}, token={request_id}")
+            if not completed.wait(timeout=float(timeout)):
+                elapsed = time.monotonic() - started
+                _plog(
+                    f"RPC timeout {request_name}: account={acc}, token={request_id}, "
+                    f"elapsed={elapsed:.1f}s, network={_get_network_signature()}"
+                )
+                try:
+                    ConnectionsManager.getInstance(acc).cancelRequest(request_id, True)
+                except Exception as cancel_exc:
+                    _plog(f"RPC cancel {request_name}: {cancel_exc}")
+                raise TimeoutError(
+                    f"{request_name}: нет callback за {elapsed:.1f}с (token={request_id})"
+                )
+            if not self._alive:
+                raise RuntimeError("Плагин выгружен")
+            elapsed = time.monotonic() - started
+            if result[1] is not None:
+                error = result[1]
+                error_text = str(getattr(error, "text", error))
+                error_code = getattr(error, "code", "?")
+                _plog(
+                    f"RPC error {request_name}: token={request_id}, "
+                    f"code={error_code}, text={error_text}, elapsed={elapsed:.1f}s"
+                )
+                raise RuntimeError(f"{request_name}: {error_text} (code={error_code})")
+            if result[0] is None:
+                _plog(f"RPC empty {request_name}: token={request_id}, elapsed={elapsed:.1f}s")
+                raise RuntimeError(f"{request_name}: пустой ответ Telegram")
+            _plog(
+                f"RPC ok {request_name}: token={request_id}, "
+                f"response={type(result[0]).__name__}, elapsed={elapsed:.1f}s"
+            )
+            return result[0]
+        finally:
+            with self._rpc_lock:
+                self._pending_rpc.pop(callback_key, None)
+
+
 
     def _get_header_tools_config(self) -> Tuple[List[str], Set[str]]:
         raw_order = self.get_setting("header_tools_order", None)
@@ -2288,7 +2701,8 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
         raw_disabled = self.get_setting("header_tools_disabled", None)
         disabled = set(raw_disabled) if isinstance(raw_disabled, list) else set()
-        return order, disabled
+        # Ignore old menu entries kept in settings when upgrading from 1.2.1.
+        return order, disabled.intersection(order)
 
     def _save_header_tools_config(self, order: List[str], disabled: Set[str], reload_ui: bool = False):
         self.set_setting("header_tools_order", list(order), reload_settings=False)
@@ -2313,7 +2727,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
         try:
             raw_ip = json.loads(str(self.get_setting("ip_cache_json", "{}")))
             if isinstance(raw_ip, dict):
-                self._ip_cache = raw_ip
+                self._ip_cache = {
+                    k: v for k, v in list(raw_ip.items())[-2000:]
+                    if isinstance(k, str) and isinstance(v, dict)
+                }
         except Exception:
             self._ip_cache = {}
 
@@ -2328,19 +2745,30 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
     def _save_ip_cache(self):
         if len(self._ip_cache) > 2000:
-            items = sorted(self._ip_cache.items(), key=lambda x: x[1].get("ts", 0))[-2000:]
+            def saved_at(entry):
+                try:
+                    return float(entry[1].get("ts", 0))
+                except (AttributeError, TypeError, ValueError):
+                    return 0.0
+            items = sorted(self._ip_cache.items(), key=saved_at)[-2000:]
             self._ip_cache = dict(items)
         self.set_setting("ip_cache_json", json.dumps(self._ip_cache, ensure_ascii=False), reload_settings=False)
 
     def _get_cached_geo(self, host: str) -> Optional[Dict[str, Any]]:
         d = self._ip_cache.get(host)
-        if not d:
+        if not isinstance(d, dict):
             return None
-        if (time.time() - float(d.get("ts", 0))) > 7 * 86400:
+        try:
+            saved_at = float(d.get("ts", 0))
+        except (ValueError, TypeError):
+            return None
+        if not 0 < saved_at <= time.time() or time.time() - saved_at > 7 * 86400:
             return None
         return d
 
     def _request_geo(self, host: str):
+        if not self.get_setting("geo_remote_lookup", False):
+            return
         with self._geo_lock:
             if self._get_cached_geo(host) is not None:
                 return
@@ -2350,31 +2778,43 @@ class AutoProxyCollectorPlugin(BasePlugin):
             if self._geo_running:
                 return
             self._geo_running = True
-        threading.Thread(target=self._geo_worker, daemon=True).start()
-
-    def _geo_worker(self):
+            generation = self._geo_generation
         try:
-            while self._alive:
+            threading.Thread(target=self._geo_worker, args=(generation,), daemon=True).start()
+        except Exception:
+            with self._geo_lock:
+                if generation == self._geo_generation:
+                    self._geo_running = False
+            raise
+
+    def _geo_worker(self, generation: int):
+        try:
+            while self._alive and generation == self._geo_generation:
                 time.sleep(0.8)
                 with self._geo_lock:
                     batch = list(self._pending_geo)[:100]
                     if not batch:
-                        self._geo_running = False
+                        if generation == self._geo_generation:
+                            self._geo_running = False
                         return
                     for h in batch:
                         self._pending_geo.discard(h)
                         self._inflight_geo.add(h)
 
-                self._fetch_geo_batch(batch)
+                self._fetch_geo_batch(batch, generation)
 
                 with self._geo_lock:
                     for h in batch:
                         self._inflight_geo.discard(h)
-        except Exception:
+        except Exception as exc:
+            _plog(f"GeoIP worker: {exc}")
             with self._geo_lock:
-                self._geo_running = False
+                if generation == self._geo_generation:
+                    self._geo_running = False
 
-    def _fetch_geo_batch(self, hosts: List[str]):
+    def _fetch_geo_batch(self, hosts: List[str], generation: int):
+        if not self._alive or not self.get_setting("geo_remote_lookup", False):
+            return
         try:
             queries = []
             for h in hosts:
@@ -2395,13 +2835,17 @@ class AutoProxyCollectorPlugin(BasePlugin):
                         self._pending_geo.update(hosts)
                     time.sleep(5.0)
                     return
-                data = json.loads(resp.read().decode("utf-8", "ignore"))
+                data = json.loads(_read_http_text(resp, MAX_GEO_RESPONSE_BYTES))
 
+            if not self._alive or generation != self._geo_generation or not isinstance(data, list):
+                return
             now = time.time()
             changed = False
             for i, item in enumerate(data):
                 if i >= len(hosts):
                     break
+                if not isinstance(item, dict):
+                    continue
                 h = hosts[i]
                 cc = str(item.get("countryCode") or "").upper()
                 isp = str(item.get("isp") or "")
@@ -2428,43 +2872,58 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
     def _hook_proxy_list_and_cells(self):
         act_cls = _resolve_jclass("org.telegram.ui.ProxyListActivity")
-        if act_cls is not None:
-            try:
-                for m in act_cls.getDeclaredMethods():
-                    if m.getName() == "createView":
-                        m.setAccessible(True)
-                        self._hooks.append(self.hook_method(m, ProxyListScreenHook(self)))
-                        break
+        if act_cls is None:
+            _plog("ProxyListActivity not found")
+        else:
+            for method_name in ("createView", "onResume", "onFragmentDestroy"):
+                total = 0
                 curr = act_cls
                 while curr is not None:
-                    done = False
-                    for m in curr.getDeclaredMethods():
-                        if m.getName() == "onResume":
-                            m.setAccessible(True)
-                            self._hooks.append(self.hook_method(m, ProxyListScreenHook(self)))
-                            done = True
-                            break
-                    if done:
+                    try:
+                        methods = curr.getDeclaredMethods()
+                    except Exception as exc:
+                        _plog(f"ProxyListActivity {method_name}: reflection {exc}")
                         break
-                    curr = curr.getSuperclass()
-            except Exception as e:
-                _plog(f"hook ProxyListActivity err: {e}")
+                    for method in methods:
+                        try:
+                            if str(method.getName()) != method_name:
+                                continue
+                            method.setAccessible(True)
+                            ref = self.hook_method(method, ProxyListScreenHook(self))
+                            if ref is not None:
+                                self._hooks.append(ref)
+                                total += 1
+                        except Exception as exc:
+                            _plog(f"ProxyListActivity {method_name}: {exc}")
+                    if total or method_name == "createView":
+                        break
+                    try:
+                        curr = curr.getSuperclass()
+                    except Exception:
+                        break
+                _plog(f"ProxyListActivity {method_name} hooks: {total}")
 
         cell_cls = _resolve_jclass("org.telegram.ui.ProxyListActivity$TextDetailProxyCell") or _resolve_jclass(
             "org.telegram.ui.Cells.TextDetailProxyCell"
         )
         if cell_cls is not None:
             try:
-                for m in cell_cls.getDeclaredMethods():
-                    if m.getName() == "setProxy":
-                        m.setAccessible(True)
-                        self._hooks.append(self.hook_method(m, CellSetProxyHook(self)))
-                    elif m.getName() == "updateStatus":
-                        m.setAccessible(True)
-                        self._hooks.append(self.hook_method(m, CellUpdateStatusHook(self)))
-            except Exception as e:
-                _plog(f"hook cell err: {e}")
-
+                methods = cell_cls.getDeclaredMethods()
+            except Exception as exc:
+                _plog(f"proxy cell reflection: {exc}")
+                methods = []
+            for method in methods:
+                try:
+                    name = str(method.getName())
+                    if name not in ("setProxy", "updateStatus"):
+                        continue
+                    method.setAccessible(True)
+                    handler = CellSetProxyHook(self) if name == "setProxy" else CellUpdateStatusHook(self)
+                    ref = self.hook_method(method, handler)
+                    if ref is not None:
+                        self._hooks.append(ref)
+                except Exception as exc:
+                    _plog(f"proxy cell method: {exc}")
     def _hook_settings_header(self):
         try:
             psa_cls = _resolve_jclass("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
@@ -2483,8 +2942,11 @@ class AutoProxyCollectorPlugin(BasePlugin):
             if ev_id is None:
                 return
             self._conn_observer = ConnectionStateObserver(self)
-            nc = get_notification_center(UserConfig.selectedAccount)
-            run_on_ui_thread(lambda: nc.addObserver(self._conn_observer, ev_id))
+            account_id = int(UserConfig.selectedAccount)
+            self._conn_observer_account = account_id
+            nc = get_notification_center(account_id)
+            observer = self._conn_observer
+            run_on_ui_thread(lambda: nc.addObserver(observer, ev_id) if self._alive else None)
         except Exception:
             pass
 
@@ -2492,15 +2954,17 @@ class AutoProxyCollectorPlugin(BasePlugin):
         try:
             ev_id = getattr(NotificationCenter, "didUpdateConnectionState", None)
             if ev_id is not None and self._conn_observer is not None:
-                nc = get_notification_center(UserConfig.selectedAccount)
+                account_id = self._conn_observer_account
+                nc = get_notification_center(account_id)
                 obs = self._conn_observer
                 run_on_ui_thread(lambda: nc.removeObserver(obs, ev_id))
         except Exception:
             pass
         self._conn_observer = None
+        self._conn_observer_account = None
 
     def _on_connection_state_event(self):
-        if not self.get_setting("network_switch_failover", True):
+        if not self._alive or not self.get_setting("network_switch_failover", True):
             return
         cur_sig = _get_network_signature()
         if cur_sig in ("offline", "unknown"):
@@ -2547,53 +3011,96 @@ class AutoProxyCollectorPlugin(BasePlugin):
             pass
 
     def _inject_proxy_screen_button(self, fragment: Any):
-        if fragment is None or not self.get_setting("show_proxy_bar_btn", True):
+        if fragment is None or not self._alive or not self.get_setting("show_proxy_bar_btn", True):
             return
 
-        def ui():
+        def insert():
+            if not self._alive or not self.get_setting("show_proxy_bar_btn", True):
+                return
             try:
                 ab = _get_action_bar(fragment)
                 if ab is None:
                     return
                 menu = ab.createMenu()
-                if menu is None:
+                if menu is None or menu.getItem(MENU_TOOLS_ID) is not None:
                     return
-                if menu.getItem(MENU_TOOLS_ID) is None:
-                    iw = AndroidUtilities.dp(40)
-                    ico = _get_drawable_res("msg_settings", _get_drawable_res("ic_ab_other", 0))
-                    it = menu.addItemWithWidth(MENU_TOOLS_ID, ico, iw, "Инструменты")
-                    it.setOnClickListener(OnClickListener(lambda _v: self._open_proxy_screen_tools(fragment)))
-            except Exception:
-                pass
+                icon = _get_drawable_res("msg_settings", _get_drawable_res("ic_ab_other", 0))
+                if not icon:
+                    _plog("ProxyListActivity: toolbar icon unavailable")
+                    return
+                item = menu.addItemWithWidth(
+                    MENU_TOOLS_ID, icon, AndroidUtilities.dp(40), "Инструменты"
+                )
+                listener = OnClickListener(lambda _v: self._open_proxy_screen_tools(fragment))
+                self._toolbar_listeners[int(System.identityHashCode(fragment))] = listener
+                item.setOnClickListener(listener)
+            except Exception as exc:
+                _plog(f"ProxyListActivity button: {exc}")
 
-        run_on_ui_thread(ui)
-
-    def enqueue_realtime_message(self, source_key: str, tl_msg: Any):
+        run_on_ui_thread(insert)
+        run_on_ui_thread(insert, 240)
+    def enqueue_realtime_message(self, source_key: str, tl_msg: Any, account_id: int):
+        if not self._alive:
+            return
         with self._lock:
-            self._rt_queue.setdefault(source_key, []).append(tl_msg)
+            queue_key = (int(account_id), source_key)
+            msg_id = int(getattr(tl_msg, "id", 0) or 0)
+            seen_key = (int(account_id), source_key, msg_id)
+            if msg_id > 0 and seen_key in self._rt_seen_ids:
+                return
+            if len(self._rt_seen_ids) >= 5000:
+                self._rt_seen_ids.clear()
+            if msg_id > 0:
+                self._rt_seen_ids.add(seen_key)
+            items = self._rt_queue.setdefault(queue_key, [])
+            if len(items) < 1000:
+                items.append(tl_msg)
+            else:
+                _plog("realtime queue full; periodic scan will catch up")
             if self._rt_worker_running:
                 return
             self._rt_worker_running = True
+            generation = self._rt_generation
 
-        def _rt_drain_worker():
-            time.sleep(0.5)
-            while self._alive:
+        def drain():
+            try:
+                time.sleep(0.4)
+                while self._alive and generation == self._rt_generation:
+                    with self._lock:
+                        if not self._rt_queue:
+                            return
+                        batch = dict(self._rt_queue)
+                        self._rt_queue.clear()
+                    for (acc, key), msgs in batch.items():
+                        if not self._alive or generation != self._rt_generation:
+                            break
+                        try:
+                            self._process_source_messages_bg(key, msgs, manual=False,
+                                                             account_id=acc, checkpoint=False)
+                        except Exception as exc:
+                            _plog(f"realtime process {key}: {exc}")
+            finally:
                 with self._lock:
-                    if not self._rt_queue:
-                        self._rt_worker_running = False
-                        return
-                    batch_map = dict(self._rt_queue)
-                    self._rt_queue.clear()
+                    self._rt_worker_running = False
+                    pending = bool(self._rt_queue)
+                if pending and self._alive and generation == self._rt_generation:
+                    # An incoming update will restart the worker; avoid lost queue.
+                    threading.Thread(target=lambda: self._flush_realtime_pending(), daemon=True).start()
+        threading.Thread(target=drain, daemon=True).start()
 
-                for s_key, msgs in batch_map.items():
-                    if not self._alive:
-                        break
-                    try:
-                        self._process_source_messages_bg(s_key, msgs, manual=False)
-                    except Exception:
-                        pass
-
-        threading.Thread(target=_rt_drain_worker, daemon=True).start()
+    def _flush_realtime_pending(self):
+        if not self._alive:
+            return
+        with self._lock:
+            snapshot = dict(self._rt_queue)
+            self._rt_queue.clear()
+        for (acc, key), msgs in snapshot.items():
+            if self._alive:
+                try:
+                    self._process_source_messages_bg(key, msgs, manual=False, account_id=acc,
+                                                     checkpoint=False)
+                except Exception as exc:
+                    _plog(f"realtime flush {key}: {exc}")
 
     def _pick_menu_icon(self, *candidates: str) -> str:
         for name in candidates:
@@ -2602,7 +3109,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
         return "msg_download"
 
     def _sync_chat_menu(self, enabled: bool):
-        self.remove_menu_item("apc_chat_menu")
+        try:
+            self.remove_menu_item("apc_chat_menu")
+        except Exception as exc:
+            _plog(f"chat menu removal: {exc}")
         self._chat_menu_item = None
         if enabled:
             try:
@@ -2625,7 +3135,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 pass
 
     def _sync_msg_menu(self, enabled: bool):
-        self.remove_menu_item("apc_msg_menu")
+        try:
+            self.remove_menu_item("apc_msg_menu")
+        except Exception as exc:
+            _plog(f"message menu removal: {exc}")
         self._msg_menu_item = None
         if enabled:
             try:
@@ -2674,28 +3187,41 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     parse_attachments=True,
                     account_id=acc,
                 )
-                self._save_proxies_native(found, manual=True, bypass_dead_cache=True)
+                self._save_proxies_native(found, manual=True, bypass_dead_cache=bool(self.get_setting("import_ignore_dead_cache", False)))
             except Exception as e:
                 run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка разбора поста: {e}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _get_sources(self) -> Dict[str, Dict[str, Any]]:
-        raw = self.get_setting("sources_json", "{}")
+    def _get_sources(self, account_id: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+        acc = int(UserConfig.selectedAccount) if account_id is None else int(account_id)
+        setting_key = f"sources_json_account_{acc}"
+        raw = self.get_setting(setting_key, None)
+        if raw is None:
+            migrated_to = self.get_setting("sources_legacy_migrated_to_account", None)
+            if migrated_to is None:
+                raw = self.get_setting("sources_json", "{}")
+                self.set_setting(setting_key, raw, reload_settings=False)
+                self.set_setting("sources_legacy_migrated_to_account", acc, reload_settings=False)
+            else:
+                raw = "{}"
         try:
             data = json.loads(str(raw))
             if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
+                result = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+                for meta in result.values():
+                    if _is_collect_proxy_url(str(meta.get("url", ""))):
+                        meta["paused"] = True
+                return result
+        except Exception as exc:
+            _plog(f"sources parse account={acc}: {exc}")
         return {}
 
-    def _save_sources(self, sources: Dict[str, Dict[str, Any]], reload_ui: bool = False):
-        self.set_setting(
-            "sources_json",
-            json.dumps(sources, ensure_ascii=False),
-            reload_settings=reload_ui,
-        )
+    def _save_sources(self, sources: Dict[str, Dict[str, Any]], reload_ui: bool = False,
+                      account_id: Optional[int] = None):
+        acc = int(UserConfig.selectedAccount) if account_id is None else int(account_id)
+        self.set_setting(f"sources_json_account_{acc}",
+                         json.dumps(sources, ensure_ascii=False), reload_settings=reload_ui)
 
     def _add_source(
         self, dialog_id: int, topic_id: int = 0, custom_title: str = "", reload_ui: bool = True
@@ -2729,6 +3255,8 @@ class AutoProxyCollectorPlugin(BasePlugin):
         u = url.strip()
         if not u.startswith(("http://", "https://")):
             u = "https://" + u
+        if _is_collect_proxy_url(u):
+            raise ValueError("Вместо collect.proxy добавь исходный канал как источник")
         key = _make_url_source_key(u)
         parsed = urllib.parse.urlparse(u)
         short_name = f"{parsed.netloc}{parsed.path[:24]}"
@@ -2752,38 +3280,28 @@ class AutoProxyCollectorPlugin(BasePlugin):
             if pl is None or int(pl.size()) == 0:
                 BulletinHelper.show_info("Список прокси пуст")
                 return
-
             active_key = _get_active_proxy_key(PC)
             working = []
-            fallback = []
-
             for i in range(int(pl.size())):
                 info = pl.get(i)
-                if info is None:
+                if info is None or not _is_fresh_working(info):
                     continue
-                k, _, srv, _, _, _, _ = _extract_proxy_details(info)
-                if not k or k == active_key or _is_local_host(srv):
+                key, _, srv, _, _, _, _ = _extract_proxy_details(info)
+                if not key or key == active_key or _is_local_host(srv):
                     continue
-                av, ping = _get_proxy_ping_and_avail(info)
-                host = _extract_connect_host(srv)
-                if av:
-                    working.append((info, host, ping))
-                else:
-                    fallback.append((info, host, 0))
-
-            pool = working if working else fallback
-            if not pool:
-                BulletinHelper.show_info("Нет других прокси для переключения")
+                _available, ping = _get_proxy_ping_and_avail(info)
+                working.append((int(ping), info, _extract_connect_host(srv)))
+            if not working:
+                BulletinHelper.show_info("Нет недавно проверенных рабочих прокси. Выполни проверку списка")
                 return
-
-            chosen, host, ping = random.choice(pool)
+            ping, chosen, host = min(working, key=lambda row: row[0])
             if _activate_proxy_info(PC, chosen):
-                suffix = f" ({ping} мс)" if ping > 0 else ""
-                BulletinHelper.show_success(f"Подключён: {host}{suffix}")
+                BulletinHelper.show_success(f"Подключён: {host} ({ping} мс)")
             else:
                 BulletinHelper.show_error("Не удалось активировать прокси")
-        except Exception as e:
-            BulletinHelper.show_error(f"Ошибка: {e}")
+        except Exception as exc:
+            _plog(f"connect best: {exc}")
+            BulletinHelper.show_error(f"Ошибка: {exc}")
 
     def deduplicate_existing_proxies_ui(self, show_toast_if_zero: bool = False) -> int:
         removed_dups = 0
@@ -2885,10 +3403,17 @@ class AutoProxyCollectorPlugin(BasePlugin):
         max_msg_id: int = 0,
         manual: bool = False,
         bypass_dead_cache: bool = False,
+        duplicate_posts: int = 0,
+        account_id: Optional[int] = None,
     ):
         def ui():
+            if not self._alive:
+                return
+            if account_id is not None and int(account_id) != int(UserConfig.selectedAccount):
+                _plog("source save deferred: selected account changed")
+                return
             try:
-                self.deduplicate_existing_proxies_ui(show_toast_if_zero=False)
+                _DETAILS_CACHE.clear()
 
                 PC, ProxyInfo, PS = _get_cached_classes()
                 max_per_host = self._get_max_per_host()
@@ -2953,7 +3478,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
                 if source_key:
                     with self._lock:
-                        sources = self._get_sources()
+                        sources = self._get_sources(account_id)
                         if source_key in sources:
                             if max_msg_id > 0:
                                 prev_max = int(sources[source_key].get("last_msg_id", 0) or 0)
@@ -2962,9 +3487,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
                             sources[source_key]["added_count"] = (
                                 int(sources[source_key].get("added_count", 0) or 0) + added
                             )
-                            self._save_sources(sources, reload_ui=False)
+                            self._save_sources(sources, reload_ui=False, account_id=account_id)
 
-                if self.get_setting("mark_read_after_collect", False) and dialog_id != 0 and max_msg_id > 0:
+                if (self.get_setting("mark_read_after_collect", False) and dialog_id != 0
+                        and max_msg_id > 0 and (account_id is None or int(account_id) == int(UserConfig.selectedAccount))):
                     self._mark_dialog_read_safely(dialog_id, max_msg_id)
 
                 if added > 0:
@@ -2988,10 +3514,15 @@ class AutoProxyCollectorPlugin(BasePlugin):
                         if counts["web"]:
                             parts.append(f"WEB: {counts['web']}")
                         suffix = f" ({', '.join(parts)})" if parts else ""
-                        BulletinHelper.show_success(f"Добавлено прокси: {added}{suffix}")
+                        extra = ""
+                        if manual and (dups or duplicate_posts):
+                            extra = f" · уже были: {dups} · повторы в постах: {duplicate_posts}"
+                        BulletinHelper.show_success(f"Добавлено прокси: {added}{suffix}{extra}")
                 elif manual:
-                    if dups > 0:
-                        BulletinHelper.show_info(f"Все найденные прокси ({dups}) уже в списке")
+                    if dups > 0 or duplicate_posts > 0:
+                        BulletinHelper.show_info(
+                            f"Новых нет · уже в списке: {dups} · повторов в постах: {duplicate_posts}"
+                        )
                     elif blacklisted > 0:
                         BulletinHelper.show_info(f"Пропущено мёртвых из кэша: {blacklisted}")
                     elif skipped > 0:
@@ -3115,6 +3646,9 @@ class AutoProxyCollectorPlugin(BasePlugin):
             active_key: str,
             removed_dups: int,
         ):
+            if not self._alive:
+                self._cleaning = False
+                return
             try:
                 PC, _, _ = _get_cached_classes()
                 pl = PC.getProxyList()
@@ -3125,7 +3659,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     return
 
                 max_limit = self._get_max_proxy_limit()
-                trim_slowest = bool(self.get_setting("trim_slowest_on_limit", True))
+                trim_slowest = bool(self.get_setting("trim_slowest_on_limit", False))
                 do_failover = bool(self.get_setting("auto_failover", True))
                 auto_sort = bool(self.get_setting("auto_sort_after_check", True))
                 strikes_needed = self._get_strike_limit()
@@ -3451,7 +3985,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     refresh_edit_btn_toggle()
 
                 refresh_edit_btn_toggle()
-                edit_btn_toggle_row.setOnClickListener(OnClickListener(toggle_edit_btn))
+                _set_view_click(edit_btn_toggle_row, OnClickListener(toggle_edit_btn))
                 _apply_press_scale(edit_btn_toggle_row, 0.98)
                 scroll_body.addView(edit_btn_toggle_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 6))
 
@@ -3493,7 +4027,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 d_bg.setColor(Theme.getColor(Theme.key_featuredStickers_addButton))
                 btn_done.setBackground(d_bg)
                 btn_done.setClickable(True)
-                btn_done.setOnClickListener(OnClickListener(lambda _v: sheet.dismiss()))
+                _set_view_click(btn_done, OnClickListener(lambda _v: sheet.dismiss()))
                 _apply_press_scale(btn_done, 0.97)
                 bottom_row.addView(btn_done, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4))
 
@@ -3718,7 +4252,9 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
                                 return False
 
-                        row_view.setOnTouchListener(_DragOrTapListener(row_idx, row_view, item_key))
+                        row_view.setOnTouchListener(
+                            _retain_view_listener(row_view, _DragOrTapListener(row_idx, row_view, item_key))
+                        )
 
                     if not state["hidden"]:
                         hidden_card.addView(make_empty_placeholder("Все пункты отображаются в меню"))
@@ -3777,7 +4313,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                                     persist_state()
                                     rebuild_lists()
 
-                            h_row.setOnClickListener(OnClickListener(restore_item))
+                            _set_view_click(h_row, OnClickListener(restore_item))
                             _apply_press_scale(h_row, 0.97)
                             hidden_card.addView(
                                 h_row,
@@ -3793,7 +4329,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     rebuild_lists()
                     BulletinHelper.show_success("Порядок сброшен")
 
-                btn_reset.setOnClickListener(OnClickListener(on_reset_click))
+                _set_view_click(btn_reset, OnClickListener(on_reset_click))
 
                 rebuild_lists()
                 sheet.setCustomView(root)
@@ -3807,53 +4343,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
         act = fragment.getParentActivity() if fragment else None
         if act is None:
             return
-
-        def do_clip():
-            raw = _read_clipboard_text()
-            if not raw:
-                BulletinHelper.show_error("Буфер обмена пуст")
-                return
-            parsed = extract_proxies_from_text(
-                raw,
-                allow_mtproto=True,
-                allow_socks5=True,
-                allow_web=True,
-                only_faketls=bool(self.get_setting("only_faketls", False)),
-            )
-            self._save_proxies_native(parsed, manual=True, bypass_dead_cache=True)
-
-        def do_url():
-            _show_input_sheet(act, "Импорт по ссылке", "https://...", self._import_from_url_async, multiline=False)
-
-        def do_text():
-            _show_input_sheet(
-                act,
-                "Вставьте прокси",
-                "tg://proxy?... или tg://webproxy?...",
-                lambda txt: self._save_proxies_native(
-                    extract_proxies_from_text(
-                        txt,
-                        allow_mtproto=True,
-                        allow_socks5=True,
-                        allow_web=True,
-                        only_faketls=bool(self.get_setting("only_faketls", False)),
-                    ),
-                    manual=True,
-                    bypass_dead_cache=True,
-                ),
-                multiline=True,
-            )
-
-        actions = [
-            ("Импорт из буфера обмена", "msg_log", do_clip, False),
-            ("Импорт по ссылке (URL / подписка)", "msg_link", do_url, False),
-            ("Импорт текстом вручную", "msg_edit", do_text, False),
-            ("Экспорт: все в буфер обмена", "msg_copy", lambda: self._export_proxies_ui(False, True), False),
-            ("Экспорт: только рабочие в буфер", "msg_check", lambda: self._export_proxies_ui(True, True), False),
-            ("Экспорт: все в Избранное", "msg_saved", lambda: self._export_proxies_ui(False, False), False),
-            ("Экспорт: только рабочие в Избранное", "msg_send", lambda: self._export_proxies_ui(True, False), False),
-        ]
-        _show_action_sheet(act, "Импорт и экспорт прокси", actions)
+        _show_action_sheet(act, "Импорт и экспорт", [
+            ("Импорт прокси", "msg_download", lambda: self._open_import_sheet(act), False),
+            ("Экспорт прокси", "msg_share", lambda: self._open_export_sheet(act), False),
+        ])
 
     def _open_country_filter_sheet(self, act: Any):
         try:
@@ -3862,64 +4355,54 @@ class AutoProxyCollectorPlugin(BasePlugin):
             if pl is None or int(pl.size()) == 0:
                 BulletinHelper.show_info("Список прокси пуст")
                 return
-
-            counts: Dict[str, List[Any]] = {}
+            groups: Dict[str, List[Tuple[Any, str, int]]] = {}
             for i in range(int(pl.size())):
                 info = pl.get(i)
                 if info is None:
                     continue
-                _, _, srv, _, _, _, _ = _extract_proxy_details(info)
-                h = _extract_connect_host(srv)
-                geo = self._get_cached_geo(h)
-                if geo and geo.get("cc"):
-                    cc = geo["cc"]
-                    flag = geo.get("flag", "")
-                    counts.setdefault(cc, [0, flag])
-                    counts[cc][0] += 1
-
-            if not counts:
-                BulletinHelper.show_info("Флаги стран ещё загружаются — подождите пару секунд")
+                _key, _kind, srv, _port, _sec, _usr, _pwd = _extract_proxy_details(info)
+                geo = self._get_cached_geo(_extract_connect_host(srv))
+                if not geo or not geo.get("cc"):
+                    continue
+                cc = str(geo["cc"])
+                _avail, ping = _get_proxy_ping_and_avail(info)
+                groups.setdefault(cc, []).append((info, str(geo.get("flag", "")), ping))
+            if not groups:
+                BulletinHelper.show_info("Нет данных GeoIP. Проверь настройки определения стран")
                 return
-
             actions = []
-            for cc in sorted(counts.keys()):
-                cnt, flag = counts[cc]
-                actions.append(
-                    (f"{flag} Оставить только {cc} ({cnt})", "msg_location", lambda c=cc: self._keep_only_country(c), False)
-                )
-            _show_action_sheet(act, "Фильтр по стране", actions, subtitle="Активный прокси и локальные туннели сохранятся")
-        except Exception as e:
-            BulletinHelper.show_error(f"Ошибка фильтра: {e}")
+            for cc, items in sorted(groups.items()):
+                flag = items[0][1]
+                actions.append((f"{flag} {cc} · {len(items)}", "msg_location",
+                                lambda code=cc, arr=items: self._show_country_proxies(act, code, arr), False))
+            _show_action_sheet(act, "Прокси по странам", actions,
+                               subtitle="Просмотр не удаляет прокси из списка")
+        except Exception as exc:
+            BulletinHelper.show_error(f"Ошибка просмотра: {exc}")
 
-    def _keep_only_country(self, target_cc: str):
-        try:
-            PC, _, _ = _get_cached_classes()
-            pl = PC.getProxyList()
-            if pl is None:
-                return
-            active_key = _get_active_proxy_key(PC)
-            to_del = []
-            for i in range(int(pl.size())):
-                info = pl.get(i)
-                if info is None:
-                    continue
-                k, _, srv, _, _, _, _ = _extract_proxy_details(info)
-                h = _extract_connect_host(srv)
-                if k == active_key or _is_local_host(h):
-                    continue
-                geo = self._get_cached_geo(h)
-                if geo and geo.get("cc") and geo["cc"] != target_cc:
-                    to_del.append(info)
+    def _show_country_proxies(self, act: Any, cc: str, rows: List[Tuple[Any, str, int]]):
+        actions = []
+        for info, _flag, ping in rows[:80]:
+            _key, kind, host, port, secret, username, password = _extract_proxy_details(info)
+            if not host:
+                continue
+            address = _extract_connect_host(host)
+            name = f"{address}:{port} · {ping} мс" if ping > 0 else f"{address}:{port} · не проверен"
+            actions.append((name, "msg_copy", lambda k=kind,h=host,p=port,s=secret,u=username,w=password:
+                            self._copy_proxy_uri(k,h,p,s,u,w), False))
+        if not actions:
+            BulletinHelper.show_info("Список пуст")
+            return
+        _show_action_sheet(act, f"{cc} · {len(rows)} прокси", actions,
+                           subtitle="Нажми на прокси, чтобы скопировать ссылку")
 
-            removed = sum(1 for inf in to_del if _delete_proxy_from_controller(PC, inf))
-            if removed > 0:
-                _persist_proxy_controller(PC)
-                _sync_fragment_proxy_list(PC, [pl.get(i) for i in range(int(pl.size()))])
-                BulletinHelper.show_success(f"Удалено прокси других стран: {removed}")
-            else:
-                BulletinHelper.show_info("Нечего удалять")
-        except Exception as e:
-            BulletinHelper.show_error(f"Ошибка: {e}")
+    def _copy_proxy_uri(self, kind: str, host: str, port: int, secret: str, user: str, pwd: str):
+        uri = ParsedProxy(kind, host, port, user, pwd, secret).to_uri()
+        if _write_clipboard_text(uri):
+            BulletinHelper.show_success("Ссылка на прокси скопирована")
+        else:
+            BulletinHelper.show_error("Не удалось скопировать ссылку")
+
 
     def _open_import_sheet(self, act: Any):
         if act is None:
@@ -3940,7 +4423,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 allow_web=True,
                 only_faketls=bool(self.get_setting("only_faketls", False)),
             )
-            self._save_proxies_native(parsed, manual=True, bypass_dead_cache=True)
+            self._save_proxies_native(parsed, manual=True, bypass_dead_cache=bool(self.get_setting("import_ignore_dead_cache", False)))
 
         def do_url():
             _show_input_sheet(act, "Импорт по ссылке", "https://...", self._import_from_url_async, multiline=False)
@@ -3959,7 +4442,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                         only_faketls=bool(self.get_setting("only_faketls", False)),
                     ),
                     manual=True,
-                    bypass_dead_cache=True,
+                    bypass_dead_cache=bool(self.get_setting("import_ignore_dead_cache", False)),
                 ),
                 multiline=True,
             )
@@ -3972,6 +4455,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
         _show_action_sheet(act, "Импорт прокси", actions)
 
     def _import_from_url_async(self, url: str):
+        if _is_collect_proxy_url(url):
+            BulletinHelper.show_info("Добавь канал в источники вместо collect.proxy")
+            return
+
         def worker():
             try:
                 u = url.strip()
@@ -3979,7 +4466,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     u = "https://" + u
                 req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=12.0) as resp:
-                    body = resp.read().decode("utf-8", "ignore")
+                    body = _read_http_text(resp)
                 parsed = extract_proxies_from_text(
                     body,
                     allow_mtproto=True,
@@ -3987,7 +4474,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                     allow_web=True,
                     only_faketls=bool(self.get_setting("only_faketls", False)),
                 )
-                self._save_proxies_native(parsed, manual=True, bypass_dead_cache=True)
+                self._save_proxies_native(parsed, manual=True, bypass_dead_cache=bool(self.get_setting("import_ignore_dead_cache", False)))
             except Exception as e:
                 run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка загрузки: {e}"))
 
@@ -4003,10 +4490,331 @@ class AutoProxyCollectorPlugin(BasePlugin):
         actions = [
             ("Скопировать все в буфер", "msg_copy", lambda: self._export_proxies_ui(False, True), False),
             ("Только рабочие в буфер", "msg_check", lambda: self._export_proxies_ui(True, True), False),
+            ("Посты Proxy# в Избранное", "msg_link", lambda: self._open_export_posts_sheet(act), False),
             ("Отправить все в Избранное", "msg_saved", lambda: self._export_proxies_ui(False, False), False),
             ("Только рабочие в Избранное", "msg_send", lambda: self._export_proxies_ui(True, False), False),
         ]
         _show_action_sheet(act, "Экспорт прокси", actions)
+
+    def _open_export_posts_sheet(self, act: Any = None):
+        if act is None:
+            fragment = get_last_fragment()
+            act = fragment.getParentActivity() if fragment else None
+        if act is None:
+            BulletinHelper.show_error("Экран экспорта недоступен")
+            return
+
+        account = int(UserConfig.selectedAccount)
+        next_key = f"export_next_proxy_number_{account}"
+
+        def ui():
+            try:
+                sheet = BottomSheet(act, True)
+                sheet.setApplyBottomPadding(False)
+                sheet.setApplyTopPadding(False)
+                root = LinearLayout(act)
+                root.setOrientation(LinearLayout.VERTICAL)
+                root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(12),
+                                AndroidUtilities.dp(20), AndroidUtilities.dp(18))
+                background = GradientDrawable()
+                background.setCornerRadii([AndroidUtilities.dp(20)] * 4 + [0] * 4)
+                background.setColor(Theme.getColor(Theme.key_dialogBackground))
+                root.setBackground(background)
+
+                handle = View(act)
+                handle_bg = GradientDrawable()
+                handle_bg.setCornerRadius(AndroidUtilities.dp(2))
+                handle_bg.setColor(0x40808080)
+                handle.setBackground(handle_bg)
+                root.addView(handle, LayoutHelper.createLinear(36, 4, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
+
+                title = TextView(act)
+                title.setText("Экспорт Proxy#")
+                title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19)
+                title.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                title.setGravity(Gravity.CENTER)
+                root.addView(title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 16))
+
+                card = LinearLayout(act)
+                card.setOrientation(LinearLayout.VERTICAL)
+                card.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(12),
+                                AndroidUtilities.dp(14), AndroidUtilities.dp(12))
+                card_bg = GradientDrawable()
+                card_bg.setCornerRadius(AndroidUtilities.dp(16))
+                card_bg.setColor(Theme.getColor(Theme.key_windowBackgroundGray))
+                card.setBackground(card_bg)
+
+                def numeric_field(label: str, value: int, last: bool = False):
+                    caption = TextView(act)
+                    caption.setText(label)
+                    caption.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                    caption.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                    card.addView(caption, LayoutHelper.createLinear(-1, -2, 0, 0 if label.startswith("Прокси") else 12, 0, 6))
+                    field = EditText(act)
+                    field.setInputType(InputType.TYPE_CLASS_NUMBER)
+                    field.setSingleLine(True)
+                    field.setSelectAllOnFocus(True)
+                    field.setText(str(value))
+                    field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                    field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                    field.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8),
+                                     AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+                    edit_bg = GradientDrawable()
+                    edit_bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+                    edit_bg.setCornerRadius(AndroidUtilities.dp(12))
+                    field.setBackground(edit_bg)
+                    card.addView(field, LayoutHelper.createLinear(-1, -2))
+                    return field
+
+                per_message = numeric_field("Желаемый размер пачки · 1–200", int(self.get_setting("export_batch_size", 20) or 20))
+                first_number = numeric_field("Начать с Proxy#", int(self.get_setting(next_key, 1) or 1))
+
+                def make_check(label: str, key: str):
+                    item = CheckBox(act)
+                    item.setText(label)
+                    item.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                    item.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                    item.setChecked(bool(self.get_setting(key, False)))
+                    try:
+                        item.setButtonTintList(ColorStateList.valueOf(Theme.getColor(Theme.key_dialogTextBlue)))
+                    except Exception:
+                        pass
+                    card.addView(item, LayoutHelper.createLinear(-1, -2, 0, 12 if key == "export_only_working" else 4, 0, 0))
+                    return item
+
+                working_only = make_check("Только рабочие прокси", "export_only_working")
+                root.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12))
+
+                preview = LinearLayout(act)
+                preview.setOrientation(LinearLayout.VERTICAL)
+                preview.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(11),
+                                   AndroidUtilities.dp(14), AndroidUtilities.dp(11))
+                preview_bg = GradientDrawable()
+                preview_bg.setCornerRadius(AndroidUtilities.dp(14))
+                preview_bg.setColor(Theme.getColor(Theme.key_windowBackgroundGray))
+                preview.setBackground(preview_bg)
+
+                preview_label = TextView(act)
+                preview_label.setText("Пример сообщения")
+                preview_label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11)
+                preview_label.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                preview.addView(preview_label, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 6))
+
+                preview_links = TextView(act)
+                next_number = int(self.get_setting(next_key, 1) or 1)
+                preview_links.setText("   ".join(f"Proxy#{n}" for n in range(next_number, next_number + 3)))
+                preview_links.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                preview_links.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+                preview_links.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                preview.addView(preview_links, LayoutHelper.createLinear(-1, -2))
+                root.addView(preview, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 10))
+
+                hint = TextView(act)
+                hint.setText("Проверка пинга не запускается. Длина ссылок может уменьшить размер пачки. Только рабочие — успешно проверенные за последний час.")
+                hint.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+                root.addView(hint, LayoutHelper.createLinear(-1, -2, 0, 0, 4, 14))
+
+                send_btn = TextView(act)
+                send_btn.setText("Отправить в Избранное")
+                send_btn.setGravity(Gravity.CENTER)
+                send_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+                send_btn.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                send_btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+                send_btn.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(14))
+                send_bg = GradientDrawable()
+                send_bg.setCornerRadius(AndroidUtilities.dp(14))
+                send_bg.setColor(Theme.getColor(Theme.key_featuredStickers_addButton))
+                send_btn.setBackground(send_bg)
+
+                def do_send(_view):
+                    try:
+                        batch = int(str(per_message.getText().toString()).strip())
+                        start = int(str(first_number.getText().toString()).strip())
+                        if not 1 <= batch <= 200 or not 1 <= start <= 100000000:
+                            raise ValueError("Пачка: 1–200; номер: 1–100000000")
+                        only_work = bool(working_only.isChecked())
+                        self.set_setting("export_batch_size", batch, reload_settings=False)
+                        self.set_setting("export_only_working", only_work, reload_settings=False)
+                        sheet.dismiss()
+                        self._export_proxy_posts_ui(batch, start, only_work, next_key, account)
+                    except Exception as e:
+                        BulletinHelper.show_error(f"Экспорт: {e}")
+
+                click_callback = OnClickListener(do_send)
+                self._dialog_callbacks.append(click_callback)
+                if len(self._dialog_callbacks) > 32:
+                    del self._dialog_callbacks[:-32]
+                _set_view_click(send_btn, click_callback)
+                _apply_press_scale(send_btn)
+                root.addView(send_btn, LayoutHelper.createLinear(-1, -2))
+                sheet.setCustomView(root)
+                sheet.show()
+            except Exception as e:
+                _plog(f"Proxy# sheet: {e}")
+                BulletinHelper.show_error(f"Не удалось открыть экспорт: {e}")
+
+        run_on_ui_thread(ui)
+
+    def _export_proxy_posts_ui(
+        self, batch_size: int, start: int, only_working: bool, next_key: str, acc: int,
+    ):
+        """UI thread: read native proxy list; background thread: send TL requests."""
+        if self._export_posts_in_progress:
+            BulletinHelper.show_info("Экспорт уже выполняется")
+            return
+        try:
+            PC, _, _ = _get_cached_classes()
+            pl = PC.getProxyList()
+            result: List[Tuple[str, int, bool]] = []
+            seen: Set[str] = set()
+            if pl is not None:
+                for i in range(int(pl.size())):
+                    info = pl.get(i)
+                    if info is None:
+                        continue
+                    av, ping = _get_proxy_ping_and_avail(info)
+                    if only_working and not _is_fresh_working(info):
+                        continue
+                    key, kind, host, port, sec, user, pwd = _extract_proxy_details(info)
+                    if not host or _is_local_host(host) or not key or key in seen:
+                        continue
+                    if kind == "mtproto" and not sec:
+                        continue
+                    if kind == "web" and not sec:
+                        continue
+                    seen.add(key)
+                    url = ParsedProxy(kind, host, port, user, pwd, sec).to_uri()
+                    if url.startswith("tg://proxy?"):
+                        url = "https://t.me/proxy?" + url.split("?", 1)[1]
+                    elif url.startswith("tg://socks?"):
+                        url = "https://t.me/socks?" + url.split("?", 1)[1]
+                    result.append((url, ping, av))
+            if not result:
+                BulletinHelper.show_info("Нет прокси, подходящих под фильтр")
+                return
+            # Compute chunks while on the UI thread (the proxy list itself is
+            # Android-owned); the RPC calls happen exclusively on a worker.
+            pages = _plan_proxy_export_chunks(result, start, batch_size)
+            self._export_posts_in_progress = True
+            BulletinHelper.show_info(f"Отправка {len(result)} прокси ({len(pages)}+ сообщений)…")
+        except Exception as e:
+            self._export_posts_in_progress = False
+            BulletinHelper.show_error(f"Не удалось подготовить экспорт: {e}")
+            return
+
+        def worker():
+            def send_page(text: str, quote_start: int, quote_length: int,
+                          links: List[Tuple[int, int, str]], use_quote: bool):
+                req = TLRPC.TL_messages_sendMessage()
+                req.peer = TLRPC.TL_inputPeerSelf()
+                req.message = text
+                req.random_id = random.SystemRandom().getrandbits(63) or 1
+                req.no_webpage = True
+                req.entities = ArrayList()
+                if use_quote and quote_length > 0:
+                    quote = TLRPC.TL_messageEntityBlockquote()
+                    quote.collapsed = True
+                    quote.offset = int(quote_start)
+                    quote.length = int(quote_length)
+                    req.entities.add(quote)
+                for offset, length, url in links:
+                    entity = TLRPC.TL_messageEntityTextUrl()
+                    entity.offset = int(offset)
+                    entity.length = int(length)
+                    entity.url = url
+                    req.entities.add(entity)
+                req.flags = int(getattr(req, "flags", 0)) | 2
+                if links or use_quote:
+                    req.flags |= 8
+                return self._request_sync(req, acc, timeout=25.0)
+
+            def send_chunk(chunk: Tuple[int, int]):
+                # Keep the original Proxy# indices when a message must be split.
+                from collections import deque
+                queue = deque([chunk])
+                completed = []
+                quote_supported = True
+                while queue:
+                    if not self._alive:
+                        return completed, RuntimeError("Плагин выгружен")
+                    first, count = queue.popleft()
+                    chosen = result[first:first + count]
+                    message, quote_start, quote_length, links = _build_proxy_post(
+                        [p[0] for p in chosen], start + first,
+                        [p[1] for p in chosen], [p[2] for p in chosen],
+                    )
+                    try:
+                        send_page(message, quote_start, quote_length, links, quote_supported)
+                    except RuntimeError as error:
+                        if "ENTITIES_TOO_LONG" not in str(error):
+                            return completed, error
+                        if count > 1:
+                            left = count // 2
+                            queue.appendleft((first + left, count - left))
+                            queue.appendleft((first, left))
+                            _plog(f"Proxy# export: split {count} -> {left}+{count-left}")
+                            continue
+                        if quote_supported:
+                            try:
+                                send_page(message, quote_start, quote_length, links, False)
+                            except RuntimeError as e:
+                                if "ENTITIES_TOO_LONG" not in str(e):
+                                    return completed, e
+                            else:
+                                quote_supported = False
+                                completed.append((first, count))
+                                continue
+                        # Even a single text-url can exceed the server entity budget.
+                        raw = f"🔗Telegram Proxy\nProxy#{start + first}\n{chosen[0][0]}"
+                        if _utf16_len(raw) > EXPORT_MAX_TEXT_UTF16:
+                            return completed, ValueError("Слишком длинная ссылка Proxy#")
+                        try:
+                            send_page(raw, 0, 0, [], False)
+                        except Exception as e:
+                            return completed, e
+                    except Exception as e:
+                        return completed, e
+                    completed.append((first, count))
+                return completed, None
+
+            confirmed = []
+            errors = []
+            try:
+                for page_idx, page in enumerate(pages):
+                    done, error = send_chunk(page)
+                    confirmed.extend(done)
+                    if error is not None:
+                        errors.append(error)
+                        break
+
+                confirmed.sort()
+                sent = sum(count for _first, count in confirmed)
+                # Never reuse any Proxy# number which may already have been sent.
+                high_watermark = max((first + count for first, count in confirmed), default=0)
+                next_num = start + high_watermark
+                if high_watermark:
+                    run_on_ui_thread(
+                        lambda number=next_num: self.set_setting(next_key, number, reload_settings=False)
+                    )
+                if errors:
+                    msg = str(errors[0])
+                    _plog(f"Proxy# export error: {msg}; sent={sent}/{len(result)}")
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(
+                        f"Отправлено {sent}/{len(result)} прокси. Ошибка: {msg}. Следующий Proxy#{next_num}"
+                    ))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(
+                        f"Отправлено: {sent} прокси, {len(confirmed)} сообщений. Следующий Proxy#{next_num}"
+                    ))
+            except Exception as e:
+                _plog(f"Proxy# export worker: {e}")
+                run_on_ui_thread(lambda err=str(e): BulletinHelper.show_error(f"Экспорт: {err}"))
+            finally:
+                self._export_posts_in_progress = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _export_proxies_ui(self, only_working: bool = False, to_clipboard: bool = True):
         try:
@@ -4022,7 +4830,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 if info is None:
                     continue
                 av, _ = _get_proxy_ping_and_avail(info)
-                if only_working and not av:
+                if only_working and not _is_fresh_working(info):
                     continue
                 _, kind, srv, port, sec, user, pwd = _extract_proxy_details(info)
                 if not srv or _is_local_host(srv):
@@ -4116,23 +4924,30 @@ class AutoProxyCollectorPlugin(BasePlugin):
                         should_run = False
                 if should_run:
                     self._scan_sources_async(manual=False)
+                    now = time.monotonic()
+                    if (self.get_setting('periodic_health_check', True)
+                            and self.get_setting("auto_failover", True)
+                            and now - self._last_health_check_ts >= 300
+                            and not self._cleaning and _is_proxy_enabled_in_client()):
+                        self._last_health_check_ts = now
+                        threading.Thread(target=self._verify_active_proxy_on_net_change,
+                                         daemon=True).start()
 
             interval_min = self._get_interval_minutes()
             run_on_ui_thread(_tick, interval_min * 60 * 1000)
 
         run_on_ui_thread(_tick, 10000)
 
-    def _process_source_messages_bg(
-        self,
-        source_key: str,
-        tl_messages: List[Any],
-        manual: bool = False,
-        min_msg_id: int = 0,
-    ):
-        sources = self._get_sources()
+    def _process_source_messages_bg(self, source_key: str, tl_messages: List[Any],
+                                    manual: bool = False, min_msg_id: int = 0,
+                                    account_id: Optional[int] = None,
+                                    checkpoint: bool = True):
+        if not self._alive:
+            return
+        acc = int(UserConfig.selectedAccount) if account_id is None else int(account_id)
+        sources = self._get_sources(acc)
         meta = sources.get(source_key, {})
         dialog_id, _ = _parse_source_key(source_key, meta)
-
         allow_mt = bool(self.get_setting("collect_mtproto", True))
         allow_sk = bool(self.get_setting("collect_socks5", True))
         allow_web = bool(self.get_setting("collect_web", True))
@@ -4140,222 +4955,230 @@ class AutoProxyCollectorPlugin(BasePlugin):
         parse_files = bool(self.get_setting("parse_attachments", True))
         ping_before_save = bool(self.get_setting("ping_before_save", False))
         use_handshake = bool(self.get_setting("real_handshake_ping", True))
-        acc = int(UserConfig.selectedAccount)
-
-        valid_msgs = [m for m in tl_messages if int(getattr(m, "id", 0) or 0) > min_msg_id]
-        if not valid_msgs:
+        valid = [m for m in tl_messages if int(getattr(m, "id", 0) or 0) > min_msg_id]
+        if not valid:
             if manual:
-                run_on_ui_thread(lambda: BulletinHelper.show_info("Новых постов не найдено"))
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Новых сообщений не найдено"))
             return
+        valid.sort(key=lambda m: int(m.id))
+        max_id = max(int(m.id) for m in valid)
+        found: List[ParsedProxy] = []
+        seen: Set[str] = set()
+        duplicate_posts = 0
+        for msg in valid:
+            if not self._alive:
+                return
+            try:
+                candidates = extract_proxies_from_message(
+                    msg, allow_mtproto=allow_mt, allow_socks5=allow_sk,
+                    allow_web=allow_web, only_faketls=only_faketls,
+                    parse_attachments=parse_files, account_id=acc,
+                )
+            except Exception as exc:
+                # Do not advance the checkpoint past a message we failed to parse.
+                _plog(f"source parser failed at {msg.id}: {exc}")
+                return
+            for p in candidates:
+                if p.key in seen:
+                    duplicate_posts += 1
+                else:
+                    seen.add(p.key)
+                    found.append(p)
+        if ping_before_save and found:
+            def check(p):
+                return _check_proxy_alive(p.kind, p.server, p.port, p.secret,
+                                          p.username, p.password, use_handshake, 3.5) is not None
+            try:
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    result = list(pool.map(check, found))
+                found = [p for p, ok in zip(found, result) if ok]
+            except Exception as exc:
+                _plog(f"source ping failed: {exc}")
+                return
+        if not self._alive:
+            return
+        self._save_proxies_native(found, source_key=source_key, dialog_id=dialog_id,
+                                  max_msg_id=max_id if checkpoint else 0, manual=manual,
+                                  duplicate_posts=duplicate_posts, account_id=acc)
 
-        valid_msgs.sort(key=lambda m: int(m.id))
-        max_msg_id = max(int(m.id) for m in valid_msgs)
-
-        extracted: List[ParsedProxy] = []
-        seen_batch_keys: Set[str] = set()
-
-        for msg in valid_msgs:
-            for p in extract_proxies_from_message(
-                msg,
-                allow_mtproto=allow_mt,
-                allow_socks5=allow_sk,
-                allow_web=allow_web,
-                only_faketls=only_faketls,
-                parse_attachments=parse_files,
-                account_id=acc,
-            ):
-                if p.key in seen_batch_keys:
-                    continue
-                if ping_before_save:
-                    if _check_proxy_alive(
-                        p.kind, p.server, p.port, p.secret, p.username, p.password, use_handshake, 3.5
-                    ) is None:
-                        continue
-                seen_batch_keys.add(p.key)
-                extracted.append(p)
-
-        self._save_proxies_native(
-            extracted,
-            source_key=source_key,
-            dialog_id=dialog_id,
-            max_msg_id=max_msg_id,
-            manual=manual,
-        )
-
-    def _process_url_source_bg(self, source_key: str, url: str, manual: bool = False):
-        allow_mt = bool(self.get_setting("collect_mtproto", True))
-        allow_sk = bool(self.get_setting("collect_socks5", True))
-        allow_web = bool(self.get_setting("collect_web", True))
-        only_faketls = bool(self.get_setting("only_faketls", False))
-        ping_before_save = bool(self.get_setting("ping_before_save", False))
-        use_handshake = bool(self.get_setting("real_handshake_ping", True))
-
+    def _process_url_source_bg(self, source_key: str, url: str, manual: bool = False,
+                               account_id: Optional[int] = None):
+        if _is_collect_proxy_url(url):
+            if manual:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(
+                    "Старая collect.proxy-подписка не поддерживается. Добавь канал"
+                ))
+            return
         try:
+            if not self._alive:
+                return
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=12.0) as resp:
-                body = resp.read().decode("utf-8", "ignore")
-
+            with urllib.request.urlopen(req, timeout=12.0) as response:
+                body = _read_http_text(response)
             parsed = extract_proxies_from_text(
                 body,
-                allow_mtproto=allow_mt,
-                allow_socks5=allow_sk,
-                allow_web=allow_web,
-                only_faketls=only_faketls,
+                allow_mtproto=bool(self.get_setting("collect_mtproto", True)),
+                allow_socks5=bool(self.get_setting("collect_socks5", True)),
+                allow_web=bool(self.get_setting("collect_web", True)),
+                only_faketls=bool(self.get_setting("only_faketls", False)),
             )
-
-            if ping_before_save and parsed:
-                parsed = [
-                    p for p in parsed
-                    if _check_proxy_alive(
-                        p.kind, p.server, p.port, p.secret, p.username, p.password, use_handshake, 3.5
-                    ) is not None
-                ]
-
-            self._save_proxies_native(parsed, source_key=source_key, manual=manual)
-        except Exception as e:
+            if parsed and self.get_setting("ping_before_save", False):
+                handshake = bool(self.get_setting("real_handshake_ping", True))
+                def check(p):
+                    return _check_proxy_alive(p.kind, p.server, p.port, p.secret,
+                                              p.username, p.password, handshake, 3.5) is not None
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    statuses = list(pool.map(check, parsed))
+                parsed = [p for p, good in zip(parsed, statuses) if good]
+            if self._alive:
+                self._save_proxies_native(parsed, source_key=source_key,
+                                          account_id=account_id, manual=manual)
+        except Exception as exc:
+            _plog(f"URL source {source_key}: {exc}")
             if manual:
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка подписки: {e}"))
+                run_on_ui_thread(lambda msg=str(exc): BulletinHelper.show_error(f"Ошибка подписки: {msg}"))
 
-    def _scan_sources_async(
-        self,
-        target_sources: Optional[Dict[str, Dict[str, Any]]] = None,
-        manual: bool = True,
-    ):
-        if self._scanning:
-            if manual:
-                BulletinHelper.show_info("Сбор уже выполняется...")
+    def _scan_sources_async(self, target_sources: Optional[Dict[str, Dict[str, Any]]] = None,
+                            manual: bool = True):
+        if not self._alive or not self.get_setting("enabled", True):
             return
-
-        all_sources = target_sources if target_sources is not None else self._get_sources()
-        active_sources = {
-            k: v for k, v in all_sources.items() if target_sources is not None or not v.get("paused", False)
-        }
-
-        if not active_sources:
+        with self._lock:
+            if self._scanning:
+                busy = True
+            else:
+                busy = False
+                self._scanning = True
+        if busy:
             if manual:
-                BulletinHelper.show_error("Нет активных источников")
+                BulletinHelper.show_info("Сбор уже выполняется")
             return
-
+        acc = int(UserConfig.selectedAccount)
+        sources = target_sources if target_sources is not None else self._get_sources(acc)
+        active = {k: v for k, v in sources.items()
+                  if (target_sources is not None or not v.get("paused", False))
+                  and isinstance(v, dict)}
+        if not active:
+            self._scanning = False
+            if manual:
+                BulletinHelper.show_info("Нет активных источников")
+            return
         if manual:
-            BulletinHelper.show_info(f"Проверка источников ({len(active_sources)})...")
+            BulletinHelper.show_info(f"Проверка источников ({len(active)})…")
 
         def worker():
-            self._scanning = True
+            failures = []
             try:
-                acc = int(UserConfig.selectedAccount)
                 limit = self._get_scan_limit()
-                single_mode = manual and len(active_sources) == 1
-
-                for key, meta in list(active_sources.items()):
-                    if not self._alive:
+                single = manual and len(active) == 1
+                for key, meta in list(active.items()):
+                    if not self._alive or int(UserConfig.selectedAccount) != acc:
                         break
                     if meta.get("type") == "url" or str(key).startswith("url_"):
                         url = str(meta.get("url", "") or "")
                         if url:
-                            self._process_url_source_bg(key, url, manual=single_mode)
+                            self._process_url_source_bg(key, url, manual=single, account_id=acc)
                         continue
-
                     did, tid = _parse_source_key(key, meta)
                     if did == 0:
                         continue
-                    saved_last_id = int(meta.get("last_msg_id", 0) or 0)
-                    min_id = 0 if manual else saved_last_id
-
-                    msgs = self._fetch_messages_sync(acc, did, tid, limit, min_id)
-                    if msgs:
-                        self._process_source_messages_bg(
-                            key, msgs, manual=single_mode, min_msg_id=min_id
-                        )
-                    elif single_mode:
-                        run_on_ui_thread(
-                            lambda: BulletinHelper.show_info("В этом источнике постов не найдено")
-                        )
-                    time.sleep(0.25)
-            except Exception as e:
-                if manual:
-                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка сбора: {e}"))
+                    saved_id = int(meta.get("last_msg_id", 0) or 0)
+                    try:
+                        msgs = self._fetch_messages_sync(acc, did, tid, limit, saved_id)
+                        if msgs:
+                            self._process_source_messages_bg(key, msgs, manual=single,
+                                                             min_msg_id=saved_id,
+                                                             account_id=acc)
+                        elif single:
+                            run_on_ui_thread(lambda: BulletinHelper.show_info("Новых сообщений нет"))
+                    except Exception as exc:
+                        failures.append(str(meta.get("title") or key))
+                        _plog(f"source scan {key}: {exc}")
+                    time.sleep(0.12)
+                if failures and manual:
+                    run_on_ui_thread(lambda n=len(failures): BulletinHelper.show_error(
+                        f"Не удалось прочитать {n} источников. Подробности — в логах"
+                    ))
             finally:
-                self._scanning = False
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _fetch_messages_sync(
-        self, account_id: int, dialog_id: int, topic_id: int, limit: int, min_msg_id: int = 0
-    ) -> List[Any]:
+                with self._lock:
+                    self._scanning = False
         try:
-            mc = MessagesController.getInstance(account_id)
-            peer = mc.getInputPeer(int(dialog_id))
-            if peer is None or isinstance(peer, TLRPC.TL_inputPeerEmpty):
-                return []
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._scanning = False
+            raise
 
+    def _fetch_messages_sync(self, account_id: int, dialog_id: int, topic_id: int,
+                             limit: int, min_msg_id: int = 0) -> List[Any]:
+        """Read every newer page without skipping IDs when a source publishes rapidly.
+
+        First import intentionally reads only the configured recent-message window.
+        If the safety page budget is exhausted, raise and *don't advance* the cursor.
+        """
+        mc = MessagesController.getInstance(int(account_id))
+        peer = mc.getInputPeer(int(dialog_id))
+        if peer is None or isinstance(peer, TLRPC.TL_inputPeerEmpty):
+            raise RuntimeError("Источник недоступен в этом аккаунте")
+        page_size = min(100, max(1, int(limit)))
+        # A fixed depth is only for initial setup; later checks always paginate.
+        budget = MAX_BACKFILL_PAGES if min_msg_id > 0 else 1
+        offset = 0
+        found: Dict[int, Any] = {}
+        finished = False
+        last_oldest = None
+        for _page in range(budget):
+            if not self._alive:
+                raise RuntimeError("Плагин выгружен")
             if topic_id > 1:
                 req = TLRPC.TL_messages_getReplies()
                 req.peer = peer
                 req.msg_id = int(topic_id)
-                req.offset_id = 0
-                req.offset_date = 0
-                req.add_offset = 0
-                req.limit = limit
-                req.max_id = 0
-                req.min_id = 0
-                req.hash = 0
-
-                ev = threading.Event()
-                box: List[Any] = [None]
-
-                def _cb_rep(resp, err):
-                    if err is None and resp is not None:
-                        box[0] = getattr(resp, "messages", None)
-                    ev.set()
-
-                send_request(req, _cb_rep, account=account_id)
-                ev.wait(timeout=10.0)
-
-                raw_rep = box[0]
-                if raw_rep is not None and hasattr(raw_rep, "size") and int(raw_rep.size()) > 0:
-                    return [
-                        raw_rep.get(i)
-                        for i in range(int(raw_rep.size()))
-                        if raw_rep.get(i) is not None
-                        and int(getattr(raw_rep.get(i), "id", 0) or 0) > min_msg_id
-                    ]
-
-            req_hist = TLRPC.TL_messages_getHistory()
-            req_hist.peer = peer
-            req_hist.offset_id = 0
-            req_hist.offset_date = 0
-            req_hist.add_offset = 0
-            req_hist.limit = limit if topic_id == 0 else max(limit, 80)
-            req_hist.max_id = 0
-            req_hist.min_id = 0
-            req_hist.hash = 0
-
-            ev2 = threading.Event()
-            box2: List[Any] = [None]
-
-            def _cb_hist(resp, err):
-                if err is None and resp is not None:
-                    box2[0] = getattr(resp, "messages", None)
-                ev2.set()
-
-            send_request(req_hist, _cb_hist, account=account_id)
-            ev2.wait(timeout=10.0)
-
-            raw_hist = box2[0]
-            if raw_hist is None or not hasattr(raw_hist, "size"):
-                return []
-
-            out = []
-            for i in range(int(raw_hist.size())):
-                m = raw_hist.get(i)
-                if m is None or int(getattr(m, "id", 0) or 0) <= min_msg_id:
+            else:
+                req = TLRPC.TL_messages_getHistory()
+                req.peer = peer
+            req.offset_id = int(offset)
+            req.offset_date = 0
+            req.add_offset = 0
+            req.limit = int(page_size)
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
+            response = self._request_sync(req, int(account_id), timeout=22.0)
+            raw = getattr(response, "messages", None)
+            if raw is None or not hasattr(raw, "size"):
+                raise RuntimeError("Telegram вернул историю без списка сообщений")
+            n = int(raw.size())
+            if not n:
+                finished = True
+                break
+            ids = []
+            saw_checkpoint = False
+            for i in range(n):
+                msg = raw.get(i)
+                if msg is None:
                     continue
-                if topic_id > 0 and _get_message_topic_id(m) != topic_id:
+                msg_id = int(getattr(msg, "id", 0) or 0)
+                if msg_id <= 0:
                     continue
-                out.append(m)
-            return out
-        except Exception:
-            return []
+                ids.append(msg_id)
+                if min_msg_id > 0 and msg_id <= min_msg_id:
+                    saw_checkpoint = True
+                    continue
+                if topic_id > 0 and _get_message_topic_id(msg) != topic_id:
+                    continue
+                found[msg_id] = msg
+            if saw_checkpoint or n < page_size or not ids:
+                finished = True
+                break
+            oldest = min(ids)
+            if last_oldest is not None and oldest >= last_oldest:
+                raise RuntimeError("Telegram повторил одну и ту же страницу истории")
+            last_oldest = oldest
+            offset = oldest
+        if not finished and min_msg_id > 0:
+            # Repeated later rather than silently skipping a backlog.
+            raise RuntimeError("Очередь постов слишком большая; курсор сохранён, попробуй снова")
+        return [found[k] for k in sorted(found)]
 
     def _fetch_forum_topics_and_prompt(self, dialog_id: int):
         base_title = _get_dialog_title(dialog_id)
@@ -4703,6 +5526,60 @@ class AutoProxyCollectorPlugin(BasePlugin):
         except Exception as e:
             BulletinHelper.show_error(f"Ошибка чтения JSON: {e}")
 
+    def _export_config_backup(self, _v=None):
+        try:
+            sources = self._get_sources()
+            settings = {}
+            for key in CONFIG_BACKUP_KEYS:
+                value = self.get_setting(key, None)
+                if isinstance(value, (str, int, float, bool, list, dict)):
+                    settings[key] = value
+            data = {"proxy_collector_config": 1, "account": int(UserConfig.selectedAccount),
+                    "settings": settings, "sources": sources}
+            raw = json.dumps(data, ensure_ascii=False, indent=2)
+            if _write_clipboard_text(raw):
+                BulletinHelper.show_success("Настройки и источники скопированы")
+            else:
+                BulletinHelper.show_error("Не удалось скопировать конфигурацию")
+        except Exception as exc:
+            BulletinHelper.show_error(f"Ошибка бэкапа: {exc}")
+
+    def _restore_config_backup(self, raw_json: str):
+        try:
+            if len(raw_json) > MAX_SOURCE_BYTES:
+                raise ValueError("Бэкап слишком большой")
+            data = json.loads(raw_json)
+            if not isinstance(data, dict) or data.get("proxy_collector_config") != 1:
+                raise ValueError("Нужен JSON конфигурации Proxy Collector")
+            settings = data.get("settings", {})
+            incoming_sources = data.get("sources", {})
+            if not isinstance(settings, dict) or not isinstance(incoming_sources, dict):
+                raise ValueError("Неверный формат полей")
+            # Only exportable, known settings are importable. No cache, tokens or internals.
+            allowed = set(CONFIG_BACKUP_KEYS)
+            restored = 0
+            for key, value in settings.items():
+                if key in allowed and isinstance(value, (str, int, float, bool, list, dict)):
+                    self.set_setting(key, value, reload_settings=False)
+                    restored += 1
+            clean_sources = {str(k): v for k, v in incoming_sources.items()
+                             if isinstance(k, str) and len(k) < 300 and isinstance(v, dict)}
+            current = self._get_sources()
+            fresh = 0
+            for key, value in clean_sources.items():
+                if key not in current:
+                    if _is_collect_proxy_url(str(value.get("url", ""))):
+                        value = dict(value)
+                        value["paused"] = True
+                    current[key] = value
+                    fresh += 1
+            self._save_sources(current, reload_ui=True)
+            self._sync_chat_menu(bool(self.get_setting("show_chat_menu", True)))
+            self._sync_msg_menu(bool(self.get_setting("show_msg_menu", False)))
+            BulletinHelper.show_success(f"Настройки: {restored} · источники: +{fresh}")
+        except Exception as exc:
+            BulletinHelper.show_error(f"Ошибка восстановления: {exc}")
+
     def _get_closest_index(self, key: str, default_val: int, choices: Tuple[int, ...]) -> int:
         try:
             val = int(self.get_setting(key, default_val))
@@ -4743,6 +5620,10 @@ class AutoProxyCollectorPlugin(BasePlugin):
 
         cb = SlideCallback(on_choose)
         self._keep_callbacks.append(cb)
+        # Old settings fragments are no longer in use after several navigations.
+        # Keep a generous window without retaining listeners for the entire session.
+        if len(self._keep_callbacks) > 128:
+            del self._keep_callbacks[:-128]
         item = UItem.asSlideView(jarray(String)(labels), chosen_idx, cb)
         return Custom(item=item)
 
@@ -4874,9 +5755,19 @@ class AutoProxyCollectorPlugin(BasePlugin):
             "Проверяется реальный TLS/MTProto/SOCKS5-хэндшейк. "
             "Мёртвые прокси удаляются только после заданного числа страйков подряд и попадают в чёрный список на время TTL, чтобы спам-каналы не добавляли их заново.\n\n"
             "**3. Failover при смене сети**\n"
-            "При переходе с Wi-Fi на мобильный интернет плагин сразу проверяет активный прокси и при недоступности переключает клиент на самый быстрый рабочий сервер.\n\n"
-            "**4. Обозначения в списке**\n"
-            "🌐 WebProxy · 🛡️ FakeTLS (сильный SNI) · 🔒 FakeTLS · ➿ Padding · ⚠️ Plain · 🧦 SOCKS5."
+            "Проверка запускается при смене сети, пока клиент работает. Это не непрерывный мониторинг.\n\n"
+            "**4. Автоматическая обработка**\n"
+            "Один раз добавьте канал или топик в источники. Новые сообщения собираются "
+            "при получении обновлений и догоняются при очередной проверке или возвращении в приложение. "
+            "Ссылки collect.proxy больше не нужны.\n\n"
+            "**5. Экспорт Proxy#**\n"
+            "В «Экспорт прокси» откройте «Посты Proxy# в Избранное». "
+            "Выберите размер пачки, начальный номер и при необходимости фильтр рабочих. "
+            "Используются сохранённые результаты пинга: повторная проверка перед отправкой не запускается. "
+            "Сообщения отправляются последовательно, а нумерация продолжается после подтверждения сервера.\n\n"
+            "**6. Обозначения в списке**\n"
+            "🌐 WebProxy · 🛡️ FakeTLS (SNI) · 🔒 FakeTLS · ➿ Padding · ⚠️ Plain · 🧦 SOCKS5. "
+            "Значки описывают конфигурацию, но не гарантируют обход блокировок."
         )
 
         def ui():
@@ -4936,7 +5827,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
                 b_bg.setColor(Theme.getColor(Theme.key_featuredStickers_addButton))
                 btn.setBackground(b_bg)
                 btn.setClickable(True)
-                btn.setOnClickListener(OnClickListener(lambda _v: sheet.dismiss()))
+                _set_view_click(btn, OnClickListener(lambda _v: sheet.dismiss()))
                 root.addView(btn, LayoutHelper.createLinear(-1, -2, 0, 14, 0, 0))
 
                 sheet.setCustomView(root)
@@ -4947,7 +5838,6 @@ class AutoProxyCollectorPlugin(BasePlugin):
         run_on_ui_thread(ui)
 
     def _sub_sources(self) -> List[Any]:
-        self._keep_callbacks.clear()
         sources = self._get_sources()
         return [
             Header(text="Источники"),
@@ -4967,7 +5857,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Header(text="Расписание и глубина"),
             Header(text="Интервал автопроверки, мин"),
             self._build_slider("interval_min", 5, INTERVAL_MINUTES, " м"),
-            Header(text="Глубина сканирования постов"),
+            Header(text="Постов при первом сборе · дальше постранично"),
             self._build_slider("scan_limit", 25, SCAN_LIMITS, " шт"),
             Header(text="Максимум прокси с одного хоста"),
             self._build_slider("max_per_host", 0, MAX_PER_HOST_LIMITS, " шт"),
@@ -4977,11 +5867,17 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Switch(
                 key="only_faketls",
                 text="Только FakeTLS (ee...)",
-                subtext="Отсеивать незащищённые plain и dd секреты",
+                subtext="Строго только MTProto FakeTLS, без SOCKS5 и WEB",
                 default=False,
             ),
             Switch(key="collect_socks5", text="SOCKS5 прокси", default=True),
             Switch(key="collect_web", text="WEB-прокси (HTTPS 443)", default=True),
+            Switch(
+                key="import_ignore_dead_cache",
+                text="При ручном импорте игнорировать кэш мёртвых",
+                subtext="Выключено — повторно не добавлять недавно нерабочие серверы",
+                default=False,
+            ),
             Switch(
                 key="parse_attachments",
                 text="Читать вложения .txt и .json",
@@ -4990,7 +5886,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
             ),
             Divider(),
             Header(text="Поведение"),
-            Switch(key="realtime_enabled", text="Мгновенный сбор новых постов", default=True),
+            Switch(key="realtime_enabled", text="Сбор при получении сообщений", subtext="Работает, пока клиент получает обновления", default=True),
             Switch(
                 key="adaptive_timer",
                 text="Адаптивный таймер",
@@ -4999,7 +5895,8 @@ class AutoProxyCollectorPlugin(BasePlugin):
             ),
             Switch(
                 key="skip_when_screen_off",
-                text="Экономия батареи при выключенном экране",
+                text="Не запускать таймер с выключенным экраном",
+                subtext="Пропущенные сообщения догоняются при возвращении в клиент",
                 default=True,
             ),
             Switch(
@@ -5011,7 +5908,6 @@ class AutoProxyCollectorPlugin(BasePlugin):
         ]
 
     def _sub_cleaning(self) -> List[Any]:
-        self._keep_callbacks.clear()
         return [
             Header(text="Проверка и переключение"),
             Switch(
@@ -5028,12 +5924,18 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Switch(
                 key="auto_failover",
                 text="Автопереключение (Failover)",
-                subtext="Переходить на самый быстрый прокси, если активный перестал отвечать",
+                subtext="Переключать после проверки недоступности активного прокси",
                 default=True,
             ),
             Switch(
                 key="network_switch_failover",
                 text="Проверка при смене сети (Wi-Fi ↔ Мобильная)",
+                default=True,
+            ),
+            Switch(
+                key='periodic_health_check',
+                text="Контроль активного прокси раз в 5 минут",
+                subtext="Только пока работает таймер; при сбое проверяет и переключает",
                 default=True,
             ),
             Switch(
@@ -5061,16 +5963,17 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Header(text="Лимит размера списка"),
             Switch(
                 key="auto_clean_on_limit",
-                text="Автоочистка при превышении лимита",
-                subtext="Выключено по умолчанию для защиты от случайного удаления",
+                text="Контролировать лимит после добавления",
+                subtext="Проверять список по достижении лимита; медленные удаляются только по отдельному разрешению",
                 default=False,
             ),
-            Header(text="Максимум прокси в списке"),
+            Header(text="Целевой лимит прокси (если включена автоочистка)"),
             self._build_slider("max_proxy_limit", 100, MAX_PROXY_LIMITS, " шт"),
             Switch(
                 key="trim_slowest_on_limit",
-                text="Удалять самые медленные сверх лимита",
-                default=True,
+                text="Удалять медленные даже если они рабочие",
+                subtext="Риск потери рабочих серверов. По умолчанию отключено",
+                default=False,
             ),
         ]
 
@@ -5082,13 +5985,19 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Switch(
                 key="show_geo_flags",
                 text="Флаги стран и провайдер",
-                subtext="Определение страны и хостинга с локальным кэшированием",
+                subtext="Из кэша GeoIP; новые данные — с отдельного разрешения",
                 default=True,
             ),
             Switch(
+                key="geo_remote_lookup",
+                text="Загружать GeoIP из интернета",
+                subtext="Передаёт IP серверов стороннему ip-api.com по HTTP; по умолчанию выкл.",
+                default=False,
+            ),
+            Switch(
                 key="show_dpi_badges",
-                text="Значки стойкости к DPI",
-                subtext="Маркировка WebProxy, FakeTLS, Padding и Plain",
+                text="Значки типа защиты",
+                subtext="Тип секретов и SNI, не проверка обхода блокировок",
                 default=True,
             ),
             Switch(
@@ -5126,7 +6035,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
             Switch(
                 key="show_msg_menu",
                 text="Пункт «Собрать прокси из поста»",
-                default=True,
+                default=False,
                 on_change=lambda v: (
                     self.set_setting("show_msg_menu", bool(v), reload_settings=False),
                     self._sync_msg_menu(bool(v)),
@@ -5143,7 +6052,13 @@ class AutoProxyCollectorPlugin(BasePlugin):
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         return [
-            Header(text="Экспорт конфигурации источников"),
+            Header(text="Полная конфигурация"),
+            Text(text="Скопировать настройки и источники", icon="msg_copy",
+                 on_click=self._export_config_backup),
+            Text(text="Восстановить настройки и источники из буфера", icon="msg_download",
+                 on_click=lambda _: self._restore_config_backup(_read_clipboard_text())),
+            Divider(),
+            Header(text="Только источники"),
             Text(
                 text="Скопировать JSON в буфер обмена",
                 icon="msg_copy",
@@ -5229,7 +6144,7 @@ class AutoProxyCollectorPlugin(BasePlugin):
             ),
             Text(
                 text="Резервное копирование",
-                subtext="Экспорт и восстановление списка источников",
+                subtext="Настройки и источники либо только источники",
                 icon="msg_saved",
                 create_sub_fragment=self._sub_backup,
             ),
