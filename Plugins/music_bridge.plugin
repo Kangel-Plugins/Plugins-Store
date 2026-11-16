@@ -1,0 +1,1079 @@
+import html
+import json
+import re
+import threading
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+__id__ = "music_bridge"
+__name__ = "MusicBridge"
+__description__ = (
+    "Открывает и конвертирует ссылки на треки между Яндекс Музыкой, Spotify, "
+    "Apple Music, YouTube / YouTube Music, SoundCloud и Deezer. "
+    "(справка: .mb help)."
+)
+__author__ = "@em_apbyz, Gemini 4 Argon High"
+__version__ = "1.0.0"
+__app_version__ = ">=12.10.6"
+__category__ = ["media", "tools"]
+
+CMD_TRIGGER = ".mb"
+CACHE_LIMIT = 60
+CACHE_KEY = "cache_json"
+
+# Базовые музыкальные сервисы (поддерживаются ссылки с https:// и без схемы)
+MUSIC_BASE_RE = re.compile(
+    r"(?<![A-Za-z0-9._/-])(?:https?://)?(?:"
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(?:track|album|playlist)/[A-Za-z0-9]+[^\s<>\"']*"
+    r"|spotify\.link/[A-Za-z0-9]+[^\s<>\"']*"
+    r"|spoti\.fi/[A-Za-z0-9]+[^\s<>\"']*"
+    r"|music\.apple\.com/(?:[a-z]{2}/)?(?:album|song|playlist)/[^\s<>\"']+"
+    r"|(?:m\.)?music\.yandex\.[a-z]{2,3}/(?!search(?:\?|/|$))[^\s<>\"']+"
+    r"|(?:www\.|m\.)?yandex\.[a-z]{2,3}/music/(?!search(?:\?|/|$))[^\s<>\"']+"
+    r"|music\.youtube\.com/(?!search(?:\?|/|$))(?:watch\?[^\s<>\"']*v=[A-Za-z0-9_-]+[^\s<>\"']*|playlist\?[^\s<>\"']+|browse/[^\s<>\"']+)"
+    r"|(?:m\.)?soundcloud\.com/(?!search\b|discover\b|stream\b|you\b)[^\s<>\"'/]+/[^\s<>\"']+"
+    r"|on\.soundcloud\.com/[A-Za-z0-9]+[^\s<>\"']*"
+    r"|(?:www\.)?deezer\.com/(?:[a-z]{2}/)?(?:track|album|playlist)/\d+[^\s<>\"']*"
+    r"|deezer\.page\.link/[A-Za-z0-9]+[^\s<>\"']*"
+    r"|(?:song|album|odesli)\.link/[^\s<>\"']+"
+    r")",
+    re.IGNORECASE,
+)
+
+# Обычный YouTube (youtu.be и youtube.com/watch) — управляется настройкой
+YOUTUBE_EXTRA_RE = re.compile(
+    r"(?<![A-Za-z0-9._/-])(?:https?://)?(?:"
+    r"(?:www\.|m\.)?youtube\.com/watch\?[^\s<>\"']*v=[A-Za-z0-9_-]+[^\s<>\"']*"
+    r"|youtu\.be/[A-Za-z0-9_-]+[^\s<>\"']*"
+    r")",
+    re.IGNORECASE,
+)
+
+# (ключ, отображаемое название, шаблон поиска-фоллбэка)
+PLATFORMS = [
+    ("yandex", "Яндекс Музыка", "https://music.yandex.ru/search?text={q}"),
+    ("spotify", "Spotify", "https://open.spotify.com/search/{q}"),
+    ("appleMusic", "Apple Music", "https://music.apple.com/search?term={q}"),
+    ("youtubeMusic", "YouTube Music", "https://music.youtube.com/search?q={q}"),
+    ("soundcloud", "SoundCloud", "https://soundcloud.com/search?q={q}"),
+    ("deezer", "Deezer", "https://www.deezer.com/search/{q}"),
+]
+
+PLATFORM_KEYS = [p[0] for p in PLATFORMS]
+PLATFORM_NAMES = [p[1] for p in PLATFORMS]
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+
+# ---------- утилиты цвета и парсинга ----------
+
+def rgb(r, g, b):
+    v = (0xFF << 24) | (r << 16) | (g << 8) | b
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def parts(c):
+    return ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+
+
+def mix(a, b, t):
+    (ra, ga, ba), (rb, gb, bb) = parts(a), parts(b)
+    return rgb(int(ra + (rb - ra) * t), int(ga + (gb - ga) * t), int(ba + (bb - ba) * t))
+
+
+C_BG_FALLBACK = rgb(28, 29, 33)
+C_FG_FALLBACK = rgb(255, 255, 255)
+C_ACCENT_FALLBACK = rgb(64, 152, 232)
+
+
+def normalize_url(url):
+    u = (url or "").strip().rstrip(".,;:)]}>\"'")
+    if u and not re.match(r"^https?://", u, re.IGNORECASE):
+        u = "https://" + u
+    return u
+
+
+def detect_platform(url):
+    low = (url or "").lower()
+    if "spotify.com" in low or "spotify.link" in low or "spoti.fi" in low:
+        return "spotify"
+    if "music.apple.com" in low:
+        return "appleMusic"
+    if "music.yandex." in low or ("yandex." in low and "/music/" in low):
+        return "yandex"
+    if "youtube.com" in low or "youtu.be" in low:
+        return "youtubeMusic"
+    if "soundcloud.com" in low:
+        return "soundcloud"
+    if "deezer.com" in low or "deezer.page.link" in low:
+        return "deezer"
+    return None
+
+
+def extract_meta(html_text, attr_name, attr_val):
+    for tag in re.findall(r"<meta\b[^>]+>", html_text, re.IGNORECASE):
+        if re.search(
+            r"\b" + attr_name + r'\s*=\s*["\']' + re.escape(attr_val) + r'["\']',
+            tag,
+            re.IGNORECASE,
+        ):
+            m = re.search(r'\bcontent\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if m:
+                return html.unescape(m.group(1)).strip()
+    return ""
+
+
+def clean_service_suffix(text):
+    t = re.sub(
+        r"\s*(?:\||—|-)\s*(?:Яндекс\.?\s*Музыка|Yandex\.?\s*Music|Spotify|Apple Music|YouTube Music|YouTube|SoundCloud|Deezer).*$",
+        "",
+        text or "",
+        flags=re.IGNORECASE,
+    ).strip()
+    t = re.sub(r"^Слушать\s+(?:трек|песню|альбом)\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+онлайн(?:\s+бесплатно)?(?:\s+на\s+Яндекс\.?\s*Музыке)?$", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
+def clean_youtube_title(title):
+    t = re.sub(
+        r"\s*[\(\[\|]\s*(?:official\s+)?(?:music\s+)?(?:video|audio|lyric\s+video|lyrics|visualizer|hd|4k|clip|премьера\s+клипа|клип|официальный\s+клип|официальное\s+видео)\s*[\)\]]?",
+        "",
+        title or "",
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s{2,}", " ", t).strip(" -|")
+
+
+# ---------- хук кликов по ссылкам ----------
+
+class BrowserOpenUrlHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("enabled", True):
+            return
+        if not self.plugin.get_setting("intercept_clicks", True):
+            return
+        args = getattr(param, "args", None)
+        if not args:
+            return
+
+        allow_yt = bool(self.plugin.get_setting("intercept_youtube", True))
+        matched = None
+
+        # Перебираем аргументы (в разных перегрузках URL может быть String или Uri)
+        for arg in args:
+            if arg is None:
+                continue
+            s = str(arg).strip()
+            if not s or " " in s or "\n" in s:
+                continue
+            low = s.lower()
+            if low.startswith("http") or "." in low:
+                found = self.plugin.extract_music_url(s, allow_youtube=allow_yt)
+                if found:
+                    matched = found
+                    break
+
+        if not matched:
+            return
+
+        # Если включено исключение для основного сервиса — пропускаем его ссылки
+        if self.plugin.get_setting("skip_primary", False):
+            src_platform = detect_platform(matched)
+            if src_platform and src_platform == self.plugin.get_primary_platform_key():
+                return
+
+        param.setResult(None)
+        self.plugin.resolve_and_show(matched)
+
+
+# ---------- плагин ----------
+
+class MusicBridgePlugin(BasePlugin):
+    def create_settings(self):
+        return [
+            Header(text="MusicBridge"),
+            Switch(key="enabled", text="Плагин включён", default=True),
+            Selector(
+                key="target_platform",
+                text="Основной сервис",
+                default=0,
+                items=PLATFORM_NAMES,
+            ),
+            Switch(
+                key="intercept_clicks",
+                text="Перехватывать нажатия на ссылки",
+                subtext="Открывать MusicBridge при тапе на музыкальную ссылку",
+                default=True,
+            ),
+            Switch(
+                key="intercept_youtube",
+                text="Перехватывать обычный YouTube",
+                subtext="Ловить youtube.com/watch и youtu.be (иначе только music.youtube.com)",
+                default=True,
+            ),
+            Switch(
+                key="skip_primary",
+                text="Не перехватывать основной сервис",
+                subtext="Ссылки выбранного выше сервиса сразу открывают приложение",
+                default=False,
+            ),
+            Switch(
+                key="instant_redirect",
+                text="Мгновенный переход",
+                subtext="Сразу открывать основной сервис без окна выбора",
+                default=False,
+            ),
+            Header(text="Дополнительно"),
+            Text(text="Настройки резолвера", create_sub_fragment=self._page_resolver),
+            Text(text="Очистить кэш ссылок", on_click=self._ui_clear_cache),
+            Text(text="Команды и справка", on_click=self._ui_help),
+        ]
+
+    def _page_resolver(self):
+        return [
+            Header(text="Источники данных"),
+            Switch(
+                key="use_custom_api",
+                text="Использовать внешний API-резолвер",
+                subtext="Опциональный Odesli-совместимый эндпоинт (?url=...)",
+                default=False,
+            ),
+            Input(
+                key="api_endpoint",
+                text="URL API-резолвера",
+                default="",
+                subtext="Укажите свой совместимый эндпоинт, если включена опция выше",
+            ),
+            Divider(text="Встроенный резолвер (публичные API Яндекса/Deezer/iTunes, oEmbed и мета-теги) работает без ключей."),
+        ]
+
+    def _int(self, key, default, lo, hi):
+        try:
+            v = int(str(self.get_setting(key, default)).strip())
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    def get_primary_platform_key(self):
+        idx = self._int("target_platform", 0, 0, len(PLATFORMS) - 1)
+        return PLATFORMS[idx][0]
+
+    def on_plugin_load(self):
+        self._unhooks = []
+        self._menu_item_id = None
+        self._session = 0
+
+        # 1. Хук команд .mb
+        self.add_on_send_message_hook()
+
+        # 2. Пункт в контекстном меню сообщения
+        try:
+            self._menu_item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Открыть в MusicBridge",
+                    icon="msg_link",
+                    on_click=self._on_message_menu_click,
+                )
+            )
+        except Exception as e:
+            log(f"music_bridge: не удалось добавить пункт меню: {e}")
+
+        # 3. Хук Browser.openUrl (и openUrlInSystemBrowser, если присутствует)
+        try:
+            from hook_utils import find_class
+            browser_cls = find_class("org.telegram.messenger.browser.Browser")
+            if browser_cls:
+                hook = BrowserOpenUrlHook(self)
+                for method_name in ("openUrl", "openUrlInSystemBrowser"):
+                    try:
+                        res = self.hook_all_methods(browser_cls, method_name, hook) or []
+                        self._unhooks.extend(res)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"music_bridge: ошибка хука Browser: {e}")
+
+    def on_plugin_unload(self):
+        self._session += 1
+        for unhook in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks = []
+
+        if getattr(self, "_menu_item_id", None):
+            try:
+                self.remove_menu_item(self._menu_item_id)
+            except Exception:
+                pass
+            self._menu_item_id = None
+
+    # ---------- локальный кэш в настройках ----------
+
+    def _load_cache(self):
+        try:
+            raw = str(self.get_setting(CACHE_KEY, "") or "")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_cache(self, cache):
+        try:
+            while len(cache) > CACHE_LIMIT:
+                cache.pop(next(iter(cache)))
+            self.set_setting(CACHE_KEY, json.dumps(cache, ensure_ascii=False) if cache else "")
+        except Exception as e:
+            log(f"music_bridge: ошибка сохранения кэша: {e}")
+
+    def _toast(self, text):
+        run_on_ui_thread(lambda: BulletinHelper.show_info(text))
+
+    def _copy(self, text, ok_msg="Ссылка скопирована"):
+        def work():
+            try:
+                from org.telegram.messenger import AndroidUtilities
+                AndroidUtilities.addToClipboard(text)
+                BulletinHelper.show_info(ok_msg)
+            except Exception as e:
+                log(f"music_bridge: ошибка копирования: {e}")
+                BulletinHelper.show_info("Не удалось скопировать")
+
+        run_on_ui_thread(work)
+
+    # ---------- команды и меню ----------
+
+    def on_send_message_hook(self, account, params):
+        if not self.get_setting("enabled", True):
+            return HookResult()
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+
+        stripped = msg.strip()
+        low = stripped.lower()
+        if low != CMD_TRIGGER and not low.startswith(CMD_TRIGGER + " "):
+            return HookResult()
+
+        arg = stripped[len(CMD_TRIGGER):].strip()
+        if not arg or arg.lower() in ("help", "?"):
+            self._ui_help()
+        elif arg.lower() == "clear":
+            self._save_cache({})
+            self._toast("Кэш MusicBridge очищен")
+        else:
+            url = self.extract_music_url(arg, allow_youtube=True)
+            if url:
+                self.resolve_and_show(url)
+            else:
+                self._toast("Не распознана музыкальная ссылка. Пример: .mb https://music.yandex.ru/track/...")
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _on_message_menu_click(self, context):
+        message_obj = context.get("message")
+        url = self._extract_url_from_message(message_obj)
+        if not url:
+            self._toast("В сообщении нет поддерживаемых музыкальных ссылок")
+            return
+        self.resolve_and_show(url)
+
+    def extract_music_url(self, text, allow_youtube=True):
+        if not text:
+            return None
+        m = MUSIC_BASE_RE.search(text)
+        if m:
+            return normalize_url(m.group(0))
+        if allow_youtube:
+            m_yt = YOUTUBE_EXTRA_RE.search(text)
+            if m_yt:
+                return normalize_url(m_yt.group(0))
+        return None
+
+    def _extract_url_from_message(self, message_obj):
+        if message_obj is None:
+            return None
+        try:
+            owner = getattr(message_obj, "messageOwner", None)
+            entities = getattr(owner, "entities", None) if owner else None
+            if entities:
+                for i in range(entities.size()):
+                    ent_url = getattr(entities.get(i), "url", None)
+                    if ent_url:
+                        found = self.extract_music_url(str(ent_url), allow_youtube=True)
+                        if found:
+                            return found
+        except Exception:
+            pass
+
+        for raw in (
+            getattr(message_obj, "messageText", None),
+            getattr(getattr(message_obj, "messageOwner", None), "message", None),
+        ):
+            if raw:
+                found = self.extract_music_url(str(raw), allow_youtube=True)
+                if found:
+                    return found
+        return None
+
+    # ---------- параллельный резолв в фоне ----------
+
+    def resolve_and_show(self, url):
+        url = normalize_url(url)
+        cache = self._load_cache()
+        if url in cache:
+            self._present_result(url, cache[url])
+            return
+
+        self._session += 1
+        session = self._session
+        loader = {"dlg": None}
+
+        def show_spinner():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                ctx = get_last_fragment().getParentActivity()
+                dlg = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+                dlg.set_title("MusicBridge")
+                dlg.set_message("Ищем трек на других платформах…")
+                dlg.set_cancelable(True)
+                dlg.show()
+                loader["dlg"] = dlg
+            except Exception as e:
+                log(f"music_bridge: спиннер не открылся: {e}")
+
+        run_on_ui_thread(show_spinner)
+
+        def work():
+            try:
+                result = self._resolve_track(url)
+                if result.get("links") or result.get("query"):
+                    c = self._load_cache()
+                    c[url] = result
+                    self._save_cache(c)
+            except Exception as e:
+                log(f"music_bridge: ошибка резолва: {e}")
+                result = {"title": "", "links": {}, "query": "", "source": detect_platform(url)}
+
+            def done():
+                if loader["dlg"]:
+                    try:
+                        loader["dlg"].dismiss()
+                    except Exception:
+                        pass
+                if session != self._session:
+                    return
+                self._present_result(url, result)
+
+            run_on_ui_thread(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _resolve_track(self, url):
+        src_platform = detect_platform(url)
+        res = {"title": "", "links": {}, "query": "", "source": src_platform}
+
+        # Сохраняем исходную ссылку как точную для её платформы
+        if src_platform:
+            if src_platform == "youtubeMusic" and "music.youtube.com" not in url.lower():
+                m_vid = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{6,})", url)
+                res["links"]["youtubeMusic"] = (
+                    f"https://music.youtube.com/watch?v={m_vid.group(1)}" if m_vid else url
+                )
+            else:
+                res["links"][src_platform] = url
+
+        use_api = bool(self.get_setting("use_custom_api", False))
+        endpoint = str(self.get_setting("api_endpoint", "") or "").strip()
+
+        # Этап 1: Параллельно получаем название трека (и внешний API, если задан)
+        api_data = None
+        local_title = ""
+        pool1 = ThreadPoolExecutor(max_workers=2)
+        try:
+            f_local = pool1.submit(self._fetch_track_title, url, src_platform)
+            f_api = pool1.submit(self._try_custom_api, endpoint, url) if (use_api and endpoint) else None
+
+            try:
+                local_title = f_local.result(timeout=4.5) or ""
+            except Exception:
+                local_title = ""
+
+            if f_api is not None:
+                try:
+                    api_data = f_api.result(timeout=3.0)
+                except Exception:
+                    api_data = None
+        finally:
+            pool1.shutdown(wait=False)
+
+        if api_data:
+            res["links"].update(api_data.get("links", {}))
+            if api_data.get("title"):
+                res["title"] = api_data["title"]
+
+        if local_title and (not res["title"] or ("—" in local_title and "—" not in res["title"])):
+            res["title"] = local_title
+
+        res["query"] = res["title"]
+
+        # Этап 2: Параллельно ищем прямые ссылки через публичные iTunes и Deezer API
+        if res["query"]:
+            need_apple = "appleMusic" not in res["links"]
+            need_deezer = "deezer" not in res["links"]
+            if need_apple or need_deezer:
+                pool2 = ThreadPoolExecutor(max_workers=2)
+                try:
+                    f_apple = pool2.submit(self._try_itunes_search, res["query"]) if need_apple else None
+                    f_deezer = pool2.submit(self._try_deezer_search, res["query"]) if need_deezer else None
+
+                    if f_apple is not None:
+                        try:
+                            apple_url = f_apple.result(timeout=3.0)
+                            if apple_url:
+                                res["links"]["appleMusic"] = apple_url
+                        except Exception:
+                            pass
+
+                    if f_deezer is not None:
+                        try:
+                            deezer_url = f_deezer.result(timeout=3.0)
+                            if deezer_url:
+                                res["links"]["deezer"] = deezer_url
+                        except Exception:
+                            pass
+                finally:
+                    pool2.shutdown(wait=False)
+
+        return res
+
+    def _try_custom_api(self, endpoint, url):
+        if not endpoint.lower().startswith(("http://", "https://")):
+            return None
+        try:
+            r = requests.get(endpoint, params={"url": url}, headers=REQUEST_HEADERS, timeout=2.5)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            links_raw = data.get("linksByPlatform") or {}
+            links = {
+                k: links_raw[k]["url"]
+                for k in PLATFORM_KEYS
+                if isinstance(links_raw.get(k), dict) and links_raw[k].get("url")
+            }
+            title = ""
+            entities = data.get("entitiesByUniqueId") or {}
+            uid = data.get("entityUniqueId")
+            ent = entities.get(uid) if uid else (next(iter(entities.values())) if entities else None)
+            if isinstance(ent, dict):
+                artist = (ent.get("artistName") or "").strip()
+                track = (ent.get("title") or "").strip()
+                title = f"{artist} — {track}".strip(" —")
+            return {"title": title, "links": links}
+        except Exception as e:
+            log(f"music_bridge: ошибка внешнего API: {e}")
+            return None
+
+    def _fetch_yandex_api_title(self, url):
+        m_track = re.search(r"/track/(\d+)", url)
+        m_album = re.search(r"/album/(\d+)", url)
+
+        if m_track:
+            tid = m_track.group(1)
+            try:
+                r = requests.get(
+                    f"https://api.music.yandex.net/tracks/{tid}",
+                    headers=REQUEST_HEADERS,
+                    timeout=2.5,
+                )
+                if r.status_code == 200:
+                    items = r.json().get("result") or []
+                    if items and isinstance(items[0], dict):
+                        t = (items[0].get("title") or "").strip()
+                        artists = ", ".join(
+                            a.get("name", "").strip()
+                            for a in (items[0].get("artists") or [])
+                            if isinstance(a, dict) and a.get("name")
+                        )
+                        if artists and t:
+                            return f"{artists} — {t}"
+                        if t:
+                            return t
+            except Exception:
+                pass
+
+            try:
+                q_id = f"{tid}:{m_album.group(1)}" if m_album else tid
+                hdrs = dict(REQUEST_HEADERS)
+                hdrs["Referer"] = "https://music.yandex.ru/"
+                r = requests.get(
+                    "https://music.yandex.ru/handlers/track.jsx",
+                    params={"track": q_id},
+                    headers=hdrs,
+                    timeout=2.5,
+                )
+                if r.status_code == 200:
+                    tr = r.json().get("track") or {}
+                    t = (tr.get("title") or "").strip()
+                    artists = ", ".join(
+                        a.get("name", "").strip()
+                        for a in (tr.get("artists") or [])
+                        if isinstance(a, dict) and a.get("name")
+                    )
+                    if artists and t:
+                        return f"{artists} — {t}"
+                    if t:
+                        return t
+            except Exception:
+                pass
+
+        elif m_album:
+            aid = m_album.group(1)
+            try:
+                r = requests.get(
+                    f"https://api.music.yandex.net/albums/{aid}",
+                    headers=REQUEST_HEADERS,
+                    timeout=2.5,
+                )
+                if r.status_code == 200:
+                    alb = r.json().get("result") or {}
+                    t = (alb.get("title") or "").strip()
+                    artists = ", ".join(
+                        a.get("name", "").strip()
+                        for a in (alb.get("artists") or [])
+                        if isinstance(a, dict) and a.get("name")
+                    )
+                    if artists and t:
+                        return f"{artists} — {t}"
+                    if t:
+                        return t
+            except Exception:
+                pass
+
+        return ""
+
+    def _fetch_track_title(self, url, src_platform):
+        if src_platform == "yandex":
+            ya_title = self._fetch_yandex_api_title(url)
+            if ya_title:
+                return ya_title
+
+        if src_platform == "deezer":
+            m_id = re.search(r"/(track|album)/(\d+)", url)
+            if m_id:
+                try:
+                    r = requests.get(
+                        f"https://api.deezer.com/{m_id.group(1)}/{m_id.group(2)}",
+                        headers=REQUEST_HEADERS,
+                        timeout=2.5,
+                    )
+                    if r.status_code == 200:
+                        j = r.json()
+                        t = (j.get("title") or "").strip()
+                        artist = ((j.get("artist") or {}).get("name") or "").strip()
+                        if artist and t:
+                            return f"{artist} — {t}"
+                        if t:
+                            return t
+                except Exception:
+                    pass
+
+        quoted = urllib.parse.quote(url, safe="")
+        if src_platform in ("youtubeMusic", "soundcloud"):
+            if src_platform == "youtubeMusic":
+                m_vid = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{6,})", url)
+                yt_norm = f"https://www.youtube.com/watch?v={m_vid.group(1)}" if m_vid else url
+                oembed = f"https://www.youtube.com/oembed?format=json&url={urllib.parse.quote(yt_norm, safe='')}"
+            else:
+                oembed = f"https://soundcloud.com/oembed?format=json&url={quoted}"
+            try:
+                r = requests.get(oembed, headers=REQUEST_HEADERS, timeout=2.5)
+                if r.status_code == 200:
+                    j = r.json()
+                    t = (j.get("title") or "").strip()
+                    if src_platform == "youtubeMusic":
+                        t = clean_youtube_title(t)
+                    author = re.sub(r"\s*-\s*Topic$", "", (j.get("author_name") or "").strip(), flags=re.IGNORECASE)
+                    author = re.sub(r"\s*VEVO$", "", author, flags=re.IGNORECASE).strip()
+                    if t and (" - " in t or " — " in t):
+                        return t
+                    if t and author and author.lower() not in t.lower():
+                        return f"{author} — {t}"
+                    if t:
+                        return t
+            except Exception:
+                pass
+
+        page_title = self._fetch_html_title_and_artist(url, src_platform)
+        if page_title:
+            return page_title
+
+        if src_platform == "spotify":
+            try:
+                r = requests.get(f"https://open.spotify.com/oembed?url={quoted}", headers=REQUEST_HEADERS, timeout=2.5)
+                if r.status_code == 200:
+                    t = (r.json().get("title") or "").strip()
+                    if t:
+                        return t
+            except Exception:
+                pass
+
+        return ""
+
+    def _fetch_html_title_and_artist(self, url, src_platform):
+        try:
+            r = requests.get(url, headers=REQUEST_HEADERS, timeout=3.5, allow_redirects=True)
+            if r.status_code != 200:
+                return ""
+            body = r.text
+            og_title = clean_service_suffix(extract_meta(body, "property", "og:title"))
+            og_desc = extract_meta(body, "property", "og:description") or extract_meta(body, "name", "description")
+
+            if og_title and any(w in og_title.lower() for w in ("вы не робот", "smartcaptcha", "captcha")):
+                return ""
+
+            if src_platform == "spotify":
+                artist = ""
+                if og_desc:
+                    first_part = og_desc.split("·")[0].strip()
+                    if first_part and not re.match(r"^(?:Listen to|Слушайте)\b", first_part, re.IGNORECASE):
+                        if og_title and first_part.lower() != og_title.lower():
+                            artist = first_part
+                    if not artist:
+                        m_sp = re.search(r"(?:Song|Album|Трек|Альбом)\s*·\s*([^·]+)", og_desc, re.IGNORECASE)
+                        if m_sp:
+                            artist = m_sp.group(1).strip()
+
+                if not artist:
+                    m_tag = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+                    if m_tag:
+                        full_t = html.unescape(m_tag.group(1)).strip()
+                        m_by = re.search(r"\bby\s+(.+?)\s*\|\s*Spotify", full_t, re.IGNORECASE)
+                        if m_by:
+                            artist = m_by.group(1).strip()
+
+                if artist and og_title and artist.lower() not in og_title.lower():
+                    return f"{artist} — {og_title}"
+                if og_title:
+                    return og_title
+
+            if src_platform == "appleMusic" and og_title:
+                m_am = re.match(r"^(.+?)\s+by\s+(.+?)(?:\s+on\s+Apple\s+Music)?$", og_title, re.IGNORECASE)
+                if m_am:
+                    return f"{m_am.group(2).strip()} — {m_am.group(1).strip()}"
+                return re.sub(r"\s+on\s+Apple\s+Music$", "", og_title, flags=re.IGNORECASE).strip()
+
+            if og_title:
+                return clean_youtube_title(og_title) if src_platform == "youtubeMusic" else og_title
+
+            m_tag = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
+            if m_tag:
+                raw_t = clean_service_suffix(html.unescape(m_tag.group(1)).strip())
+                if any(w in raw_t.lower() for w in ("вы не робот", "smartcaptcha", "captcha")):
+                    return ""
+                return clean_youtube_title(raw_t) if src_platform == "youtubeMusic" else raw_t
+        except Exception as e:
+            log(f"music_bridge: ошибка парсинга HTML: {e}")
+        return ""
+
+    def _try_itunes_search(self, query):
+        try:
+            r = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": query, "entity": "song", "limit": 1},
+                headers=REQUEST_HEADERS,
+                timeout=2.5,
+            )
+            if r.status_code == 200:
+                items = r.json().get("results") or []
+                if items and items[0].get("trackViewUrl"):
+                    return items[0]["trackViewUrl"]
+        except Exception:
+            pass
+        return None
+
+    def _try_deezer_search(self, query):
+        try:
+            r = requests.get(
+                "https://api.deezer.com/search",
+                params={"q": query, "limit": 1},
+                headers=REQUEST_HEADERS,
+                timeout=2.5,
+            )
+            if r.status_code == 200:
+                items = r.json().get("data") or []
+                if items and items[0].get("link"):
+                    return items[0]["link"]
+        except Exception:
+            pass
+        return None
+
+    def _build_target_url(self, platform_key, result):
+        direct = (result.get("links") or {}).get(platform_key)
+        if direct:
+            return direct, True
+        query = result.get("query") or ""
+        if not query:
+            return None, False
+        for key, _, tpl in PLATFORMS:
+            if key == platform_key:
+                return tpl.format(q=urllib.parse.quote(query)), False
+        return None, False
+
+    # ---------- нативный UI в стиле темы клиента ----------
+
+    def _present_result(self, original_url, result):
+        target_idx = self._int("target_platform", 0, 0, len(PLATFORMS) - 1)
+        preferred_key = PLATFORMS[target_idx][0]
+        src_platform = result.get("source") or detect_platform(original_url)
+
+        if self.get_setting("instant_redirect", False):
+            url, _ = self._build_target_url(preferred_key, result)
+            if url:
+                self._open_external(url)
+                return
+            self._toast("Не удалось распознать трек, открываю оригинал")
+            self._open_external(original_url)
+            return
+
+        rows = []
+        ordered = [PLATFORMS[target_idx]] + [p for i, p in enumerate(PLATFORMS) if i != target_idx]
+        for key, label, _ in ordered:
+            url, is_exact = self._build_target_url(key, result)
+            if url:
+                if key == src_platform:
+                    subtitle = "Исходная ссылка"
+                elif is_exact:
+                    subtitle = "Точное совпадение"
+                else:
+                    subtitle = "Поиск по названию"
+                rows.append((label, url, subtitle, key == preferred_key))
+
+        if not rows:
+            self._toast("Не удалось получить данные о треке")
+            self._open_external(original_url)
+            return
+
+        def build():
+            try:
+                from android.graphics import Typeface
+                from android.graphics.drawable import GradientDrawable
+                from android.widget import LinearLayout, ScrollView, TextView
+                from client_utils import get_last_fragment
+                from org.telegram.messenger import AndroidUtilities
+                from org.telegram.ui.ActionBar import Theme
+                from ui.alert import AlertDialogBuilder
+
+                ctx = get_last_fragment().getParentActivity()
+
+                def dp(x):
+                    return int(AndroidUtilities.dp(x))
+
+                def theme(key, fallback):
+                    try:
+                        return Theme.getColor(getattr(Theme, key))
+                    except Exception:
+                        return fallback
+
+                c_bg = theme("key_dialogBackground", C_BG_FALLBACK)
+                c_fg = theme("key_dialogTextBlack", C_FG_FALLBACK)
+                c_gray = theme("key_dialogTextGray2", mix(c_bg, c_fg, 0.55))
+                c_accent = theme("key_dialogTextBlue2", C_ACCENT_FALLBACK)
+                c_card = mix(c_bg, c_fg, 0.08)
+                c_btn = mix(c_bg, c_fg, 0.14)
+                c_open_bg = mix(c_bg, c_accent, 0.18)
+
+                def rounded(color, radius=10):
+                    d = GradientDrawable()
+                    d.setColor(color)
+                    d.setCornerRadius(float(dp(radius)))
+                    return d
+
+                root = LinearLayout(ctx)
+                root.setOrientation(LinearLayout.VERTICAL)
+                root.setPadding(dp(16), dp(8), dp(16), dp(8))
+
+                title_tv = TextView(ctx)
+                title_tv.setText(result.get("title") or "Трек найден")
+                title_tv.setTextSize(15.0)
+                title_tv.setTextColor(c_fg)
+                try:
+                    title_tv.setTypeface(None, Typeface.BOLD)
+                except Exception:
+                    pass
+                title_tv.setPadding(0, 0, 0, dp(10))
+                root.addView(title_tv)
+
+                dlg_holder = {"dlg": None}
+
+                for label, target_url, subtitle, is_pref in rows:
+                    card = LinearLayout(ctx)
+                    card.setOrientation(LinearLayout.VERTICAL)
+                    card.setBackground(rounded(c_card, 12))
+                    card.setPadding(dp(12), dp(10), dp(12), dp(10))
+                    clp = LinearLayout.LayoutParams(-1, -2)
+                    clp.setMargins(0, dp(4), 0, dp(4))
+                    card.setLayoutParams(clp)
+
+                    # Верхняя строка: название сервиса и статус
+                    header = LinearLayout(ctx)
+                    header.setOrientation(LinearLayout.HORIZONTAL)
+                    header.setGravity(16)
+                    header.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+
+                    name_tv = TextView(ctx)
+                    name_tv.setText(label)
+                    name_tv.setTextSize(14.5)
+                    name_tv.setTextColor(c_accent if is_pref else c_fg)
+                    if is_pref:
+                        try:
+                            name_tv.setTypeface(None, Typeface.BOLD)
+                        except Exception:
+                            pass
+                    name_tv.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1.0))
+                    header.addView(name_tv)
+
+                    sub_tv = TextView(ctx)
+                    sub_tv.setText(subtitle)
+                    sub_tv.setTextSize(11.5)
+                    sub_tv.setTextColor(c_gray)
+                    sub_tv.setPadding(dp(8), 0, 0, 0)
+                    header.addView(sub_tv)
+
+                    def on_open(u=target_url):
+                        if dlg_holder["dlg"]:
+                            dlg_holder["dlg"].dismiss()
+                        self._open_external(u)
+
+                    header.setOnClickListener(OnClickListener(lambda *a, fn=on_open: fn()))
+                    card.addView(header)
+
+                    # Нижняя строка: кнопки Открыть и Копировать
+                    btns = LinearLayout(ctx)
+                    btns.setOrientation(LinearLayout.HORIZONTAL)
+                    blp = LinearLayout.LayoutParams(-1, -2)
+                    blp.setMargins(0, dp(8), 0, 0)
+                    btns.setLayoutParams(blp)
+
+                    open_tv = TextView(ctx)
+                    open_tv.setText("Открыть")
+                    open_tv.setTextSize(12.5)
+                    open_tv.setTextColor(c_accent)
+                    open_tv.setGravity(17)
+                    try:
+                        open_tv.setTypeface(None, Typeface.BOLD)
+                    except Exception:
+                        pass
+                    open_tv.setBackground(rounded(c_open_bg, 8))
+                    open_tv.setPadding(dp(8), dp(7), dp(8), dp(7))
+                    olp = LinearLayout.LayoutParams(0, -2, 1.0)
+                    olp.setMargins(0, 0, dp(4), 0)
+                    open_tv.setLayoutParams(olp)
+                    open_tv.setOnClickListener(OnClickListener(lambda *a, fn=on_open: fn()))
+                    btns.addView(open_tv)
+
+                    copy_tv = TextView(ctx)
+                    copy_tv.setText("Копировать")
+                    copy_tv.setTextSize(12.5)
+                    copy_tv.setTextColor(c_fg)
+                    copy_tv.setGravity(17)
+                    copy_tv.setBackground(rounded(c_btn, 8))
+                    copy_tv.setPadding(dp(8), dp(7), dp(8), dp(7))
+                    cplp = LinearLayout.LayoutParams(0, -2, 1.0)
+                    cplp.setMargins(dp(4), 0, 0, 0)
+                    copy_tv.setLayoutParams(cplp)
+                    copy_tv.setOnClickListener(
+                        OnClickListener(lambda *a, u=target_url, l=label: self._copy(u, f"Ссылка {l} скопирована"))
+                    )
+                    btns.addView(copy_tv)
+
+                    card.addView(btns)
+                    root.addView(card)
+
+                scroll = ScrollView(ctx)
+                scroll.addView(root)
+
+                b = AlertDialogBuilder(ctx)
+                b.set_title("MusicBridge")
+                b.set_view(scroll)
+                b.set_neutral_button(
+                    "Оригинал",
+                    lambda *a: (b.dismiss(), self._open_external(original_url)),
+                )
+                b.set_negative_button("Закрыть", lambda *a: b.dismiss())
+                dlg_holder["dlg"] = b
+                b.show()
+            except Exception as e:
+                log(f"music_bridge: ошибка UI: {e}")
+                self._open_external(rows[0][1])
+
+        run_on_ui_thread(build)
+
+    def _open_external(self, url):
+        def work():
+            try:
+                from android.content import Intent
+                from android.net import Uri
+                from client_utils import get_last_fragment
+                ctx = get_last_fragment().getParentActivity()
+                intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+            except Exception as e:
+                log(f"music_bridge: не удалось открыть {url}: {e}")
+                BulletinHelper.show_info("Не удалось открыть ссылку")
+
+        run_on_ui_thread(work)
+
+    # ---------- обработчики настроек ----------
+
+    def _show_info_dialog(self, title, msg):
+        def build():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                ctx = get_last_fragment().getParentActivity()
+                b = AlertDialogBuilder(ctx)
+                b.set_title(title)
+                b.set_message(msg)
+                b.set_positive_button("Понятно", lambda *a: b.dismiss())
+                b.show()
+            except Exception as e:
+                log(f"music_bridge: диалог не открылся: {e}")
+
+        run_on_ui_thread(build)
+
+    def _ui_clear_cache(self, *args):
+        self._save_cache({})
+        self._toast("Кэш MusicBridge очищен")
+
+    def _ui_help(self, *args):
+        msg = "\n".join([
+            "Как пользоваться MusicBridge:",
+            "• Нажмите на ссылку Spotify, Яндекс Музыки, YouTube / YouTube Music, Apple Music, SoundCloud или Deezer.",
+            "• Или выберите «Открыть в MusicBridge» в меню сообщения.",
+            "",
+            "Команды:",
+            f"{CMD_TRIGGER} <ссылка> — разобрать ссылку вручную",
+            f"{CMD_TRIGGER} clear — очистить локальный кэш",
+            f"{CMD_TRIGGER} help — показать эту справку",
+        ])
+        self._show_info_dialog("Справка MusicBridge", msg)
