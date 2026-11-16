@@ -1,0 +1,392 @@
+__id__ = "theme_per_account"
+__name__ = "Theme per Account"
+__description__ = "Отдельная тема приложения и цветовой вариант для каждого аккаунта"
+__author__ = "@limeplug"
+__version__ = "1.0.5"
+__icon__ = "atb_pack_by_fStikBot/4"
+__app_version__ = ">=13.1.1"
+__category__ = ["appearance"]
+__sdk_version__ = ">=1.4.5.3"
+
+import json
+import os
+
+from base_plugin import AppEvent, BasePlugin, MethodHook
+from client_utils import get_last_fragment, run_on_ui_thread
+from java import dynamic_proxy
+from org.telegram.messenger import NotificationCenter, UserConfig
+from org.telegram.ui import LaunchActivity
+from org.telegram.ui.ActionBar import Theme
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Text
+
+
+class _AccountObserver(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def didReceivedNotification(self, event_id, account, args):
+        self.plugin._schedule(True)
+
+
+class _AutoNightHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin._alive and self.plugin._selected_binding() is not None:
+                param.setResult(None)
+        except Exception as error:
+            self.plugin.logger.error(f"Auto-night guard: {error}")
+
+
+class ThemePerAccountPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._alive = True
+        self._pending = None
+        self._force = False
+        self._baseline = None
+        self._managed = False
+        self._last_user = None
+        self._original_accents = {}
+        self._warned = set()
+        try:
+            bindings = json.loads(self.get_setting("bindings", "{}"))
+            self._bindings = bindings if isinstance(bindings, dict) else {}
+        except (ValueError, TypeError):
+            self._bindings = {}
+            self.logger.warning("Invalid saved bindings; using an empty mapping")
+        theme_class = Theme.getClass()
+        target = None
+        for method in theme_class.getDeclaredMethods():
+            if str(method.getName()) == "applyDayNightThemeMaybe":
+                types = method.getParameterTypes()
+                if len(types) == 1 and str(types[0].getName()) == "boolean":
+                    target = method
+                    break
+        if target is None:
+            self._alive = False
+            raise RuntimeError("Theme.applyDayNightThemeMaybe(boolean) is unavailable")
+        handle = self.hook_method(target, _AutoNightHook(self))
+        if handle is None:
+            self._alive = False
+            raise RuntimeError("Unable to install the auto-night guard")
+        self._observer = _AccountObserver(self)
+        run_on_ui_thread(self._attach)
+
+    def _attach(self):
+        if not self._alive:
+            return
+        NotificationCenter.getGlobalInstance().addObserver(
+            self._observer, NotificationCenter.activeAccountChanged
+        )
+        self._schedule(True)
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._pending = None
+        self._force = False
+        run_on_ui_thread(self._detach)
+
+    def _detach(self):
+        observer = getattr(self, "_observer", None)
+        if observer is not None:
+            NotificationCenter.getGlobalInstance().removeObserver(
+                observer, NotificationCenter.activeAccountChanged
+            )
+        try:
+            if not self._restore():
+                Theme.checkAutoNightThemeConditions()
+        except Exception as error:
+            self.logger.error(f"Restore on unload: {error}")
+
+    def on_app_event(self, event_type):
+        if event_type in (AppEvent.START, AppEvent.RESUME):
+            run_on_ui_thread(lambda: self._schedule(False))
+
+    def _user_id(self, account):
+        config = UserConfig.getInstance(account)
+        return str(int(config.getClientUserId())) if config.isClientActivated() else None
+
+    def _selected_binding(self):
+        uid = self._user_id(int(UserConfig.selectedAccount))
+        binding = self._bindings.get(uid)
+        return binding if self._resolve(binding) is not None else None
+
+    def _snapshot(self, theme):
+        if theme is None:
+            return None
+        return {
+            "theme": str(theme.getKey()),
+            "accent": int(theme.currentAccentId),
+            "name": str(theme.getName()),
+        }
+
+    def _resolve(self, binding):
+        if not isinstance(binding, dict):
+            return None
+        key = binding.get("theme")
+        accent = binding.get("accent")
+        if not isinstance(key, str) or type(accent) is not int:
+            return None
+        return self._available(Theme.getTheme(key), accent)
+
+    def _available(self, theme, accent=None):
+        if theme is None or not theme.loaded:
+            return None
+        if theme.pathToFile and not os.path.isfile(str(theme.pathToFile)):
+            return None
+        if accent is not None:
+            accents = theme.themeAccentsMap
+            if accents is not None and accents.size() > 0 and accents.get(accent) is None:
+                return None
+        return theme
+
+    def _schedule(self, force, delay=80):
+        if not self._alive:
+            return
+        self._force = self._force or force
+        if self._pending is not None and delay >= self._pending[1]:
+            return
+        if not self._force and self._user_id(int(UserConfig.selectedAccount)) == self._last_user:
+            return
+        token = (object(), delay)
+        self._pending = token
+
+        def flush_if_current():
+            if self._alive and self._pending is token:
+                self._flush()
+
+        run_on_ui_thread(flush_if_current, delay)
+
+    def _flush(self):
+        self._pending = None
+        if not self._alive:
+            return
+        try:
+            uid = self._user_id(int(UserConfig.selectedAccount))
+            force = self._force
+            self._force = False
+            if not force and uid == self._last_user:
+                return
+            if Theme.getPreviousTheme() is not None:
+                self._schedule(True, 300)
+                return
+            self._last_user = uid
+            binding = self._bindings.get(uid)
+            theme = self._resolve(binding)
+            if theme is None:
+                self._restore()
+                if binding is not None and uid not in self._warned:
+                    self._warned.add(uid)
+                    self.logger.warning("An assigned theme or accent is no longer available")
+                    BulletinHelper.show_error("Тема аккаунта недоступна. Выберите её заново в настройках плагина.")
+                return
+            if not self._managed:
+                self._baseline = self._snapshot(Theme.getActiveTheme())
+            self._managed = True
+            self._apply(theme, binding["accent"])
+        except Exception as error:
+            self.logger.error(f"Account theme switch: {error}")
+            BulletinHelper.show_error("Не удалось переключить тему. Подробности — в журнале плагина.")
+
+    def _apply(self, theme, accent):
+        key = str(theme.getKey())
+        current = Theme.getActiveTheme()
+        if current == theme and int(theme.currentAccentId) == accent:
+            return
+        if key not in self._original_accents:
+            self._original_accents[key] = int(theme.currentAccentId)
+        theme.setCurrentAccentId(accent)
+        self._render(theme)
+
+    def _render(self, theme):
+        Theme.applyTheme(theme, False, True)
+        activity = LaunchActivity.instance
+        if activity is not None:
+            activity.rebuildAllFragments(True)
+
+    def _restore(self):
+        if not self._managed:
+            return
+        for key, accent in self._original_accents.items():
+            theme = Theme.getTheme(key)
+            if theme is not None:
+                theme.setCurrentAccentId(accent)
+        self._original_accents.clear()
+        theme = self._resolve(self._baseline)
+        if theme is not None:
+            theme.setCurrentAccentId(self._baseline["accent"])
+        else:
+            theme = Theme.getCurrentTheme()
+        if theme is not None:
+            self._render(theme)
+        self._managed = False
+        Theme.checkAutoNightThemeConditions()
+        return True
+
+    def _save(self, uid, binding):
+        if not self._alive:
+            return
+        if binding is None:
+            self._bindings.pop(uid, None)
+        else:
+            self._bindings[uid] = dict(binding)
+        self._warned.discard(uid)
+        self.set_setting("bindings", json.dumps(self._bindings, ensure_ascii=False), reload_settings=True)
+        self._schedule(True)
+        BulletinHelper.show_success("Привязка снята" if binding is None else "Тема аккаунта сохранена")
+
+    def _show_guide(self, view=None):
+        self._dialog(
+            "Как назначить тему",
+            message="Нажми на аккаунт и выбери тему, затем цвет.\n\n"
+            "Нравится тема, которая стоит сейчас? Нажми «Сохранить текущую тему».\n\n"
+            "Чтобы убрать свою тему у аккаунта, выбери «Использовать общую тему».\n\n"
+            "Нет нужной темы в списке? Сначала установи её в приложении.",
+        )
+
+    def _show_auto_night(self, view=None):
+        assigned = self._selected_binding() is not None
+        status = "выключен для этого аккаунта" if assigned else "как в настройках приложения"
+        self._dialog(
+            "Автоночной режим",
+            message=f"Сейчас: {status}.\n\n"
+            "Если у аккаунта своя тема, она не меняется сама между днём и ночью.\n\n"
+            "Без своей темы всё работает как обычно. Расписание плагин не трогает.",
+        )
+
+    def _dialog(self, title, labels=None, callback=None, message=None):
+        fragment = get_last_fragment()
+        context = fragment.getParentActivity() if fragment is not None else None
+        if context is None:
+            BulletinHelper.show_error("Откройте настройки плагина в основном окне приложения.")
+            return
+        builder = AlertDialogBuilder(context)
+        builder.set_title(title)
+        if message is not None:
+            builder.set_message(message)
+        if labels is not None:
+            def selected(dialog, which):
+                dialog.dismiss()
+                if self._alive and 0 <= int(which) < len(labels):
+                    callback(int(which))
+
+            builder.set_items(labels, selected)
+        builder.set_negative_button("Понятно" if labels is None else "Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _choose_theme(self, uid, title):
+        themes = []
+        for index in range(Theme.themes.size()):
+            theme = Theme.themes.get(index)
+            if self._available(theme, int(theme.currentAccentId)) is not None:
+                themes.append(theme)
+        themes.sort(key=lambda theme: str(theme.getName()).casefold())
+        labels = ["Сохранить текущую тему", "Использовать общую тему"]
+        labels.extend(str(theme.getName()) for theme in themes)
+
+        def choose(which):
+            if which == 0:
+                if Theme.getPreviousTheme() is not None:
+                    BulletinHelper.show_error("Сначала завершите предпросмотр темы.")
+                    return
+                binding = self._snapshot(Theme.getActiveTheme())
+                if self._resolve(binding) is not None:
+                    self._save(uid, binding)
+                else:
+                    BulletinHelper.show_error("Тема ещё не загружена. Сначала примените её в настройках приложения.")
+            elif which == 1:
+                self._save(uid, None)
+            else:
+                self._choose_accent(uid, themes[which - 2])
+
+        binding = self._bindings.get(uid)
+        theme = self._resolve(binding)
+        if theme is not None:
+            message = f"Тема: {theme.getName()}\nЦветовой вариант: {binding['accent']}"
+        elif isinstance(binding, dict):
+            message = f"Тема «{binding.get('name', 'Без названия')}» недоступна. Выберите другую."
+        else:
+            message = "Используется общая тема приложения."
+        self._dialog(title, labels, choose, message=message)
+
+    def _choose_accent(self, uid, theme):
+        binding = self._snapshot(theme)
+        accents = theme.themeAccents
+        if accents is None or accents.size() == 0:
+            self._save(uid, binding)
+            return
+        if self._available(theme) is None:
+            BulletinHelper.show_error("Нет доступных цветовых вариантов. Примените тему в настройках приложения.")
+            return
+        options = []
+        labels = []
+        accent_map = theme.themeAccentsMap
+        check_accent = accent_map is not None and accent_map.size() > 0
+        for index in range(accents.size()):
+            accent = accents.get(index)
+            if check_accent and accent_map.get(accent.id) is None:
+                continue
+            if accent.info is not None:
+                label = str(accent.info.title)
+            else:
+                color = int(accent.accentColor) & 0xFFFFFF
+                label = f"Вариант {int(accent.id)} · #{color:06X}"
+            if int(accent.id) == int(theme.currentAccentId):
+                label += " (текущий)"
+            labels.append(label)
+            options.append(int(accent.id))
+        if not options:
+            BulletinHelper.show_error("Нет доступных цветовых вариантов. Примените тему в настройках приложения.")
+            return
+        self._dialog(str(theme.getName()), labels, lambda which: self._save(uid, dict(binding, accent=options[which])))
+
+    def create_settings(self):
+        rows = [Header(text="Аккаунты")]
+        selected = int(UserConfig.selectedAccount)
+        for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            uid = self._user_id(account)
+            if uid is None:
+                continue
+            user = UserConfig.getInstance(account).getCurrentUser()
+            name = " ".join(str(part) for part in (user.first_name, user.last_name) if part).strip()
+            title = name or f"Аккаунт {account + 1}"
+            if account == selected:
+                title += " · текущий"
+            binding = self._bindings.get(uid)
+            theme = self._resolve(binding)
+            if theme is not None:
+                subtitle = str(theme.getName())
+            elif isinstance(binding, dict):
+                subtitle = "Тема недоступна"
+            else:
+                subtitle = "Общая тема"
+            rows.append(Text(
+                text=title,
+                subtext=subtitle,
+                icon="msg_theme",
+                on_click=lambda view, user_id=uid, caption=title: self._choose_theme(user_id, caption),
+            ))
+        if len(rows) == 1:
+            rows.append(Text(text="Нет активных аккаунтов"))
+        rows.extend([
+            Divider(text="Нажми на аккаунт, чтобы выбрать тему."),
+            Header(text="Справка"),
+            Text(
+                text="Как назначить тему",
+                icon="msg_info",
+                on_click=self._show_guide,
+            ),
+            Text(
+                text="Автоночной режим",
+                icon="menu_night_mode_24",
+                on_click=self._show_auto_night,
+            ),
+            Divider(),
+        ])
+        return rows
