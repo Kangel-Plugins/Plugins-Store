@@ -1,0 +1,401 @@
+# -*- coding: utf-8 -*-
+"""
+Split Forwards — пересылка пачки разобщённых сообщений В КАНАЛ так,
+чтобы КАЖДЫЙ пост получил свои комментарии.
+
+Симптом (каким он был): пересылаешь пачку отдельных картинок в канал — кнопка
+«Комментарии» появляется только у первой. Причина: клиент отправляет весь батч
+ОДНИМ RPC `messages.forwardMessages`; сервер создаёт зеркало в дискуссионной
+группе одно, поэтому комментарии приходят только на первый пост.
+
+Что делает плагин:
+  * Работает ТОЛЬКО при пересылке в широковещательные каналы (чат — TLRPC.TL_channel
+    и megagroup == false). В прочие диалоги плагин не вмешивается.
+  * Хукает SendMessagesHelper#sendMessage(ArrayList<MessageObject>, long, ...)
+    и разбивает батч на серию штатных вызовов — по одному на сообщение без
+    grouped_id; альбомы с общим grouped_id остаются ОДНИМ вызовом.
+  * Отправка идёт на UI-потоке с задержкой ~0.10 с между вызовами — фактически как
+    ручные нажатия «Переслать» по одной картинке.
+  * Исходный общий вызов глушится (setResult(null) + очистка исходного списка) —
+    дублирования постов не происходит.
+
+НАСТРОЕК НЕТ НАМЕРЕННО: если разбивка не нужна — просто отключите/удалите плагин
+целиком в Настройки -> Плагины.
+
+Уведомление (единственное): сразу после пересылки — «Split Forwards: отправлено N из M».
+"""
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+
+try:
+    from android_utils import run_on_ui_thread
+except Exception:
+    run_on_ui_thread = None
+
+from java.lang import Long as JLong
+from java import jclass
+
+_JArray = jclass("java.lang.reflect.Array")
+_JObject = jclass("java.lang.Object")
+_JArrays = jclass("java.util.Arrays")
+
+__id__ = "split_forwards"
+__name__ = "Split Forwards"
+__description__ = "Фикс пересылаемых сообщений в канал, чтобы у каждого поста были комментарии. Альбомы не разбивает."
+__author__ = "@shaeply"
+__version__ = "1.1"
+__icon__ = "tgmacicons/25"
+__app_version__ = ">=12.10.6"
+__min_version__ = "12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["tools", "chats"]
+
+_ArrayList = jclass("java.util.ArrayList")
+
+# -----------------------------------------------------------------------------
+# Функция 2: разбиение пересылаемых пачек на отдельные вызовы
+# -----------------------------------------------------------------------------
+
+def _as_long(v):
+    """Python int из Java-числа любого вида (boxed Long из param.args / примитив)."""
+    try:
+        return int(v)
+    except Exception:
+        pass
+    for attr in ("longValue", "intValue"):
+        try:
+            m = getattr(v, attr, None)
+            if m is not None:
+                return int(m())
+        except Exception:
+            pass
+    try:
+        return int(str(v))
+    except Exception:
+        return None
+
+
+def _get_chat_for_peer(cid):
+    """Возвращает TLRPC.Chat по chat_id (как в клиенте: getChat(-peer) / getChat(chatId))."""
+    try:
+        from client_utils import get_messages_controller, get_hook_account
+    except Exception:
+        try:
+            from client_utils import get_messages_controller
+            get_hook_account = None
+        except Exception:
+            return None
+    account = None
+    try:
+        if get_hook_account is not None:
+            account = get_hook_account()
+    except Exception:
+        account = None
+    try:
+        if account is not None:
+            mc = get_messages_controller(account)
+        else:
+            mc = get_messages_controller()
+    except Exception:
+        try:
+            mc = get_messages_controller()
+        except Exception:
+            return None
+    try:
+        # getChat принимает Long — создаём его явно, иначе Chaquopy может передать не тот тип.
+        return mc.getChat(JLong(int(cid)))
+    except Exception:
+        try:
+            return mc.getChat(int(cid))
+        except Exception:
+            return None
+
+
+def _is_broadcast_channel(peer):
+    """
+    True только для широковещательных каналов: peer не положителен,
+    чат найден в памяти, тип TLRPC.TL_channel и megagroup == false.
+    Формат dialog_id во внимание не принимается (конвенции id в разных
+    ветках Telegram разные).
+    """
+    pid = _as_long(peer)
+    if pid is None or pid >= 0:
+        return False
+    chat = _get_chat_for_peer(-pid)
+    if chat is None:
+        return False
+    try:
+        cls_name = str(chat.getClass().getName())
+    except Exception:
+        return False
+    if "TL_channel" not in cls_name:
+        return False
+    try:
+        if bool(get_private_field(chat, "megagroup")):
+            return False
+    except Exception:
+        return False
+    return True
+
+def _group_forward_messages(messages):
+    """
+    Группирует список MessageObject для разбивки пересылки.
+
+    Возвращает список кортежей (key, [items]) в порядке первого появления:
+      * сообщения с общим grouped_id (альбом) — одна группа;
+      * сообщения без grouped_id — каждый в своей группе.
+    Порядок внутри групп сохраняется.
+    """
+    groups = []
+    index_map = {}
+    n = int(messages.size())
+    for i in range(n):
+        m = messages.get(i)
+        try:
+            owner = m.messageOwner
+        except Exception:
+            owner = None
+        gid = 0
+        try:
+            gid = int(owner.grouped_id) if owner is not None else 0
+        except Exception:
+            gid = 0
+
+        if gid != 0:
+            key = ("album", gid)
+        else:
+            key = ("single", i)
+
+        idx = index_map.get(key)
+        if idx is None:
+            index_map[key] = len(groups)
+            groups.append((key, [m]))
+        else:
+            groups[idx][1].append(m)
+    return groups
+
+
+class SplitForwardHook(MethodHook):
+    """
+    sendMessage(ArrayList<MessageObject>, long, ...): разбиваем батч пересылаемых
+    сообщений на серию штатных вызовов (альбомы с общим grouped_id — одним RPC).
+
+    Намеренно НЕ привязываемся к числу параметров (в форках сигнатура плавает):
+    ориентируемся на то, что первый аргумент — ArrayList из MessageObject-ов.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) < 2:
+                return
+            messages = args[0]
+            if messages is None:
+                return
+            # Первый аргумент должен быть ArrayList из MessageObject-ов.
+            try:
+                first_zero = messages.get(0)
+                first_name = str(first_zero.getClass().getName())
+                total = int(messages.size())
+                raw_class = str(messages.getClass().getName())
+            except Exception as e:
+                return
+            if "ArrayList" not in raw_class and "List" not in raw_class:
+                return
+            if "MessageObject" not in first_name:
+                return
+            if total < 2:
+                return
+
+            # Только широковещательные каналы: в прочие диалоги не вмешиваемся.
+            try:
+                peer_for_check = args[1]
+            except Exception:
+                peer_for_check = None
+            if peer_for_check is None or not _is_broadcast_channel(peer_for_check):
+                return
+
+            groups = _group_forward_messages(messages)
+            if len(groups) <= 1:
+                return  # всё одним альбомом — нечего делить
+
+            tail = [args[i] for i in range(1, len(args))]
+            n_args = len(args)
+
+            def _candidate_methods():
+                picked = []
+                for m in getattr(self.plugin, "send_methods", None) or []:
+                    try:
+                        params = m.getParameterTypes()
+                        if int(params.length) != n_args:
+                            continue
+                        first = str(params[0].getName())
+                        if first.endswith("ArrayList") or first.endswith("List"):
+                            picked.append(m)
+                    except Exception:
+                        continue
+                pm = getattr(param, "method", None)
+                if pm is not None:
+                    picked.append(pm)
+                return picked
+
+            def _invoke(method_obj, receiver, sub_array, extra_args, args_source):
+                try:
+                    method_obj.setAccessible(True)
+                except Exception:
+                    pass
+                errors = []
+                # Попытка 1: клонируем исходный args[] (все boxing и типы —
+                # оригинальные), подменяем только нулевой элемент на sub-батч.
+                try:
+                    clone = _JArrays.copyOf(args_source, len(extra_args) + 1)
+                    _JArray.set(clone, 0, sub_array)
+                    return method_obj.invoke(receiver, clone)
+                except Exception as e:
+                    errors.append(f"clone: {type(e).__name__}: {e}")
+                # Попытка 2: явно собранный Object[].
+                try:
+                    arr = _JArray.newInstance(_JObject, len(extra_args) + 1)
+                    _JArray.set(arr, 0, sub_array)
+                    for idx, value in enumerate(extra_args):
+                        _JArray.set(arr, idx + 1, value)
+                    return method_obj.invoke(receiver, arr)
+                except Exception as e:
+                    errors.append(f"array: {type(e).__name__}: {e}")
+                # Попытка 3 (fallback): элементы varargs по позициям.
+                try:
+                    return method_obj.invoke(receiver, sub_array, *extra_args)
+                except Exception as e:
+                    errors.append(f"varargs: {type(e).__name__}: {e}")
+                raise RuntimeError(" | ".join(errors))
+
+            n_groups = len(groups)
+            state = {"done": 0, "ok": 0, "fail": 0}
+
+            def _show_final():
+                try:
+                    from ui.bulletin import BulletinHelper
+
+                    BulletinHelper.show_success(
+                        f"Split Forwards: отправлено {state['ok']} из {n_groups}"
+                    )
+                except Exception:
+                    pass
+
+            def _send_partition(group):
+                try:
+                    sub = _ArrayList()
+                    for item in group:
+                        sub.add(item)
+                    last_error = None
+                    for method_obj in _candidate_methods():
+                        try:
+                            _invoke(method_obj, param.thisObject, sub, tail, param.args)
+                            last_error = None
+                            break
+                        except Exception as inner:
+                            last_error = inner
+                    if last_error is None:
+                        state["ok"] += 1
+                    else:
+                        state["fail"] += 1
+                        self.plugin.logger.error("Forward split call failed: %s", last_error)
+                except Exception as e:
+                    state["fail"] += 1
+                    self.plugin.logger.error("Forward split partition error: %s", e)
+                finally:
+                    state["done"] += 1
+                    if state["done"] == n_groups:
+                        _show_final()
+
+            # Отправка «как ручными нажатиями»: по одному вызову в UI-потоке
+            # с нарастающей задержкой (~0.10 c), в исходном порядке.
+            delay_step = 100
+            if run_on_ui_thread is not None:
+                for idx, (_, group) in enumerate(groups):
+                    try:
+                        run_on_ui_thread(
+                            lambda g=group: _send_partition(g),
+                            (idx + 1) * delay_step
+                        )
+                    except Exception as e:
+                        self.plugin.logger.error(
+                            "schedule failed, sending synchronously: %s", e
+                        )
+                        _send_partition(group)
+            else:
+                for _, group in groups:
+                    _send_partition(group)
+
+            # Пачка уже разбита — глушим исходный общий вызов.
+            # Комбинация из двух мер, т.к. setResult может не сработать
+            # на int-возвращающем методе в некоторых сборках клиента:
+            #  1) setResult(None) — штатное «пропустить оригинал»;
+            #  2) messages.clear() — тот же Java-объект под-списка; клиент
+            #     первой строкой делает `if (messages == null || messages.isEmpty()) return 0;`,
+            #     поэтому даже если оригинал ВСЁ РАВНО выполнится, RPC не уйдёт.
+            try:
+                messages.clear()
+            except Exception as e:
+                self.plugin.logger.error("failed to clear original messages list: %s", e)
+            param.setResult(None)
+        except Exception as e:
+            self.plugin.logger.error("Split forward hook failed: %s", e)
+
+
+class SplitForwardsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.hooks = []
+        self.send_methods = []
+
+        try:
+            helper = find_class("org.telegram.messenger.SendMessagesHelper")
+        except Exception as e:
+            self.logger.error("find_class failed: %s", e)
+            return
+        if helper is None:
+            self.logger.error("SendMessagesHelper not found — plugin disabled")
+            return
+
+        # NB: helper — это Chaquopy JavaClass: instance-методы java.lang.Class
+        # (getDeclaredMethods) у него недоступны. Собираем методы best-effort —
+        # они нужны лишь для запасного механизма вызова; регистрация хука ниже
+        # не зависит от них.
+        try:
+            for m in helper.getDeclaredMethods("sendMessage"):
+                try:
+                    m.setAccessible(True)
+                    self.send_methods.append(m)
+                except Exception:
+                    continue
+        except Exception:
+            pass  # ожидаемо для Chaquopy
+
+        # Регистрируем перехват: сначала с классом, при ошибке — с именем класса.
+        hooked = None
+        try:
+            hooked = self.hook_all_methods(helper, "sendMessage", SplitForwardHook(self))
+        except Exception:
+            try:
+                hooked = self.hook_all_methods(
+                    "org.telegram.messenger.SendMessagesHelper",
+                    "sendMessage",
+                    SplitForwardHook(self),
+                )
+            except Exception as e:
+                self.logger.error("hook_all_methods failed: %s", e)
+                return
+        if hooked:
+            self.hooks.extend(hooked if isinstance(hooked, list) else [hooked])
+
+    def on_plugin_unload(self):
+        for hook in getattr(self, "hooks", []):
+            try:
+                self.unhook_method(hook)
+            except Exception:
+                pass
+        self.hooks = []
