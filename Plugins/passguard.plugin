@@ -59,7 +59,7 @@ __id__ = "passguard"  # kept for settings compatibility with older versions
 __name__ = "Security Manager"
 __description__ = "Скрытые чаты: исчезают из общего списка и открываются только по секретному паролю в поиске. Динамический пароль приложения по времени телефона. Экстренный выход из аккаунта по коду-приманке. Тихие уведомления с фото при неверном пароле."
 __author__ = "@xeate, @xeplagin"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __icon__ = "zamokdliamoegoebanogonikomunenujnogoplagina/0"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -342,6 +342,10 @@ class PassGuardPlugin(BasePlugin):
     _shared_hidden_code = None
     _shared_hidden_ids = None
     _shared_hidden_ts = 0.0
+    # True only when hidden chats are enabled, a password is set and at
+    # least one chat is hidden. Hot hooks check this before doing any
+    # work, so an unused plugin costs almost nothing.
+    _shared_hidden_runtime = False
     # The hidden chat whose screen is really open. A ProfileActivity is
     # allowed only while this chat is open, not because an old unlock is
     # still stored somewhere.
@@ -363,6 +367,9 @@ class PassGuardPlugin(BasePlugin):
         self._shared_config_class = None
         self._last_alert_ts = 0.0
         self._hidden_unhooks = []
+        self._hidden_hooks_installed = False
+        self._hidden_menu_hook_installed = False
+        self._ui_handler = Handler(Looper.getMainLooper())
         self._hidden_menu_item_id = None
         self._hidden_menu_dialog_id = None
         self._search_results_field = None
@@ -381,6 +388,12 @@ class PassGuardPlugin(BasePlugin):
         self._closing_fragment_key = None
         self._closing_fragment_ts = 0.0
         self._hints_filter_ts = 0.0
+        self._drawable_cache = {}
+        self._badge_res_id = None
+        self._badge_density = 0.0
+        self._badge_logged = False
+        self._search_patch_pending = False
+        self._pending_search_adapter = None
         self._hidden_enabled = bool(self.get_setting("hidden_enabled", False))
         self._hidden_code = str(
             self.get_setting("hidden_code", "") or ""
@@ -408,7 +421,7 @@ class PassGuardPlugin(BasePlugin):
         self._dialog_filter_last_removed = -1
         self._controller_dialogs_hooked = False
         self._install_passcode_hook()
-        self._install_hidden_hooks()
+        self._sync_hidden_hooks()
         self._refresh_hidden_menu()
         self._filter_search_hints()
 
@@ -426,6 +439,8 @@ class PassGuardPlugin(BasePlugin):
             except Exception:
                 self.logger.exception("Failed to remove hidden chat hook")
         self._hidden_unhooks = []
+        self._hidden_hooks_installed = False
+        self._hidden_menu_hook_installed = False
 
         if self._hidden_menu_item_id:
             try:
@@ -461,8 +476,60 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             self.logger.exception("Could not hook SharedConfig.checkPasscode")
 
+    def _install_hidden_menu_hook(self):
+        """Install lightweight hooks for the profile and chat menu items."""
+        if getattr(self, "_hidden_menu_hook_installed", False):
+            return
+        if not self._hidden_configured():
+            return
+        installed = False
+        for class_name, hook_class, label in (
+            (
+                "org.telegram.ui.ProfileActivity",
+                ProfileResumeHook,
+                "Hooked ProfileActivity.onResume (menu only)",
+            ),
+            (
+                "org.telegram.ui.ChatActivity",
+                ChatResumeHook,
+                "Hooked ChatActivity.onResume (menu only)",
+            ),
+        ):
+            try:
+                class_loader = jclass("java.lang.Class")
+                target_class = class_loader.forName(class_name)
+                for method in target_class.getDeclaredMethods():
+                    if (
+                        method.getName() == "onResume"
+                        and len(method.getParameterTypes()) == 0
+                    ):
+                        try:
+                            method.setAccessible(True)
+                        except Exception:
+                            pass
+                        unhook = self.hook_method(
+                            method, hook_class(self), priority=10
+                        )
+                        if unhook:
+                            self._hidden_unhooks.append(unhook)
+                            installed = True
+                            self.logger.info(label)
+                        break
+            except Exception:
+                self.logger.exception(
+                    "Could not hook %s.onResume for the menu", class_name
+                )
+        self._hidden_menu_hook_installed = installed
+
     def _install_hidden_hooks(self):
+        if getattr(self, "_hidden_hooks_installed", False):
+            return
+        if not PassGuardPlugin._shared_hidden_runtime:
+            return
+        if getattr(self, "_hidden_menu_hook_installed", False):
+            self._remove_hidden_hooks()
         self._hidden_unhooks = []
+        self._controller_dialogs_hooked = False
         try:
             class_loader = jclass("java.lang.Class")
             dialogs_class = class_loader.forName(
@@ -705,6 +772,7 @@ class PassGuardPlugin(BasePlugin):
                     )
                     if unhook:
                         self._hidden_unhooks.append(unhook)
+                        self._hidden_menu_hook_installed = True
                         self.logger.info("Hooked ProfileActivity.onResume")
                     break
         except Exception:
@@ -981,6 +1049,46 @@ class PassGuardPlugin(BasePlugin):
             self.logger.exception(
                 "Could not hook SearchAdapterHelper result getters"
             )
+        self._hidden_hooks_installed = True
+
+    def _remove_hidden_hooks(self):
+        for unhook in self._hidden_unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                self.logger.exception("Failed to remove hidden chat hook")
+        self._hidden_unhooks = []
+        self._hidden_hooks_installed = False
+        self._hidden_menu_hook_installed = False
+        self._controller_dialogs_hooked = False
+
+    def _sync_hidden_hooks(self):
+        """Keep only the hooks needed by the current hidden-chat state.
+
+        With no hidden chats only the two lightweight menu hooks are
+        installed, so list scrolling and search do not enter Python at
+        all.
+        """
+        if PassGuardPlugin._shared_hidden_runtime:
+            if getattr(self, "_hidden_hooks_installed", False):
+                return
+            self._remove_hidden_hooks()
+            self._install_hidden_hooks()
+        elif self._hidden_configured():
+            if (
+                getattr(self, "_hidden_menu_hook_installed", False)
+                and not getattr(self, "_hidden_hooks_installed", False)
+            ):
+                return
+            self._remove_hidden_hooks()
+            self._install_hidden_menu_hook()
+        else:
+            if not (
+                getattr(self, "_hidden_hooks_installed", False)
+                or getattr(self, "_hidden_menu_hook_installed", False)
+            ):
+                return
+            self._remove_hidden_hooks()
 
     # ------------------------------------------------------------------
     # Detection
@@ -1108,9 +1216,11 @@ class PassGuardPlugin(BasePlugin):
             if not part:
                 continue
             try:
-                result.add(int(part))
+                item = int(part)
             except ValueError:
                 continue
+            if item:
+                result.add(item)
         return result
 
     def _save_hidden_ids(self, reload_settings=False):
@@ -1172,6 +1282,9 @@ class PassGuardPlugin(BasePlugin):
             getattr(self, "_hidden_code", "") or ""
         )
         PassGuardPlugin._shared_hidden_ids = self._hidden_ids
+        PassGuardPlugin._shared_hidden_runtime = bool(
+            self._hidden_configured() and self._hidden_ids
+        )
         PassGuardPlugin._shared_hidden_ts = time.time()
         PassGuardPlugin._shared_hidden_exit_on_bg = bool(
             getattr(self, "_hidden_exit_on_bg", True)
@@ -1202,6 +1315,8 @@ class PassGuardPlugin(BasePlugin):
             )
 
     def _hidden_active(self):
+        if not PassGuardPlugin._shared_hidden_runtime:
+            return False
         shared_ids = PassGuardPlugin._shared_hidden_ids
         if shared_ids is None:
             self._refresh_hidden_state()
@@ -1320,8 +1435,10 @@ class PassGuardPlugin(BasePlugin):
     def on_search_hints_count(self):
         """Prune the hints list before the ChatHints row reports its size."""
         try:
+            if not PassGuardPlugin._shared_hidden_runtime:
+                return
             now = time.time()
-            if now - self._hints_filter_ts < 1.0:
+            if now - self._hints_filter_ts < 5.0:
                 return
             self._hints_filter_ts = now
             self._filter_search_hints()
@@ -1356,7 +1473,12 @@ class PassGuardPlugin(BasePlugin):
 
     def _drawable_id(self, name):
         # Resource ids are stable even when Telegram's resource names are
-        # obfuscated in a particular build.
+        # obfuscated in a particular build. Resolve each name once: this
+        # method is called for every bound hidden search row.
+        cache = self._drawable_cache
+        if name in cache:
+            return cache[name]
+        # Resource ids are stable even when Telegram's resource names are
         for class_name in (
             "org.telegram.messenger.R$drawable",
             "com.exteragram.messenger.R$drawable",
@@ -1365,6 +1487,7 @@ class PassGuardPlugin(BasePlugin):
                 drawable_class = jclass(class_name)
                 res_id = int(getattr(drawable_class, name))
                 if res_id:
+                    cache[name] = res_id
                     return res_id
             except Exception:
                 pass
@@ -1387,11 +1510,13 @@ class PassGuardPlugin(BasePlugin):
                         name, "drawable", package
                     )
                     if res_id:
+                        cache[name] = int(res_id)
                         return int(res_id)
                 except Exception:
                     pass
         except Exception:
             pass
+        cache[name] = 0
         return 0
 
     def _badged_name(self, name):
@@ -1404,11 +1529,16 @@ class PassGuardPlugin(BasePlugin):
             context = ApplicationLoader.applicationContext
             resources = context.getResources()
 
-            res_id = self._drawable_id("msg_archive_hide")
+            res_id = self._badge_res_id
+            if res_id is None:
+                res_id = self._drawable_id("msg_archive_hide")
+                if not res_id:
+                    res_id = self._drawable_id("design_ic_visibility_off")
+                self._badge_res_id = res_id or 0
             if not res_id:
-                res_id = self._drawable_id("design_ic_visibility_off")
-            if not res_id:
-                self.logger.error("Hidden chat badge drawable not found")
+                if not self._badge_logged:
+                    self.logger.error("Hidden chat badge drawable not found")
+                    self._badge_logged = True
                 return plain
 
             try:
@@ -1420,7 +1550,10 @@ class PassGuardPlugin(BasePlugin):
             if (tint & 0xFF000000) == 0:
                 tint = -7829368
 
-            density = resources.getDisplayMetrics().density
+            density = self._badge_density
+            if not density:
+                density = resources.getDisplayMetrics().density
+                self._badge_density = density
             size = int(17 * density)
             start = len(text) + 1
             end = start + 1
@@ -1439,10 +1572,12 @@ class PassGuardPlugin(BasePlugin):
                     end,
                     Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
-                self.logger.info(
-                    "Hidden chat badge created with ColoredImageSpan, drawable id %s",
-                    res_id,
-                )
+                if not self._badge_logged:
+                    self.logger.info(
+                        "Hidden chat badge created with ColoredImageSpan, drawable id %s",
+                        res_id,
+                    )
+                    self._badge_logged = True
                 return spannable
             except Exception:
                 self.logger.exception(
@@ -1464,14 +1599,25 @@ class PassGuardPlugin(BasePlugin):
                 end,
                 Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
             )
-            self.logger.info(
-                "Hidden chat badge created with ImageSpan, drawable id %s",
-                res_id,
-            )
+            if not self._badge_logged:
+                self.logger.info(
+                    "Hidden chat badge created with ImageSpan, drawable id %s",
+                    res_id,
+                )
+                self._badge_logged = True
             return spannable
         except Exception:
             self.logger.exception("Could not create hidden chat badge")
             return plain
+
+    def _is_badged_name(self, name):
+        try:
+            text = str(name)
+            return text.endswith(("⊘", "\u00a0")) or text.rstrip().endswith(
+                "⊘"
+            )
+        except Exception:
+            return False
 
     def on_profile_cell(self, param):
         try:
@@ -1483,7 +1629,7 @@ class PassGuardPlugin(BasePlugin):
             name = param.args[2]
             if name is None:
                 name = self._dialog_name(obj)
-            if str(name).rstrip().endswith(("⊘", "\u00a0")):
+            if self._is_badged_name(name):
                 return
             param.args[2] = self._badged_name(name)
         except Exception:
@@ -1518,15 +1664,29 @@ class PassGuardPlugin(BasePlugin):
         except Exception:
             return None
 
-    def _refresh_hidden_menu(self, dialog_id=None):
+    def _hidden_menu_type(self):
         try:
-            if self._hidden_menu_item_id:
-                try:
-                    self.remove_menu_item(self._hidden_menu_item_id)
-                except Exception:
-                    pass
-            self._hidden_menu_item_id = None
-            self._hidden_menu_dialog_id = None
+            fragment = get_last_fragment()
+            if fragment is not None and "ChatActivity" in str(
+                fragment.getClass().getName()
+            ):
+                return MenuItemType.CHAT_ACTION_MENU
+        except Exception:
+            pass
+        return MenuItemType.PROFILE_ACTION_MENU
+
+    def _clear_hidden_menu_item(self):
+        if self._hidden_menu_item_id:
+            try:
+                self.remove_menu_item(self._hidden_menu_item_id)
+            except Exception:
+                pass
+        self._hidden_menu_item_id = None
+        self._hidden_menu_dialog_id = None
+
+    def _refresh_hidden_menu(self, dialog_id=None, menu_type=None):
+        try:
+            self._clear_hidden_menu_item()
 
             if not self._hidden_configured():
                 return
@@ -1535,9 +1695,15 @@ class PassGuardPlugin(BasePlugin):
             if dialog_id is None:
                 return
             dialog_id = int(dialog_id)
+            if menu_type is None:
+                menu_type = self._hidden_menu_type()
 
-            self._hidden_ids = self._load_hidden_ids()
-            self._publish_hidden_state()
+            shared_ids = PassGuardPlugin._shared_hidden_ids
+            if shared_ids is not None:
+                self._hidden_ids = shared_ids
+            else:
+                self._hidden_ids = self._load_hidden_ids()
+                self._publish_hidden_state()
             hidden = dialog_id in self._hidden_ids
             if hidden:
                 text = "Вернуть"
@@ -1554,7 +1720,7 @@ class PassGuardPlugin(BasePlugin):
 
             item_id = self.add_menu_item(
                 MenuItemData(
-                    menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                    menu_type=menu_type,
                     text=text,
                     on_click=handler,
                     icon=icon,
@@ -1566,14 +1732,40 @@ class PassGuardPlugin(BasePlugin):
                 self._hidden_menu_item_id = item_id
                 self._hidden_menu_dialog_id = dialog_id
                 self.logger.info(
-                    "Added hidden chat profile menu item: %s for %s",
+                    "Added hidden chat menu item: %s for %s (type %s)",
                     text,
                     dialog_id,
+                    menu_type,
                 )
         except Exception:
             self.logger.exception("Could not refresh hidden chat menu")
 
+    def _open_chat_dialog_id(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return None
+            name = str(fragment.getClass().getName())
+            if "ChatActivity" not in name and "ProfileActivity" not in name:
+                return None
+            value = self._fragment_dialog_id(fragment)
+            if value and value < 0:
+                return value
+        except Exception:
+            pass
+        return None
+
+    def _refresh_chat_menu_if_group(self, dialog_id):
+        if dialog_id is not None and dialog_id < 0:
+            self._refresh_hidden_menu(
+                dialog_id, MenuItemType.CHAT_ACTION_MENU
+            )
+
     def _dialog_id_from_context(self, context):
+        open_chat_id = self._open_chat_dialog_id()
+        if open_chat_id:
+            return open_chat_id
+
         for key in ("dialog_id", "dialogId"):
             value = context.get(key)
             if value is not None:
@@ -1594,7 +1786,9 @@ class PassGuardPlugin(BasePlugin):
         user_id = context.get("userId")
         if user_id is not None:
             try:
-                return int(user_id)
+                user_id = int(user_id)
+                if user_id:
+                    return user_id
             except Exception:
                 pass
 
@@ -1602,7 +1796,8 @@ class PassGuardPlugin(BasePlugin):
         if chat_id is not None:
             try:
                 chat_id = int(chat_id)
-                return chat_id if chat_id < 0 else -chat_id
+                if chat_id:
+                    return chat_id if chat_id < 0 else -chat_id
             except Exception:
                 pass
 
@@ -1678,6 +1873,7 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_ids.add(dialog_id)
             self._save_hidden_ids()
             self._publish_hidden_state()
+            self._sync_hidden_hooks()
             self._filter_search_hints()
             # The chat is hidden now, so the current screen must lose its
             # authorization immediately. The actual close is deferred: a
@@ -1723,6 +1919,7 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_ids.discard(dialog_id)
             self._save_hidden_ids()
             self._publish_hidden_state()
+            self._sync_hidden_hooks()
             self._schedule_hidden_menu_refresh(dialog_id)
             if self._current_unlock()[0] == dialog_id:
                 self._clear_unlock_state()
@@ -2107,7 +2304,7 @@ class PassGuardPlugin(BasePlugin):
             self._clear_search_authorization()
             self._clear_open_chat()
             self._clear_hide_exit()
-            handler = Handler(Looper.getMainLooper())
+            handler = self._ui_handler
             handler.post(
                 UiRunnable(
                     lambda: self._close_hidden_background_layer(
@@ -2295,8 +2492,16 @@ class PassGuardPlugin(BasePlugin):
             activity = param.thisObject
             if activity is None:
                 return
+            if not self._hidden_configured():
+                if self._hidden_menu_item_id:
+                    self._refresh_hidden_menu(
+                        menu_type=MenuItemType.PROFILE_ACTION_MENU
+                    )
+                return
             dialog_id = self._fragment_dialog_id(activity)
-            self._refresh_hidden_menu(dialog_id)
+            self._refresh_hidden_menu(
+                dialog_id, MenuItemType.PROFILE_ACTION_MENU
+            )
             if not self._hidden_active():
                 return
             # The profile arguments may carry a group dialog id instead of
@@ -2313,6 +2518,7 @@ class PassGuardPlugin(BasePlugin):
             if self._secret_unlocked(dialog_id):
                 self._persist_unlock(dialog_id)
                 return
+            self._clear_hidden_menu_item()
             self._show_blocked_toast(dialog_id, profile=True)
             self._schedule_hidden_screen_close(dialog_id)
             self.logger.info("Blocked hidden profile %s", dialog_id)
@@ -2324,14 +2530,28 @@ class PassGuardPlugin(BasePlugin):
             activity = param.thisObject
             if activity is None:
                 return
+
+            # Never leave a stale "Вернуть" item from another chat in this
+            # menu, even if the current dialog id cannot be resolved.
+            self._clear_hidden_menu_item()
+
             dialog_id = self._fragment_dialog_id(activity)
             if dialog_id is None:
                 return
-            if not self._hidden_active() or dialog_id not in self._hidden_ids:
+
+            if not self._hidden_active():
+                # The feature is configured but nothing is hidden yet.
+                # Groups and channels can still be hidden from this menu.
+                self._refresh_chat_menu_if_group(dialog_id)
+                return
+
+            if dialog_id not in self._hidden_ids:
+                self._refresh_chat_menu_if_group(dialog_id)
                 return
             if self._secret_unlocked(dialog_id):
                 self._persist_unlock(dialog_id)
                 self._remember_open_chat(dialog_id)
+                self._refresh_chat_menu_if_group(dialog_id)
                 return
             # A screen closed right after "Hide" must not be reopened or
             # kept alive by a stale search authorization.
@@ -2353,6 +2573,7 @@ class PassGuardPlugin(BasePlugin):
             ):
                 self._set_unlock(dialog_id, now)
                 self._remember_open_chat(dialog_id)
+                self._refresh_chat_menu_if_group(dialog_id)
                 self.logger.info(
                     "Hidden chat %s unlocked by the password search result",
                     dialog_id,
@@ -2436,16 +2657,21 @@ class PassGuardPlugin(BasePlugin):
             if result is None or result.isEmpty():
                 return
 
+            hidden_found = False
+            for index in range(result.size()):
+                if self._is_hidden_object(result.get(index)):
+                    hidden_found = True
+                    break
+            if not hidden_found:
+                return
+
             filtered = ArrayList()
-            removed = False
             for index in range(result.size()):
                 item = result.get(index)
                 if self._is_hidden_object(item):
-                    removed = True
                     continue
                 filtered.add(item)
-            if removed:
-                param.setResult(filtered)
+            param.setResult(filtered)
         except Exception:
             self.logger.exception(
                 "Failed to filter hidden chats from server search"
@@ -2488,7 +2714,8 @@ class PassGuardPlugin(BasePlugin):
 
     def _filter_recent_entries(self, recent):
         if recent is None:
-            return
+            return False
+        removed = False
         for index in range(recent.size() - 1, -1, -1):
             entry = recent.get(index)
             dialog_id = None
@@ -2504,6 +2731,8 @@ class PassGuardPlugin(BasePlugin):
                     pass
             if dialog_id is not None and dialog_id in self._hidden_ids:
                 recent.remove(index)
+                removed = True
+        return removed
 
     def on_recent_search_filtered(self, param):
         try:
@@ -2655,15 +2884,25 @@ class PassGuardPlugin(BasePlugin):
             adapter = param.thisObject
             if adapter is None:
                 return
+            # updateSearchResults() fires for every keystroke. One queued
+            # patch is enough: it always reads the latest adapter state.
+            self._pending_search_adapter = adapter
+            if self._search_patch_pending:
+                return
+            self._search_patch_pending = True
             # Handler.post always queues, even when the caller is already
             # on the UI thread. This must run after updateSearchResults()
             # has assigned its fresh result lists.
-            handler = Handler(Looper.getMainLooper())
-            handler.post(
-                UiRunnable(
-                    lambda: self._patch_hidden_search_results(adapter)
-                )
-            )
+            handler = self._ui_handler
+
+            def run_patch():
+                self._search_patch_pending = False
+                pending = self._pending_search_adapter
+                self._pending_search_adapter = None
+                if pending is not None:
+                    self._patch_hidden_search_results(pending)
+
+            handler.post(UiRunnable(run_patch))
         except Exception:
             self.logger.exception("Failed to schedule hidden search patch")
 
@@ -2722,8 +2961,9 @@ class PassGuardPlugin(BasePlugin):
             if results is None or names is None:
                 return
 
-            self._filter_recent_entries(_recent.get(adapter))
-            self._filter_recent_entries(_recent_all.get(adapter))
+            changed = self._filter_recent_entries(_recent.get(adapter))
+            if self._filter_recent_entries(_recent_all.get(adapter)):
+                changed = True
 
             query = str(query_field.get(adapter) or "").strip()
 
@@ -2735,13 +2975,16 @@ class PassGuardPlugin(BasePlugin):
                     dialog_id = self._object_dialog_id(results.get(index))
                     if dialog_id in self._hidden_ids:
                         present.add(dialog_id)
-                        if index < names.size():
+                        if index < names.size() and not self._is_badged_name(
+                            names.get(index)
+                        ):
                             names.set(
                                 index,
                                 self._badged_name(
                                     self._dialog_name(results.get(index))
                                 ),
                             )
+                            changed = True
 
                 for dialog_id in sorted(self._hidden_ids):
                     if dialog_id in present:
@@ -2754,6 +2997,7 @@ class PassGuardPlugin(BasePlugin):
                         self._badged_name(self._dialog_name(obj))
                     )
                     present.add(dialog_id)
+                    changed = True
                 PassGuardPlugin._shared_search_ids = set(present)
             else:
                 PassGuardPlugin._shared_search_ids = set()
@@ -2763,8 +3007,10 @@ class PassGuardPlugin(BasePlugin):
                         results.remove(index)
                         if index < names.size():
                             names.remove(index)
+                        changed = True
 
-            adapter.notifyDataSetChanged()
+            if changed:
+                adapter.notifyDataSetChanged()
         except Exception:
             self.logger.exception("Failed to patch hidden search results")
 
@@ -3569,7 +3815,9 @@ class PassGuardPlugin(BasePlugin):
         self.set_setting(
             "hidden_enabled", self._hidden_enabled, reload_settings=True
         )
+        self._hidden_ids = self._load_hidden_ids()
         self._publish_hidden_state()
+        self._sync_hidden_hooks()
         self._refresh_hidden_menu()
 
     def _on_hidden_exit_on_background_change(self, value):
@@ -3579,6 +3827,7 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_exit_on_bg,
             reload_settings=True,
         )
+        self._hidden_ids = self._load_hidden_ids()
         self._publish_hidden_state()
 
     def _on_hidden_dynamic_password_change(self, value):
@@ -3588,7 +3837,9 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_dynamic_password,
             reload_settings=True,
         )
+        self._hidden_ids = self._load_hidden_ids()
         self._publish_hidden_state()
+        self._sync_hidden_hooks()
         self._clear_unlock_state()
         self._clear_search_authorization()
         self._refresh_hidden_menu()
@@ -3614,7 +3865,9 @@ class PassGuardPlugin(BasePlugin):
             self._hidden_dynamic_password = False
             self.set_setting("hidden_code", code, reload_settings=True)
             self.set_setting("hidden_dynamic_password", False)
+            self._hidden_ids = self._load_hidden_ids()
             self._publish_hidden_state()
+            self._sync_hidden_hooks()
             self._clear_unlock_state()
             self._refresh_hidden_menu()
             builder.dismiss()
