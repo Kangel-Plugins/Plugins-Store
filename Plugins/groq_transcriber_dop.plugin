@@ -1,7 +1,3 @@
-# groq_transcriber_dop.py — Groq Whisper (без LLM)
-# Кружки: ждём fileLoaded, извлекаем аудио в WAV 16к моно -> Groq.
-# Цитата: SendMessageParams + sendMessage(p, False) — entities сохраняются.
-
 import os
 import random
 import re
@@ -20,9 +16,13 @@ from java.chaquopy import dynamic_proxy
 from java.lang import String as JavaString
 from java.util import ArrayList, HashMap, Objects
 
-from android.content import Intent
+from android.content import ClipData, Context, Intent
 from android.media import MediaCodec, MediaExtractor, MediaFormat
 from android.net import Uri
+from android.view import View
+from android.text import TextUtils
+from android.text.method import PasswordTransformationMethod
+from android.widget import EditText as AndroidEditText, LinearLayout, ProgressBar, ScrollView, TextView
 
 from hook_utils import find_class, get_private_field, set_private_field
 from base_plugin import (
@@ -35,18 +35,34 @@ from client_utils import (
 )
 from file_utils import ensure_dir_exists, get_cache_dir
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Input, Selector, Switch, Text
+from ui.alert import AlertDialogBuilder
+from ui.settings import Custom, Divider, Input, Selector, Switch, Text
 
+from org.telegram.ui.ActionBar import Theme
 from org.telegram.messenger import (
-    FileLoader, MessageObject, NotificationCenter, SendMessagesHelper, UserConfig,
+    ApplicationLoader, FileLoader, MessageObject, NotificationCenter, SendMessagesHelper, UserConfig,
 )
 from org.telegram.tgnet import TLRPC
 
+
+def _groq_notice_text(message):
+    text = str(message)
+    return text if text.startswith("Groq:") else "Groq: " + text
+
+
+def _groq_show_error(message):
+    run_on_ui_thread(lambda: BulletinHelper.show_error(_groq_notice_text(message)))
+
+
+def _groq_show_success(message):
+    run_on_ui_thread(lambda: BulletinHelper.show_success(_groq_notice_text(message)))
+
+
 __id__ = "groq_transcriber_dop"
 __name__ = "Groq Transcriber 2"
-__description__ = "Расшифровка голосовых и кружков через Groq Whisper: кнопка под сообщением + авто-цитата для своих ГС/кружков."
+__description__ = "Расшифровывает голосовые, видеокружки и аудио- или видеофайлы через Groq Whisper. Результат показывается в окне; есть автоцитата для своих записей."
 __author__ = "@n0white (Fork) | rebild by @Dkaq1"
-__version__ = "3.3"
+__version__ = "4.10"
 __icon__ = "aisdhjaiosdhoiuashd/0"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.5.0"
@@ -60,6 +76,8 @@ LANGUAGES = [
 ]
 CHUNK = 3900
 MAX_FILE_BYTES = 100 * 1024 * 1024
+MAX_RAW_GROQ_BYTES = 24 * 1024 * 1024
+MAX_SEGMENT_SEC = 480
 
 
 def _fit_bytes(s: str, limit: int = 896) -> str:
@@ -104,6 +122,73 @@ def _to_mono16k(pcm: bytes, rate: int, channels: int) -> array:
     return out
 
 
+class NoSpeechError(RuntimeError):
+    pass
+
+
+class TranscriptionCancelled(Exception):
+    pass
+
+
+def _trim_silence(samples, rate, channels):
+    n = len(samples)
+    if n == 0:
+        return None
+    frame = max(1, int(rate * 0.03)) * channels
+    pad = int(rate * 0.3) * channels
+    if n < frame:
+        return samples
+
+    energies = [
+        sum(map(abs, samples[i:i + frame])) / frame
+        for i in range(0, n - frame + 1, frame)
+    ]
+    peak = max(energies, default=0)
+    if peak < 8:
+        return None
+    ordered = sorted(energies)
+    floor = ordered[len(ordered) // 5]
+    upper = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
+    if peak < 32 and upper < 32 and (upper - floor) < 8:
+        return None
+
+    threshold = min(max(floor * 2, peak * 0.03, 8), peak * 0.6)
+    voiced = [i for i, energy in enumerate(energies) if energy >= threshold]
+    if not voiced:
+        return samples
+
+    start = max(0, voiced[0] * frame - pad)
+    end = min(n, (voiced[-1] + 1) * frame + pad)
+    trimmed = samples[start:end]
+    return trimmed if len(trimmed) else samples
+
+
+def _split_wav_segments(wav_path: str, out_dir: str, max_sec: int = MAX_SEGMENT_SEC) -> List[str]:
+    with wave.open(wav_path, "rb") as w:
+        channels = w.getnchannels()
+        sampwidth = w.getsampwidth()
+        rate = w.getframerate()
+        total_frames = w.getnframes()
+        frames_per_chunk = max(1, int(rate * max_sec))
+        if total_frames <= frames_per_chunk:
+            return [wav_path]
+        parts = []
+        idx = 0
+        while True:
+            raw = w.readframes(frames_per_chunk)
+            if not raw:
+                break
+            part_path = os.path.join(out_dir, "part_%d_%d.wav" % (int(time.time() * 1000), idx))
+            with wave.open(part_path, "wb") as pw:
+                pw.setnchannels(channels)
+                pw.setsampwidth(sampwidth)
+                pw.setframerate(rate)
+                pw.writeframes(raw)
+            parts.append(part_path)
+            idx += 1
+        return parts
+
+
 class _Observer(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
     def __init__(self, plugin):
         super().__init__()
@@ -127,25 +212,46 @@ class GroqTranscriberPlugin(BasePlugin):
         self._seen = OrderedDict()
         self._file_waiters = {}
         self._observers = {}
+        self._hooks = []
+        self._menu_items = []
+        self._session = requests.Session()
 
         TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
         ChatMessageCell = find_class("org.telegram.ui.Cells.ChatMessageCell")
         if TranscribeButton is not None and ChatMessageCell is not None:
-            self.hook_method(
-                TranscribeButton.getClass().getDeclaredMethod("onTap"),
-                CreateTranscribeButtonHook(self))
-            self.hook_method(
-                ChatMessageCell.getClass().getDeclaredMethod("updateWaveform"),
-                CreateUpdateWaveformHook())
+            h1 = self.hook_all_methods(TranscribeButton, "onTap", CreateTranscribeButtonHook(self))
+            if h1:
+                self._hooks.extend(h1 if isinstance(h1, list) else [h1])
+            h2 = self.hook_all_methods(ChatMessageCell, "updateWaveform", CreateUpdateWaveformHook())
+            if h2:
+                self._hooks.extend(h2 if isinstance(h2, list) else [h2])
 
-        self.add_menu_item(MenuItemData(
+        self._menu_items.append(self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
             text="Расшифровать аудио в чат",
             icon="msg_reply",
             priority=11,
             condition="message != null && (message.isVoice() || message.isRoundVideo())",
             on_click=self._on_quote_click,
-        ))
+        )))
+
+        self._menu_items.append(self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Копировать расшифровку",
+            icon="",
+            priority=12,
+            condition="message != null && (message.isVoice() || message.isRoundVideo())",
+            on_click=self._on_copy_click,
+        )))
+
+        self._menu_items.append(self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Расшифровать медиа",
+            icon="msg_voice_unmute",
+            priority=13,
+            condition="message != null && (message.isMusic() || message.isVideo()) && !message.isVoice() && !message.isRoundVideo()",
+            on_click=self._on_media_transcribe_click,
+        )))
 
         def register():
             for acc in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
@@ -161,6 +267,22 @@ class GroqTranscriberPlugin(BasePlugin):
 
     def on_plugin_unload(self):
         observers = dict(self._observers)
+        hooks = list(self._hooks)
+        menu_items = list(self._menu_items)
+
+        for item in menu_items:
+            if item is not None:
+                try:
+                    self.remove_menu_item(item)
+                except Exception:
+                    pass
+
+        for h in hooks:
+            if h is not None:
+                try:
+                    self.unhook_method(h)
+                except Exception:
+                    pass
 
         def unregister():
             for acc, d in observers.items():
@@ -171,27 +293,168 @@ class GroqTranscriberPlugin(BasePlugin):
                 except Exception:
                     pass
         run_on_ui_thread(unregister)
+
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
         with self._lock:
             self._cache.clear()
             self._seen.clear()
             self._file_waiters.clear()
             self._observers.clear()
+            self._hooks.clear()
+            self._menu_items.clear()
 
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Groq API"),
-            Input(key="groq_token", text="API-токен", default=""),
-            Text(text="console.groq.com", icon="msg_openin", accent=True, on_click=self._open_groq_url),
-            Header(text="Распознавание"),
-            Selector(key="model_idx", text="Модель", default=0, items=WHISPER_MODELS),
-            Selector(key="language_idx", text="Язык", default=0, items=[l for l, _ in LANGUAGES]),
-            Switch(key="extract_audio", text="Кружки → аудио (WAV)", default=True),
-            Header(text="Цитата"),
-            Switch(key="native_send", text="Нативная отправка (мгновенно)", default=True),
-            Switch(key="reply_to_original", text="Отправлять ответом на сообщение", default=False),
-            Switch(key="auto_quote_out", text="Авто-цитата для моих ГС и кружков", default=False),
-            Input(key="auto_max_sec", text="Макс. длительность авто-цитаты в секундах", default="300"),
+            Divider(text="Подключение"),
+            Text(
+                text="API-ключ: задан" if self._token() else "Добавить API-ключ",
+                subtext="Нажми, чтобы изменить ключ или проверить соединение.",
+                icon="msg_settings",
+                on_click=self._edit_groq_token,
+            ),
+            Text(
+                text="Проверить API-ключ",
+                subtext="Отправить тестовый запрос к Groq API",
+                icon="msg_check",
+                on_click=self._test_groq_token,
+            ),
+            Text(
+                text="Открыть Groq Console",
+                subtext="Управление API-ключом и лимитами",
+                icon="msg_openin",
+                accent=True,
+                on_click=self._open_groq_url,
+            ),
+            Divider(text="Распознавание"),
+            Selector(key="model_idx", text="Модель", default=0,
+                     items=WHISPER_MODELS, icon="msg_list"),
+            Selector(key="language_idx", text="Язык", default=0,
+                     items=[label for label, _ in LANGUAGES], icon="msg_list"),
+            Switch(
+                key="extract_audio",
+                text="Извлекать аудио из кружков",
+                default=True,
+                subtext="Конвертировать в WAV 16 кГц для более стабильного распознавания.",
+                icon="msg_settings",
+            ),
+            Switch(
+                key="trim_silence",
+                text="Обрезать тишину по краям",
+                default=True,
+                subtext="Убирает пустые паузы в начале и конце записи.",
+                icon="msg_settings",
+            ),
+            Input(
+                key="custom_prompt",
+                text="Словарь подсказок для Whisper",
+                default="",
+                subtext="Имена, термины или сленг через запятую (до 800 байт).",
+                icon="msg_text",
+            ),
+            Divider(text="Отправка в чат"),
+            Switch(
+                key="native_send",
+                text="Быстрая отправка",
+                default=True,
+                subtext="Сначала использовать встроенный механизм отправки exteraGram.",
+                icon="msg_reply",
+            ),
+            Switch(
+                key="reply_to_original",
+                text="Ответить на исходное сообщение",
+                default=False,
+                subtext="Иначе расшифровка отправляется в тему чата без ответа на сообщение.",
+                icon="msg_reply",
+            ),
+            Switch(
+                key="collapsed_quote",
+                text="Сворачивать длинную цитату",
+                default=True,
+                subtext="Оформлять расшифровку в виде сворачиваемого блока цитаты.",
+                icon="msg_text",
+            ),
+            Switch(
+                key="auto_quote_out",
+                text="Автоцитата моих голосовых и кружков",
+                default=False,
+                subtext="Автоматически распознать и отправить текст в тот же чат.",
+                icon="msg_settings",
+            ),
+            Input(
+                key="auto_max_sec",
+                text="Лимит длительности, секунд",
+                default="300",
+                subtext="Автоцитата пропускает записи длиннее этого значения.",
+                icon="msg_text",
+            ),
+            Text(
+                text="Очистить кэш расшифровок",
+                subtext="Удалить сохранённые результаты и временные WAV-файлы.",
+                icon="msg_delete",
+                red=True,
+                on_click=self._clear_cache_action,
+            ),
+            Divider(text="Подробности"),
+            self._readable_guide_block(),
         ]
+
+    def _readable_guide_block(self):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return Text(
+                text="Инструкция по голосовым и медиафайлам",
+                subtext="В меню аудио- или видеофайла выбери «Плагины → Расшифровать медиа».",
+                icon="msg_info",
+            )
+
+        density = float(activity.getResources().getDisplayMetrics().density)
+        pad = int(16 * density)
+        gap = int(7 * density)
+        block = LinearLayout(activity)
+        block.setOrientation(LinearLayout.VERTICAL)
+        block.setPadding(pad, int(12 * density), pad, int(12 * density))
+
+        def add_paragraph(title, body):
+            title_view = TextView(activity)
+            title_view.setText(title)
+            title_view.setTextSize(16)
+            title_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            title_view.setSingleLine(False)
+            title_view.setMaxLines(20)
+            title_view.setLineSpacing(int(2 * density), 1.0)
+            block.addView(title_view, LinearLayout.LayoutParams(-1, -2))
+
+            body_view = TextView(activity)
+            body_view.setText(body)
+            body_view.setTextSize(14)
+            body_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            body_view.setSingleLine(False)
+            body_view.setMaxLines(20)
+            body_view.setLineSpacing(int(2 * density), 1.0)
+            body_view.setPadding(0, int(2 * density), 0, gap)
+            block.addView(body_view, LinearLayout.LayoutParams(-1, -2))
+
+        add_paragraph(
+            "Приватность",
+            "Не включай автоцитату для чувствительных чатов. "
+            "Ручное распознавание тоже отправляет выбранную запись в Groq.",
+        )
+        add_paragraph(
+            "Как пользоваться",
+            "1. Вставь ключ, выбери модель и язык." + chr(10)
+            + "2. Нажми кнопку расшифровки под голосовым или кружком, либо открой меню сообщения.",
+        )
+        add_paragraph(
+            "Медиафайлы",
+            "Открой меню аудио- или видеофайла и выбери «Плагины → Расшифровать медиа». "
+            "Длинные файлы автоматически делятся на части; обработку можно прервать.",
+        )
+        return Custom(view=block)
 
     def _run_bg(self, fn):
         def safe():
@@ -200,6 +463,48 @@ class GroqTranscriberPlugin(BasePlugin):
             except Exception:
                 self.logger.exception("bg task failed")
         threading.Thread(target=safe, daemon=True).start()
+
+    def _clear_cache_action(self, view):
+        with self._lock:
+            self._cache.clear()
+            self._seen.clear()
+        out_dir = os.path.join(get_cache_dir(), "groq_stt")
+        removed = 0
+        if os.path.isdir(out_dir):
+            for name in os.listdir(out_dir):
+                try:
+                    os.remove(os.path.join(out_dir, name))
+                    removed += 1
+                except OSError:
+                    pass
+        _groq_show_success("Кэш очищен (удалено файлов: %d)" % removed)
+
+    def _test_groq_token(self, view):
+        token = self._token()
+        if not token:
+            _groq_show_error("Сначала укажи API-ключ")
+            return
+        BulletinHelper.show_info("Groq: проверяю ключ...")
+
+        def check():
+            try:
+                resp = self._session.get(
+                    "https://api.groq.com/openai/v1/models",
+                    headers={"Authorization": "Bearer " + token},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    _groq_show_success("Ключ рабочий (200 OK)")
+                elif resp.status_code == 401:
+                    _groq_show_error("Неверный API-ключ (401)")
+                else:
+                    _groq_show_error("Код ответа %d" % resp.status_code)
+            except requests.exceptions.Timeout:
+                _groq_show_error("Таймаут соединения. Проверь интернет или VPN")
+            except Exception as e:
+                _groq_show_error("Ошибка сети: %s" % str(e)[:100])
+
+        self._run_bg(check)
 
     def _open_groq_url(self, view):
         try:
@@ -212,6 +517,75 @@ class GroqTranscriberPlugin(BasePlugin):
 
     def _token(self) -> str:
         return str(self.get_setting("groq_token", "") or "").strip()
+
+    def _edit_groq_token(self, view):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            _groq_show_error("Не удалось открыть окно ввода ключа")
+            return
+
+        field = AndroidEditText(activity)
+        field.setSingleLine(True)
+        field.setInputType(129)
+        password_method = PasswordTransformationMethod.getInstance()
+        field.setTransformationMethod(password_method)
+        field.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        field.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        field.setHint("Вставь API-ключ Groq")
+        current = self._token()
+        if current:
+            field.setText(JavaString(current))
+            field.setSelection(len(current))
+
+        content = LinearLayout(activity)
+        content.setOrientation(LinearLayout.VERTICAL)
+        content.setPadding(24, 8, 24, 0)
+        content.addView(field, LinearLayout.LayoutParams(-1, -2))
+
+        reveal = TextView(activity)
+        reveal.setText("Показать ключ")
+        reveal.setTextSize(14)
+        reveal.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        reveal.setPadding(0, 12, 0, 8)
+        content.addView(reveal, LinearLayout.LayoutParams(-1, -2))
+
+        class RevealListener(dynamic_proxy(View.OnClickListener)):
+            def __init__(self):
+                super().__init__()
+                self.visible = False
+
+            def onClick(self, view):
+                self.visible = not self.visible
+                if self.visible:
+                    field.setTransformationMethod(None)
+                    reveal.setText("Скрыть ключ")
+                else:
+                    field.setTransformationMethod(password_method)
+                    reveal.setText("Показать ключ")
+                field.setSelection(field.getText().length())
+
+        listener = RevealListener()
+        self._key_reveal_listener = listener
+        reveal.setOnClickListener(listener)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("API-ключ Groq")
+        builder.set_message("Ключ скрыт. Нажми «Показать ключ», чтобы проверить его.")
+        builder.set_view(content)
+
+        def save_key(dialog, which):
+            value = str(field.getText().toString()).strip()
+            if value:
+                self.set_setting("groq_token", value, reload_settings=True)
+                _groq_show_success("API-ключ сохранён")
+            else:
+                _groq_show_error("Ключ не изменён")
+            dialog.dismiss()
+
+        builder.set_positive_button("Сохранить", save_key)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
 
     def _lang(self) -> str:
         try:
@@ -264,24 +638,33 @@ class GroqTranscriberPlugin(BasePlugin):
         except Exception:
             return int(getattr(owner, "id", 0)) > 0
 
-    def _wait_sent(self, owner, timeout: float) -> bool:
+    def _check_cancel(self, cancel_event=None):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled()
+
+    def _wait_sent(self, owner, timeout: float, cancel_event=None) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline and not self._is_sent(owner):
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             time.sleep(0.3)
         return self._is_sent(owner)
 
-    @staticmethod
-    def _whisper_hint(lang: str) -> str:
+    def _whisper_hint(self, lang: str) -> str:
+        custom = str(self.get_setting("custom_prompt", "") or "").strip()
+        base = ""
         if lang in ("ru", "auto"):
-            return _fit_bytes(
+            base = (
                 "блять, нахуй, пиздец, ёбаный, ебать, сука, хуй, залупа, мудак, гондон, уёбок, "
                 "заебись, охуенно, ахуенно, невъебенно, дохуя, охуеть, разъебай, задрот, "
                 "кринж, рофл, чиллить, шарить, хайп, скам, треш, угар, лол, кек, имхо, го, "
                 "катка, тимейт, рандом, лут, читер, нерф, баф, апнуть, хилить, тащить, слив, "
                 "щас, чё, ничё, короч, вобщем, типа, пофиг, похер, хз, лан, спс, пж, кста, мб, гс, "
                 "Тинькофф, Сбер, Озон, Вайлдберриз, Авито, Госуслуги, Яндекс, ВК, Телега, "
-                "Дискорд, Ютуб, ГитХаб, ЧатГПТ, айфон, макбук, вайфай, Москва, Питер")
-        return ""
+                "Дискорд, Ютуб, ГитХаб, ЧатГПТ, айфон, макбук, вайфай, Москва, Питер"
+            )
+        combined = (custom + ", " + base) if (custom and base) else (custom or base)
+        return _fit_bytes(combined) if combined else ""
 
     @staticmethod
     def _format_text(text: str) -> str:
@@ -310,7 +693,8 @@ class GroqTranscriberPlugin(BasePlugin):
             w["path"] = path
             w["event"].set()
 
-    def _resolve_audio(self, account: int, owner) -> str:
+    def _resolve_audio(self, account: int, owner, cancel_event=None) -> str:
+        self._check_cancel(cancel_event)
         attach = getattr(owner, "attachPath", None)
         if attach and os.path.isfile(attach) and os.path.getsize(attach) > 0:
             return attach
@@ -349,10 +733,15 @@ class GroqTranscriberPlugin(BasePlugin):
         try:
             if doc is not None:
                 loader.loadFile(doc, None, FileLoader.PRIORITY_HIGH, 0)
-            if ev.wait(180):
-                p = waiter["path"]
-                if p and os.path.isfile(p) and os.path.getsize(p) > 0:
-                    return p
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                self._check_cancel(cancel_event)
+                if ev.wait(0.2):
+                    break
+            self._check_cancel(cancel_event)
+            p = waiter["path"]
+            if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
             p = find()
             if p:
                 return p
@@ -370,7 +759,8 @@ class GroqTranscriberPlugin(BasePlugin):
                 with self._lock:
                     self._file_waiters.pop(name, None)
 
-    def _extract_audio_wav(self, src: str) -> str:
+    def _extract_audio_wav(self, src: str, cancel_event=None) -> str:
+        self._check_cancel(cancel_event)
         extractor = MediaExtractor()
         codec = None
         chunks = []
@@ -398,6 +788,7 @@ class GroqTranscriberPlugin(BasePlugin):
             stalls = 0
             deadline = time.time() + 180
             while not out_done:
+                self._check_cancel(cancel_event)
                 if time.time() > deadline:
                     raise RuntimeError("таймаут извлечения аудио")
                 if not in_done:
@@ -451,9 +842,14 @@ class GroqTranscriberPlugin(BasePlugin):
         if not pcm:
             raise RuntimeError("не удалось извлечь аудио")
         samples = _to_mono16k(pcm, rate, channels)
+        if self.get_setting("trim_silence", True):
+            trimmed = _trim_silence(samples, 16000, 1)
+            if trimmed is None:
+                raise NoSpeechError("в записи нет слов")
+            samples = trimmed
         out_dir = os.path.join(get_cache_dir(), "groq_stt")
         ensure_dir_exists(out_dir)
-        out_path = os.path.join(out_dir, "a_%d.wav" % int(time.time() * 1000))
+        out_path = os.path.join(out_dir, "a_%d_%d.wav" % (int(time.time() * 1000), random.randint(100, 999)))
         with wave.open(out_path, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
@@ -461,25 +857,14 @@ class GroqTranscriberPlugin(BasePlugin):
             w.writeframes(samples.tobytes())
         return out_path
 
-    def _transcribe_path(self, path: str, kind: str, token: str, lang: str) -> str:
-        size = os.path.getsize(path)
-        if size > MAX_FILE_BYTES:
-            raise RuntimeError("файл больше 100 МБ")
-        filename = os.path.basename(path)
-        if kind == "wav":
-            mime = "audio/wav"
-            if "." not in filename:
-                filename += ".wav"
-        elif kind == "round":
-            mime = "video/mp4"
-            if "." not in filename:
-                filename += ".mp4"
-        else:
-            mime = "audio/ogg"
-            if "." not in filename:
-                filename += ".ogg"
-        form = {"model": (None, self._model()), "response_format": (None, "json"),
-                "temperature": (None, "0")}
+    def _post_whisper_file(self, path: str, filename: str, mime: str, token: str,
+                           lang: str, cancel_event=None) -> str:
+        self._check_cancel(cancel_event)
+        form = {
+            "model": (None, self._model()),
+            "response_format": (None, "json"),
+            "temperature": (None, "0"),
+        }
         if lang != "auto":
             form["language"] = (None, lang)
         hint = self._whisper_hint(lang)
@@ -487,49 +872,133 @@ class GroqTranscriberPlugin(BasePlugin):
             form["prompt"] = (None, hint)
         with open(path, "rb") as f:
             data = f.read()
-        try:
-            resp = requests.post(
-                GROQ_WHISPER_URL, headers={"Authorization": "Bearer " + token},
-                files={**form, "file": (filename, data, mime)}, timeout=120)
-        except requests.exceptions.Timeout:
-            raise RuntimeError("Groq не отвечает (таймаут). Проверь интернет/VPN")
-        except requests.exceptions.ConnectionError:
-            raise RuntimeError("Нет соединения с Groq (сеть/регион/VPN)")
-        if resp.status_code == 429:
-            raise RuntimeError("Groq: лимит запросов (429), подожди")
-        if resp.status_code == 401:
-            raise RuntimeError("Groq: неверный токен (401)")
-        if resp.status_code != 200:
-            raise RuntimeError("Groq %d: %s" % (resp.status_code, resp.text[:200]))
-        dataj = resp.json()
-        text = (dataj.get("text") or "").strip()
-        if not text:
-            text = " ".join(s.get("text", "").strip() for s in (dataj.get("segments") or [])).strip()
-        if not text:
-            raise RuntimeError("пустая расшифровка")
-        return self._format_text(text)
+        self._check_cancel(cancel_event)
 
-    def get_transcription(self, account: int, owner, is_round: bool) -> str:
+        last_err = None
+        for attempt in range(2):
+            self._check_cancel(cancel_event)
+            try:
+                resp = self._session.post(
+                    GROQ_WHISPER_URL,
+                    headers={"Authorization": "Bearer " + token},
+                    files={**form, "file": (filename, data, mime)},
+                    timeout=120,
+                )
+            except requests.exceptions.Timeout:
+                last_err = RuntimeError("Groq не отвечает (таймаут). Проверь интернет/VPN")
+                continue
+            except requests.exceptions.ConnectionError:
+                last_err = RuntimeError("Нет соединения с Groq (сеть/регион/VPN)")
+                continue
+            self._check_cancel(cancel_event)
+            if resp.status_code == 429:
+                if attempt == 0:
+                    time.sleep(2.0)
+                    continue
+                raise RuntimeError("Groq: лимит запросов (429), подожди")
+            if resp.status_code == 401:
+                raise RuntimeError("Groq: неверный токен (401)")
+            if resp.status_code >= 500 and attempt == 0:
+                time.sleep(1.0)
+                continue
+            if resp.status_code != 200:
+                raise RuntimeError("Groq %d: %s" % (resp.status_code, resp.text[:200]))
+            dataj = resp.json()
+            text = (dataj.get("text") or "").strip()
+            if not text:
+                text = " ".join(s.get("text", "").strip() for s in (dataj.get("segments") or [])).strip()
+            return text
+        if last_err is not None:
+            raise last_err
+        return ""
+
+    def _transcribe_path(self, path: str, kind: str, token: str, lang: str,
+                         cancel_event=None, status_cb=None) -> str:
+        self._check_cancel(cancel_event)
+        size = os.path.getsize(path)
+        if size > MAX_FILE_BYTES:
+            raise RuntimeError("файл больше 100 МБ")
+
+        if kind == "wav":
+            out_dir = os.path.join(get_cache_dir(), "groq_stt")
+            ensure_dir_exists(out_dir)
+            parts = _split_wav_segments(path, out_dir, MAX_SEGMENT_SEC)
+            try:
+                texts = []
+                total = len(parts)
+                for idx, part in enumerate(parts):
+                    self._check_cancel(cancel_event)
+                    if status_cb is not None and total > 1:
+                        status_cb("Распознаю часть %d из %d..." % (idx + 1, total))
+                    part_text = self._post_whisper_file(
+                        part, "part_%d.wav" % idx, "audio/wav", token, lang, cancel_event
+                    )
+                    if part_text:
+                        texts.append(part_text)
+                full_text = " ".join(texts).strip()
+            finally:
+                for part in parts:
+                    if part != path:
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+        else:
+            if size > MAX_RAW_GROQ_BYTES:
+                raise RuntimeError("файл больше 24 МБ без извлечения WAV")
+            filename = os.path.basename(path)
+            if kind == "round":
+                mime = "video/mp4"
+                if "." not in filename:
+                    filename += ".mp4"
+            else:
+                mime = "audio/ogg"
+                if "." not in filename:
+                    filename += ".ogg"
+            full_text = self._post_whisper_file(path, filename, mime, token, lang, cancel_event)
+
+        if not full_text:
+            raise RuntimeError("Groq не распознал речь. Проверь громкость и качество записи")
+        return self._format_text(full_text)
+
+    def get_transcription(self, account: int, owner, is_round: bool,
+                          cancel_event=None, status_cb=None) -> str:
+        self._check_cancel(cancel_event)
         doc = getattr(getattr(owner, "media", None), "document", None)
-        key = (int(account), int(doc.id) if doc is not None else int(owner.id))
+        cache_key = (
+            int(account),
+            int(doc.id) if doc is not None else int(owner.id),
+            self._model(),
+            self._lang(),
+        )
         with self._lock:
-            cached = self._cache.get(key)
-        if cached is not None:
-            return cached
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+                return cached
+
         token = self._token()
         if not token:
             raise RuntimeError("укажи Groq API Token в настройках")
-        path = self._resolve_audio(account, owner)
+        if status_cb is not None:
+            status_cb("Загружаю файл из Telegram...")
+        path = self._resolve_audio(account, owner, cancel_event)
         kind = "round" if is_round else "voice"
         tmp = None
-        if is_round and self.get_setting("extract_audio", True):
+        if (not is_round) or self.get_setting("extract_audio", True):
             try:
-                tmp = self._extract_audio_wav(path)
+                if status_cb is not None:
+                    status_cb("Извлекаю аудиодорожку...")
+                tmp = self._extract_audio_wav(path, cancel_event)
                 path, kind = tmp, "wav"
+            except (NoSpeechError, TranscriptionCancelled):
+                raise
             except Exception as e:
-                self.logger.warning("audio extract failed, sending video: %s", e)
+                self.logger.warning("audio extract failed, sending raw file: %s", e)
         try:
-            text = self._transcribe_path(path, kind, token, self._lang())
+            if status_cb is not None:
+                status_cb("Отправляю в Groq Whisper...")
+            text = self._transcribe_path(path, kind, token, self._lang(), cancel_event, status_cb)
         finally:
             if tmp:
                 try:
@@ -537,30 +1006,205 @@ class GroqTranscriberPlugin(BasePlugin):
                 except OSError:
                     pass
         with self._lock:
-            self._cache[key] = text
+            self._cache[cache_key] = text
             if len(self._cache) > 200:
                 self._cache.popitem(last=False)
         return text
 
-    def _on_quote_click(self, context):
+    def _on_copy_click(self, context):
         message = context.get("message")
         if message is None:
-            BulletinHelper.show_error("Не удалось получить сообщение")
+            _groq_show_error("Не удалось получить сообщение")
             return
         try:
-            if not (message.isVoice() or message.isRoundVideo()):
-                BulletinHelper.show_error("Это не голосовое и не кружок")
-                return
             if message.isVoiceOnce() or message.isRoundOnce():
-                BulletinHelper.show_error("Одноразовые не расшифровываются")
+                _groq_show_error("Одноразовые не расшифровываются")
                 return
         except Exception:
             return
         if not self._token():
-            BulletinHelper.show_error("Укажи Groq API Token в настройках")
+            _groq_show_error("Укажи Groq API Token в настройках")
             return
         account = context.get("account")
         account = int(account) if account is not None else int(message.currentAccount)
+        BulletinHelper.show_info("Groq: расшифровываю...")
+        self._run_bg(lambda: self._copy_job(account, message.messageOwner, bool(message.isRoundVideo())))
+
+    def _copy_job(self, account, owner, is_round):
+        if not self._wait_sent(owner, 120):
+            _groq_show_error("Сообщение не отправлено")
+            return
+        try:
+            text = self.get_transcription(account, owner, is_round)
+        except Exception as e:
+            self.logger.exception("copy failed")
+            _groq_show_error("Ошибка расшифровки: %s" % str(e)[:150])
+            return
+        self._copy_to_clipboard(text, notify=True)
+
+    def _copy_to_clipboard(self, text, notify=False):
+        def do():
+            try:
+                cm = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+                cm.setPrimaryClip(ClipData.newPlainText("transcription", JavaString(text)))
+                if notify:
+                    _groq_show_success("Расшифровка скопирована")
+            except Exception:
+                self.logger.exception("clipboard failed")
+                _groq_show_error("Не удалось скопировать")
+        run_on_ui_thread(do)
+
+    def _on_media_transcribe_click(self, context):
+        message = context.get("message")
+        if message is None:
+            _groq_show_error("Не удалось получить медиа")
+            return
+        owner = getattr(message, "messageOwner", None)
+        media = getattr(owner, "media", None) if owner is not None else None
+        document = getattr(media, "document", None) if media is not None else None
+        if document is None:
+            _groq_show_error("В этом сообщении нет аудиофайла")
+            return
+        try:
+            if message.isVoiceOnce() or message.isRoundOnce():
+                _groq_show_error("Одноразовое медиа не расшифровывается")
+                return
+        except Exception:
+            pass
+        if not self._token():
+            _groq_show_error("Укажи Groq API Token в настройках")
+            return
+        account = context.get("account")
+        account = int(account) if account is not None else int(message.currentAccount)
+        run_on_ui_thread(lambda: self._start_media_transcription(account, owner))
+
+    def _start_media_transcription(self, account, owner):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            _groq_show_error("Не удалось открыть окно обработки")
+            return
+
+        density = float(activity.getResources().getDisplayMetrics().density)
+        content = LinearLayout(activity)
+        content.setOrientation(LinearLayout.VERTICAL)
+        content.setPadding(int(22 * density), int(12 * density),
+                           int(22 * density), int(18 * density))
+        label = TextView(activity)
+        label.setText("Подготовка к обработке...")
+        label.setTextSize(15)
+        label.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        content.addView(label, LinearLayout.LayoutParams(-1, -2))
+        progress = ProgressBar(activity, None, 16842872)
+        progress.setIndeterminate(True)
+        params = LinearLayout.LayoutParams(-1, int(4 * density))
+        params.topMargin = int(14 * density)
+        content.addView(progress, params)
+
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Groq: обработка медиа")
+        dialog.set_view(content)
+        cancel_event = threading.Event()
+        dialog.set_negative_button(
+            "Прервать",
+            lambda current_dialog, which: self._cancel_media_job(cancel_event, current_dialog),
+        )
+        dialog.set_cancelable(False)
+        dialog.show()
+
+        def update_status(msg):
+            if not cancel_event.is_set():
+                run_on_ui_thread(lambda: label.setText(JavaString(msg)))
+
+        self._run_bg(lambda: self._media_transcribe_job(
+            account, owner, dialog, cancel_event, update_status))
+
+    def _cancel_media_job(self, cancel_event, dialog):
+        cancel_event.set()
+        self._dismiss_dialog(dialog)
+
+    def _media_transcribe_job(self, account, owner, progress_dialog, cancel_event, status_cb):
+        if not self._wait_sent(owner, 120, cancel_event):
+            if not cancel_event.is_set():
+                run_on_ui_thread(lambda: self._finish_media_error(
+                    progress_dialog, "Медиа ещё не загружено"))
+            return
+        try:
+            text = self.get_transcription(account, owner, False, cancel_event, status_cb)
+        except TranscriptionCancelled:
+            return
+        except Exception as e:
+            if cancel_event.is_set():
+                return
+            self.logger.exception("media transcription failed")
+            error_text = "Ошибка расшифровки: %s" % str(e)[:150]
+            run_on_ui_thread(lambda: self._finish_media_error(progress_dialog, error_text))
+            return
+        if not cancel_event.is_set():
+            run_on_ui_thread(lambda: self._finish_media_success(progress_dialog, text))
+
+    @staticmethod
+    def _dismiss_dialog(dialog):
+        try:
+            dialog.dismiss()
+        except Exception:
+            pass
+
+    def _finish_media_error(self, dialog, message):
+        self._dismiss_dialog(dialog)
+        _groq_show_error(message)
+
+    def _finish_media_success(self, dialog, text):
+        self._dismiss_dialog(dialog)
+        self._show_media_transcription(text)
+
+    def _show_media_transcription(self, text):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            _groq_show_error("Не удалось открыть окно расшифровки")
+            return
+        density = float(activity.getResources().getDisplayMetrics().density)
+        scroll = ScrollView(activity)
+        body = TextView(activity)
+        body.setText(JavaString(text))
+        body.setTextSize(16)
+        body.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        body.setPadding(int(20 * density), int(16 * density), int(20 * density), int(16 * density))
+        body.setTextIsSelectable(True)
+        body.setSingleLine(False)
+        scroll.addView(body, LinearLayout.LayoutParams(-1, -2))
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Groq: расшифровка")
+        builder.set_view(scroll)
+        builder.set_neutral_button(
+            "Копировать",
+            lambda dialog, which: self._copy_to_clipboard(text, notify=True),
+        )
+        builder.set_positive_button("Закрыть", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _on_quote_click(self, context):
+        message = context.get("message")
+        if message is None:
+            _groq_show_error("Не удалось получить сообщение")
+            return
+        try:
+            if not (message.isVoice() or message.isRoundVideo()):
+                _groq_show_error("Это не голосовое и не кружок")
+                return
+            if message.isVoiceOnce() or message.isRoundOnce():
+                _groq_show_error("Одноразовые не расшифровываются")
+                return
+        except Exception:
+            return
+        if not self._token():
+            _groq_show_error("Укажи Groq API Token в настройках")
+            return
+        account = context.get("account")
+        account = int(account) if account is not None else int(message.currentAccount)
+        BulletinHelper.show_info("Groq: расшифровываю для отправки...")
         self._run_bg(lambda: self._quote_job(
             account, int(message.getDialogId()), int(message.getId()),
             self._topic_top(message.messageOwner), message.messageOwner,
@@ -581,13 +1225,13 @@ class GroqTranscriberPlugin(BasePlugin):
 
     def _quote_job(self, account, dialog_id, msg_id, top, owner, is_round, mo):
         if not self._wait_sent(owner, 120):
-            BulletinHelper.show_error("Сообщение не отправлено — расшифровка отменена")
+            _groq_show_error("Сообщение не отправлено — расшифровка отменена")
             return
         try:
             text = self.get_transcription(account, owner, is_round)
         except Exception as e:
             self.logger.exception("quote failed")
-            BulletinHelper.show_error("Ошибка расшифровки: %s" % str(e)[:150])
+            _groq_show_error("Ошибка расшифровки: %s" % str(e)[:150])
             return
         self._send_text_quotes(account, dialog_id, msg_id, top, text, mo)
 
@@ -666,15 +1310,15 @@ class GroqTranscriberPlugin(BasePlugin):
 
             def on_sent(response, error):
                 if error is not None:
-                    BulletinHelper.show_error("Цитата не отправлена: %s"
-                                              % (getattr(error, "text", None) or "ошибка"))
+                    _groq_show_error("Цитата не отправлена: %s"
+                                     % (getattr(error, "text", None) or "ошибка"))
                     return
                 self._apply_updates_bg(account, response)
 
             self._send_req(req, on_sent, account)
         except Exception:
             self.logger.exception("send quote failed")
-            BulletinHelper.show_error("Не удалось отправить расшифровку")
+            _groq_show_error("Не удалось отправить расшифровку")
 
     def _send_one_quote(self, account, dialog_id, msg_id, top, text, mo):
         if self.get_setting("native_send", True):
@@ -686,7 +1330,7 @@ class GroqTranscriberPlugin(BasePlugin):
         e = TLRPC.TL_messageEntityBlockquote()
         e.offset = 0
         e.length = JavaString(text).length()
-        e.collapsed = True
+        e.collapsed = bool(self.get_setting("collapsed_quote", True))
         arr = ArrayList()
         arr.add(e)
         return arr
@@ -753,7 +1397,7 @@ class GroqTranscriberPlugin(BasePlugin):
             text = self.get_transcription(account, owner, is_round)
         except Exception as e:
             self.logger.exception("auto failed")
-            BulletinHelper.show_error("Авто-расшифровка: %s" % str(e)[:150])
+            _groq_show_error("Авто-расшифровка: %s" % str(e)[:150])
             return
         self._send_text_quotes(account, dialog_id, int(getattr(owner, "id", 0)), top, text, mo)
 
@@ -764,7 +1408,7 @@ class CreateTranscribeButtonHook(MethodReplacement):
         self.plugin = plugin_instance
 
     def replace_hooked_method(self, param):
-        self.plugin._run_bg(lambda: self.onTap(param))
+        self.onTap(param)
 
     def onTap(self, param):
         this = param.thisObject
@@ -791,7 +1435,7 @@ class CreateTranscribeButtonHook(MethodReplacement):
 
     def transcribePressed(self, param, messageObject, open):
         if not self.plugin._token():
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Укажи Groq API Token в настройках"))
+            _groq_show_error("Укажи Groq API Token в настройках")
             return
         TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
         MessagesStorage = find_class("org.telegram.messenger.MessagesStorage")
@@ -826,19 +1470,9 @@ class CreateTranscribeButtonHook(MethodReplacement):
                 opsById = get_private_field(this, "transcribeOperationsById")
             opsById.put(int(self.reqInfoHash(messageObject)), messageObject)
             messageObject.messageOwner.voiceTranscriptionId = messageId
-            try:
-                text = self.plugin.get_transcription(account, messageObject.messageOwner, False)
-            except Exception as e:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Groq: %s" % str(e)[:150]))
-                self.plugin.logger.exception("ui-hook failed")
-                return
-            TranscribeButton.openVideoTranscription(messageObject)
-            messageObject.messageOwner.voiceTranscriptionOpen = True
-            messageObject.messageOwner.voiceTranscriptionFinal = True
-            MessagesStorage.getInstance(account).updateMessageVoiceTranscription(
-                dialogId, messageId, text, messageObject.messageOwner)
-            run_on_ui_thread(lambda: this.finishTranscription(messageObject, messageId, text))
-            opsByPos.remove(int(self.reqInfoHash(messageObject)))
+            self.plugin._run_bg(lambda: self.transcribeInBackground(
+                this, messageObject, dialogId, messageId, account,
+                TranscribeButton, MessagesStorage, opsByPos, opsById))
         else:
             if opsByPos is not None:
                 opsByPos.remove(int(self.reqInfoHash(messageObject)))
@@ -847,6 +1481,50 @@ class CreateTranscribeButtonHook(MethodReplacement):
                 dialogId, messageId, messageObject.messageOwner)
             run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
                 NotificationCenter.voiceTranscriptionUpdate, messageObject, None, None, False, None))
+
+    def transcribeInBackground(self, this, messageObject, dialogId, messageId, account,
+                               TranscribeButton, MessagesStorage, opsByPos, opsById):
+        try:
+            text = self.plugin.get_transcription(account, messageObject.messageOwner, False)
+            MessagesStorage.getInstance(account).updateMessageVoiceTranscription(
+                dialogId, messageId, text, messageObject.messageOwner)
+        except Exception as e:
+            self.plugin.logger.exception("transcription worker failed")
+            error_text = str(e)[:150]
+
+            def fail_on_ui():
+                key = int(self.reqInfoHash(messageObject))
+                try:
+                    if opsByPos is not None:
+                        opsByPos.remove(key)
+                    if opsById is not None:
+                        opsById.remove(key)
+                    messageObject.messageOwner.voiceTranscriptionId = 0
+                    this.setLoading(False, True)
+                    this.setOpen(False, True)
+                    set_private_field(this, "pressed", False)
+                    NotificationCenter.getInstance(account).postNotificationName(
+                        NotificationCenter.voiceTranscriptionUpdate,
+                        messageObject, None, None, False, None)
+                except Exception:
+                    self.plugin.logger.exception("transcription UI cleanup failed")
+                _groq_show_error("Groq: %s" % error_text)
+
+            run_on_ui_thread(fail_on_ui)
+            return
+
+        def finish_on_ui():
+            TranscribeButton.openVideoTranscription(messageObject)
+            messageObject.messageOwner.voiceTranscriptionOpen = True
+            messageObject.messageOwner.voiceTranscriptionFinal = True
+            this.finishTranscription(messageObject, messageId, text)
+            key = int(self.reqInfoHash(messageObject))
+            if opsByPos is not None:
+                opsByPos.remove(key)
+            if opsById is not None:
+                opsById.remove(key)
+
+        run_on_ui_thread(finish_on_ui)
 
     def reqInfoHash(self, messageObject):
         if messageObject is None:
