@@ -26,7 +26,10 @@ store.json               # метаданные всех плагинов (кл�
 - `status` — один из: `utilities`, `customization`, `fun`, `informational`, `messages`, `library`
 - `requirements`, `requires`, `dependencies`
 - `description_<lang>` — локализованные описания; `<lang>` = язык из elyx-локалей
-- `legacy_version` — объект `{ "<version>": { "url": "...", "hash": "sha256" } }`
+- `changelog` — текст изменений актуальной `version` (строка; может содержать
+  HTML-разметку Telegram и `\n`); пишется сразу за `version`, только если есть
+- `legacy_version` — объект `{ "<version>": { "url": "...", "hash": "sha256", "changelog": "..." } }`
+  (`changelog` у legacy-записи — опционален)
 
 Пример:
 ```json
@@ -35,6 +38,7 @@ store.json               # метаданные всех плагинов (кл�
     "url": "https://raw.githubusercontent.com/Kangel-Plugins/Plugins-Store/main/Plugins/custom_profile.plugin",
     "name": "Custom Profile",
     "version": "1.6",
+    "changelog": "Что изменилось в 1.6",
     "author": "@RoflPlugins",
     "description": "Описание на дефолтном языке",
     "description_ru": "Русское описание",
@@ -44,7 +48,8 @@ store.json               # метаданные всех плагинов (кл�
     "legacy_version": {
       "1.1": {
         "url": "https://raw.githubusercontent.com/Kangel-Plugins/Plugins-Store/main/legacy_versions/custom_profile/Custom Profile_v1.1.plugin",
-        "hash": "sha256..."
+        "hash": "sha256...",
+        "changelog": "Что изменилось в 1.1"
       }
     }
   }
