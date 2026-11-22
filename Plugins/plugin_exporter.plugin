@@ -1,0 +1,1710 @@
+# -*- coding: utf-8 -*-
+import os
+import sys
+import time
+import json
+import zlib
+import base64
+import re
+import ast
+import zipfile
+import io
+import threading
+import traceback
+import weakref
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import send_document, run_on_queue, get_last_fragment
+from file_utils import get_plugins_dir
+from hook_utils import find_class
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Divider
+
+from java import dynamic_proxy, jclass
+from java.io import File as JavaFile
+from java.util import Locale
+from org.telegram.messenger import ApplicationLoader, NotificationCenter, Utilities, UserConfig, FileLoader
+
+try:
+    import plugin_settings as engine_settings
+except ImportError:
+    engine_settings = None
+
+try:
+    from com.exteragram.messenger.plugins import PluginsController
+except ImportError:
+    PluginsController = None
+
+__id__ = "plugin_exporter"
+__name__ = "Plugin Exporter"
+__description__ = """Thanks: @chillden4ik, @oodze. Credits: @Playerqwe, @ArThirtyFour
+
+[EN]: A plugin for a quick, complete export of plugins and their data
+Usage: send the command .export in the chat, or go to: three dots -> Plugins -> Export plugins
+
+[RU]: Плагин для быстрого полного экспорта плагинов и их данных
+Использование: отправьте команду .export в чате / в чате: три точки -> Плагины -> Экспорт плагинов"""
+
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "1.0.7"
+__icon__ = "MaxExteraPluginsStickers/34"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+
+ENTRY_CLASS = "com.exteraplugins.max_cactus_export.Main"
+DEX_BEGIN = "__DEX_BEGIN__"
+DEX_END = "__DEX_END__"
+
+FileClass = JavaFile
+
+
+def get_private_field(obj, field_name):
+    try:
+        field = obj.getClass().getDeclaredField(field_name)
+        field.setAccessible(True)
+        return field.get(obj)
+    except Exception:
+        try:
+            field = obj.getClass().getSuperclass().getDeclaredField(field_name)
+            field.setAccessible(True)
+            return field.get(obj)
+        except Exception:
+            return None
+
+
+def _parse_yaml_simple(text):
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip()
+        val = val.strip().strip("'\"")
+        if key:
+            result[key] = val
+    return result
+
+
+def _zip_folder_to_bytes(folder_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(folder_path):
+            for fn in files:
+                if fn == ".DS_Store" or fn.startswith(".temp"):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, folder_path)
+                zf.write(full, rel)
+    return buf.getvalue()
+
+
+def _read_elyx_dir_metadata(dir_path):
+    meta = {}
+    base_id = os.path.basename(dir_path)
+    meta_path = None
+
+    for rname in ("refmap.yml", "refmap.yaml", "refmap.json"):
+        rp = os.path.join(dir_path, rname)
+        if os.path.exists(rp):
+            try:
+                with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                rdata = _parse_yaml_simple(content) if not rname.endswith(".json") else json.loads(content)
+                meta_rel = rdata.get("metainfo", "")
+                if meta_rel:
+                    cand = os.path.join(dir_path, meta_rel)
+                    if os.path.exists(cand):
+                        meta_path = cand
+            except Exception:
+                pass
+            break
+
+    if not meta_path:
+        for c in ("metainfo.yml", "metainfo.yaml", "meta.yml", "meta.yaml", "metainfo.json", "meta.json"):
+            cand = os.path.join(dir_path, c)
+            if os.path.exists(cand):
+                meta_path = cand
+                break
+        if not meta_path:
+            sub = os.path.join(dir_path, base_id)
+            if os.path.isdir(sub):
+                for c in ("meta.yml", "metainfo.yml"):
+                    cand = os.path.join(sub, c)
+                    if os.path.exists(cand):
+                        meta_path = cand
+                        break
+
+    if meta_path and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = _parse_yaml_simple(content) if not meta_path.endswith(".json") else json.loads(content)
+            for k in ("id", "name", "version", "icon"):
+                if k in m:
+                    meta[f"__{k}__"] = str(m[k])
+        except Exception:
+            pass
+
+    if not meta.get("__id__"):
+        meta["__id__"] = base_id
+    if not meta.get("__name__"):
+        meta["__name__"] = meta["__id__"]
+    return meta
+
+
+def _read_elyx_zip_metadata(filepath):
+    meta = {}
+    base_id = os.path.splitext(os.path.basename(filepath))[0]
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            namelist = zf.namelist()
+            meta_path = None
+            for rname in ("refmap.yml", "refmap.yaml", "refmap.json"):
+                if rname in namelist:
+                    raw = zf.read(rname).decode("utf-8", errors="ignore")
+                    rdata = _parse_yaml_simple(raw) if not rname.endswith(".json") else json.loads(raw)
+                    meta_rel = rdata.get("metainfo", "")
+                    if meta_rel and meta_rel in namelist:
+                        meta_path = meta_rel
+                    break
+
+            if not meta_path:
+                for candidate in ("metainfo.yml", "metainfo.yaml", "meta.yml", "meta.yaml", "metainfo.json", "meta.json"):
+                    if candidate in namelist:
+                        meta_path = candidate
+                        break
+
+            if not meta_path:
+                for name in namelist:
+                    if name.endswith(("/metainfo.yml", "/meta.yml")):
+                        meta_path = name
+                        break
+
+            if meta_path and meta_path in namelist:
+                raw = zf.read(meta_path).decode("utf-8", errors="ignore")
+                m = _parse_yaml_simple(raw) if not meta_path.endswith(".json") else json.loads(raw)
+                for k in ("id", "name", "version", "icon"):
+                    if k in m:
+                        meta[f"__{k}__"] = str(m[k])
+    except Exception:
+        pass
+
+    if not meta.get("__id__"):
+        meta["__id__"] = base_id
+    if not meta.get("__name__"):
+        meta["__name__"] = meta["__id__"]
+    return meta
+
+
+def _find_plugin_path(plugins_dir, pid):
+    if not plugins_dir or not os.path.exists(plugins_dir):
+        return None
+
+    pid_str = str(pid)
+    pid_lower = pid_str.lower()
+
+    # 1. Приоритет №1: обычные плагины в корне plugins_dir (.plugin / .py)
+    # Если на диске лежит .plugin или .py — берем его сразу, не глядя в archives!
+    for ext in ('.plugin', '.py'):
+        c = os.path.join(plugins_dir, f"{pid_str}{ext}")
+        if os.path.isfile(c):
+            return c
+
+    try:
+        for fname in os.listdir(plugins_dir):
+            base, ext = os.path.splitext(fname)
+            if base.lower() == pid_lower and ext.lower() in ('.plugin', '.py'):
+                p = os.path.join(plugins_dir, fname)
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+
+    # 2. Приоритет №2: Elyx-плагины в корне plugins_dir (.elyx / .eaf)
+    for ext in ('.elyx', '.eaf'):
+        c = os.path.join(plugins_dir, f"{pid_str}{ext}")
+        if os.path.isfile(c):
+            return c
+
+    try:
+        for fname in os.listdir(plugins_dir):
+            base, ext = os.path.splitext(fname)
+            if base.lower() == pid_lower and ext.lower() in ('.elyx', '.eaf'):
+                p = os.path.join(plugins_dir, fname)
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+
+    # 3. Приоритет №3: Elyx-плагины в ElyxPlugins/ (папка или архив)
+    elyx_dir = os.path.join(plugins_dir, "ElyxPlugins")
+    if os.path.isdir(elyx_dir):
+        # 3.1 Проверяем распакованную папку в ElyxPlugins/
+        direct_folder = os.path.join(elyx_dir, pid_str)
+        if os.path.isdir(direct_folder):
+            # Если для этой папки есть оригинальный архив в archives/ — берем его
+            for ext in ('.elyx', '.eaf'):
+                arch = os.path.join(elyx_dir, "archives", f"{pid_str}{ext}")
+                if os.path.isfile(arch):
+                    return arch
+            return direct_folder
+
+        # Регистронезависимый поиск распакованной папки в ElyxPlugins/
+        try:
+            for name in os.listdir(elyx_dir):
+                if name.lower() == pid_lower:
+                    d = os.path.join(elyx_dir, name)
+                    if os.path.isdir(d):
+                        for ext in ('.elyx', '.eaf'):
+                            arch = os.path.join(elyx_dir, "archives", f"{name}{ext}")
+                            if os.path.isfile(arch):
+                                return arch
+                            arch2 = os.path.join(elyx_dir, "archives", f"{pid_str}{ext}")
+                            if os.path.isfile(arch2):
+                                return arch2
+                        return d
+        except Exception:
+            pass
+
+        # 3.2 Проверяем архивы в ElyxPlugins/archives/
+        arch_dir = os.path.join(elyx_dir, "archives")
+        if os.path.isdir(arch_dir):
+            for ext in ('.elyx', '.eaf'):
+                arch = os.path.join(arch_dir, f"{pid_str}{ext}")
+                if os.path.isfile(arch):
+                    return arch
+            try:
+                for name in os.listdir(arch_dir):
+                    base, ext = os.path.splitext(name)
+                    if base.lower() == pid_lower and ext.lower() in ('.elyx', '.eaf'):
+                        return os.path.join(arch_dir, name)
+            except Exception:
+                pass
+
+    # 4. Приоритет №4: распакованная папка в корне plugins_dir
+    root_folder = os.path.join(plugins_dir, pid_str)
+    if os.path.isdir(root_folder):
+        return root_folder
+
+    return None
+
+
+if hasattr(sys, "_cactus_Callback"):
+    Callback = sys._cactus_Callback
+else:
+    class Callback(dynamic_proxy(Utilities.Callback)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def run(self, arg):
+            try:
+                self.fn(arg)
+            except Exception:
+                traceback.print_exc()
+
+    sys._cactus_Callback = Callback
+
+
+class Dex:
+    def __init__(self, ec: str):
+        self.ec = ec
+        self.clazz = None
+        self.loaded = False
+        self.loading = False
+        self._m = {}
+
+    def load(self):
+        if self.loaded or self.loading:
+            return
+        self.loading = True
+        try:
+            if self.clazz is None:
+                ctx = ApplicationLoader.applicationContext
+                if not ctx:
+                    raise RuntimeError("Application context is null")
+                raw = self._read_payload()
+                loader_cls = jclass("dalvik.system.InMemoryDexClassLoader")
+                loader = loader_cls(jclass("java.nio.ByteBuffer").wrap(raw), ctx.getClassLoader())
+                self.clazz = loader.loadClass(self.ec)
+                self._m = {}
+                for m in self.clazz.getDeclaredMethods():
+                    m.setAccessible(True)
+                    name = str(m.getName())
+                    if name not in self._m:
+                        self._m[name] = []
+                    self._m[name].append(m)
+            if "load" in self._m:
+                self._invoke_best("load")
+            self.loaded = True
+            self.loading = False
+        except Exception:
+            self.loading = False
+            traceback.print_exc()
+
+    def unload(self):
+        try:
+            if self.loaded and "unload" in self._m:
+                self._invoke_best("unload")
+        except Exception:
+            traceback.print_exc()
+        self.loaded = False
+
+    def call(self, name: str, *args):
+        try:
+            if not self.loaded:
+                self.load()
+            if self.loaded and name in self._m:
+                return self._invoke_best(name, *args)
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    def _invoke_best(self, name: str, *args):
+        methods = self._m.get(name, [])
+        for m in methods:
+            if len(m.getParameterTypes()) == len(args):
+                try:
+                    return m.invoke(None, *args)
+                except TypeError:
+                    return m.invoke(None, list(args))
+        if methods:
+            try:
+                return methods[0].invoke(None, *args)
+            except TypeError:
+                return methods[0].invoke(None, list(args))
+        return None
+
+    def _read_payload(self) -> bytes:
+        with open(__file__, "r", encoding="utf-8") as f:
+            t = f.read()
+        if "# " + DEX_BEGIN not in t or "# " + DEX_END not in t:
+            raise RuntimeError("DEX markers missing in plugin file")
+        b = t.split("# " + DEX_BEGIN, 1)[1].split("# " + DEX_END, 1)[0]
+        p = "".join(l.strip()[1:].strip() for l in b.splitlines() if l.strip().startswith("#"))
+        if not p:
+            raise RuntimeError("DEX payload empty")
+        return zlib.decompress(base64.b64decode(p))
+
+
+class OpenForViewHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin_ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        try:
+            plugin = self._plugin_ref()
+            if not plugin:
+                return
+            args = param.args
+            if not args or len(args) == 0:
+                return
+            arg0 = args[0]
+            if not arg0:
+                return
+
+            fn = ""
+            path = ""
+
+            # 1. Check if arg0 is java.io.File
+            if hasattr(arg0, "getAbsolutePath"):
+                try:
+                    path = str(arg0.getAbsolutePath() or "")
+                except Exception:
+                    pass
+            if hasattr(arg0, "getName"):
+                try:
+                    fn = str(arg0.getName() or "")
+                except Exception:
+                    pass
+
+            # 2. Check if arg0 is MessageObject
+            if not fn and hasattr(arg0, "getDocumentName"):
+                try:
+                    fn = str(arg0.getDocumentName() or "")
+                except Exception:
+                    pass
+            if not fn and hasattr(arg0, "getFileName"):
+                try:
+                    fn = str(arg0.getFileName() or "")
+                except Exception:
+                    pass
+            if not fn and hasattr(arg0, "messageOwner"):
+                try:
+                    media = arg0.messageOwner.media
+                    doc = media.document if media else None
+                    if doc:
+                        fl_cls = find_class("org.telegram.messenger.FileLoader")
+                        if fl_cls:
+                            fn = str(fl_cls.getDocumentFileName(doc) or "")
+                except Exception:
+                    pass
+
+            # 3. Check args[1] (filename in openForView(File, String name, ...))
+            if len(args) > 1 and isinstance(args[1], str) and args[1]:
+                fn = fn or args[1]
+
+            is_target = (fn and fn.lower().endswith(".pl_export")) or (path and path.lower().endswith(".pl_export"))
+
+            if is_target:
+                param.setResult(True)
+                if path and os.path.exists(path):
+                    run_on_ui_thread(lambda: plugin.open_import_ui(path))
+                else:
+                    run_on_ui_thread(lambda: plugin._handle_backup_message(arg0))
+                return
+        except Exception:
+            traceback.print_exc()
+
+
+class MaxCactusExport(BasePlugin):
+    STRINGS = {
+        "en": {
+            "import_alert_title": "Import Plugins",
+            "import_info": "The file contains plugins with saved settings and data.",
+            "import_warning": "Warning: Existing plugin settings or data may be overwritten.",
+            "import_progress": "Importing {}...",
+            "import_done": "Successfully imported {} plugins!",
+            "import": "Import",
+            "export_alert_title": "Export Plugins",
+            "export_info": "Creates a backup archive of selected plugins with settings and data.",
+            "export_warning": "Warning: Plugin settings and files may contain private tokens or history.",
+            "export2": "Export",
+            "export_progress": "Loaded {} plugins for export",
+            "export_done": "Exported successfully!",
+            "cancel": "Cancel",
+            "include_settings": "Plugin settings",
+            "export_settings_sub": "Export saved plugin configuration",
+            "import_settings_sub": "Restore plugin configuration from backup",
+            "include_plugin_data": "Plugin data and memory",
+            "include_plugin_data_sub": "Databases, cache, music stats, and saved files",
+            "import_data_sub": "Restore databases, music stats, and saved files",
+            "include_pinned": "Pinned plugins",
+            "export_pinned_sub": "Save which plugins are pinned",
+            "import_pinned_sub": "Restore pinned state of plugins",
+            "export_error": "Export failed: {}",
+            "import_error": "Import failed: {}",
+            "cat_control": "General",
+            "cmd_menu": "Menu Command",
+            "cat_state": "State on Import",
+            "restore_state": "Same as export",
+            "restore_state_sub": "Restore each plugin's original state (enabled/disabled) from the backup.",
+            "force_enable": "Force Enable",
+            "force_enable_sub": "When enabled, all imported plugins will be activated immediately. If turned off, they will be added disabled.",
+            "not_imported": "Nothing was imported.",
+            "error_empty": "Error: Backup file is empty",
+            "restart_needed": "Please restart exteraGram!",
+            "loading_meta": "Loading plugin list...",
+            "menu_item_title": "Export Plugins",
+            "downloading_file": "Downloading file...",
+            "select_all": "Select All",
+            "deselect_all": "Deselect All"
+        },
+        "ru": {
+            "import_alert_title": "Импорт плагинов",
+            "import_info": "В файле находятся плагины с сохраненными настройками и данными.",
+            "import_warning": "Внимание: Существующие данные и настройки могут быть перезаписаны.",
+            "import_progress": "Импортировано {}",
+            "import_done": "Успешно импортировано {} плагинов!",
+            "import": "Импорт",
+            "export_alert_title": "Экспорт плагинов",
+            "export_info": "Создаёт файл с текущими версиями плагинов, настройками и данными.",
+            "export_warning": "Внимание: Настройки и базы данных могут содержать личную информацию или токены.",
+            "export2": "Экспорт",
+            "export_progress": "Загружено для экспорта: {}",
+            "export_done": "Успешно экспортировано!",
+            "cancel": "Отмена",
+            "include_settings": "Настройки плагинов",
+            "export_settings_sub": "Сохранить конфигурацию плагинов",
+            "import_settings_sub": "Применить настройки плагинов из архива",
+            "include_plugin_data": "Информация и данные плагинов",
+            "include_plugin_data_sub": "Базы данных, статистика музыки, кэш и файлы памяти",
+            "import_data_sub": "Восстановить базы данных, статистику музыки и файлы",
+            "include_pinned": "Закрепление плагинов",
+            "export_pinned_sub": "Сохранить закреплённые плагины в списке",
+            "import_pinned_sub": "Восстановить закрепление плагинов в списке",
+            "export_error": "Ошибка экспорта: {}",
+            "import_error": "Ошибка импорта: {}",
+            "cat_control": "Основные",
+            "cmd_menu": "Команда для меню",
+            "cat_state": "Состояние при импорте",
+            "restore_state": "Как при экспорте",
+            "restore_state_sub": "Восстанавливать исходное состояние плагинов (включён/выключен) из архива.",
+            "force_enable": "Принудительное включение",
+            "force_enable_sub": "Если включено, все плагины из архива будут сразу активированы. Если выключено — они добавятся выключенными.",
+            "not_imported": "Ничего не было импортировано.",
+            "error_empty": "Ошибка: Дамп пуст",
+            "restart_needed": "Требуется перезапуск приложения!",
+            "loading_meta": "Загрузка списка плагинов...",
+            "menu_item_title": "Экспорт плагинов",
+            "downloading_file": "Загрузка файла...",
+            "select_all": "Выбрать все",
+            "deselect_all": "Снять все"
+        }
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.dex = Dex(ENTRY_CLASS)
+        self.installed_plugins_cache = {}
+        self.metadata_loading = False
+        self._unhooks = []
+
+    def on_plugin_load(self):
+        self.dex.load()
+        self.add_on_send_message_hook()
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id="dumper_open_menu",
+                icon="msg_filled_data_sent",
+                text=self._get_string_by_key("menu_item_title"),
+                on_click=lambda _: self._manual_dump(None)
+            )
+        )
+
+        self._install_open_hook()
+        threading.Thread(target=self._scan_all_installed_plugins, daemon=True).start()
+
+    def _install_open_hook(self):
+        try:
+            Class = find_class("java.lang.Class")
+            AU_cls = Class.forName("org.telegram.messenger.AndroidUtilities")
+            if AU_cls:
+                for m in AU_cls.getDeclaredMethods():
+                    if str(m.getName()) == "openForView":
+                        m.setAccessible(True)
+                        try:
+                            u = self.hook_method(m, OpenForViewHook(self))
+                            if u:
+                                self._unhooks.append(u)
+                        except Exception:
+                            pass
+        except Exception:
+            traceback.print_exc()
+
+    def _handle_backup_message(self, message):
+        try:
+            file_path = None
+            try:
+                ChatUtils = find_class("com.exteragram.messenger.utils.chats.ChatUtils")
+                if ChatUtils:
+                    p = ChatUtils.getInstance().getPathToMessage(message)
+                    if p and os.path.exists(str(p)):
+                        file_path = str(p)
+            except Exception:
+                pass
+
+            if not file_path:
+                try:
+                    if hasattr(message, "messageOwner") and message.messageOwner:
+                        media = message.messageOwner.media
+                        doc = media.document if media else None
+                        if doc and hasattr(doc, "localPath") and doc.localPath and os.path.exists(str(doc.localPath)):
+                            file_path = str(doc.localPath)
+                except Exception:
+                    pass
+
+            doc = message.getDocument() if hasattr(message, "getDocument") else None
+            acc = int(UserConfig.selectedAccount)
+
+            if not file_path and doc:
+                try:
+                    fl = FileLoader.getInstance(acc)
+                    f = fl.getPathToAttach(doc, True)
+                    if f and f.exists():
+                        file_path = str(f.getAbsolutePath())
+                    else:
+                        f = fl.getPathToAttach(doc, False)
+                        if f and f.exists():
+                            file_path = str(f.getAbsolutePath())
+                        else:
+                            f = fl.getPathToMessage(message.messageOwner)
+                            if f and f.exists():
+                                file_path = str(f.getAbsolutePath())
+                except Exception:
+                    pass
+
+            if file_path and os.path.exists(file_path):
+                self.open_import_ui(file_path)
+            else:
+                if doc:
+                    FileLoader.getInstance(acc).loadFile(doc, message, 1, 0)
+                    BulletinHelper.show_info(self._get_string_by_key("downloading_file"))
+                else:
+                    BulletinHelper.show_error("Could not find file path")
+        except Exception as e:
+            traceback.print_exc()
+            BulletinHelper.show_error(f"Error opening file: {e}")
+
+    def on_plugin_unload(self):
+        self.remove_menu_item("dumper_open_menu")
+        for u in self._unhooks:
+            try:
+                self.unhook_method(u)
+            except Exception:
+                pass
+        self._unhooks = []
+        self.dex.unload()
+
+    def has_settings(self):
+        return True
+
+    def create_settings(self):
+        settings = [
+            Header(self._get_string_by_key("cat_control")),
+            Input(key="trigger_command", text=self._get_string_by_key("cmd_menu"), default=".export"),
+            Divider(),
+            Header(self._get_string_by_key("cat_state"))
+        ]
+
+        restore_mode = self.get_setting("restore_state_mode", True)
+
+        settings.append(Switch(
+            key="restore_state_mode",
+            text=self._get_string_by_key("restore_state"),
+            subtext=self._get_string_by_key("restore_state_sub"),
+            default=True,
+            icon="avd_theme",
+            on_change=lambda v: self._refresh_ui()
+        ))
+
+        if not restore_mode:
+            settings.append(Switch(
+                key="force_enable_mode",
+                text=self._get_string_by_key("force_enable"),
+                subtext=self._get_string_by_key("force_enable_sub"),
+                default=False,
+                icon="ic_unlock",
+                on_change=lambda v: self._refresh_ui()
+            ))
+
+        return settings
+
+    def _refresh_ui(self):
+        run_on_ui_thread(lambda: self._refresh_ui_safe())
+
+    def _refresh_ui_safe(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            adapter = get_private_field(fragment, "adapter")
+            if adapter:
+                adapter.update(True)
+        except Exception:
+            pass
+
+    def _get_string_by_key(self, key):
+        lang = Locale.getDefault().getLanguage()
+        if lang not in self.STRINGS:
+            lang = "en"
+        return self.STRINGS[lang].get(key, key)
+
+    def on_send_message_hook(self, account, params) -> HookResult:
+        if not isinstance(params.message, str):
+            return HookResult()
+        msg = params.message.strip()
+        msg_lower = msg.lower()
+
+        cmd = str(self.get_setting("trigger_command", ".export") or ".export").strip().lower()
+
+        if msg_lower == cmd or msg_lower in (".export", ".sexport"):
+            if self.metadata_loading:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(self._get_string_by_key("loading_meta")))
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            peer_id = getattr(params, "peer", 0)
+            run_on_queue(lambda: self._prepare_dump(peer_id))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()
+
+    def _scan_all_installed_plugins(self):
+        if self.metadata_loading:
+            return
+        self.metadata_loading = True
+        try:
+            plugins_dir = get_plugins_dir()
+            plugins = {}
+
+            pc = PluginsController.getInstance() if PluginsController else None
+
+            # 1. Сначала опрашиваем PluginsController
+            if pc:
+                try:
+                    all_plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if all_plugins_map:
+                        for entry in all_plugins_map.entrySet():
+                            try:
+                                pid = str(entry.getKey())
+                                p_obj = entry.getValue()
+                                if not p_obj:
+                                    continue
+
+                                p_name = str(p_obj.getName()) if (hasattr(p_obj, "getName") and p_obj.getName()) else pid
+                                p_ver = str(p_obj.getVersion()) if (hasattr(p_obj, "getVersion") and p_obj.getVersion()) else "1.0"
+                                p_engine = str(p_obj.getEngine()) if (hasattr(p_obj, "getEngine") and p_obj.getEngine()) else ""
+                                is_on = bool(p_obj.isEnabled()) if hasattr(p_obj, "isEnabled") else self._is_plugin_enabled(pid)
+
+                                p_path = None
+                                try:
+                                    raw_p = pc.getPluginPath(pid)
+                                    if raw_p and os.path.exists(str(raw_p)):
+                                        p_path = str(raw_p)
+                                except Exception:
+                                    pass
+
+                                if not p_path or not os.path.exists(p_path):
+                                    p_path = _find_plugin_path(plugins_dir, pid)
+
+                                is_elyx = (
+                                    "elyx" in p_engine.lower() or
+                                    (p_path and ("elyx" in p_path.lower() or p_path.endswith((".elyx", ".eaf")) or "elyxplugins" in p_path.lower()))
+                                )
+
+                                if p_path and os.path.exists(p_path):
+                                    plugins[pid] = {
+                                        "id": pid,
+                                        "name": p_name,
+                                        "version": p_ver,
+                                        "path": p_path,
+                                        "enabled": is_on,
+                                        "type": "elyx" if is_elyx else "python"
+                                    }
+                            except Exception:
+                                traceback.print_exc()
+                except Exception:
+                    traceback.print_exc()
+
+            # 2. Сканируем файлы в корне plugins_dir (.plugin, .py, .elyx, .eaf)
+            if plugins_dir and os.path.exists(plugins_dir):
+                exts = ('.plugin', '.py', '.elyx', '.eaf')
+                for fname in os.listdir(plugins_dir):
+                    if fname.startswith(".temp"):
+                        continue
+                    fpath = os.path.join(plugins_dir, fname)
+                    if not os.path.isfile(fpath) or not fname.endswith(exts):
+                        continue
+
+                    meta = self._read_plugin_metadata(fpath)
+                    pid = meta.get("__id__", os.path.splitext(fname)[0])
+                    if pid not in plugins:
+                        plugins[pid] = {
+                            "id": pid,
+                            "name": meta.get("__name__", pid),
+                            "version": meta.get("__version__", "1.0"),
+                            "path": fpath,
+                            "enabled": self._is_plugin_enabled(pid),
+                            "type": "elyx" if fname.endswith(('.elyx', '.eaf')) else "python"
+                        }
+
+                # 3. Сканируем распакованные папки ElyxPlugins/
+                elyx_dir = os.path.join(plugins_dir, "ElyxPlugins")
+                if os.path.isdir(elyx_dir):
+                    for d in os.listdir(elyx_dir):
+                        if d == "archives" or d.startswith("."):
+                            continue
+                        dpath = os.path.join(elyx_dir, d)
+                        if os.path.isdir(dpath):
+                            meta = _read_elyx_dir_metadata(dpath)
+                            pid = meta.get("__id__", d)
+                            if pid not in plugins and d not in plugins:
+                                # Предпочитаем архив, если он есть в archives/
+                                p_path = dpath
+                                for ext in ('.elyx', '.eaf'):
+                                    c1 = os.path.join(elyx_dir, "archives", f"{pid}{ext}")
+                                    if os.path.isfile(c1):
+                                        p_path = c1
+                                        break
+                                    c2 = os.path.join(elyx_dir, "archives", f"{d}{ext}")
+                                    if os.path.isfile(c2):
+                                        p_path = c2
+                                        break
+
+                                plugins[pid] = {
+                                    "id": pid,
+                                    "name": meta.get("__name__", pid),
+                                    "version": meta.get("__version__", "1.0"),
+                                    "path": p_path,
+                                    "enabled": self._is_plugin_enabled(pid),
+                                    "type": "elyx"
+                                }
+
+                # 4. Сканируем распакованные подпапки в корне plugins_dir
+                for d in os.listdir(plugins_dir):
+                    if d in ("ElyxPlugins", "datastores", "__pycache__") or d.startswith((".", "temp")):
+                        continue
+                    dpath = os.path.join(plugins_dir, d)
+                    if os.path.isdir(dpath):
+                        has_ref = (
+                            os.path.exists(os.path.join(dpath, "refmap.yml")) or
+                            os.path.exists(os.path.join(dpath, "metainfo.yml")) or
+                            os.path.exists(os.path.join(dpath, "meta.yml")) or
+                            os.path.exists(os.path.join(dpath, "main.py"))
+                        )
+                        if has_ref:
+                            meta = _read_elyx_dir_metadata(dpath)
+                            pid = meta.get("__id__", d)
+                            if pid not in plugins:
+                                plugins[pid] = {
+                                    "id": pid,
+                                    "name": meta.get("__name__", pid),
+                                    "version": meta.get("__version__", "1.0"),
+                                    "path": dpath,
+                                    "enabled": self._is_plugin_enabled(pid),
+                                    "type": "elyx"
+                                }
+
+                # 5. Только в последнюю очередь проверяем ElyxPlugins/archives/
+                if os.path.isdir(elyx_dir):
+                    archives_dir = os.path.join(elyx_dir, "archives")
+                    if os.path.isdir(archives_dir):
+                        for af in os.listdir(archives_dir):
+                            if af.endswith(('.elyx', '.eaf')):
+                                apath = os.path.join(archives_dir, af)
+                                meta = _read_elyx_zip_metadata(apath)
+                                pid = meta.get("__id__", os.path.splitext(af)[0])
+                                if pid not in plugins:
+                                    plugins[pid] = {
+                                        "id": pid,
+                                        "name": meta.get("__name__", pid),
+                                        "version": meta.get("__version__", "1.0"),
+                                        "path": apath,
+                                        "enabled": self._is_plugin_enabled(pid),
+                                        "type": "elyx"
+                                    }
+
+            self.installed_plugins_cache = plugins
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.metadata_loading = False
+
+    def _read_plugin_metadata(self, filepath):
+        metadata = {}
+        try:
+            fname = os.path.basename(filepath)
+            base_id = os.path.splitext(fname)[0]
+
+            if os.path.isdir(filepath):
+                metadata = _read_elyx_dir_metadata(filepath)
+            elif fname.endswith(('.elyx', '.eaf')):
+                metadata = _read_elyx_zip_metadata(filepath)
+            else:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(1024 * 16)
+
+                try:
+                    tree = ast.parse(content)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Assign):
+                            for target in node.targets:
+                                if isinstance(target, ast.Name) and target.id in ['__id__', '__name__', '__version__', '__icon__']:
+                                    if isinstance(node.value, (ast.Constant, ast.Str)):
+                                        metadata[target.id] = (
+                                            node.value.value if isinstance(node.value, ast.Constant) else node.value.s
+                                        )
+                except Exception:
+                    pass
+
+                if not metadata:
+                    patterns = {
+                        '__id__': r'^__id__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__name__': r'^__name__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__version__': r'^__version__\s*=\s*[\'"]([^\'"]+)[\'"]',
+                        '__icon__': r'^__icon__\s*=\s*[\'"]([^\'"]+)[\'"]'
+                    }
+                    for key, pattern in patterns.items():
+                        m = re.search(pattern, content, re.MULTILINE)
+                        if m:
+                            metadata[key] = m.group(1)
+
+            pid = metadata.get('__id__', base_id)
+            metadata['__id__'] = pid
+            metadata['enabled'] = self._is_plugin_enabled(pid)
+            return metadata
+        except Exception:
+            return metadata
+
+    def _manual_dump(self, v):
+        try:
+            frag = get_last_fragment()
+            pid = 0
+            if frag:
+                try:
+                    if hasattr(frag, "getDialogId"):
+                        pid = frag.getDialogId()
+                except Exception:
+                    pass
+            if not pid:
+                try:
+                    pid = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                except Exception:
+                    pid = 0
+
+            run_on_queue(lambda: self._prepare_dump(pid))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {e}"))
+
+    def _prepare_dump(self, peer_id):
+        try:
+            self._scan_all_installed_plugins()
+            if not self.installed_plugins_cache:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("error_empty")))
+                return
+
+            run_on_ui_thread(lambda: self._show_export_import_sheet(peer_id, self.installed_plugins_cache, True))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Prepare error: {e}"))
+
+    def open_import_ui(self, filepath):
+        try:
+            with open(filepath, "rb") as f:
+                content = f.read()
+            data = json.loads(self.decode_and_decompress(content))
+
+            plugins_map = {}
+            if "file_content" in data:
+                meta = data.get("plugin_meta", {})
+                pid = meta.get("id", "unknown")
+                plugins_map[pid] = data
+            else:
+                plugins_map = data
+
+            run_on_ui_thread(lambda: self._show_export_import_sheet(None, plugins_map, False, plugins_map))
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error opening import: {e}"))
+
+    def _show_export_import_sheet(self, peer_id, plugins_data, is_export_mode, parsed_import_data=None):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity():
+                run_on_ui_thread(lambda: BulletinHelper.show_error("No active screen"))
+                return
+
+            self.dex.load()
+            if not self.dex.loaded:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("restart_needed")))
+                return
+
+            items = []
+            if is_export_mode:
+                for pid, pinfo in plugins_data.items():
+                    p_name = pinfo.get("name", pid)
+                    p_ver = str(pinfo.get("version", "1.0"))
+                    status_txt = f"v{p_ver}" if not p_ver.startswith("v") else p_ver
+                    items.append({
+                        "id": pid,
+                        "name": str(p_name),
+                        "subtext": status_txt
+                    })
+            else:
+                for pid, pdata in plugins_data.items():
+                    if not pdata or not isinstance(pdata, dict):
+                        continue
+                    meta = pdata.get("plugin_meta") or {}
+                    p_name = meta.get("name", pid) if isinstance(meta, dict) else pid
+                    p_ver = str(meta.get("version", "1.0")) if isinstance(meta, dict) else "1.0"
+                    status_txt = f"v{p_ver}" if not p_ver.startswith("v") else p_ver
+                    items.append({
+                        "id": str(pid),
+                        "name": str(p_name),
+                        "subtext": status_txt
+                    })
+
+            lang = Locale.getDefault().getLanguage()
+            string_dict = self.STRINGS.get(lang, self.STRINGS["en"])
+
+            items_json_str = json.dumps(items, ensure_ascii=False)
+            strings_json_str = json.dumps(string_dict, ensure_ascii=False)
+
+            plugin_ref = self
+
+            def on_result(result_str):
+                try:
+                    res = json.loads(str(result_str))
+                    sel_list = res.get("selected", [])
+                    if not sel_list:
+                        return
+                    inc_settings = bool(res.get("includeSettings", True))
+                    inc_data = bool(res.get("includeData", True))
+                    inc_pinned = bool(res.get("includePinned", False))
+
+                    if is_export_mode:
+                        target_peer = peer_id
+                        if not target_peer:
+                            try:
+                                target_peer = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                            except Exception:
+                                target_peer = 0
+                        run_on_queue(lambda: plugin_ref._process_export(target_peer, sel_list, inc_settings, inc_data, inc_pinned))
+                    else:
+                        run_on_queue(lambda: plugin_ref._process_import(parsed_import_data, sel_list, inc_settings, inc_data, inc_pinned))
+                except Exception as ex:
+                    traceback.print_exc()
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Callback error: {ex}"))
+
+            self.dex.call(
+                "pyShowSheet",
+                frag,
+                bool(is_export_mode),
+                items_json_str,
+                strings_json_str,
+                Callback(on_result)
+            )
+
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"UI error: {e}"))
+
+    def _get_settings_native(self, pid):
+        if not engine_settings:
+            return {}
+        try:
+            return engine_settings.get_all_settings(pid) or {}
+        except Exception:
+            return {}
+
+    def _set_setting_native(self, pid, key, value):
+        if not engine_settings:
+            return
+        try:
+            engine_settings.set_setting(pid, key, value)
+        except Exception:
+            pass
+
+    def _clear_settings_native(self, pid):
+        if not engine_settings:
+            return
+        try:
+            if hasattr(engine_settings, "clear_settings"):
+                engine_settings.clear_settings(pid)
+        except Exception:
+            pass
+
+    def _dump_plugin_data(self, pid):
+        data = {
+            "datastores": {},
+            "files": {},
+            "prefs": {}
+        }
+        try:
+            ctx = ApplicationLoader.applicationContext
+            files_dir = str(ApplicationLoader.getFilesDirFixed().getAbsolutePath())
+
+            # 1. Datastores
+            ds_dir = os.path.join(files_dir, "datastores")
+            if os.path.exists(ds_dir):
+                for f in os.listdir(ds_dir):
+                    if f.startswith(f"{pid}_") or f == f"{pid}.json":
+                        p = os.path.join(ds_dir, f)
+                        try:
+                            with open(p, "r", encoding="utf-8", errors="ignore") as jf:
+                                data["datastores"][f] = json.load(jf)
+                        except Exception:
+                            pass
+
+            # 2. Files in filesDir (music_stats, databases, json files)
+            cands = []
+            if os.path.exists(files_dir):
+                for f in os.listdir(files_dir):
+                    if f.startswith(f"{pid}_") or f == f"{pid}.json" or f == f"{pid}.db":
+                        cands.append(f)
+                    elif pid in ("music_stats", "max_music_stats") and (
+                        f == "music_stats_data.json" or
+                        f.startswith("music_stats_data_acc_") or
+                        f == "ym_synced_ids.json"
+                    ):
+                        cands.append(f)
+
+            for cand in cands:
+                p = os.path.join(files_dir, cand)
+                try:
+                    if os.path.isfile(p):
+                        with open(p, "rb") as bf:
+                            raw = bf.read()
+                        data["files"][cand] = base64.b64encode(zlib.compress(raw, 9)).decode('utf-8')
+                except Exception:
+                    pass
+
+            # 3. SharedPreferences
+            pref_names = [pid, f"{pid}_prefs", f"plugin_{pid}"]
+            if pid in ("music_stats", "max_music_stats"):
+                pref_names.append("music_stats_prefs")
+
+            for pname in pref_names:
+                try:
+                    sp = ctx.getSharedPreferences(pname, 0)
+                    all_entries = sp.getAll()
+                    if all_entries and all_entries.size() > 0:
+                        pref_map = {}
+                        for entry in all_entries.entrySet():
+                            k = str(entry.getKey())
+                            v = entry.getValue()
+                            if v is not None:
+                                pref_map[k] = v
+                        data["prefs"][pname] = pref_map
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        return data if (data["datastores"] or data["files"] or data["prefs"]) else None
+
+    def _restore_plugin_data(self, pid, data):
+        if not data or not isinstance(data, dict):
+            return
+        try:
+            ctx = ApplicationLoader.applicationContext
+            files_dir = str(ApplicationLoader.getFilesDirFixed().getAbsolutePath())
+
+            # 1. Restore Datastores
+            datastores = data.get("datastores", {})
+            if datastores:
+                ds_dir = os.path.join(files_dir, "datastores")
+                os.makedirs(ds_dir, exist_ok=True)
+                for fname, content in datastores.items():
+                    try:
+                        p = os.path.join(ds_dir, fname)
+                        with open(p, "w", encoding="utf-8") as jf:
+                            json.dump(content, jf, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+            # 2. Restore Files
+            files = data.get("files", {})
+            if files:
+                for fname, enc in files.items():
+                    try:
+                        raw = zlib.decompress(base64.b64decode(enc))
+                        p = os.path.join(files_dir, fname)
+                        with open(p, "wb") as bf:
+                            bf.write(raw)
+                    except Exception:
+                        pass
+
+            # 3. Restore SharedPreferences
+            prefs = data.get("prefs", {})
+            if prefs:
+                for pname, entries in prefs.items():
+                    try:
+                        sp = ctx.getSharedPreferences(pname, 0)
+                        editor = sp.edit()
+                        for k, v in entries.items():
+                            if isinstance(v, bool):
+                                editor.putBoolean(k, v)
+                            elif isinstance(v, int):
+                                editor.putLong(k, int(v))
+                            elif isinstance(v, float):
+                                editor.putFloat(k, float(v))
+                            elif isinstance(v, str):
+                                editor.putString(k, v)
+                        editor.apply()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _dump_single_plugin_by_info(self, pinfo, include_settings, include_data, include_pinned=False):
+        try:
+            pid = pinfo["id"]
+            path = pinfo["path"]
+            p_type = pinfo.get("type", "python")
+
+            if os.path.isdir(path):
+                # Распакованная папка elyx плагина — пакуем в zip архив в память
+                raw_content = _zip_folder_to_bytes(path)
+                fname = f"{pid}.elyx"
+            else:
+                with open(path, "rb") as f:
+                    raw_content = f.read()
+                fname = os.path.basename(path)
+
+            file_content_enc = base64.b64encode(zlib.compress(raw_content, level=9)).decode('utf-8')
+            enabled_state = pinfo.get("enabled") if "enabled" in pinfo else self._is_plugin_enabled(pid)
+
+            is_pinned = False
+            if include_pinned:
+                try:
+                    if PluginsController and hasattr(PluginsController, "isPluginPinned"):
+                        is_pinned = bool(PluginsController.isPluginPinned(str(pid)))
+                except Exception:
+                    pass
+
+            settings = None
+            if include_settings:
+                settings = self._get_settings_native(pid)
+
+            plugin_data = None
+            if include_data:
+                plugin_data = self._dump_plugin_data(pid)
+
+            return {
+                "file_name": fname,
+                "file_content": file_content_enc,
+                "settings": settings,
+                "plugin_data": plugin_data,
+                "pinned": is_pinned,
+                "plugin_meta": {
+                    "id": pid,
+                    "name": pinfo.get("name", pid),
+                    "version": pinfo.get("version", "1.0"),
+                    "icon": "",
+                    "enabled": enabled_state,
+                    "pinned": is_pinned,
+                    "type": p_type
+                }
+            }
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _process_export(self, peer_id, selected_ids, include_settings, include_data, include_pinned=False):
+        plugins_dir = get_plugins_dir()
+        msg = self._get_string_by_key("export_progress").format(len(selected_ids))
+        run_on_ui_thread(lambda: BulletinHelper.show_info(msg))
+
+        master_data = {}
+        for pid in selected_ids:
+            pinfo = self.installed_plugins_cache.get(pid)
+            if not pinfo:
+                continue
+            dump = self._dump_single_plugin_by_info(pinfo, include_settings, include_data, include_pinned)
+            if dump:
+                master_data[pid] = dump
+
+        if not master_data:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("error_empty")))
+            return
+
+        try:
+            json_str = json.dumps(master_data)
+            final_blob = base64.b64encode(zlib.compress(json_str.encode('utf-8'), level=9)).decode('utf-8')
+            export_name = "plugins-export.pl_export"
+            export_path = os.path.join(plugins_dir, export_name)
+            with open(export_path, "wb") as f:
+                f.write(final_blob.encode('utf-8'))
+
+            if not peer_id:
+                try:
+                    peer_id = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+                except Exception:
+                    peer_id = 0
+
+            send_document(peer_id, export_path, caption=self._get_string_by_key("export_done"))
+            time.sleep(1)
+            try:
+                os.remove(export_path)
+            except Exception:
+                pass
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("export_error").format(e)))
+
+    def _process_import(self, all_data, selected_ids, with_settings, with_data, with_pinned=False):
+        count = 0
+        plugins_dir = get_plugins_dir()
+
+        restore_state = self.get_setting("restore_state_mode", True)
+        force_enable = self.get_setting("force_enable_mode", False)
+
+        try:
+            pc = PluginsController.getInstance() if PluginsController else None
+
+            for pid in selected_ids:
+                if pid not in all_data:
+                    continue
+                pdata = all_data[pid]
+                if not pdata or not isinstance(pdata, dict):
+                    continue
+
+                try:
+                    enc_content = pdata.get("file_content")
+                    if not enc_content:
+                        continue
+
+                    code = self.decode_and_decompress(enc_content)
+                    raw_filename = pdata.get("file_name")
+
+                    meta = pdata.get("plugin_meta") or {}
+                    is_elyx = (meta.get("type") == "elyx" if isinstance(meta, dict) else False) or (raw_filename and raw_filename.endswith(('.elyx', '.eaf')))
+
+                    if raw_filename:
+                        target_filename = raw_filename
+                    elif is_elyx:
+                        target_filename = f"{pid}.elyx"
+                    else:
+                        target_filename = f"{pid}.plugin" if b"__DEX_BEGIN__" in code else f"{pid}.py"
+
+                    target_path = os.path.join(plugins_dir, target_filename)
+                    with open(target_path, "wb") as f:
+                        f.write(code)
+
+                    # Для elyx плагина также распаковываем в ElyxPlugins/{pid} и сохраняем архив в archives/
+                    if is_elyx:
+                        try:
+                            elyx_dest = os.path.join(plugins_dir, "ElyxPlugins", pid)
+                            os.makedirs(elyx_dest, exist_ok=True)
+                            with zipfile.ZipFile(io.BytesIO(code), "r") as zf:
+                                zf.extractall(elyx_dest)
+
+                            # Страховка для Chaquopy/Elyx: гарантируем наличие __init__.py во всех поддиректориях пакета с Python файлами
+                            for root, dirs, files in os.walk(elyx_dest):
+                                has_py = any(f.endswith((".py", ".pyc")) for f in files)
+                                if has_py and "__init__.py" not in files and "__init__.pyc" not in files:
+                                    try:
+                                        with open(os.path.join(root, "__init__.py"), "w", encoding="utf-8") as f_init:
+                                            f_init.write("# init\n")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            traceback.print_exc()
+
+                        try:
+                            arch_dir = os.path.join(plugins_dir, "ElyxPlugins", "archives")
+                            os.makedirs(arch_dir, exist_ok=True)
+                            arch_dest = os.path.join(arch_dir, target_filename)
+                            with open(arch_dest, "wb") as af:
+                                af.write(code)
+                        except Exception:
+                            pass
+
+                    target_state = meta.get("enabled", True) if (isinstance(meta, dict) and restore_state) else force_enable
+
+                    # 1. Restore settings
+                    if with_settings and engine_settings:
+                        self._clear_settings_native(pid)
+                        settings = pdata.get("settings", {})
+                        if isinstance(settings, dict):
+                            for k, v in settings.items():
+                                self._set_setting_native(pid, k, v)
+
+                    # 2. Restore plugin data
+                    if with_data:
+                        if "data" in pdata and pdata["data"]:
+                            self._restore_plugin_data(pid, {"datastores": {f"{pid}_db.json": pdata["data"]}})
+                        if "plugin_data" in pdata and pdata["plugin_data"]:
+                            self._restore_plugin_data(pid, pdata["plugin_data"])
+
+                    # 3. Native load engine invocation
+                    if pc:
+                        file_obj = FileClass(target_path)
+                        engine = None
+                        try:
+                            engine = PluginsController.getPluginEngine(file_obj)
+                        except Exception:
+                            pass
+                        if not engine and hasattr(pc, 'engines'):
+                            engine = pc.engines.get("elyx" if is_elyx else "python")
+
+                        existing = None
+                        try:
+                            if hasattr(pc, 'getPlugins'):
+                                existing = pc.getPlugins().get(pid)
+                            elif hasattr(pc, 'plugins'):
+                                existing = pc.plugins.get(pid)
+                        except Exception:
+                            pass
+
+                        if target_state:
+                            self._invoke_native_load(engine, target_path, existing)
+                            self._set_plugin_enabled(pid, True)
+                        else:
+                            self._set_plugin_enabled(pid, False)
+                            if existing and hasattr(pc, 'unloadPlugin'):
+                                try:
+                                    pc.unloadPlugin(pid)
+                                except Exception:
+                                    pass
+
+                    # 4. Restore pinned state
+                    if with_pinned:
+                        try:
+                            is_pinned = meta.get("pinned", False) if isinstance(meta, dict) else False
+                            if not is_pinned and "pinned" in pdata:
+                                is_pinned = bool(pdata["pinned"])
+                            if PluginsController and hasattr(PluginsController, "setPluginPinned"):
+                                PluginsController.setPluginPinned(str(pid), bool(is_pinned))
+                        except Exception:
+                            pass
+
+                    count += 1
+                except Exception:
+                    traceback.print_exc()
+
+            if count > 0:
+                run_on_ui_thread(lambda: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.pluginsUpdated))
+                msg = self._get_string_by_key("import_done").format(count)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("not_imported")))
+
+        except Exception as e:
+            traceback.print_exc()
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._get_string_by_key("import_error").format(e)))
+
+    def _invoke_native_load(self, engine, path, existing_plugin):
+        if not engine:
+            return
+        try:
+            for m in engine.getClass().getDeclaredMethods():
+                if m.getName() == "loadPluginFromFile":
+                    m.setAccessible(True)
+                    pts = m.getParameterTypes()
+                    if len(pts) == 4:
+                        m.invoke(engine, path, existing_plugin, None, None)
+                        return
+                    elif len(pts) == 3:
+                        m.invoke(engine, path, existing_plugin, None)
+                        return
+        except Exception:
+            traceback.print_exc()
+
+    def _set_plugin_enabled(self, pid, state):
+        pid_str = str(pid)
+        state_bool = bool(state)
+
+        # 1. Записываем в SharedPreferences plugin_settings (гарантированное сохранение состояния)
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                prefs = ctx.getSharedPreferences("plugin_settings", 0)
+                editor = prefs.edit()
+                editor.putBoolean(f"plugin_enabled_{pid_str}", state_bool)
+                editor.apply()
+        except Exception:
+            pass
+
+        # 2. Уведомляем PluginsController
+        if PluginsController:
+            try:
+                pc = PluginsController.getInstance()
+                if pc:
+                    try:
+                        pc.setPluginEnabled(pid_str, state_bool, None)
+                    except Exception:
+                        for m in pc.getClass().getDeclaredMethods():
+                            if m.getName() == "setPluginEnabled":
+                                m.setAccessible(True)
+                                m.invoke(pc, pid_str, state_bool, None)
+                                break
+                    plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if plugins_map and plugins_map.containsKey(pid_str):
+                        p_obj = plugins_map.get(pid_str)
+                        if p_obj and hasattr(p_obj, "setEnabled"):
+                            p_obj.setEnabled(state_bool)
+            except Exception:
+                traceback.print_exc()
+
+    def _is_plugin_enabled(self, pid):
+        try:
+            if PluginsController:
+                pc = PluginsController.getInstance()
+                if pc:
+                    active_method = getattr(pc, "isPluginActive$TMessagesProj", None) or getattr(pc, "isPluginActive", None)
+                    if active_method:
+                        try:
+                            return bool(active_method(str(pid)))
+                        except Exception:
+                            pass
+                    plugins_map = pc.getPlugins() if hasattr(pc, "getPlugins") else getattr(pc, "plugins", None)
+                    if plugins_map and plugins_map.containsKey(str(pid)):
+                        p_obj = plugins_map.get(str(pid))
+                        if p_obj and hasattr(p_obj, "isEnabled"):
+                            return bool(p_obj.isEnabled())
+        except Exception:
+            pass
+
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                prefs = ctx.getSharedPreferences("plugin_settings", 0)
+                key = f"plugin_enabled_{pid}"
+                if prefs.contains(key):
+                    return bool(prefs.getBoolean(key, True))
+        except Exception:
+            pass
+        return True
+
+    def compress_and_encode(self, data):
+        if not data:
+            return ""
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        return base64.b64encode(zlib.compress(data, level=9)).decode('utf-8')
+
+    def decode_and_decompress(self, data):
+        if not data:
+            return b""
+        return zlib.decompress(base64.b64decode(data))
+
+
+# __DEX_BEGIN__
+# eNqtfA1AnNWV9nnf+eNngGGAQAiBlwlJgPAXAmQI5IdAQjDEYBiIQmoywCSMgXeGmYGA1Zom1sT1
+# p9bWVFtXbY1Wt9q1a0y7frZrm2zrWu1mo7Z+rd+2dbW/brXW7ddu3eZ7zr13hoEkrn5uyPOec8/9
+# O/fv3HPvOzMjgem0ulWNlOI7d/LRFw6+69p1d+jqFddtDnX+9vAtofDat7qIwkQ03d/gJvXPgKxK
+# k/JODtuIBkBb7USrQWNpRF8BrXIS4T/dnU30YhNRUQ7RbdVEtwPHgLuAe4AvAA8DjwKPA08BzwI/
+# B94FFtUQFQOlwFKgEqgFGoA1wDZgJzAAXAkMA0FgHIgAB4BrgIPAncDjwPPArwFXLdE6YAdwALgZ
+# eBx4HvgNkF9H1ARcBnwCeBJ4E6hYSTQC3AP8ALDUE7UDh4FTgGUVwsBh4PtAfgPRR4DPA2eAdwGj
+# kWgTEACOAl8Bngd+AfwJyECfLQFWAzuAIHAQuAP4MvAN4J+BnwK/Axzo/GKgC5gC7geeB6xeompg
+# CPgE8GXgR4DWjH4EdgKHgBuATwFfBL4JnAK+AzwLfB84C/wQeAV4Ffgl8Cbwe+CPwDnAuoYoDcgB
+# CgEDKAeqgJVAI+AFWoE2YBtwBbAXiAIHgVuAzwEPAn8HfBN4FvgB8CrwW+A/AXsLkRsoASqBVYAX
+# 6AC2AX3AMDAGTAE3AZ8C7gTuBx4FTgG/Bt4E3m7hSUyUCiwACoHFwDJgDdAJDAAh4DrgRuBW4IvA
+# 14BngB8BrwFvA9paolygAlgHdAH9wCgwAUwB1wGHgZuAe4HHgG8AZ4DXgbcBbR3aCXiA1UAPMASY
+# wCHgJuAO4G7gQeAE8F3gFeB3wF+A4vWYa8Be4GrgEHAUuBm4C7gHuB94GHgMOAk8B5wBXgV+A5wD
+# 8jdAD2A50AC0Am1AD9AL+IFx4ABwGLgFOA58Hfgu8GPgTcDRhn4FvEAHcCmwGzCBq4EbgM8CDwNP
+# At8H/hX4NfB7QNtIlAksArzAOuAyYCewB9gPxIBrgOuBm4FjwBeAJ4B/Al4AXgXeAv6Ly2uHjQGq
+# gQZgNZCBKZEJlLCdA0oBD7AEKAOWAsuA5UA5UAFUAivY/gEwXwQzQzAlBDNBMA0Ec0BY/oQlTli2
+# wmZiORKWD2Fak5qGhKEnDB2h2wldRmg2QU2CWtQBbAI2Kxu8BYBZpkuArUA3sA24FNgO9ACXATsA
+# H9AP7AQuB64ABoFdwEeAK4HdwB7ADwwBw8AIEAD2AwdVv2hqT8hS/CNouEvxJ8BnK/4p8G7Fnwaf
+# o/jnwC8A1VU5CwFsI/Qy5MWKfw18ESi2FXoDfIGq+4TK61J5F5EMv7NC8iWKL1Rj965KX6XS5yve
+# WiXlNUpepHhnlczLfG7VrJz1z1djalVpalWaBWp8+V+hGud3lQ6NSTyPe1GVLGe1KqdI8WXgFyu+
+# SpXfnJSX50hD1Swfb9daVe8CNV/ifFtSu5hvVXXxXOpQ5TDfrfRvT8rbofj9ar7xvzHF81ibimf9
+# Q4r3VUnfYJMaownF74I8onge36jiRyGPKT4Gfkrx14CfUfxR8AcUz3Pgo4q/MynvcfCTcd2S5CeS
+# +LtXzPJPJZV5OinNc0n8i0n8K0n8a0n8G0n1vpMkfzdJboUhmFa8s3q23oLqpPQrZtMYSWl4Hsbl
+# VUnpveCvVvyGJHlRcp8ktTc3qZxupL9G8Zcn8aNJ9U6DvzbeXpTzMcUfrJbrf7OaDx9XPOt/SPFH
+# q2flrE+cZx2sWPmVWPw2/KWKtazR5xX9lqIlGq/zUlqksU2I0zVUJuh6Wq7xvJXyQoSXCCrjFyn5
+# okR4PS3TeM5L+eIEraGlGtuZElos6HryCGpQucb2Yz3dK+yIQUUa2xALPSBsyRr6O0FlOaWwQHeI
+# vcGgY4I2018L2kJfEFSmL0UPfE/R5xR9XtGXBG2gH5As7/8K2kh/EnQ1FWi879TQaZL0F4oWarwX
+# abRX7Ek1dBXJ8HViT7HSw2IP0ehlRf+3oj9S9MeKvqLo/1H0XxX9iaI/BXVgd7MJuoJsGtNKsoOm
+# oJ4HiamNvizs9EqRLg0a/EXQFcLYZ2I3tInxrRE0S6XLQj/dJegKStUkzRS0jrI0tu8ynQv1/VlQ
+# Wa6LeilFxMt8LvR7hqDxfJeQS8VnazK/W9AqRZsoR9DVgmaretyqnW5Y0TdB85TeCzCONrFvrFR0
+# Lf2noOsoTWO6ntIF7aVcMX83i3QFyPfvYm/rEuGFKlyowoUqvEiFF6lwkcpfpMKLscvbBK2gd4jn
+# aYcIF6v4EqxOm9r3Toj52SnCBiQ3qj3w7wWtoF8L2kZvCNquqJN+K2iGorL9BnaHN8U8vEyUV4oW
+# HBa0gK4XtJ8+IehOukHQYjqi1sNRQTPpr9Q8v0nRm1W+W1S+WwXdQZ8U1E23CbqFPqXS3a7SfVrQ
+# VXSnWi93C9pH9whaQQ8Jmkb/JmgqvSZoDv1B0F56V9H/UlTTJNU1uU4dmiwnT9BLaYEm9Vqo5Iai
+# pWI9bhf9sUTNF6avCtpDbwsfUKfXFf258DVkOvYhfiZ8BhmuxQz7nKALFM2mYo39RRlfr+gqtPOU
+# oFn0K+FbXE6fFdRFjwuaTz9UPke+xv6GjG9E/vtIhr8oaB+9qMK/V34Jp29S9TSh3ZIuoieVr/Iz
+# QQvpd8IvkelWq3RYPfRNQa+gbwuaS28JWqTSL1ZUtssLY/A3wj5to/8Qvk23mM9r4O39L0FL6Snh
+# AzeK8tfB0hwX1EJfFzSFviFoH70g/ON6kQ7Wm54QdDl9TdB0+gdFnxa0gs4KKu3IemVH1qPHLRpT
+# H1kFbSWnoNKerIdH7RJU2pENKv+GpLBbUGlP2jADeP5sxAnhfuFbLaXfCLpM0HacFE4KKstpR/1s
+# TztUmOk5kn4uKR+V/ZZ97DfB2R/YNOsrz49/C/H7N836n/PjU3BQOLRp1l+eH28g/q5Ns/7i/Hgv
+# 4h9T8YuT4o+r+B7Ef0vFF18g/yjiX1LxJUl+Jv/j+IOIf0PFG0ruToq/E/F/VvGl6gzRmhT/DOLr
+# lGPiUfFVSfF/RPyzKn7JBeJTcIj6EeLf3sxnEl3Ed1bIc8igZqOwa1TsYFYRizNWhTw3+ZbYaMLV
+# hhnqtERcHwVNs/gMlrFn7aSIa1LshL5SG62ypIm0mkh7AGnLSzmdDMdUGWEuAzM0F3knWIb+8oj8
+# Kq/mwzyPGFPgy38l6+8Ueb2WdEoOm65mUCnZkuC6wHE7rKKNQxXyfDWo2WlQT6FBi2NOWy3grqqQ
+# tsK3xE4+w44yLhFtcmd/zTVhbBUlp8yJMevuxsqSUgdNGN0ijYznHvJashKlFWpfRYptsGVO0EuF
+# dpTQbzKhXyr0S4N+6efpd21Cv1SUmIpatifp1yPqTpsTE9ePpekJ/WT8rH6ytPfW72hCPyf0y4R+
+# Gefpd1uFnNO+JU6UiFJc7Un6dYi6M+fExPVjaYbSLzMxL+9KzMusRF0OUZdG9yKO91pff5aYL3Zy
+# 2iOuGdA0u9fOpXjsq5Hr45B4YLfCLj4B+C7LIjUTNZ6JkoZB03SvXiRmImR6iY6Z2JuVmPG+Mp6J
+# 07Bk3GcO8nmWk2kcZD/6Z4Xan9COG7DKC+Htyhou4RI1s+4I/MdC+MRSun2O9DklbU+S+nqyyHTx
+# /QVzEy5xOsIayZoTNl1HZXuNm3CHUZ6aYS+kUYwfVl2dlVx2Hje+1+H2aXRIs4gewx1VBfuw3J8u
+# jGF20vhpSKHTP1TIOxRfnQs7xWLyrXRRoc772DLyuWR4wrVZ9JpXy5gTNl23CFquu7UJ40tiFvlW
+# ZqNnHiSXzjrzyaK8UKVHmXmiHg5zmyZcDwl6gTypGWgb2gcJt69UzEsiec5KE/cC3M4tibn6QmKu
+# utHOXMzVnERbbWqu/hhp2Lfz4drfdDUiZ5rV/Va99RpaY70amrnRAwuAhedZuAYr7NnoBVMYUeyR
+# TmuJ1TOvhDbZtjY5i1xsJ1e6ye32wmPwueal6uBUV6Mkt7U868KxUxyb66vLEStog+5ryEnUOOFa
+# LXsUq8kq2ufrQBkdC4V1nC/pgiRTzAELgP2jQt43DboXUNgw4KMN5uRhBRVTeEM9uepN4x6xRi3i
+# D2fcShK+iVm3lsdMY3/BjhiWOSvlHY/HCs+jMR8aFhDPE9bO3Zaj51G459Ow+B5bHmbDlo0Trhul
+# vfhduK4EEtP4a7TIbZtwfQrlOW2m8TmE82wH15vGXeB8jQWilT7y2EooXNdAjdZsGwnrwfOgAPWn
+# 8xi7zh9FeZ8nb/cWI51F3BsWiPu8+DxaUhmfRwsxf9gbGNTzMZsK5rWfbVSJVoI+aEEfZMIrl+2v
+# qZT3Ub49c+fIwfhe51+YZI0mhR1wu79a6rasKrCSuwBrKUWmUfuhVc6fNqTzxbB+bOXQuYK+Vm5e
+# fi9a6ZvOE/OhwOI7gNhR2TtHxHrR1X6+OFlfYz3GenavX1spfZGQUQyP01eHUdFkX8MerEKJRkHC
+# RluFxcCdR6W86/Sgp8LwBwzao9eLUWa7OWHchpLSdBO7oyH61qLW33alhwdlhetS0G/ZifHoV+PR
+# hzxZSnf+N6jkuzRDnH/PT196kfSlF0lfcpH0JSK9rtL7K+X9rRup55fhg5eZndS/g2o9hI2dwgYm
+# t3kv4nLFfFxGcuUvwxhcj1ayH5Qqw3WfIEN36tn4O7+uJeq+eb586UXkRReRFwt5KkaA17xZyX0B
+# 6roZYacYPVDNrYc33EoWtwdjGHbx7edg3VLaVV8KlAAGDTYU065GD/GOW2732FcinYlSB5uWkNch
+# ZA65CztocPUyGvQWYdUuId57eUXz3msTO7ZL7L2Q2UvsWBmrl5Jvr7R0+6j835VmtnDdDuq1Zqo2
+# aapN3Iawa4+6WZsv9wt58viwfMLYLeb+fHnYuFLIU6Axj+ONlfIdhQfSsJGFsTKNBbC+JtbCHlpj
+# c1OOfsbRuDRT9JoDvgPP+aVizuezf2Bl2kN5+n1tbN907DOK6nk2EjL0gM1tN/vyaMMy99vu1yaM
+# PpylnLpZl04W2JM8jJoDOtxTKSYTdHPjXiiH3A7TuAI30aZxuXgO4OkuMI1BWBiPDp/JgC2FPAO3
+# lh6LXJ85sMbs+XJr99iaKKbdgjnptLPWAehh4gKAbSxtiGt2qM80dMhM+LDtyA19bK6N8dg8+0GR
+# En5XKq9jX+oVWyyUl2qIlqUixRWbrDTL68Stqrd6LFK/HKFflHKsLnBO1JBnlT3FO3Je2kHBp3FN
+# 6U+LmtIpLd0czKT2nRPi1gT79p+9VtjL/yi35tqys7PPeZxyrIqoLwNzM8NGhRmPUrmlMOM7Yl2e
+# IWcGj+IrlJdxZxuP5CvkzjDrFtErKTxau7CfoJWZB9e73wxvSKXJN1nnUzaPTZabR4O2MljfMspz
+# 7hH5/1GEuISXUpjzWu2U6/zDEyPnytP3OOvivZzJvfwGpTm5FpmH9zbMGkiylSTPKWeFk9Iy81wH
+# NxzQbmSPwa5kzrxso03JUs0r8uj173Auj70Aui3DOJhGLkZSlI15dA5jy9r32jn0Z95Fuf9tfRb0
+# jAU9Y/kK94zlGdEzdXy6Yt2tjz322Llyyx7rSox2T1uKPZemHOwbTln6MafYsvfB/3Za46OZj/yl
+# YnbBrzSK0FrTKMNomsZS3KWZxhLcZHisBryIJrL6B62LyAeYhkeMuNz7ecR9tiVij+a5NWHsxb1b
+# mu12q9U2ZKumHTBSh/pyU3d98tvrHrLZUo/0TRj7MDMxT2wnEjOSc7GMNdya0PBieq8X6xbetNW9
+# KScVHonv05RzRx88OK8VvWN9jHvH+qzoHfbtCp3/IvinMWZ9maXEO++p19QoWtlDaRe2ZRithdew
+# oZysw+wzcSs3xFvpZC2+x6POWjiTtHCGd4n6najfifqdZ7h+53cTdRZm/rPgf4rZlOfasLHPWiJ0
+# +LfuC+tQCB0qEzqoeTOvb5J7YX77/1a0/59m22/7vuB7MJP6UmENd95LvZ+5cN2LUHfVf1P3xcYl
+# 2TocJmUDrFxGNo+xDDvyUjfE7QzWAmzCpMcq1yi8frTdh3NWDmakaeTAa+JQnjUsVqwM8Yr9lxTm
+# 9lgb431g41XKM4hXqUyn6rXusa2Kp3JwqknossfREJcJK7qP12rdJ8ln5/7IViV4rEXQqwajz+tz
+# ttT5PZJjVetUEz2hmcYu7CJyd4vvZXF/Il+9Z/bqfIYJ8p5CfBNSnubB6S1cVwevasL1VyJPpnh/
+# oQvPtgz5+L2M1/4cNTus8CCfIWVLHV6E3W/BkhJbUtO4D+2Ke4ELUMsxbqeeZwm3uXO9Ottsl9hj
+# 8lH2EC75TKMQt8lm3ULaiHuZz4jUXh3zRPGm8QVOnwh9EflUiIZ0zn+cEqkRuh82yXR9VoS8uI+M
+# 81wv3pM4YKscws5acx1npxaem43P5z1RhhxDJDVzJCR51NPGWnbSHkcNdnJAryVzw+dpyjBdd4g0
+# XkcTxXnT+BvcPsdDMj1g4TxfJkd9Ip3rYV4JyFtA82Wm8UhSGbPSR4X0TkjL9Qy7HCv2jU8JX+ZZ
+# jceMfZRLV8jPofnqCtEXO6mvDqsUNq+QHuFViv2DV6ZFnKIx49CesOsq7l9jDE8nTtCa4Pk9iK9+
+# KfE9ni48lf1CVqhbE/Gma1zeNWCf1ESNvpWcY0acUn6iaZiZbj4XzIvx4n4tV9u79+fryi1y3rjU
+# GUO2YdcK+TkSXx12SfhJvjqph7g7XCltP5fjqy+jVS7oRF9KtIp10TG7C+mP82Sz93z7Vsgzmzzv
+# D2rLcWYrx5mtIsk3jKyI+4ajyjeU/v3UCnk/Im9TgrBjFqE73xrYkfOj6p1+Id5SelPDwl9OxUpt
+# 1ngNjcJrkP6vjbzpzWJFwlfR1mqr8NYVN1DGtfRVcqebruvEfVPjCr5D+hhkTt2D3dg0DvMoWQvt
+# v4jzDj4NDDmc9kJHoVaYQuJ0EElxwi8fovZlESOC+8CX09O1crxW9TqzRJ3wEdLXpqeSJx2et3EI
+# +4zjZLnFne446dFLyfFp7bjjh1P2DWLdfUT0ZwY5UgvT0Ob0dHHD8mSqnINO8bkZ7rPRb+A9UiY9
+# zU8tN7ui+qiWm3Wi5MhnBwboDc0ievFNjjx7YvrIC3ROiQ7pCdHtuhTdoUT0FWboq/x8YWBAW5D1
+# s8HigRMnnhg48tKi4hl6Qdc5+Q8xtpeWb9WKsrZuDWo5bo56w6IqxDuNzCByai6X5nKXt56tOVsy
+# cPbYMT2ymH5l4fzVrdV67g30tAjQ9wQ599YRaP06H2Kf5hLotCxvoLqaXhIpTmnurFMPDEzTTzi+
+# dXqaHhTygbN0qyZK2sX5dgn2MLNHuO2nZihqEwetTD307Wurq5uqqx94oAaFTZdM010Wu7y1yhxo
+# bQ2eXosOPEa3i+KOtLZ2D6wbGDj7QKuWnVV9JLhuoHVAy3NtPTpwbmBr65G109MIZh3TFmXp2ceP
+# Xa0VZZ8cQKbpQa3UpWVnnzyFDm3V02948djZs4I5eYwlt548OdCKcqaR/63q4AOHr9ELj78w09ra
+# Sme534/prhv00GL6uejrq7ZOtw5uhXIDa4PT08dmgtPHpo/d+bng9A8eOHFybVGJ3rOYHkGvbT2r
+# lWed1XJc9ASH/rGi+sE7qVZ0YWs1+tBAfyynzGlaqzrj9MCRgemt1cFTseZNxUeu/tK6RdUzemCx
+# fDeRqt5RVCd91kpX5ztJ1wpagz+LonXyGJRYz5r67IUu5GsEdaq4+DsUTcWXIr+m3lHG343I8qsU
+# 3SzkhpJX4k8X96lrhXxNQr9ZHeRdZFwfLRFnFVQTbbALPkvVvkbEW1DXWlWWTZVrU/ntSp6m5Gmw
+# JRxOV/L4Z83inzPLVTT+WbMFqpwSFS4Rd7zysx7rlYw5i+gTi2iX5NcLXlOf87MKyr2yOdH/NUrf
+# NZBxqDkp3IAbv2ZV/no1FpxXV+/FEWOUk1ZOlvKKftIqyN4aNIOxdaSvayHruhYIHW0j/nAsECFn
+# x6bNbX3dvt0bt3d3UOGmSCQUMYKm4R+OBUPmxphphMz2seDwfspNxIVnekdDB3pHA4EYLZbSKARB
+# c58xNDk2FoghjRmKBYcDpGGku0jvQsO6urr4gautrm7cmuLRTdld4+FQJLZpmp+ywJSuWGC8y9wb
+# Iq2b9G7k6UZGazdn15HF0i1kkhuAaIAWdPvNkUgoOFLrD4dr26D5VDA200ILE/LhkBkLmLHadqbT
+# sRYqSETti/jDo8HhaG1PKGgiZtH5Mb6ZcGCvfzjQQmXnR45E/Af8Q2OB2g7FtFDVe6TqjPhHglBl
+# NrU7kXoyFhyr7Q7ta6ElCdlUMHCgth+Psu1yHLqDUTQlEGmhnPMTtdDS84WdkdBkGJrPhCZjPf6I
+# fzya3P65yVqoKBFzIDiyLxCr3YwcAZm7hSrnx3YHzYA/IqPn1bH4vdImj46K9mFkZCPq41HTtZHA
+# 8MzwWCAi1LxAOdv8pn8f98aq986zQ8lEV6rJ//+VqZW8HyATT+Y2Mzjuj4VQXfMHyDmved4PnDU+
+# DE0fICc/toTGRrjGFe8/Xwut6x4OjddiAAOY8WOT+4JmtHbcP717GHZkMro7IBZ47TZ/0Cw7b8mX
+# rfyQ+es/ZP5VHzJ/w4fM3/gh8ze1UNeHya9mdln/Fh6Kzv+Zolqo43+goBZq/RCl8AJ//7nVvsNG
+# 7v1maiFP94h/bCq4v9ZvYsvz86ZZu8kcHgtFsR22j/mjUbbm75FmWyA2GhppoeILJOoyYehVIaUX
+# iN8WGB9SCQJR3p0ulISLF7YggPYIs3x+qt7gPtMfm4wEeGe4yj/lrx3zm/tq20f9kd7AxGTA5M3P
+# lRSzzR8b5a1rVrJ96KrAMHo8N0m2Y9I045vcrLQ3FkG7eQOYL9s4GZS2Jy8pyjcaCamtUonFPtkW
+# ifhneDPkjXBWvMUfHe0NzOohhF08ksICu5KkMvN8SStlJUlEUfMErSg7FNlXe1UUPXdJ7/ZLhSqs
+# 3RxpvEMqhDgWGAvAGxivHQ9gsEzY9No2aV77UGwwFuQBXHGxpIk0Ze3+sbEh//D+D5S4lcrnJp4M
+# CjcJDp4/UrvRHw1gk983HmD/p/G9UoZisdC4XKDsSmEFxDeA5e8vG6/Iiyf0jQbGA2U7AtHQZGQ4
+# EO2JhKaCYj6U/neZePLPT9IeGBuLYg4HhvdvDE1zqIWqz08VgtUw0fRordyoAyOzjsjS90q+Ufm6
+# 7PC9j2SbYT1CEcyTZe+VOq5u/XkT58LpePBaSN/WQ6lskGp4plLWNv90uzBW0hhS4TyB0bHpcmMs
+# 5B8JjJDF19ZJWj/p/ThB9G8B4F/3s8fez443HpvFE58r5ie88H743v3dHO4W/nw/+/P97JI7+Nm1
+# uZujunEDAOlAN9n5iVi9fwCJIdZ34gM5IIizDMCBT/MPY7ijZXW4To3zK8Gnz/JzAvWzgTnJ6pMD
+# q5IKq0/ik+UNSXzjHL4+wTclyVcn8d4kvnkOn1Bv85h/X5RSE2cpcvjVscviHxlBjpER3nF2hA5w
+# zAjPObLjDBMwR8g5JFbNNn8E+w85htg09nVRyrBa05Qz7Dc7gtHxYDS6Mxgb7T0QDAfwIgDTnGxw
+# zPwRSh2Or1Fkk2yUcocjAUzy3uB4eCwQn5u0NFnaiynHc3VHaNIcgZ+XOKyQZTg2TRqUGwlERaLd
+# 0IYcI1INSgcTHvPP9AavDpA+gs98Bcght8t6cksGOQJ4xoIxlJeuZEE+72WrQDiIbW9kd3RyiHKU
+# KBqIQct9USHMVMID/ogJIaXsVcaLLHBMyY2H8h56sMNy11MOy+atbsqCMHkZkStJINpOKSwJjYVw
+# TgbHHkI75DHKQGjWxlM2gthioUL88ClqjBuyuB0TwnjnJvo0lYVi+6N0sAn1WJt+/9hkICFxwA6I
+# wi2j/ig58LgUUaQHR8geFL4PuSWd08lZSjbij/lFB6Yrgex1FUjudSWa0+vpQXgskyOBDpRCGSrQ
+# IzKhBhnsVRlwZSgFqlSUGA8Ld0qoQvkXEIqqXPGIuAKUFjSn/GNBpAigidH2yQh3trD8Hf7IfnIE
+# o5vGw+iZlGDc5NmCGK0oBGrvJ+f+wMzuYR7eodA0ZSeHxKBTDotGgv6x0D7u8o3o+vr5QhzfZ7C8
+# pVAOajEH9gaE+zTSi1uP/XCzdmM5b5zEAsbSeu/4nghv3CNUcsFkQyIN10xuThDlTXR3dDgSGhvr
+# C5N9DFt+bJSsbMtJHwtT+rh/f6BDqWaB14oH1rfVhP9HNn5GEeDycvmKZu8Mj2cvz3v4WlBDD+0l
+# F4xV0ByZPQySI34J5AYjLEVS5IKQyaG2WMyPDh3xhXYiM0xaaigcn9iW8GSM0pPvjeyRwHhoChYl
+# MmlSBh7bzb4uuHoBtEOLklOal7axMTabaUnGJkXyUBXS+EJnKRKHR/2Ux1w4PDYjvY4edDRr4I6L
+# faFwXJYB2UaY0n0Rsdjdc4KytLkyaQoWQNZ+Adu7+Dy5LzQ5PLp9MhbFaJArOmtdZEFpcQkaww2Q
+# 0izBRWC1d+CqaDIq1GyfjKIxwgpwrk3CrZZd0KmMAudLvm4QFc65RRBJki8HRPPm3StRJssifEcl
+# zgaijniPOaLSQPH4CEaqnK5Cwu6LgLoxo0UI9MMUBbFt9YpZC5ctrr2Vbw0pm587pS2/VN4aWqNc
+# kCMqJg820GhsZizADhxkk0N8g0f22GgQDoOiKxWtp5RYSM251FgorHZP92SYTYfyGeWyVLLe5HmW
+# AiNTJnbQDObYIEnT4ORgYptJ5xD72+hUyuKANHMybTYL4pZLitJYpBS1TbFNJ22GPq997GMd3o96
+# eDfHju9Z4xkJTHuqPDh8hoNjovOrx0MjARExNLkPUTD51cJoRSfHo541e/1j0UCVBwu82h8Oetas
+# rPJER/3VK5Gjztvg9zavrG/yB+oam5uGG5ubVzasGtnbuNrf1NjQ1NDk31vvXbVyFQqdgqFBXcjU
+# XFNf01A9EpjyXEt6uf4ZrUjrcB2kX4IW60u1h/XCHfoyiK30CwhEAgsnKHO58B/JLMXFxXoFEhZp
+# +RaZQFcJEKsXq1KulKQhKYU1niBefv64XoZEBYaqB0Xw+8d4JVK7MnJJ5WRBCEqJXpwQuZJEomwd
+# ZafIskv15ULXghKptCW/Ln9tvl0G0vL1/MH8g/m9+Rvy7fk78wfyu/Md8XRCGA/0ISYRGBABUVMq
+# asqVNS2J12TMRuXJLCmqnm78yTpEUr3AU1CKr5ZpttuMZQcPWu9etlz7+jJ8kl+z32Zo4n85xAfL
+# K7Tj5SxOjYsrIb6vYoV2uoLFzri4CuKnK6u11yq51KzbjBoITqyo1c7gu2Wa5hKJ6iC7vmaldryG
+# 87rjeeshfqN2lXZbHX/JLc8FUQNED9Xjs3OOfLfmhqCJi2vQjhp3N3i1d1bp3zJebtC0dxo0MPVg
+# 6sEcbdK0403kxJtWXdPx4Ue3pos/LkI8N3wcTV2DUl5sxuMpfjyyGo/T/HiDg9dz7BkvHi+34PEW
+# P17h2Hf4cbQVj19y7H3M3czcca+mf71V00+vtaTdtlrTX27S9OubHfqLXVrazZdAvk3Tj27v1Z7y
+# 8le4lmfjA9bZQ9Djl9v588eVUFYrHEb45h4t9ThwusdiPZc/av2LeofzUvvsO7XXwb/RLvk/gGZ2
+# SD6/Y5Zf0TGbpl7xXE6zit8JipcxQnalolFFDyl6R4d8b/Q46EPAk8ApFXdG0d8o+kdFbZvk+6fF
+# oG6gbJOsj8PVm2Qar6LbQVM6Zbvi7wz5Nyre3Xy+nD9rkNt5vrzyIvKqi8hrVPlV8+T8LtKAzDtP
+# Xq/K6Z4n5+8udkA23UmJ94akvoN4ead8vxjulN/5Gu2Unz3dA/pIZ/x94+x31453yu94faZT/k7H
+# 3Z3ydxFuBn2qk+b8OzNPD/6di2c65e9XJMvFO1H120d60u8fcd3x30Cy0uzvIPF7v/hvIdlp9veQ
+# 8BFtkYZ/E8liyN8P4e+Z4asnoq38fTl8LEjUxb+ZhI8Giu/biflqyHL4e4A2Q+rE31ezuOT7TR4H
+# u0rD3xfkLyxo6neb/h/3e1f8
+# __DEX_END__
