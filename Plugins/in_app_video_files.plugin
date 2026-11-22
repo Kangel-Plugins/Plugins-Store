@@ -1,37 +1,25 @@
 import os
 import threading
-import traceback
 from collections import OrderedDict
 from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
-from hook_utils import find_class
-
-try:
-    from android_utils import run_on_ui_thread
-except Exception:
-    def run_on_ui_thread(fn, delay=0):
-        fn()
-
-try:
-    from ui.bulletin import BulletinHelper
-except Exception:
-    BulletinHelper = None
-
-try:
-    from ui.alert import AlertDialogBuilder
-except Exception:
-    AlertDialogBuilder = None
-
-try:
-    from ui.settings import Header, Divider, Switch, Selector, Text
-    HAS_SETTINGS_UI = True
-except Exception:
-    HAS_SETTINGS_UI = False
+from hook_utils import find_class, get_private_field, get_static_private_field
+from android_utils import run_on_ui_thread
+from client_utils import (
+    PLUGINS_QUEUE,
+    get_file_loader,
+    get_last_fragment,
+    get_notification_center,
+    run_on_queue,
+)
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Divider, Switch, Selector, Text
 
 __id__ = "in_app_video_files"
 __name__ = "In-App Video"
-__description__ = "Показывает видео, которые отправлены файлом в встроенном плеере. Кнопка в троеточии или на файл (.mp4, .mov, .webm, .mkv, .avi, .m4v, .3gp, .flv, .ts)"
+__description__ = "Открывает видео, отправленные файлом, во встроенном плеере. Доступно через меню чата или контекстное меню файла (.mp4, .mov, .webm, .mkv, .avi, .m4v, .3gp, .flv, .ts)."
 __author__ = "@Dkaq1"
-__version__ = "0.4"
+__version__ = "0.7"
 __icon__ = "Ciehwjsoufhwns/0"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.5.0"
@@ -71,7 +59,8 @@ BLOCKED_EXACT_MIMES = {
 IN_APP_THUMB_MARKER = "in_app_video"
 FILE_BADGE_PREFIX = "Файл: "
 MAX_META_CACHE = 200
-MAX_STATE_CACHE = 300
+MAX_STATE_CACHE = 500
+MAX_CELL_REFS = 40
 
 THRESHOLD_OPTIONS = ["3 файла", "5 файлов", "10 файлов", "20 файлов"]
 THRESHOLD_VALUES = [3, 5, 10, 20]
@@ -80,6 +69,14 @@ SHOW_MSG_CONDITION = (
     "message != null && message.getDocument() != null && "
     "!message.isVideo() && !message.isRoundVideo() && !message.isVoice() && "
     "!message.isGif() && !message.isSticker() && !message.isAnimatedSticker() && !message.isMusic() && "
+    "(message.getDocument().mime_type == null || ("
+    "!message.getDocument().mime_type.toLowerCase().startsWith(\"text/\") && "
+    "!message.getDocument().mime_type.toLowerCase().startsWith(\"image/\") && "
+    "!message.getDocument().mime_type.toLowerCase().startsWith(\"audio/\") && "
+    "!message.getDocument().mime_type.toLowerCase().equals(\"application/typescript\") && "
+    "!message.getDocument().mime_type.toLowerCase().equals(\"application/x-typescript\") && "
+    "!message.getDocument().mime_type.toLowerCase().equals(\"application/javascript\")"
+    ")) && "
     "((message.getDocument().mime_type != null && message.getDocument().mime_type.toLowerCase().startsWith(\"video/\")) || "
     "(message.getDocumentName() != null && ("
     "message.getDocumentName().toLowerCase().endsWith(\".mp4\") || "
@@ -100,6 +97,54 @@ HIDE_MSG_CONDITION = (
     "message.getDocument().thumbs.get(0).type != null && "
     "message.getDocument().thumbs.get(0).type.equals(\"in_app_video\")"
 )
+
+
+class _JavaCache:
+    _loaded = False
+    ArrayList = None
+    JavaFile = None
+    Bitmap = None
+    BitmapConfig = None
+    CompressFormat = None
+    ByteArrayOutputStream = None
+    MediaMetadataRetriever = None
+    VideoAttr = None
+    PhotoCachedSize = None
+    FileLoc = None
+    FileLoader = None
+    NotificationCenter = None
+    NCDelegate = None
+    UserConfig = None
+    TYPE_VIDEO = 3
+
+    @classmethod
+    def ensure_loaded(cls):
+        if cls._loaded:
+            return
+        cls._loaded = True
+        cls.ArrayList = find_class("java.util.ArrayList")
+        cls.JavaFile = find_class("java.io.File")
+        cls.Bitmap = find_class("android.graphics.Bitmap")
+        cls.BitmapConfig = find_class("android.graphics.Bitmap$Config")
+        cls.CompressFormat = find_class("android.graphics.Bitmap$CompressFormat")
+        cls.ByteArrayOutputStream = find_class("java.io.ByteArrayOutputStream")
+        cls.MediaMetadataRetriever = find_class("android.media.MediaMetadataRetriever")
+        cls.VideoAttr = find_class("org.telegram.tgnet.TLRPC$TL_documentAttributeVideo")
+        cls.PhotoCachedSize = find_class("org.telegram.tgnet.TLRPC$TL_photoCachedSize")
+        cls.FileLoc = find_class("org.telegram.tgnet.TLRPC$TL_fileLocationToBeDeprecated")
+        cls.FileLoader = find_class("org.telegram.messenger.FileLoader")
+        cls.NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+        cls.NCDelegate = find_class("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate")
+        cls.UserConfig = find_class("org.telegram.messenger.UserConfig")
+
+        msg_cls = find_class("org.telegram.messenger.MessageObject")
+        if msg_cls is not None:
+            val = get_static_private_field(msg_cls, "TYPE_VIDEO")
+            if val is not None:
+                try:
+                    cls.TYPE_VIDEO = int(val)
+                except Exception:
+                    pass
 
 
 def _jint(val):
@@ -126,32 +171,6 @@ def _jbool(val):
         return bool(val)
 
 
-def _get_field_value(obj, field_name):
-    if obj is None:
-        return None
-    cls = obj.getClass()
-    while cls is not None:
-        try:
-            f = cls.getDeclaredField(field_name)
-            f.setAccessible(True)
-            return f.get(obj)
-        except Exception:
-            cls = cls.getSuperclass()
-    return None
-
-
-def _get_static_field(cls, field_name):
-    cur = cls
-    while cur is not None:
-        try:
-            f = cur.getDeclaredField(field_name)
-            f.setAccessible(True)
-            return f.get(None)
-        except Exception:
-            cur = cur.getSuperclass()
-    return None
-
-
 def _format_bytes(num_bytes):
     size = float(max(0, int(num_bytes)))
     for unit in ("Б", "КБ", "МБ", "ГБ"):
@@ -169,6 +188,15 @@ def _msg_cache_key(message_obj):
         int(message_obj.getDialogId()),
         int(message_obj.getId()),
     )
+
+
+def _get_doc_id(doc):
+    if doc is None:
+        return 0
+    try:
+        return int(getattr(doc, "id", 0))
+    except Exception:
+        return 0
 
 
 def _get_msg_group_id(message_obj):
@@ -204,8 +232,7 @@ def _has_video_attribute(doc):
 
 
 def _is_non_document_media(message_obj):
-    checks = ("isVideo", "isRoundVideo", "isVoice", "isGif", "isSticker", "isAnimatedSticker", "isMusic")
-    for method_name in checks:
+    for method_name in ("isVideo", "isRoundVideo", "isVoice", "isGif", "isSticker", "isAnimatedSticker", "isMusic"):
         try:
             fn = getattr(message_obj, method_name, None)
             if fn is not None and bool(fn()):
@@ -271,13 +298,11 @@ def _resolve_msg_local_path(message_obj):
     except Exception:
         pass
 
-    account = getattr(message_obj, "currentAccount", 0)
-    FileLoader = find_class("org.telegram.messenger.FileLoader")
-    if FileLoader is None:
-        return None
-
+    account = int(getattr(message_obj, "currentAccount", 0))
     try:
-        loader = FileLoader.getInstance(account)
+        loader = get_file_loader(account=account)
+        if loader is None:
+            return None
         owner = getattr(message_obj, "messageOwner", None)
         if owner is not None:
             f = loader.getPathToMessage(owner)
@@ -294,44 +319,50 @@ def _resolve_msg_local_path(message_obj):
     return None
 
 
+def _safe_parse_int(raw_val, default=0):
+    if raw_val is None:
+        return default
+    try:
+        return int(str(raw_val).strip())
+    except Exception:
+        return default
+
+
+def _utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
 def _extract_video_info_and_thumb(file_path):
+    _JavaCache.ensure_loaded()
     width, height, duration_sec = 1280, 720, 1.0
     thumb_w, thumb_h = 320, 180
     jpeg_bytes = None
     retriever = None
     meta_dimensions_found = False
-    rotation = 0
 
-    Bitmap = find_class("android.graphics.Bitmap")
-    CompressFormat = find_class("android.graphics.Bitmap$CompressFormat")
-    ByteArrayOutputStream = find_class("java.io.ByteArrayOutputStream")
+    Bitmap = _JavaCache.Bitmap
+    CompressFormat = _JavaCache.CompressFormat
+    ByteArrayOutputStream = _JavaCache.ByteArrayOutputStream
 
     try:
-        MMR = find_class("android.media.MediaMetadataRetriever")
+        MMR = _JavaCache.MediaMetadataRetriever
         if MMR is not None:
             retriever = MMR()
             retriever.setDataSource(file_path)
 
-            w_str = retriever.extractMetadata(18)
-            h_str = retriever.extractMetadata(19)
-            d_str = retriever.extractMetadata(9)
-            r_str = retriever.extractMetadata(24)
+            raw_w = _safe_parse_int(retriever.extractMetadata(18), 0)
+            raw_h = _safe_parse_int(retriever.extractMetadata(19), 0)
+            raw_d = _safe_parse_int(retriever.extractMetadata(9), 0)
+            rotation = _safe_parse_int(retriever.extractMetadata(24), 0)
 
-            if r_str:
-                try:
-                    rotation = int(str(r_str))
-                except Exception:
-                    rotation = 0
-
-            if w_str and h_str and int(str(w_str)) > 0 and int(str(h_str)) > 0:
-                width = int(str(w_str))
-                height = int(str(h_str))
+            if raw_w > 0 and raw_h > 0:
+                width, height = raw_w, raw_h
                 meta_dimensions_found = True
                 if rotation in (90, 270):
                     width, height = height, width
 
-            if d_str and int(str(d_str)) > 0:
-                duration_sec = max(1.0, int(str(d_str)) / 1000.0)
+            if raw_d > 0:
+                duration_sec = max(1.0, raw_d / 1000.0)
 
             bmp = None
             try:
@@ -342,30 +373,35 @@ def _extract_video_info_and_thumb(file_path):
                 try:
                     bmp = retriever.getFrameAtTime()
                 except Exception:
-                    pass
+                    bmp = None
 
             if bmp is not None:
-                bw = int(bmp.getWidth())
-                bh = int(bmp.getHeight())
-                if not meta_dimensions_found and bw > 0 and bh > 0:
-                    width, height = bw, bh
-                    if rotation in (90, 270):
-                        width, height = height, width
+                try:
+                    bw = int(bmp.getWidth())
+                    bh = int(bmp.getHeight())
+                    if bw > 0 and bh > 0:
+                        if not meta_dimensions_found:
+                            width, height = bw, bh
 
-                max_side = 360.0
-                scale = min(1.0, max_side / float(max(width, height)))
-                thumb_w = max(16, int(round(width * scale)))
-                thumb_h = max(16, int(round(height * scale)))
+                        max_side = 360.0
+                        scale = min(1.0, max_side / float(max(bw, bh)))
+                        thumb_w = max(16, int(round(bw * scale)))
+                        thumb_h = max(16, int(round(bh * scale)))
 
-                if Bitmap is not None and CompressFormat is not None and ByteArrayOutputStream is not None:
-                    scaled = Bitmap.createScaledBitmap(bmp, _jint(thumb_w), _jint(thumb_h), _jbool(True))
-                    baos = ByteArrayOutputStream()
-                    scaled.compress(CompressFormat.JPEG, _jint(80), baos)
-                    jpeg_bytes = baos.toByteArray()
-                    baos.close()
-                    if scaled != bmp:
-                        scaled.recycle()
-                bmp.recycle()
+                        if Bitmap is not None and CompressFormat is not None and ByteArrayOutputStream is not None:
+                            target_bmp = bmp
+                            if scale < 1.0:
+                                target_bmp = Bitmap.createScaledBitmap(bmp, _jint(thumb_w), _jint(thumb_h), _jbool(True))
+                            try:
+                                baos = ByteArrayOutputStream()
+                                target_bmp.compress(CompressFormat.JPEG, _jint(80), baos)
+                                jpeg_bytes = baos.toByteArray()
+                                baos.close()
+                            finally:
+                                if target_bmp is not bmp:
+                                    target_bmp.recycle()
+                finally:
+                    bmp.recycle()
     except Exception:
         pass
     finally:
@@ -382,15 +418,17 @@ def _extract_video_info_and_thumb(file_path):
         thumb_h = max(16, int(round(height * scale)))
 
         try:
-            BitmapConfig = find_class("android.graphics.Bitmap$Config")
+            BitmapConfig = _JavaCache.BitmapConfig
             if Bitmap is not None and BitmapConfig is not None and CompressFormat is not None and ByteArrayOutputStream is not None:
                 fallback_bmp = Bitmap.createBitmap(_jint(thumb_w), _jint(thumb_h), BitmapConfig.ARGB_8888)
-                fallback_bmp.eraseColor(_jint(-16777216))
-                baos = ByteArrayOutputStream()
-                fallback_bmp.compress(CompressFormat.JPEG, _jint(60), baos)
-                jpeg_bytes = baos.toByteArray()
-                baos.close()
-                fallback_bmp.recycle()
+                try:
+                    fallback_bmp.eraseColor(_jint(-16777216))
+                    baos = ByteArrayOutputStream()
+                    fallback_bmp.compress(CompressFormat.JPEG, _jint(60), baos)
+                    jpeg_bytes = baos.toByteArray()
+                    baos.close()
+                finally:
+                    fallback_bmp.recycle()
         except Exception:
             pass
 
@@ -420,12 +458,7 @@ def _save_original_state(message_obj, state_store):
         except Exception:
             orig_thumbs = []
 
-    orig_mime = None
-    if doc is not None:
-        try:
-            orig_mime = doc.mime_type
-        except Exception:
-            pass
+    orig_mime = getattr(doc, "mime_type", None) if doc is not None else None
 
     orig_type = 9
     try:
@@ -433,17 +466,22 @@ def _save_original_state(message_obj, state_store):
     except Exception:
         pass
 
-    orig_caption = None
+    orig_caption = getattr(owner, "message", None) if owner is not None else None
+    orig_attach_path = getattr(owner, "attachPath", None) if owner is not None else None
     orig_grouped_id = 0
+    orig_entity_offsets = None
+
     if owner is not None:
-        try:
-            orig_caption = getattr(owner, "message", None)
-        except Exception:
-            pass
         try:
             orig_grouped_id = int(getattr(owner, "grouped_id", 0))
         except Exception:
             pass
+        entities = getattr(owner, "entities", None)
+        if entities is not None:
+            try:
+                orig_entity_offsets = [int(entities.get(i).offset) for i in range(entities.size())]
+            except Exception:
+                orig_entity_offsets = None
 
     if len(state_store) >= MAX_STATE_CACHE:
         state_store.popitem(last=False)
@@ -454,53 +492,77 @@ def _save_original_state(message_obj, state_store):
         "mime": orig_mime,
         "type": orig_type,
         "caption": orig_caption,
+        "attach_path": orig_attach_path,
         "grouped_id": orig_grouped_id,
+        "entity_offsets": orig_entity_offsets,
     }
 
 
-def _apply_video_transformation(message_obj, meta, matched_ext, file_name, state_store, show_badge=False):
+def _apply_video_transformation(
+    message_obj,
+    meta,
+    matched_ext,
+    file_name,
+    local_path,
+    state_store,
+    doc_local_paths,
+    show_badge=False,
+):
+    _JavaCache.ensure_loaded()
     doc = message_obj.getDocument()
     if doc is None:
         return False
 
+    doc_id = _get_doc_id(doc)
+    if local_path and doc_id != 0:
+        doc_local_paths[doc_id] = local_path
+
+    owner = getattr(message_obj, "messageOwner", None)
     if _has_video_attribute(doc) and message_obj.isVideo():
+        if local_path and owner is not None:
+            try:
+                if not getattr(owner, "attachPath", None):
+                    owner.attachPath = local_path
+                    message_obj.checkMediaExistance()
+            except Exception:
+                pass
         return True
+
+    if _JavaCache.VideoAttr is None or _JavaCache.ArrayList is None:
+        return False
 
     _save_original_state(message_obj, state_store)
 
     width, height, duration_sec, thumb_w, thumb_h, jpeg_bytes = meta
 
-    VideoAttr = find_class("org.telegram.tgnet.TLRPC$TL_documentAttributeVideo")
-    ArrayList = find_class("java.util.ArrayList")
-    if VideoAttr is None or ArrayList is None:
-        return False
-
-    attr = VideoAttr()
+    attr = _JavaCache.VideoAttr()
     attr.w = int(width)
     attr.h = int(height)
     try:
         attr.duration = float(duration_sec)
     except TypeError:
         attr.duration = int(duration_sec)
+    try:
+        attr.supports_streaming = False
+    except Exception:
+        pass
 
     if getattr(doc, "attributes", None) is None:
-        doc.attributes = ArrayList()
+        doc.attributes = _JavaCache.ArrayList()
     doc.attributes.add(attr)
 
     try:
-        PhotoCachedSize = find_class("org.telegram.tgnet.TLRPC$TL_photoCachedSize")
-        FileLoc = find_class("org.telegram.tgnet.TLRPC$TL_fileLocationToBeDeprecated")
-        if PhotoCachedSize is not None:
-            ps = PhotoCachedSize()
+        if _JavaCache.PhotoCachedSize is not None:
+            ps = _JavaCache.PhotoCachedSize()
             ps.type = IN_APP_THUMB_MARKER
             ps.w = int(thumb_w)
             ps.h = int(thumb_h)
             ps.bytes = jpeg_bytes if jpeg_bytes is not None else bytes([0])
-            if FileLoc is not None:
-                ps.location = FileLoc()
+            if _JavaCache.FileLoc is not None:
+                ps.location = _JavaCache.FileLoc()
 
             if getattr(doc, "thumbs", None) is None:
-                doc.thumbs = ArrayList()
+                doc.thumbs = _JavaCache.ArrayList()
             doc.thumbs.add(_jint(0), ps)
     except Exception:
         pass
@@ -512,17 +574,19 @@ def _apply_video_transformation(message_obj, meta, matched_ext, file_name, state
     if not cur_mime or cur_mime == "application/octet-stream":
         doc.mime_type = MIME_BY_EXT.get(matched_ext, "video/mp4")
 
+    if local_path and owner is not None:
+        try:
+            owner.attachPath = local_path
+        except Exception:
+            pass
+
     try:
-        MessageObject = find_class("org.telegram.messenger.MessageObject")
-        type_video = 3
-        if MessageObject is not None:
-            try:
-                f = MessageObject.getDeclaredField("TYPE_VIDEO")
-                f.setAccessible(True)
-                type_video = int(f.getInt(None))
-            except Exception:
-                pass
-        message_obj.type = type_video
+        message_obj.type = _JavaCache.TYPE_VIDEO
+    except Exception:
+        pass
+
+    try:
+        message_obj.checkMediaExistance()
     except Exception:
         pass
 
@@ -539,23 +603,33 @@ def _apply_video_transformation(message_obj, meta, matched_ext, file_name, state
         except Exception:
             pass
 
-    if show_badge:
+    if show_badge and owner is not None:
         try:
-            owner = getattr(message_obj, "messageOwner", None)
-            if owner is not None:
-                display_name = file_name if file_name else "video"
-                badge = f"{FILE_BADGE_PREFIX}{display_name}"
-                existing_text = str(owner.message) if getattr(owner, "message", None) else ""
-                if not existing_text.startswith(FILE_BADGE_PREFIX):
-                    owner.message = f"{badge}\n{existing_text}" if existing_text.strip() else badge
-                    message_obj.generateCaption()
+            display_name = file_name if file_name else "video"
+            badge = f"{FILE_BADGE_PREFIX}{display_name}"
+            existing_text = str(owner.message) if getattr(owner, "message", None) else ""
+            if not existing_text.startswith(FILE_BADGE_PREFIX):
+                if existing_text.strip():
+                    prefix = f"{badge}\n\n"
+                    owner.message = f"{prefix}{existing_text}"
+                    entities = getattr(owner, "entities", None)
+                    if entities is not None:
+                        shift = _utf16_len(prefix)
+                        for i in range(entities.size()):
+                            ent = entities.get(i)
+                            if ent is not None:
+                                ent.offset = int(ent.offset) + shift
+                else:
+                    owner.message = badge
+                message_obj.generateCaption()
         except Exception:
             pass
 
     return True
 
 
-def _revert_video_transformation(message_obj, state_store):
+def _revert_video_transformation(message_obj, state_store, doc_local_paths):
+    _JavaCache.ensure_loaded()
     key = _msg_cache_key(message_obj)
     saved = state_store.get(key)
     doc = message_obj.getDocument()
@@ -564,7 +638,11 @@ def _revert_video_transformation(message_obj, state_store):
     if saved is None and doc is None:
         return False
 
-    ArrayList = find_class("java.util.ArrayList")
+    doc_id = _get_doc_id(doc)
+    if doc_id != 0:
+        doc_local_paths.pop(doc_id, None)
+
+    ArrayList = _JavaCache.ArrayList
 
     if doc is not None:
         if saved is not None:
@@ -604,8 +682,19 @@ def _revert_video_transformation(message_obj, state_store):
                     ):
                         thumbs.remove(idx)
 
+    if owner is not None and saved is not None:
+        try:
+            owner.attachPath = saved.get("attach_path")
+        except Exception:
+            pass
+
     try:
         message_obj.type = int(saved.get("type", 9)) if saved is not None else 9
+    except Exception:
+        pass
+
+    try:
+        message_obj.checkMediaExistance()
     except Exception:
         pass
 
@@ -621,11 +710,19 @@ def _revert_video_transformation(message_obj, state_store):
         try:
             if saved is not None:
                 owner.message = saved.get("caption")
+                orig_offsets = saved.get("entity_offsets")
+                entities = getattr(owner, "entities", None)
+                if orig_offsets is not None and entities is not None:
+                    limit = min(len(orig_offsets), entities.size())
+                    for i in range(limit):
+                        ent = entities.get(i)
+                        if ent is not None:
+                            ent.offset = orig_offsets[i]
             else:
                 cur_msg = str(owner.message) if getattr(owner, "message", None) else ""
                 if cur_msg.startswith(FILE_BADGE_PREFIX):
                     nl_idx = cur_msg.find("\n")
-                    owner.message = cur_msg[nl_idx + 1:] if nl_idx != -1 else None
+                    owner.message = cur_msg[nl_idx + 1:].lstrip("\n") if nl_idx != -1 else None
 
             if not getattr(owner, "message", None):
                 try:
@@ -646,7 +743,7 @@ def _revert_video_transformation(message_obj, state_store):
     return True
 
 
-def _recalculate_group_for_videos(grouped_map, group_id, group, logger=None):
+def _recalculate_group_for_videos(grouped_map, group_id, group, detached_groups=None, logger=None):
     if group is None:
         return False
     try:
@@ -691,6 +788,12 @@ def _recalculate_group_for_videos(grouped_map, group_id, group, logger=None):
                 group.calculate()
             return msgs.size() > 1
 
+        if detached_groups is not None and group_id != 0 and group_id not in detached_groups:
+            detached_groups[group_id] = {
+                "group": group,
+                "siblings": list(non_video_items),
+            }
+
         for m in video_items:
             msgs.remove(m)
             try:
@@ -713,39 +816,63 @@ def _recalculate_group_for_videos(grouped_map, group_id, group, logger=None):
                 except Exception:
                     pass
             return False
-        else:
-            try:
-                if getattr(group, "positions", None) is not None:
-                    group.positions.clear()
-                if getattr(group, "posArray", None) is not None:
-                    group.posArray.clear()
-                group.calculate()
-            except Exception:
-                pass
-            return True
-    except Exception as e:
-        if logger:
-            logger(f"[InAppVideoDocs] Group recalc error: {e}")
+
+        try:
+            if getattr(group, "positions", None) is not None:
+                group.positions.clear()
+            if getattr(group, "posArray", None) is not None:
+                group.posArray.clear()
+            group.calculate()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        if logger is not None:
+            logger.exception("Group recalc error")
         return False
 
 
-def _restore_group_as_documents(group, extra_messages=None, logger=None):
-    if group is None:
-        return
+def _restore_group_as_documents(grouped_map, group_id, group, extra_messages=None, detached_groups=None, logger=None):
     try:
+        detached = detached_groups.pop(group_id, None) if detached_groups is not None else None
+        if group is None and detached is not None:
+            group = detached.get("group")
+            if group is not None and grouped_map is not None and group_id != 0:
+                try:
+                    grouped_map.put(_jlong(group_id), group)
+                except Exception:
+                    pass
+
+        if group is None:
+            return
+
         msgs = getattr(group, "messages", None)
         if msgs is None:
             return
 
+        restore_list = []
+        if detached is not None:
+            for sib in detached.get("siblings", []):
+                if sib is not None:
+                    try:
+                        if getattr(sib, "messageOwner", None) is not None:
+                            sib.messageOwner.grouped_id = group_id
+                    except Exception:
+                        pass
+                    restore_list.append(sib)
         if extra_messages:
+            restore_list.extend(extra_messages)
+
+        if restore_list:
             existing_ids = set()
             for i in range(msgs.size()):
                 m = msgs.get(i)
                 if m is not None:
                     existing_ids.add(int(m.getId()))
-            for m in extra_messages:
+            for m in restore_list:
                 if m is not None and int(m.getId()) not in existing_ids:
                     msgs.add(m)
+                    existing_ids.add(int(m.getId()))
 
         any_video = False
         for i in range(msgs.size()):
@@ -770,60 +897,88 @@ def _restore_group_as_documents(group, extra_messages=None, logger=None):
             except Exception:
                 pass
             group.calculate()
-    except Exception as e:
-        if logger:
-            logger(f"[InAppVideoDocs] Group restore error: {e}")
+    except Exception:
+        if logger is not None:
+            logger.exception("Group restore error")
 
 
 def _notify(fragment, text, level="info"):
-    def _show():
-        if BulletinHelper is not None:
-            try:
-                if level == "success":
-                    BulletinHelper.show_success(str(text))
-                    return
-                if level == "error":
-                    BulletinHelper.show_error(str(text))
-                    return
-                BulletinHelper.show_info(str(text))
-                return
-            except Exception:
-                pass
-        try:
-            BulletinFactory = find_class("org.telegram.ui.Components.BulletinFactory")
-            if BulletinFactory is not None and fragment is not None:
-                bf = BulletinFactory.of(fragment)
-                ctx = fragment.getParentActivity()
-                if bf is not None and ctx is not None:
-                    icon_name = "msg_video" if level == "success" else "msg_info"
-                    icon_id = int(ctx.getResources().getIdentifier(icon_name, "drawable", ctx.getPackageName()))
-                    if icon_id != 0:
-                        bf.createSimpleBulletin(icon_id, str(text)).show()
-        except Exception:
-            pass
-
-    run_on_ui_thread(_show)
+    frag = fragment if (fragment is not None and _is_fragment_alive(fragment)) else None
+    try:
+        if level == "success":
+            BulletinHelper.show_success(str(text), fragment=frag)
+        elif level == "error":
+            BulletinHelper.show_error(str(text), fragment=frag)
+        else:
+            BulletinHelper.show_info(str(text), fragment=frag)
+    except Exception:
+        pass
 
 
-def _create_file_load_delegate(plugin, account):
+def _is_fragment_alive(fragment):
+    if fragment is None:
+        return False
+    try:
+        return fragment.getParentActivity() is not None
+    except Exception:
+        return False
+
+
+def _create_file_load_delegate(plugin):
+    _JavaCache.ensure_loaded()
+    NCDelegate = _JavaCache.NCDelegate
+    if NCDelegate is None:
+        return None
     try:
         from java import dynamic_proxy
-        NCDelegate = find_class("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate")
-        if NCDelegate is None:
-            return None
 
         class FileLoadDelegate(dynamic_proxy(NCDelegate)):
-            def __init__(self, plg, acc):
+            def __init__(self, plg):
                 super().__init__()
                 self.plg = plg
-                self.acc = acc
 
-            def didReceivedNotification(self, event_id, acc, *args):
-                self.plg._on_notification_received(int(event_id), int(acc), args)
+            def didReceivedNotification(self, event_id, account, *args):
+                payload = args
+                if len(args) == 1 and args[0] is not None and not isinstance(args[0], (str, bytes)):
+                    try:
+                        len(args[0])
+                        payload = args[0]
+                    except TypeError:
+                        pass
+                self.plg._on_notification_received(int(event_id), int(account), payload)
 
-        return FileLoadDelegate(plugin, account)
+        return FileLoadDelegate(plugin)
     except Exception:
+        plugin.logger.exception("Failed to create FileLoadDelegate")
         return None
+
+
+class GetPathToAttachHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.doc_local_paths:
+            return
+        try:
+            args = param.args
+            if not args or len(args) == 0:
+                return
+            attach = args[0]
+            if attach is None:
+                return
+            if len(args) >= 2 and isinstance(args[1], str) and args[1]:
+                return
+            if not hasattr(attach, "mime_type"):
+                return
+            doc_id = _get_doc_id(attach)
+            if doc_id == 0:
+                return
+            mapped = self.plugin.doc_local_paths.get(doc_id)
+            if mapped and _JavaCache.JavaFile is not None and os.path.isfile(mapped):
+                param.setResult(_JavaCache.JavaFile(mapped))
+        except Exception:
+            pass
 
 
 class SetMessageObjectHook(MethodHook):
@@ -831,7 +986,7 @@ class SetMessageObjectHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param):
-        auto_reveal = bool(self.plugin.get_setting("auto_reveal", False))
+        auto_reveal = self.plugin._auto_reveal
         if not self.plugin.revealed_messages and not auto_reveal:
             return
 
@@ -845,8 +1000,8 @@ class SetMessageObjectHook(MethodHook):
                 return
 
             group = args[1] if len(args) >= 2 else None
-            allow_ts = bool(self.plugin.get_setting("allow_ts", True))
-            show_badge = bool(self.plugin.get_setting("show_file_badge", False))
+            allow_ts = self.plugin._allow_ts
+            show_badge = self.plugin._show_file_badge
 
             candidates = [message_obj]
             if group is not None and getattr(group, "messages", None) is not None:
@@ -860,7 +1015,7 @@ class SetMessageObjectHook(MethodHook):
                 m_key = _msg_cache_key(m)
                 if m_key in self.plugin.revealed_messages:
                     targets.append((m, m_key))
-                elif auto_reveal:
+                elif auto_reveal and m_key not in self.plugin.hidden_messages:
                     doc = m.getDocument()
                     is_cand, _, _ = _is_video_doc(m, doc, allow_ts=allow_ts)
                     if is_cand and _resolve_msg_local_path(m):
@@ -871,10 +1026,10 @@ class SetMessageObjectHook(MethodHook):
                 return
 
             if param.thisObject is not None:
-                self.plugin.cell_refs[_msg_cache_key(message_obj)] = param.thisObject
+                self.plugin._remember_cell_ref(_msg_cache_key(message_obj), param.thisObject)
 
             transformed_any = False
-            for m, m_key in targets:
+            for m, _ in targets:
                 doc = m.getDocument()
                 is_candidate, matched_ext, file_name = _is_video_doc(m, doc, allow_ts=allow_ts)
                 if not is_candidate:
@@ -884,21 +1039,32 @@ class SetMessageObjectHook(MethodHook):
                     continue
                 meta = self.plugin._get_cached_meta(local_path)
                 if meta is not None:
-                    if _apply_video_transformation(m, meta, matched_ext, file_name, self.plugin.original_states, show_badge=show_badge):
+                    if _apply_video_transformation(
+                        m,
+                        meta,
+                        matched_ext,
+                        file_name,
+                        local_path,
+                        self.plugin.original_states,
+                        self.plugin.doc_local_paths,
+                        show_badge=show_badge,
+                    ):
                         transformed_any = True
                 else:
                     self.plugin._schedule_meta_extraction(m, local_path, matched_ext, file_name, None)
 
             if group is not None and transformed_any:
                 gid = _get_msg_group_id(message_obj)
-                group_valid = _recalculate_group_for_videos(None, gid, group, self.plugin.log)
+                group_valid = _recalculate_group_for_videos(
+                    None, gid, group, self.plugin.detached_groups, self.plugin.logger
+                )
                 if not group_valid or _get_msg_group_id(message_obj) == 0:
                     try:
                         param.args[1] = None
                     except Exception:
                         pass
         except Exception:
-            self.plugin.log(f"[InAppVideoDocs] Hook error:\n{traceback.format_exc()}")
+            self.plugin.logger.exception("SetMessageObjectHook error")
 
 
 class InAppVideoDocsPlugin(BasePlugin):
@@ -907,74 +1073,70 @@ class InAppVideoDocsPlugin(BasePlugin):
         self.menu_items = []
         self.meta_cache = OrderedDict()
         self.revealed_messages = set()
+        self.hidden_messages = set()
         self.original_states = OrderedDict()
+        self.doc_local_paths = {}
+        self.detached_groups = {}
         self.pending_paths = set()
         self.pending_tasks = {}
         self.waiting_downloads = {}
-        self.cell_refs = {}
-        self.nc_delegates = {}
-        self.dialog_proxies = []
+        self.cell_refs = OrderedDict()
+        self.nc_delegate = None
+        self.registered_accounts = []
         self.file_loaded_event_id = None
         self.file_failed_event_id = None
         self.lock = threading.Lock()
 
-        try:
-            ChatMessageCell = find_class("org.telegram.ui.Cells.ChatMessageCell")
-            if ChatMessageCell is not None:
-                unhooks = self.hook_all_methods(ChatMessageCell, "setMessageObject", SetMessageObjectHook(self))
-                if unhooks:
-                    self.hook_refs.extend(unhooks)
+        self._auto_reveal = bool(self.get_setting("auto_reveal", False))
+        self._auto_download = bool(self.get_setting("auto_download", True))
+        self._show_file_badge = bool(self.get_setting("show_file_badge", False))
+        self._allow_ts = bool(self.get_setting("allow_ts", True))
+        self._download_threshold_idx = self._parse_threshold_idx(
+            self.get_setting("download_confirm_threshold", 1)
+        )
 
-            show_chat_btn = self.add_menu_item(
+        _JavaCache.ensure_loaded()
+
+        try:
+            self._hook_chat_message_cell()
+            self._hook_file_loader()
+
+            for item_data in (
                 MenuItemData(
                     menu_type=MenuItemType.CHAT_ACTION_MENU,
                     text="Показать видеофайлы",
                     on_click=self.on_reveal_chat_videos,
                     icon="msg_video",
-                )
-            )
-            if show_chat_btn is not None:
-                self.menu_items.append(show_chat_btn)
-
-            hide_chat_btn = self.add_menu_item(
+                ),
                 MenuItemData(
                     menu_type=MenuItemType.CHAT_ACTION_MENU,
                     text="Скрыть видеофайлы",
                     on_click=self.on_hide_chat_videos,
                     icon="msg_cancel",
-                )
-            )
-            if hide_chat_btn is not None:
-                self.menu_items.append(hide_chat_btn)
-
-            show_msg_btn = self.add_menu_item(
+                ),
                 MenuItemData(
                     menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                     text="Показать как видео",
                     on_click=self.on_reveal_single_message,
                     icon="msg_video",
                     condition=SHOW_MSG_CONDITION,
-                )
-            )
-            if show_msg_btn is not None:
-                self.menu_items.append(show_msg_btn)
-
-            hide_msg_btn = self.add_menu_item(
+                ),
                 MenuItemData(
                     menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                     text="Скрыть как файл",
                     on_click=self.on_hide_single_message,
                     icon="msg_cancel",
                     condition=HIDE_MSG_CONDITION,
-                )
-            )
-            if hide_msg_btn is not None:
-                self.menu_items.append(hide_msg_btn)
+                ),
+            ):
+                item_id = self.add_menu_item(item_data)
+                if item_id is not None:
+                    self.menu_items.append(item_id)
 
             self._register_download_observers()
-            self.log("[InAppVideoDocs] v0.4 ready")
+            self.logger.info("In-App Video v%s loaded", __version__)
         except Exception:
-            self.log(f"[InAppVideoDocs] Load error:\n{traceback.format_exc()}")
+            self.logger.exception("Plugin load error")
 
     def on_plugin_unload(self):
         self._unregister_download_observers()
@@ -992,70 +1154,146 @@ class InAppVideoDocsPlugin(BasePlugin):
             except Exception:
                 pass
         self.menu_items = []
-        self.meta_cache.clear()
+
+        with self.lock:
+            self.meta_cache.clear()
+            self.pending_paths.clear()
+            self.pending_tasks.clear()
+            self.waiting_downloads.clear()
+
         self.revealed_messages.clear()
+        self.hidden_messages.clear()
         self.original_states.clear()
-        self.pending_paths.clear()
-        self.pending_tasks.clear()
-        self.waiting_downloads.clear()
+        self.doc_local_paths.clear()
+        self.detached_groups.clear()
         self.cell_refs.clear()
-        self.dialog_proxies.clear()
+
+    def _hook_chat_message_cell(self):
+        ChatMessageCell = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        if ChatMessageCell is None:
+            return
+
+        hook = SetMessageObjectHook(self)
+        target_method = None
+        max_params = -1
+        try:
+            for m in ChatMessageCell.getDeclaredMethods():
+                if str(m.getName()) == "setMessageObject":
+                    n_params = len(m.getParameterTypes())
+                    if n_params > max_params:
+                        max_params = n_params
+                        target_method = m
+        except Exception:
+            target_method = None
+
+        if target_method is not None:
+            unhook = self.hook_method(target_method, hook)
+            if unhook is not None:
+                self.hook_refs.append(unhook)
+                return
+
+        unhooks = self.hook_all_methods(ChatMessageCell, "setMessageObject", hook)
+        if unhooks:
+            self.hook_refs.extend(unhooks)
+
+    def _hook_file_loader(self):
+        FileLoader = _JavaCache.FileLoader
+        if FileLoader is None:
+            return
+
+        unhooks = self.hook_all_methods(FileLoader, "getPathToAttach", GetPathToAttachHook(self))
+        if unhooks:
+            self.hook_refs.extend(unhooks)
 
     def create_settings(self):
-        if not HAS_SETTINGS_UI:
-            return []
-
         return [
             Header(text="Основные параметры"),
             Switch(
                 key="auto_reveal",
                 text="Автопоказ скачанных видеофайлов",
                 subtext="Автоматически превращать кэшированные видеодокументы в плеер при открытии чата",
+                icon="msg_video",
                 default=False,
+                on_change=self._on_auto_reveal_change,
             ),
             Switch(
                 key="auto_download",
                 text="Автоскачивание при нажатии",
                 subtext="Загружать видеофайл автоматически, если он ещё не скачан на устройство",
+                icon="msg_download",
                 default=True,
+                on_change=self._on_auto_download_change,
             ),
             Selector(
                 key="download_confirm_threshold",
                 text="Порог подтверждения загрузки",
+                icon="msg_list",
                 items=THRESHOLD_OPTIONS,
                 default=1,
+                on_change=self._on_threshold_change,
             ),
             Switch(
                 key="show_file_badge",
                 text="Добавлять имя файла в подпись",
-                subtext="Показывать исходное имя документа перед текстом сообщения",
+                subtext="Показывать исходное имя документа перед текстом сообщения с отступом",
+                icon="msg_edit",
                 default=False,
+                on_change=self._on_show_badge_change,
             ),
             Switch(
                 key="allow_ts",
                 text="Распознавать файлы .ts",
-                subtext="Включить поддержку видеофайлов с расширением .ts",
+                subtext="Включить поддержку видеофайлов с расширением .ts (MPEG-TS)",
+                icon="msg_info",
                 default=True,
+                on_change=self._on_allow_ts_change,
             ),
-            Divider(),
+            Divider(text="Скрытые вручную видеофайлы не открываются повторно автопоказом до ручного включения."),
             Header(text="Кэш и обслуживание"),
             Text(
                 text="Очистить кэш превью",
+                subtext="Удалить сохранённые миниатюры и метаданные видео из памяти",
                 icon="msg_delete",
                 red=True,
                 on_click=self._on_clear_cache_click,
             ),
         ]
 
-    def _get_download_threshold(self):
-        idx = self.get_setting("download_confirm_threshold", 1)
+    def _on_auto_reveal_change(self, value):
+        self._auto_reveal = bool(value)
+
+    def _on_auto_download_change(self, value):
+        self._auto_download = bool(value)
+
+    def _on_show_badge_change(self, value):
+        self._show_file_badge = bool(value)
+
+    def _on_allow_ts_change(self, value):
+        self._allow_ts = bool(value)
+
+    def _on_threshold_change(self, value):
+        self._download_threshold_idx = self._parse_threshold_idx(value)
+
+    def _parse_threshold_idx(self, idx):
         try:
-            idx = int(idx)
-            if 0 <= idx < len(THRESHOLD_VALUES):
-                return THRESHOLD_VALUES[idx]
+            i = int(idx)
+            if 0 <= i < len(THRESHOLD_VALUES):
+                return i
         except Exception:
             pass
-        return 5
+        return 1
+
+    def _get_download_threshold(self):
+        return THRESHOLD_VALUES[self._download_threshold_idx]
+
+    def _remember_cell_ref(self, msg_key, cell):
+        if msg_key in self.cell_refs:
+            self.cell_refs[msg_key] = cell
+            self.cell_refs.move_to_end(msg_key)
+        else:
+            if len(self.cell_refs) >= MAX_CELL_REFS:
+                self.cell_refs.popitem(last=False)
+            self.cell_refs[msg_key] = cell
 
     def _get_activity(self, fragment=None):
         if fragment is not None:
@@ -1066,20 +1304,11 @@ class InAppVideoDocsPlugin(BasePlugin):
             except Exception:
                 pass
         try:
-            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
-            if LaunchActivity is not None:
-                inst = _get_static_field(LaunchActivity, "instance")
-                if inst is not None:
-                    return inst
-        except Exception:
-            pass
-        try:
-            ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
-            AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
-            if ApplicationLoader is not None and AndroidUtilities is not None:
-                ctx = _get_static_field(ApplicationLoader, "applicationContext")
-                if ctx is not None:
-                    return AndroidUtilities.findActivity(ctx)
+            last_frag = get_last_fragment()
+            if last_frag is not None:
+                act = last_frag.getParentActivity()
+                if act is not None:
+                    return act
         except Exception:
             pass
         return None
@@ -1110,13 +1339,13 @@ class InAppVideoDocsPlugin(BasePlugin):
     def _register_download_observers(self):
         def _bind():
             try:
-                NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
-                UserConfig = find_class("org.telegram.messenger.UserConfig")
-                if NotificationCenter is None:
+                _JavaCache.ensure_loaded()
+                NC = _JavaCache.NotificationCenter
+                if NC is None:
                     return
 
-                loaded_id = _get_static_field(NotificationCenter, "fileLoaded")
-                failed_id = _get_static_field(NotificationCenter, "fileLoadFailed")
+                loaded_id = get_static_private_field(NC, "fileLoaded")
+                failed_id = get_static_private_field(NC, "fileLoadFailed")
                 if loaded_id is None:
                     return
 
@@ -1124,37 +1353,45 @@ class InAppVideoDocsPlugin(BasePlugin):
                 self.file_failed_event_id = int(failed_id) if failed_id is not None else None
 
                 max_accounts = 4
-                if UserConfig is not None:
-                    val = _get_static_field(UserConfig, "MAX_ACCOUNT_COUNT")
+                if _JavaCache.UserConfig is not None:
+                    val = get_static_private_field(_JavaCache.UserConfig, "MAX_ACCOUNT_COUNT")
                     if val is not None:
                         max_accounts = int(val)
 
+                self.nc_delegate = _create_file_load_delegate(self)
+                if self.nc_delegate is None:
+                    return
+                self.registered_accounts = []
+
                 for acc in range(max_accounts):
-                    delegate = _create_file_load_delegate(self, acc)
-                    if delegate is not None:
-                        nc = NotificationCenter.getInstance(_jint(acc))
-                        nc.addObserver(delegate, _jint(self.file_loaded_event_id))
+                    nc = get_notification_center(account=acc)
+                    if nc is not None:
+                        nc.addObserver(self.nc_delegate, _jint(self.file_loaded_event_id))
                         if self.file_failed_event_id is not None:
-                            nc.addObserver(delegate, _jint(self.file_failed_event_id))
-                        self.nc_delegates[acc] = delegate
+                            nc.addObserver(self.nc_delegate, _jint(self.file_failed_event_id))
+                        self.registered_accounts.append(acc)
             except Exception:
-                self.log(f"[InAppVideoDocs] Observer bind error:\n{traceback.format_exc()}")
+                self.logger.exception("Observer bind error")
 
         run_on_ui_thread(_bind)
 
     def _unregister_download_observers(self):
-        delegates = dict(self.nc_delegates)
-        self.nc_delegates.clear()
+        delegate = self.nc_delegate
+        accounts = list(self.registered_accounts)
         loaded_id = self.file_loaded_event_id
         failed_id = self.file_failed_event_id
+        self.nc_delegate = None
+        self.registered_accounts = []
+
+        if delegate is None or not accounts:
+            return
 
         def _unbind():
             try:
-                NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
-                if NotificationCenter is None:
-                    return
-                for acc, delegate in delegates.items():
-                    nc = NotificationCenter.getInstance(_jint(acc))
+                for acc in accounts:
+                    nc = get_notification_center(account=acc)
+                    if nc is None:
+                        continue
                     if loaded_id is not None:
                         nc.removeObserver(delegate, _jint(loaded_id))
                     if failed_id is not None:
@@ -1170,23 +1407,20 @@ class InAppVideoDocsPlugin(BasePlugin):
             return False
 
         account = int(getattr(message_obj, "currentAccount", 0))
-        FileLoader = find_class("org.telegram.messenger.FileLoader")
-        if FileLoader is None:
+        loader = get_file_loader(account=account)
+        if loader is None:
             return False
 
         attach_name = ""
         try:
-            raw_name = FileLoader.getAttachFileName(doc)
-            if raw_name is not None:
-                attach_name = str(raw_name)
+            if _JavaCache.FileLoader is not None:
+                raw_name = _JavaCache.FileLoader.getAttachFileName(doc)
+                if raw_name is not None:
+                    attach_name = str(raw_name)
         except Exception:
             pass
 
-        doc_id = 0
-        try:
-            doc_id = int(getattr(doc, "id", 0))
-        except Exception:
-            pass
+        doc_id = _get_doc_id(doc)
 
         msg_key = _msg_cache_key(message_obj)
         with self.lock:
@@ -1201,7 +1435,6 @@ class InAppVideoDocsPlugin(BasePlugin):
             }
 
         try:
-            loader = FileLoader.getInstance(_jint(account))
             try:
                 loader.loadFile(doc, message_obj, _jint(1), _jint(0))
             except Exception:
@@ -1215,11 +1448,31 @@ class InAppVideoDocsPlugin(BasePlugin):
                 self.waiting_downloads.pop(msg_key, None)
             return False
 
+    def _match_download_entry(self, entry, loaded_name):
+        if loaded_name:
+            if entry["attach_name"] and loaded_name == entry["attach_name"]:
+                return True
+            if entry["doc_id"] != 0 and str(entry["doc_id"]) in loaded_name:
+                return True
+        return False
+
     def _on_notification_received(self, event_id, account, args):
         if not self.waiting_downloads:
             return
 
-        loaded_name = str(args[0]) if args and len(args) >= 1 and args[0] is not None else ""
+        arg0 = None
+        arg1 = None
+        if args is not None:
+            try:
+                n_args = len(args)
+                if n_args >= 1:
+                    arg0 = args[0]
+                if n_args >= 2:
+                    arg1 = args[1]
+            except Exception:
+                pass
+
+        loaded_name = str(arg0) if arg0 is not None else ""
 
         if event_id == self.file_loaded_event_id:
             ready_entries = []
@@ -1227,23 +1480,15 @@ class InAppVideoDocsPlugin(BasePlugin):
                 for key, entry in list(self.waiting_downloads.items()):
                     if entry["account"] != account:
                         continue
-                    matched = False
-                    if loaded_name and entry["attach_name"] and loaded_name == entry["attach_name"]:
-                        matched = True
-                    elif loaded_name and entry["doc_id"] != 0 and str(entry["doc_id"]) in loaded_name:
-                        matched = True
-                    else:
-                        local_path = _resolve_msg_local_path(entry["msg"])
-                        if local_path:
-                            matched = True
-
-                    if matched:
-                        local_path = _resolve_msg_local_path(entry["msg"])
-                        if local_path:
-                            self.waiting_downloads.pop(key, None)
-                            ready_entries.append((key, entry, local_path))
+                    if not self._match_download_entry(entry, loaded_name):
+                        continue
+                    local_path = _resolve_msg_local_path(entry["msg"])
+                    if local_path:
+                        self.waiting_downloads.pop(key, None)
+                        ready_entries.append((key, entry, local_path))
 
             for key, entry, local_path in ready_entries:
+                self.hidden_messages.discard(key)
                 self.revealed_messages.add(key)
                 self._schedule_meta_extraction(
                     entry["msg"],
@@ -1255,15 +1500,13 @@ class InAppVideoDocsPlugin(BasePlugin):
                 )
 
         elif self.file_failed_event_id is not None and event_id == self.file_failed_event_id:
-            reason = int(args[1]) if args and len(args) >= 2 and args[1] is not None else 0
+            reason = _safe_parse_int(arg1, 0)
             failed_fragment = None
             with self.lock:
                 for key, entry in list(self.waiting_downloads.items()):
                     if entry["account"] != account:
                         continue
-                    if (loaded_name and entry["attach_name"] and loaded_name == entry["attach_name"]) or (
-                        loaded_name and entry["doc_id"] != 0 and str(entry["doc_id"]) in loaded_name
-                    ):
+                    if self._match_download_entry(entry, loaded_name):
                         self.waiting_downloads.pop(key, None)
                         failed_fragment = entry["fragment"]
             if failed_fragment is not None and reason != 1:
@@ -1285,7 +1528,7 @@ class InAppVideoDocsPlugin(BasePlugin):
                 self._put_cached_meta(local_path, meta)
             except Exception:
                 meta = None
-                self.log(f"[InAppVideoDocs] Worker error:\n{traceback.format_exc()}")
+                self.logger.exception("Metadata extraction worker error")
 
             with self.lock:
                 self.pending_paths.discard(local_path)
@@ -1295,7 +1538,7 @@ class InAppVideoDocsPlugin(BasePlugin):
                 return
 
             def _apply_on_ui():
-                show_badge = bool(self.get_setting("show_file_badge", False))
+                show_badge = self._show_file_badge
                 fragments_to_refresh = set()
                 touched_groups = {}
                 notified = False
@@ -1303,14 +1546,23 @@ class InAppVideoDocsPlugin(BasePlugin):
                 for m_obj, m_key, m_ext, m_name, frag, should_notify in tasks:
                     if m_key not in self.revealed_messages:
                         continue
-                    if _apply_video_transformation(m_obj, meta, m_ext, m_name, self.original_states, show_badge=show_badge):
+                    if _apply_video_transformation(
+                        m_obj,
+                        meta,
+                        m_ext,
+                        m_name,
+                        local_path,
+                        self.original_states,
+                        self.doc_local_paths,
+                        show_badge=show_badge,
+                    ):
                         gid = _get_msg_group_id(m_obj)
-                        if frag is not None:
+                        if frag is not None and _is_fragment_alive(frag):
                             fragments_to_refresh.add(frag)
                             if gid != 0:
                                 touched_groups.setdefault(frag, set()).add(gid)
                         else:
-                            cell = self.cell_refs.get(m_key)
+                            cell = self.cell_refs.pop(m_key, None)
                             if cell is not None:
                                 self._rebind_single_cell(cell, m_obj)
                         if should_notify and not notified:
@@ -1320,28 +1572,29 @@ class InAppVideoDocsPlugin(BasePlugin):
                 for frag in fragments_to_refresh:
                     gids = touched_groups.get(frag)
                     if gids:
-                        grouped_map = _get_field_value(frag, "groupedMessagesMap")
+                        grouped_map = get_private_field(frag, "groupedMessagesMap")
                         if grouped_map is not None:
                             for gid in gids:
                                 try:
                                     grp = grouped_map.get(_jlong(gid))
                                     if grp is not None:
-                                        _recalculate_group_for_videos(grouped_map, gid, grp, self.log)
+                                        _recalculate_group_for_videos(
+                                            grouped_map, gid, grp, self.detached_groups, self.logger
+                                        )
                                 except Exception:
                                     pass
                     self._refresh_chat_ui(frag)
 
             run_on_ui_thread(_apply_on_ui)
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        run_on_queue(_worker, PLUGINS_QUEUE)
 
     def _rebind_single_cell(self, cell, message_obj):
         try:
             if not hasattr(cell, "getMessageObject") or not hasattr(cell, "setMessageObject"):
                 return
             cur_msg = cell.getMessageObject()
-            if cur_msg is None or int(cur_msg.getId()) != int(message_obj.getId()):
+            if cur_msg is None or _msg_cache_key(cur_msg) != _msg_cache_key(message_obj):
                 return
             p_bot = _jbool(cell.isPinnedBottom()) if hasattr(cell, "isPinnedBottom") else _jbool(False)
             p_top = _jbool(cell.isPinnedTop()) if hasattr(cell, "isPinnedTop") else _jbool(False)
@@ -1363,7 +1616,7 @@ class InAppVideoDocsPlugin(BasePlugin):
         if fragment is None:
             return []
 
-        msgs_list = _get_field_value(fragment, "messages")
+        msgs_list = get_private_field(fragment, "messages")
         if msgs_list is not None:
             try:
                 for i in range(msgs_list.size()):
@@ -1376,7 +1629,7 @@ class InAppVideoDocsPlugin(BasePlugin):
         chat_list = (
             fragment.getChatListView()
             if hasattr(fragment, "getChatListView")
-            else _get_field_value(fragment, "chatListView")
+            else get_private_field(fragment, "chatListView")
         )
         if chat_list is not None:
             for i in range(chat_list.getChildCount()):
@@ -1389,7 +1642,7 @@ class InAppVideoDocsPlugin(BasePlugin):
         return list(collected.values())
 
     def _split_video_candidates(self, candidates):
-        allow_ts = bool(self.get_setting("allow_ts", True))
+        allow_ts = self._allow_ts
         cached = []
         uncached = []
         uncached_bytes = 0
@@ -1417,11 +1670,12 @@ class InAppVideoDocsPlugin(BasePlugin):
         immediate_count = 0
         queued_count = 0
         download_count = 0
+        matched_count = 0
         touched_group_ids = set()
 
-        allow_ts = bool(self.get_setting("allow_ts", True))
-        show_badge = bool(self.get_setting("show_file_badge", False))
-        auto_download = allow_download and bool(self.get_setting("auto_download", True))
+        allow_ts = self._allow_ts
+        show_badge = self._show_file_badge
+        auto_download = allow_download and self._auto_download
 
         for msg in candidates:
             if msg is None:
@@ -1431,18 +1685,30 @@ class InAppVideoDocsPlugin(BasePlugin):
             if not is_candidate:
                 continue
 
+            matched_count += 1
+            msg_key = _msg_cache_key(msg)
+            self.hidden_messages.discard(msg_key)
+
             local_path = _resolve_msg_local_path(msg)
             if not local_path:
                 if auto_download and self._start_file_download(msg, matched_ext, file_name, fragment):
                     download_count += 1
                 continue
 
-            msg_key = _msg_cache_key(msg)
             self.revealed_messages.add(msg_key)
 
             meta = self._get_cached_meta(local_path)
             if meta is not None:
-                if _apply_video_transformation(msg, meta, matched_ext, file_name, self.original_states, show_badge=show_badge):
+                if _apply_video_transformation(
+                    msg,
+                    meta,
+                    matched_ext,
+                    file_name,
+                    local_path,
+                    self.original_states,
+                    self.doc_local_paths,
+                    show_badge=show_badge,
+                ):
                     immediate_count += 1
                     gid = _get_msg_group_id(msg)
                     if gid != 0:
@@ -1451,20 +1717,22 @@ class InAppVideoDocsPlugin(BasePlugin):
                 queued_count += 1
                 self._schedule_meta_extraction(msg, local_path, matched_ext, file_name, fragment)
 
-        grouped_map = _get_field_value(fragment, "groupedMessagesMap")
+        grouped_map = get_private_field(fragment, "groupedMessagesMap")
         if grouped_map is not None and touched_group_ids:
             for gid in touched_group_ids:
                 try:
                     grp = grouped_map.get(_jlong(gid))
                     if grp is not None:
-                        _recalculate_group_for_videos(grouped_map, gid, grp, self.log)
-                except Exception as e:
-                    self.log(f"[InAppVideoDocs] groupedMessagesMap lookup error: {e}")
+                        _recalculate_group_for_videos(
+                            grouped_map, gid, grp, self.detached_groups, self.logger
+                        )
+                except Exception:
+                    self.logger.exception("groupedMessagesMap lookup error")
 
-        return immediate_count, queued_count, download_count
+        return immediate_count, queued_count, download_count, matched_count
 
     def _execute_reveal(self, candidates, fragment, allow_download, is_single=False):
-        immediate, queued, downloading = self._convert_message_list(
+        immediate, queued, downloading, matched = self._convert_message_list(
             candidates, fragment, allow_download=allow_download
         )
         if immediate > 0:
@@ -1486,7 +1754,10 @@ class InAppVideoDocsPlugin(BasePlugin):
                 else:
                     _notify(fragment, f"Загрузка видеофайлов: {downloading}...", "info")
             elif is_single:
-                _notify(fragment, "Сначала скачайте видеофайл", "info")
+                if matched == 0:
+                    _notify(fragment, "Формат файла отключён в настройках или не поддерживается", "info")
+                else:
+                    _notify(fragment, "Сначала скачайте видеофайл", "info")
             else:
                 _notify(fragment, "Новых скачанных видеофайлов не найдено", "info")
 
@@ -1503,74 +1774,27 @@ class InAppVideoDocsPlugin(BasePlugin):
             "Загрузить и показать их все?"
         )
 
-        def _on_download_all(*args):
-            try:
-                if args and hasattr(args[0], "dismiss"):
-                    args[0].dismiss()
-            except Exception:
-                pass
+        def _on_download_all(builder, _which):
+            builder.dismiss()
             self._execute_reveal(cached_msgs + uncached_msgs, fragment, allow_download=True, is_single=is_single)
 
-        def _on_cached_only(*args):
-            try:
-                if args and hasattr(args[0], "dismiss"):
-                    args[0].dismiss()
-            except Exception:
-                pass
+        def _on_cached_only(builder, _which):
+            builder.dismiss()
             self._execute_reveal(cached_msgs, fragment, allow_download=False, is_single=is_single)
 
-        def _on_cancel(*args):
-            try:
-                if args and hasattr(args[0], "dismiss"):
-                    args[0].dismiss()
-            except Exception:
-                pass
+        def _on_cancel(builder, _which):
+            builder.dismiss()
 
         def _open_dialog():
-            if AlertDialogBuilder is not None:
-                try:
-                    builder = AlertDialogBuilder(activity)
-                    builder.set_title(title_text)
-                    builder.set_message(body_text)
-                    builder.set_positive_button("Скачать все", _on_download_all)
-                    if cached_msgs:
-                        builder.set_neutral_button("Только скачанные", _on_cached_only)
-                    builder.set_negative_button("Отмена", _on_cancel)
-                    builder.show()
-                    return
-                except Exception:
-                    pass
-
             try:
-                from java import dynamic_proxy
-                AlertBuilder = find_class("org.telegram.ui.ActionBar.AlertDialog$Builder")
-                OnClickListener = find_class("android.content.DialogInterface$OnClickListener")
-                if AlertBuilder is None or OnClickListener is None:
-                    self._execute_reveal(cached_msgs + uncached_msgs, fragment, allow_download=True, is_single=is_single)
-                    return
-
-                class ClickProxy(dynamic_proxy(OnClickListener)):
-                    def __init__(self, handler):
-                        super().__init__()
-                        self.handler = handler
-
-                    def onClick(self, dialog, which):
-                        self.handler(dialog, which)
-
-                pos_proxy = ClickProxy(_on_download_all)
-                neg_proxy = ClickProxy(_on_cancel)
-                self.dialog_proxies.extend([pos_proxy, neg_proxy])
-
-                b = AlertBuilder(activity)
-                b.setTitle(title_text)
-                b.setMessage(body_text)
-                b.setPositiveButton("Скачать все", pos_proxy)
+                builder = AlertDialogBuilder(activity)
+                builder.set_title(title_text)
+                builder.set_message(body_text)
+                builder.set_positive_button("Скачать все", _on_download_all)
                 if cached_msgs:
-                    neu_proxy = ClickProxy(_on_cached_only)
-                    self.dialog_proxies.append(neu_proxy)
-                    b.setNeutralButton("Только скачанные", neu_proxy)
-                b.setNegativeButton("Отмена", neg_proxy)
-                b.show()
+                    builder.set_neutral_button("Только скачанные", _on_cached_only)
+                builder.set_negative_button("Отмена", _on_cancel)
+                builder.show()
             except Exception:
                 self._execute_reveal(cached_msgs + uncached_msgs, fragment, allow_download=True, is_single=is_single)
 
@@ -1588,33 +1812,39 @@ class InAppVideoDocsPlugin(BasePlugin):
                 continue
 
             self.revealed_messages.discard(key)
-            if _revert_video_transformation(msg, self.original_states):
+            self.hidden_messages.add(key)
+
+            saved = self.original_states.get(key)
+            orig_gid = saved.get("grouped_id", 0) if saved is not None else 0
+
+            if _revert_video_transformation(msg, self.original_states, self.doc_local_paths):
                 reverted_count += 1
-                gid = _get_msg_group_id(msg)
+                gid = _get_msg_group_id(msg) or orig_gid
                 if gid != 0:
                     reverted_by_gid.setdefault(gid, []).append(msg)
 
-        grouped_map = _get_field_value(fragment, "groupedMessagesMap")
-        if grouped_map is not None and reverted_by_gid:
+        grouped_map = get_private_field(fragment, "groupedMessagesMap")
+        if reverted_by_gid:
             for gid, msgs in reverted_by_gid.items():
                 try:
-                    grp = grouped_map.get(_jlong(gid))
-                    if grp is not None:
-                        _restore_group_as_documents(grp, msgs, self.log)
-                except Exception as e:
-                    self.log(f"[InAppVideoDocs] Group restore lookup error: {e}")
+                    grp = grouped_map.get(_jlong(gid)) if grouped_map is not None else None
+                    _restore_group_as_documents(
+                        grouped_map, gid, grp, msgs, self.detached_groups, self.logger
+                    )
+                except Exception:
+                    self.logger.exception("Group restore lookup error")
 
         return reverted_count
 
     def _refresh_chat_ui(self, fragment):
-        if fragment is None:
+        if not _is_fragment_alive(fragment):
             return
         try:
-            grouped_map = _get_field_value(fragment, "groupedMessagesMap")
+            grouped_map = get_private_field(fragment, "groupedMessagesMap")
             chat_list = (
                 fragment.getChatListView()
                 if hasattr(fragment, "getChatListView")
-                else _get_field_value(fragment, "chatListView")
+                else get_private_field(fragment, "chatListView")
             )
             if chat_list is None:
                 return
@@ -1657,7 +1887,7 @@ class InAppVideoDocsPlugin(BasePlugin):
 
             chat_list.invalidateViews()
         except Exception:
-            self.log(f"[InAppVideoDocs] Refresh UI error:\n{traceback.format_exc()}")
+            self.logger.exception("Refresh UI error")
 
     def on_reveal_chat_videos(self, context):
         try:
@@ -1666,8 +1896,7 @@ class InAppVideoDocsPlugin(BasePlugin):
                 return
 
             candidates = self._collect_chat_messages(fragment)
-            auto_download = bool(self.get_setting("auto_download", True))
-            if not auto_download:
+            if not self._auto_download:
                 self._execute_reveal(candidates, fragment, allow_download=False, is_single=False)
                 return
 
@@ -1680,7 +1909,7 @@ class InAppVideoDocsPlugin(BasePlugin):
             else:
                 self._execute_reveal(candidates, fragment, allow_download=True, is_single=False)
         except Exception:
-            self.log(f"[InAppVideoDocs] on_reveal_chat_videos error:\n{traceback.format_exc()}")
+            self.logger.exception("on_reveal_chat_videos error")
 
     def on_hide_chat_videos(self, context):
         try:
@@ -1693,13 +1922,14 @@ class InAppVideoDocsPlugin(BasePlugin):
 
             try:
                 dialog_id = int(fragment.getDialogId())
-                self.revealed_messages = {k for k in self.revealed_messages if k[1] != dialog_id}
-                stale_keys = [k for k in self.original_states.keys() if k[1] == dialog_id]
-                for k in stale_keys:
+                for k in list(self.revealed_messages):
+                    if k[1] == dialog_id:
+                        self.revealed_messages.discard(k)
+                        self.hidden_messages.add(k)
+                for k in [k for k in self.original_states.keys() if k[1] == dialog_id]:
                     self.original_states.pop(k, None)
                 with self.lock:
-                    wait_keys = [k for k in self.waiting_downloads.keys() if k[1] == dialog_id]
-                    for k in wait_keys:
+                    for k in [k for k in self.waiting_downloads.keys() if k[1] == dialog_id]:
                         self.waiting_downloads.pop(k, None)
             except Exception:
                 pass
@@ -1711,7 +1941,7 @@ class InAppVideoDocsPlugin(BasePlugin):
             else:
                 _notify(fragment, "Нет открытых видеофайлов для скрытия", "info")
         except Exception:
-            self.log(f"[InAppVideoDocs] on_hide_chat_videos error:\n{traceback.format_exc()}")
+            self.logger.exception("on_hide_chat_videos error")
 
     def on_reveal_single_message(self, context):
         try:
@@ -1723,7 +1953,7 @@ class InAppVideoDocsPlugin(BasePlugin):
             targets = [msg]
             gid = _get_msg_group_id(msg)
             if gid != 0 and fragment is not None:
-                grouped_map = _get_field_value(fragment, "groupedMessagesMap")
+                grouped_map = get_private_field(fragment, "groupedMessagesMap")
                 if grouped_map is not None:
                     try:
                         grp = grouped_map.get(_jlong(gid))
@@ -1732,8 +1962,7 @@ class InAppVideoDocsPlugin(BasePlugin):
                     except Exception:
                         pass
 
-            auto_download = bool(self.get_setting("auto_download", True))
-            if auto_download and len(targets) > 1:
+            if self._auto_download and len(targets) > 1:
                 cached_msgs, uncached_msgs, uncached_bytes = self._split_video_candidates(targets)
                 threshold = self._get_download_threshold()
                 if len(uncached_msgs) >= threshold:
@@ -1744,7 +1973,7 @@ class InAppVideoDocsPlugin(BasePlugin):
 
             self._execute_reveal(targets, fragment, allow_download=True, is_single=True)
         except Exception:
-            self.log(f"[InAppVideoDocs] on_reveal_single_message error:\n{traceback.format_exc()}")
+            self.logger.exception("on_reveal_single_message error")
 
     def on_hide_single_message(self, context):
         try:
@@ -1756,7 +1985,7 @@ class InAppVideoDocsPlugin(BasePlugin):
             targets = [msg]
             gid = _get_msg_group_id(msg)
             if gid != 0 and fragment is not None:
-                grouped_map = _get_field_value(fragment, "groupedMessagesMap")
+                grouped_map = get_private_field(fragment, "groupedMessagesMap")
                 if grouped_map is not None:
                     try:
                         grp = grouped_map.get(_jlong(gid))
@@ -1771,4 +2000,4 @@ class InAppVideoDocsPlugin(BasePlugin):
             if count == 0:
                 _notify(fragment, "Этот файл не был открыт из документа", "info")
         except Exception:
-            self.log(f"[InAppVideoDocs] on_hide_single_message error:\n{traceback.format_exc()}")
+            self.logger.exception("on_hide_single_message error")
