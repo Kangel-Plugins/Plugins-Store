@@ -1,0 +1,1080 @@
+__id__ = "draft_shelf"
+__name__ = "Второй черновик"
+__description__ = "Добавляет отдельную строку для черновиков в каждом чате или теме. Чтобы включить функцию, активируйте «Второй черновик» в разделе «Плагины». Откройте чат и потяните вверх за полоску над полем сообщения. Нажмите карандаш, чтобы редактировать черновик. Кнопка со стрелками меняет местами текст черновика и текст сообщения, а её удержание создаёт новый черновик."
+__author__ = "@rz3nx | @Sub5Plugins"
+__version__ = "66.77.4"
+__icon__ = "sub5plugins/0"
+__app_version__ = ">=13.1.1"
+
+import json
+import os
+import sqlite3
+import time
+from contextlib import closing
+
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import get_private_field
+from java import dynamic_proxy, jclass, jarray, jint
+
+
+def rich_parts(payload):
+    if isinstance(payload, dict):
+        return payload["text"], payload["count"], payload["entities"]
+    return payload
+
+
+def frame_edge(text):
+    if not text.startswith("x\nx\n") or not text.endswith("\nx\nx"):
+        return 0
+    left, right = 0, len(text)
+    while right - left >= 4 and text.startswith("x\n", left) and text.endswith("\nx", left, right):
+        left += 2
+        right -= 2
+    return left
+
+
+def repair_frame(value):
+    rich = isinstance(value, bytes)
+    if rich:
+        text, count, encoded = rich_parts(json.loads(value))
+    else:
+        text = value
+    left = frame_edge(text)
+    if not left:
+        return value
+    right = len(text) - left
+    core = text[left:right]
+    if core == "п":
+        return ""
+    if not rich:
+        return core
+    units = len(core.encode("utf-16-le")) // 2
+    codec = jclass("org.telegram.messenger.Utilities")
+    data = jclass("org.telegram.tgnet.SerializedData")
+    entity_type = jclass("org.telegram.tgnet.TLRPC$MessageEntity")
+    src = data(codec.hexToBytes(encoded))
+    dst = data()
+    kept = 0
+    try:
+        for _ in range(count):
+            item = entity_type.TLdeserialize(src, src.readInt32(True), True)
+            start = max(0, item.offset - left)
+            end = min(units, item.offset + item.length - left)
+            if start < end:
+                item.offset, item.length = start, end - start
+                item.serializeToStream(dst)
+                kept += 1
+        if not kept:
+            return core
+        return json.dumps([core, kept, str(codec.bytesToHex(dst.toByteArray()))], ensure_ascii=False).encode()
+    finally:
+        src.cleanup()
+        dst.cleanup()
+
+
+class Shelf:
+    def __init__(self, path, key):
+        self.path, self.key = path, key
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, chat TEXT NOT NULL, stamp INTEGER NOT NULL, body TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS recent ON notes(chat,id)")
+
+            db.execute("CREATE TABLE IF NOT EXISTS empty_shelf (chat TEXT PRIMARY KEY)")
+
+            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                    rows = db.execute("SELECT id,chat,body FROM notes WHERE typeof(body)='blob' OR substr(body,1,4)=?", ("x\nx\n",))
+                    for ident, chat, body in rows.fetchall():
+                        try:
+                            repaired = repair_frame(body)
+                        except Exception:
+                            continue
+                        if repaired != body:
+                            db.execute("CREATE TABLE IF NOT EXISTS legacy_frames (id INTEGER PRIMARY KEY, chat TEXT, body BLOB)")
+                            db.execute("INSERT INTO legacy_frames VALUES(?,?,?)", (ident, chat, body))
+                            if repaired:
+                                db.execute("UPDATE notes SET body=? WHERE id=?", (repaired, ident))
+                            else:
+                                db.execute("DELETE FROM notes WHERE id=?", (ident,))
+                    db.execute("PRAGMA user_version=1")
+
+            if db.execute("PRAGMA user_version").fetchone()[0] == 1:
+                archive = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_frames'").fetchone()
+                if archive:
+                    pairs = db.execute("SELECT n.id,n.chat,n.body,l.body FROM notes n JOIN legacy_frames l ON l.id=n.id AND l.chat=n.chat").fetchall()
+                    for ident, chat, current, old in pairs:
+                        try:
+                            text = rich_parts(json.loads(current))[0] if isinstance(current, bytes) else current
+                            original = rich_parts(json.loads(old))[0] if isinstance(old, bytes) else old
+                            edge = frame_edge(original)
+                            if text == "п" and edge and original[edge:-edge] == "п":
+                                db.execute("DELETE FROM notes WHERE id=? AND chat=? AND body=?", (ident, chat, current))
+                        except (ValueError, TypeError, KeyError):
+                            continue
+                db.execute("PRAGMA user_version=2")
+
+    def rows(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("SELECT id,body FROM notes WHERE chat=? ORDER BY id DESC", (self.key,)).fetchall()
+
+    def latest(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("SELECT id,body FROM notes WHERE chat=? AND chat NOT IN (SELECT chat FROM empty_shelf WHERE chat=?) ORDER BY id DESC LIMIT 1", (self.key, self.key)).fetchall()
+
+    def put(self, ident, body, remember_empty=False):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            if body:
+                db.execute("DELETE FROM empty_shelf WHERE chat=?", (self.key,))
+            elif remember_empty:
+                db.execute("INSERT OR IGNORE INTO empty_shelf(chat) VALUES(?)", (self.key,))
+            if ident is None:
+                if not body:
+                    return None
+                return db.execute("INSERT INTO notes(chat,stamp,body) VALUES(?,?,?)",
+                                  (self.key, int(time.time()), body)).lastrowid
+            if not body:
+                db.execute("DELETE FROM notes WHERE id=? AND chat=?", (ident, self.key))
+                return None
+            db.execute("UPDATE notes SET body=? WHERE id=? AND chat=?", (body, ident, self.key))
+            return ident
+
+
+def chat_key(frag):
+    return "%s:%s:%s:%s" % (frag.getUserConfig().getClientUserId(), frag.getDialogId(),
+                              frag.getThreadId(), frag.getTopicId())
+
+
+class ChatHook(MethodHook):
+    def __init__(self, owner, leaving):
+        super().__init__()
+        self.owner, self.leaving = owner, leaving
+
+    def after_hooked_method(self, param):
+        frag = param.thisObject
+        if self.leaving:
+            self.owner.leave(frag)
+        else:
+            self.owner.attach(frag)
+
+
+class RestoredDraftHook(MethodHook):
+    def after_hooked_method(self, param):
+        if len(param.args) != 2:
+            return
+        frag = param.thisObject
+        enter = frag.getChatActivityEnterView()
+        if enter is None or enter.isEditingMessage() or enter.isRichDraftActive():
+            return
+        field = enter.getEditField()
+        if field is None:
+            return
+        editable = field.getText()
+        if editable is None or editable.length() < 8 or editable.charAt(0) != "x":
+            return
+        text = str(editable.toString())
+        edge = frame_edge(text)
+        if not edge:
+            return
+        draft = frag.getMediaDataController().getDraft(frag.getDialogId(), frag.getDraftThreadId())
+        if draft is None or str(draft.message) != text:
+            return
+        core = editable.subSequence(edge, editable.length() - edge)
+        enter.setFieldText("" if str(core) == "п" else core)
+        frag.saveDraft()
+
+
+class ComposerLayoutHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        enter = param.thisObject
+        frag = enter.getParentFragment()
+        if frag and enter.isAttachedToWindow() and not frag.isPaused():
+            bar = self.owner.bars.get(frag.hashCode())
+            if not bar or bar.enter != enter or bar.field != enter.getEditField():
+                self.owner.attach(frag)
+
+
+class EmojiFocus(dynamic_proxy(jclass("android.view.View$OnFocusChangeListener"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+
+    def onFocusChange(self, view, focused):
+        if focused and self.bar.open:
+            self.bar.enter.overrideEditTextView(view)
+        elif not focused:
+            self.bar.release_emoji()
+
+
+class PaddingHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def before_hooked_method(self, param):
+        for bar in self.owner.bars.values():
+            if param.thisObject == bar.paddings:
+                bar.base_bottom = float(param.args[1])
+                if bar.reserved:
+                    param.args[1] = jclass("java.lang.Float")(bar.base_bottom + bar.reserved)
+                break
+
+
+class EnterKey(dynamic_proxy(jclass("android.view.View$OnKeyListener"))):
+    def onKey(self, view, code, event):
+        return code in (66, 160)
+
+
+class EnterAction(dynamic_proxy(jclass("android.widget.TextView$OnEditorActionListener"))):
+    def onEditorAction(self, view, action, event):
+        return event is None or event.getKeyCode() in (66, 160)
+
+
+class EnterFilter(dynamic_proxy(jclass("android.text.InputFilter"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+
+    def filter(self, source, start, end, dest, dstart, dend):
+        if not self.bar.muted and end > start and end-start <= 2:
+            piece = str(source.subSequence(start, end)) if not isinstance(source, str) else source[start:end]
+            if piece in ("\n", "\r", "\r\n"):
+                return dest.subSequence(dstart, dend) if dend > dstart else ""
+        return None
+
+
+class DraftShelfPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.active = True
+        self.bars = {}
+        self.hooks = []
+        loader = jclass("org.telegram.messenger.ApplicationLoader").applicationContext.getClassLoader()
+        def host_class(name):
+            return jclass("java.lang.Class").forName(name, False, loader)
+
+        animator = host_class("org.telegram.ui.Components.chat.ChatListViewPaddingsAnimator")
+        self.hooks.extend(self.hook_all_methods(animator, "setPaddings", PaddingHook(self)) or [])
+        chat = host_class("org.telegram.ui.ChatActivity")
+        self.hooks.extend(self.hook_all_methods(chat, "applyDraftMaybe", RestoredDraftHook()) or [])
+        for method in ("createView", "onResume", "onBecomeFullyVisible", "updateTopicButtons", "onPause", "onFragmentDestroy"):
+            hook = ChatHook(self, method in ("onPause", "onFragmentDestroy"))
+            self.hooks.extend(self.hook_all_methods(chat, method, hook) or [])
+        composer = host_class("org.telegram.ui.Components.ChatActivityEnterView")
+        self.hooks.extend(self.hook_all_methods(composer, "onLayout", ComposerLayoutHook(self)) or [])
+        run_on_ui_thread(lambda: self.attach(get_last_fragment()))
+
+    def attach(self, frag):
+        if not self.active or frag is None or not hasattr(frag, "getChatActivityEnterView"):
+            return
+        try:
+            enter = frag.getChatActivityEnterView()
+            if not enter or not enter.getEditField() or not frag.getParentActivity():
+                return
+            slot = frag.hashCode()
+            bar = self.bars.get(slot)
+            if bar and bar.enter == enter and bar.field == enter.getEditField():
+                tabs = get_private_field(frag, "topicsTabs")
+                if bar.topic_tabs != tabs:
+                    bar.shift_topic_strip(0)
+                    bar.topic_tabs = tabs
+                bar.sync_scope()
+                return
+            self.leave(frag)
+            if frag.getCurrentEncryptedChat() is not None or not frag.getDialogId():
+                return
+            bar = Composer(frag, enter)
+            self.bars[slot] = bar
+            bar.mount()
+        except Exception as exc:
+            self.leave(frag)
+            jclass("android.util.Log").e("DraftShelf", type(exc).__name__)
+
+    def leave(self, frag=None):
+        slots = list(self.bars) if frag is None else [frag.hashCode()]
+        for slot in slots:
+            bar = self.bars.pop(slot, None)
+            if bar:
+                bar.detach()
+
+    def on_plugin_unload(self):
+        self.active = False
+        for hook in self.hooks:
+            hook.unhook()
+        run_on_ui_thread(self.leave)
+
+
+class LayoutListener(dynamic_proxy(jclass("android.view.ViewTreeObserver$OnPreDrawListener"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+
+    def onPreDraw(self):
+        self.bar.position()
+        return True
+
+
+class Watcher(dynamic_proxy(jclass("android.text.TextWatcher"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+
+    def onTextChanged(self, s, start, before, count):
+        pass
+
+    def afterTextChanged(self, editable):
+        empty = editable.length() == 0
+        if empty != self.bar.empty:
+            self.bar.empty = empty
+            hint = self.bar.placeholder
+            hint.animate().cancel()
+            hint.setVisibility(0 if empty else 8)
+            if empty and self.bar.open:
+                hint.setAlpha(0.0)
+                hint.setTranslationY(float(self.bar.dp(3)))
+                hint.animate().alpha(1.0).translationY(0.0).setDuration(150).start()
+            else:
+                hint.setAlpha(1.0)
+                hint.setTranslationY(0.0)
+        if not self.bar.muted:
+            self.bar.edit.removeCallbacks(self.bar.autosave)
+            self.bar.edit.postDelayed(self.bar.autosave, 450)
+
+
+class Autosave(dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+
+    def run(self):
+        try:
+            if self.bar.open and not self.bar.sync_scope():
+                self.bar.save_editor()
+        except Exception:
+            self.bar.edit.setError(label("SaveError"))
+
+
+LABELS = {
+    "Draft": ("Черновик", "Draft"),
+    "Edit": ("Редактировать черновик", "Edit draft"),
+    "Clear": ("Очистить", "Clear"),
+    "Cut": ("Вырезать", "Cut"),
+    "Swap": ("Обменять тексты. Удерживать — новый черновик.", "Swap texts. Hold for a new draft."),
+    "Grip": ("Открыть или свернуть вторую строку", "Open or close the second input"),
+    "SaveError": ("Не удалось сохранить черновик", "Could not save draft"),
+    "OpenError": ("Не удалось открыть черновик", "Could not open draft"),
+    "Busy": ("Заверши запись или редактирование перед переносом", "Finish recording or editing before swapping"),
+    "Rejected": ("Поле не приняло текст. Копия осталась в черновиках.", "Text was not accepted. A copy remains in drafts."),
+}
+
+
+def label(key):
+    locale = jclass("org.telegram.messenger.LocaleController").getInstance().getCurrentLocale()
+    return LABELS[key][0 if str(locale.getLanguage()).lower() == "ru" else 1]
+
+
+class PencilMenu(dynamic_proxy(jclass("android.view.View$OnTouchListener"), jclass("android.view.View$OnLongClickListener"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+        self.popup = None
+        self.selected = -1
+
+    def close(self):
+        if self.popup is not None:
+            self.popup.dismiss()
+            self.popup = None
+            self.selected = -1
+
+    def onLongClick(self, view):
+        b = self.bar
+        if not b.open or b.sync_scope():
+            return True
+        self.close()
+        self.box = jclass("android.widget.LinearLayout")(b.ctx)
+        self.box.setOrientation(1)
+        panel = b.color("chat_messagePanelBackground")
+        tint = (panel & 0xffffff) | (min((panel >> 24) & 255, 196) << 24)
+        if tint >= 0x80000000:
+            tint -= 0x100000000
+        outline = (b.field.getCurrentTextColor() & 0xffffff) | 0x26000000
+        self.box.setBackground(b.shape(tint, 18, outline))
+        self.box.setPadding(0, 0, 0, 0)
+        self.labels = []
+        for key in ("Clear", "Cut"):
+            if key == "Clear":
+                row = b.icon("msg_delete", b.field.getCurrentTextColor())
+            else:
+                row = jclass("android.widget.ImageView")(b.ctx)
+                attrs = b.ctx.obtainStyledAttributes(jarray(jint)([jclass("android.R$attr").actionModeCutDrawable]))
+                try:
+                    drawable = attrs.getDrawable(0)
+                finally:
+                    attrs.recycle()
+                if drawable is None:
+                    row = b.icon("media_magic_cut", b.field.getCurrentTextColor())
+                else:
+                    row.setImageDrawable(drawable)
+                    row.setColorFilter(b.field.getCurrentTextColor())
+                    row.setScaleType(jclass("android.widget.ImageView$ScaleType").FIT_CENTER)
+            pad = b.dp(12)
+            row.setPadding(pad, pad, pad, pad)
+            row.setContentDescription(label(key))
+            self.box.addView(row, -1, b.dp(48))
+            self.labels.append(row)
+        self.popup = jclass("android.widget.PopupWindow")(self.box, b.dp(48), b.dp(48)*2, False)
+        self.popup.setAnimationStyle(jclass("android.R$style").Animation_Dialog)
+        self.popup.setTouchable(False)
+        self.popup.setBackgroundDrawable(jclass("android.graphics.drawable.ColorDrawable")(0))
+        xy = jarray(jint)(2)
+        view.getLocationInWindow(xy)
+        self.popup.showAtLocation(view, 51, max(0, xy[0]+(view.getWidth()-b.dp(48))//2), max(0, xy[1]-2*b.dp(48)))
+        for i, icon in enumerate(self.labels):
+            icon.setAlpha(0.0)
+            icon.setTranslationY(float(b.dp(8)))
+            icon.animate().alpha(1.0).translationY(0.0).setStartDelay(35*(1-i)).setDuration(150).start()
+        self.scope = b.key
+        view.getParent().requestDisallowInterceptTouchEvent(True)
+        return True
+
+    def onTouch(self, view, event):
+        if self.popup is None:
+            return False
+        action = event.getActionMasked()
+        if action not in (1, 2, 3, 5):
+            return True
+        xy = jarray(jint)(2)
+        self.box.getLocationOnScreen(xy)
+        x, y = event.getRawX()-xy[0], event.getRawY()-xy[1]
+        index = int(y // self.bar.dp(48)) if 0 <= x < self.box.getWidth() and 0 <= y < self.box.getHeight() else -1
+        if index != self.selected:
+            for i, row in enumerate(self.labels):
+                scale = 1.09 if i == index else 1.0
+                row.animate().scaleX(scale).scaleY(scale).setStartDelay(0).setDuration(110).start()
+                row.setBackground(self.bar.shape((self.bar.field.getCurrentTextColor() & 0xffffff) | 0x33000000, 12) if i == index else None)
+            self.selected = index
+        if action != 2:
+            self.close()
+            view.setPressed(False)
+            view.getParent().requestDisallowInterceptTouchEvent(False)
+            if action == 1 and 0 <= index < 2 and self.bar.open and not self.bar.sync_scope() and self.bar.key == self.scope:
+                self.bar.pencil_action(index)
+        return True
+
+
+class HoldAction(dynamic_proxy(jclass("android.view.View$OnLongClickListener"))):
+    def __init__(self, bar, action):
+        super().__init__()
+        self.bar, self.action = bar, action
+
+    def onLongClick(self, view):
+        try:
+            self.action()
+        except Exception:
+            self.bar.edit.setError(label("OpenError"))
+        return True
+
+
+class ShelfMotion(dynamic_proxy(jclass("android.animation.ValueAnimator$AnimatorUpdateListener"))):
+    def __init__(self, bar, start, end):
+        super().__init__()
+        self.bar, self.start, self.end = bar, start, end
+
+    def onAnimationUpdate(self, animator):
+        fraction = animator.getAnimatedFraction()
+        self.bar.reveal(round(self.start + (self.end - self.start) * fraction))
+
+
+def tap_feedback(view, turn=0):
+    view.animate().cancel()
+    view.setScaleX(0.88)
+    view.setScaleY(0.88)
+    view.setRotation(float(turn))
+    view.animate().scaleX(1.0).scaleY(1.0).rotation(0.0).setDuration(180).start()
+
+
+class Drag(dynamic_proxy(jclass("android.view.View$OnTouchListener"))):
+    def __init__(self, bar):
+        super().__init__()
+        self.bar = bar
+        self.tracking = False
+
+    def onTouch(self, view, event):
+        bar = self.bar
+        action = event.getActionMasked()
+        if action == 0:
+            self.y, self.x = event.getRawY(), event.getRawX()
+            bar.stop_motion()
+            self.start = bar.amount
+            self.dragging = False
+            self.tracking = True
+            view.getParent().requestDisallowInterceptTouchEvent(True)
+            return True
+        if not self.tracking:
+            return False
+        dy = self.y - event.getRawY()
+        if action == 2:
+            if abs(dy) > bar.slop and abs(dy) > abs(self.x-event.getRawX()):
+                self.dragging = True
+            if self.dragging:
+                bar.reveal(min(bar.height, max(0, self.start+dy)))
+            return True
+        if action in (1, 3, 5):
+            self.tracking = False
+            view.getParent().requestDisallowInterceptTouchEvent(False)
+            if action == 1 and self.dragging:
+                target = (dy > bar.dp(15)) if not bar.open else (dy > -bar.dp(15))
+                bar.toggle(target)
+            elif action == 1 and abs(dy) <= bar.slop and abs(self.x-event.getRawX()) <= bar.slop:
+                view.performClick()
+            else:
+                bar.settle(bar.height if bar.open else 0)
+            return True
+        return True
+
+
+class Composer:
+    def __init__(self, frag, enter):
+        self.frag, self.enter, self.ctx = frag, enter, frag.getParentActivity()
+        self.host = get_private_field(frag, "chatInputViewsContainer")
+        self.messages = get_private_field(frag, "chatListView")
+        self.paddings = get_private_field(frag, "chatListViewPaddingsAnimator")
+        self.base_bottom = float(self.messages.getPaddingBottom())
+        self.reserved = 0
+        self.bubble = get_private_field(self.host, "blurredBackgroundDrawable")
+        self.anchor_xy = jarray(jint)(2)
+        self.host_xy = jarray(jint)(2)
+        self.amount = 0
+        self.motion = None
+        self.geometry = None
+        self.field = enter.getEditField()
+        self.tabs_position = jclass("org.telegram.ui.Components.TopicsTabsView$Position")
+        self.row_dp = 48
+        self.topic_shift = 0
+        self.topic_tabs = get_private_field(frag, "topicsTabs")
+        self.is_forum = (jclass("org.telegram.messenger.ChatObject").isForum(frag.getCurrentChat())
+                         or jclass("org.telegram.messenger.UserObject").isBotForum(frag.getCurrentUser())
+                         or self.topic_tabs is not None)
+        self.density = self.ctx.getResources().getDisplayMetrics().density
+        self.height = self.dp(56)
+        self.slop = jclass("android.view.ViewConfiguration").get(self.ctx).getScaledTouchSlop()
+        self.key = chat_key(frag)
+        self.store = Shelf(os.path.join(str(self.ctx.getNoBackupFilesDir().getAbsolutePath()), "draft_shelf_v1.sqlite"), self.key)
+        self.saved_note = None
+        self.ident = None
+        self.open = False
+        self.empty = True
+        self.muted = False
+        self.clicks = []
+        self.Frame = jclass("android.widget.FrameLayout")
+        self.LP = jclass("android.widget.FrameLayout$LayoutParams")
+        self.shell = self.Frame(self.ctx)
+        self.grip = self.Frame(self.ctx)
+        self.row = self.Frame(self.ctx)
+        self.edit = jclass("org.telegram.ui.Components.EditTextCaption")(self.ctx, frag.getResourceProvider())
+        self.layout = LayoutListener(self)
+        self.touch = Drag(self)
+        self.watcher = Watcher(self)
+        self.autosave = Autosave(self)
+        self.swapping = False
+
+    def dp(self, n):
+        return int(n*self.density+0.5)
+
+    def color(self, key):
+        return self.frag.getThemedColor(getattr(jclass("org.telegram.ui.ActionBar.Theme"), "key_"+key))
+
+    def shape(self, color, radius, line=0):
+        shape = jclass("android.graphics.drawable.GradientDrawable")()
+        shape.setColor(color)
+        shape.setCornerRadius(float(self.dp(radius)))
+        if line:
+            shape.setStroke(self.dp(1), line)
+        return shape
+
+    def click(self, view, fn):
+        listener = OnClickListener(lambda _: fn())
+        self.clicks.append(listener)
+        view.setOnClickListener(listener)
+
+    def icon(self, resource, color):
+        resources = self.ctx.getResources()
+        res_id = getattr(jclass("org.telegram.messenger.R$drawable"), resource, 0)
+        if not res_id:
+            res_id = resources.getIdentifier(resource, "drawable", self.ctx.getPackageName())
+        try:
+            manager = jclass("com.exteragram.messenger.icons.IconManager").INSTANCE
+            drawable = manager.getDrawable(res_id, 0, self.ctx.getTheme(), resources)
+        except Exception:
+            drawable = None
+        if drawable is None:
+            drawable = self.ctx.getDrawable(res_id)
+        image = jclass("android.widget.ImageView")(self.ctx)
+        image.setImageDrawable(drawable.mutate())
+        image.setScaleType(jclass("android.widget.ImageView$ScaleType").FIT_CENTER)
+        image.setColorFilter(color)
+        return image
+
+    def action(self, resource, desc, fn, primary=False):
+        tint = self.color("chat_messagePanelBackground" if primary else "chat_messagePanelIcons")
+        button = self.icon(resource, tint)
+        pad = self.dp(8)
+        button.setPadding(pad, pad, pad, pad)
+        if primary:
+            button.setBackground(self.shape(self.color("chat_messagePanelSend"), 24))
+        button.setContentDescription(desc)
+        self.click(button, fn)
+        return button
+
+    def pencil_action(self, index):
+        value = self.edit.getText()
+        if not value.length():
+            return
+        if index == 0:
+            value.clear()
+        elif index == 1:
+            start, end = sorted((self.edit.getSelectionStart(), self.edit.getSelectionEnd()))
+            if start < 0 or start == end:
+                self.edit.setSelection(0, value.length())
+            self.edit.onTextContextMenuItem(jclass("android.R$id").cut)
+
+    def focus_editor(self):
+        if self.sync_scope():
+            return
+        tap_feedback(self.pencil, -6)
+        self.edit.requestFocus()
+        self.edit.setSelection(self.edit.length())
+        self.ctx.getSystemService("input_method").showSoftInput(self.edit, 1)
+
+    def mount(self):
+        ink = self.field.getCurrentTextColor()
+        factory = get_private_field(self.frag, "glassBackgroundDrawableFactory")
+        provider = get_private_field(self.frag, "blurredBackgroundColorProvider")
+        glass = factory.create(self.row, provider)
+        gutter = self.dp(7)
+        glass.setPadding(gutter)
+        glass.setRadius(float(self.dp(24)))
+        self.row.setBackground(jclass("android.graphics.drawable.InsetDrawable")(glass, -gutter))
+        self.row.setPadding(0, 0, 0, 0)
+        self.edit.setBackgroundDrawable(None)
+        self.edit.setInputType(self.field.getInputType())
+        self.edit.setImeOptions(0x10000001)
+        self.edit.setSingleLine(False)
+        self.edit.setMaxLines(1)
+        self.edit.quoteColor = self.field.quoteColor
+        self.emoji_focus = EmojiFocus(self)
+        self.edit.setOnFocusChangeListener(self.emoji_focus)
+        self.enter_key = EnterKey()
+        self.enter_action = EnterAction()
+        self.enter_filter = EnterFilter(self)
+        self.edit.setOnKeyListener(self.enter_key)
+        self.edit.setOnEditorActionListener(self.enter_action)
+        filters = list(self.edit.getFilters()) + [self.enter_filter]
+        self.edit.setFilters(jarray(jclass("android.text.InputFilter"))(filters))
+        self.edit.setHorizontallyScrolling(True)
+        self.edit.setGravity(self.field.getGravity())
+        self.edit.setFocusable(False)
+        self.edit.setIncludeFontPadding(self.field.getIncludeFontPadding())
+        self.edit.setTypeface(self.field.getTypeface())
+        self.edit.setTextSize(0, float(self.field.getTextSize()))
+        self.edit.setContentDescription(label("Draft"))
+        self.edit.setTextColor(ink)
+        self.edit.setHintTextColor(self.field.getCurrentHintTextColor())
+        self.edit.setHintColor(self.field.getCurrentHintTextColor())
+        self.edit.setCursorColor(self.color("chat_messagePanelCursor"))
+        self.edit.setHandlesColor(self.color("chat_TextSelectionCursor"))
+        self.edit.setHighlightColor(self.field.getHighlightColor())
+        self.edit.setLetterSpacing(self.field.getLetterSpacing())
+        self.editLP = self.LP(-1, -2, 19)
+        self.editLP.rightMargin = self.dp(46)
+        self.editLP.leftMargin = self.dp(6) + self.dp(40)
+        self.edit.setPadding(self.dp(2), self.field.getPaddingTop(), self.dp(2), self.field.getPaddingBottom())
+        pencil = self.action("msg_edit", label("Edit"), self.focus_editor)
+        self.pencil_hold = PencilMenu(self)
+        pencil.setOnTouchListener(self.pencil_hold)
+        pencil.setOnLongClickListener(self.pencil_hold)
+        self.pencil = pencil
+        pencil_lp = self.LP(self.dp(40), self.dp(44), 19)
+        pencil_lp.leftMargin = self.dp(6)
+        self.row.addView(pencil, pencil_lp)
+        self.row.addView(self.edit, self.editLP)
+        self.placeholder = jclass("android.widget.TextView")(self.ctx)
+        self.placeholder.setText(label("Draft"))
+        self.placeholder.setTextSize(0, float(self.field.getTextSize()))
+        self.placeholder.setTypeface(self.field.getTypeface())
+        self.placeholder.setTextColor(self.field.getCurrentHintTextColor())
+        self.placeholder.setGravity(17)
+        self.placeholder.setImportantForAccessibility(2)
+        self.row.addView(self.placeholder, self.LP(-1, -1))
+        self.swap = self.action("msg_replace", label("Swap"), self.exchange, True)
+        btn = self.LP(self.dp(40), self.dp(40), 21)
+        btn.rightMargin = self.dp(4)
+        self.row.addView(self.swap, btn)
+        self.new_listener = HoldAction(self, self.new_draft)
+        self.swap.setOnLongClickListener(self.new_listener)
+        self.swap.setContentDescription(label("Swap"))
+        row_lp = self.LP(-1, self.dp(48), 83)
+        row_lp.bottomMargin = self.dp(22)//2 + self.dp(4)
+        self.shell.setClipChildren(True)
+        self.shell.addView(self.row, row_lp)
+        grip_lp = self.LP(self.dp(92), self.dp(22), 81)
+        self.shell.addView(self.grip, grip_lp)
+        line = self.Frame(self.ctx)
+        line.setBackground(self.shape((ink & 0xffffff) | 0x66000000, 4))
+        self.handle_line = line
+        self.grip.addView(line, self.LP(self.dp(40), self.dp(3), 17))
+        self.grip.setContentDescription(label("Grip"))
+        self.grip.setFocusable(True)
+        self.click(self.grip, lambda: self.toggle(not self.open))
+        self.grip.setOnTouchListener(self.touch)
+        self.edit.addTextChangedListener(self.watcher)
+        self.row.setVisibility(4)
+        self.shell.setVisibility(4)
+        self.host.addView(self.shell, self.LP(1, self.dp(22), 51))
+        self.host.getViewTreeObserver().addOnPreDrawListener(self.layout)
+        self.position()
+        self.host.postInvalidateDelayed(40)
+
+    def position(self):
+        bounds = self.bubble.getPaddedBounds() if self.bubble is not None else None
+        width = bounds.width() if bounds is not None else 0
+        if width > 0 and bounds.height() > 0:
+            left, top = bounds.left, bounds.top
+        else:
+            self.enter.getLocationInWindow(self.anchor_xy)
+            self.host.getLocationInWindow(self.host_xy)
+            left = self.anchor_xy[0] - self.host_xy[0]
+            top = self.anchor_xy[1] - self.host_xy[1]
+            width = self.enter.getWidth()
+        visible = width > 0 and self.field.isShown()
+        self.reserve_space(self.amount if visible and not self.is_forum else 0)
+        lift = 0
+        if visible and self.amount and self.topic_tabs is not None:
+            if self.topic_tabs.getCurrentTabsPosition() == self.tabs_position.BOTTOM:
+                lift = self.amount
+        self.shift_topic_strip(lift)
+        if not visible:
+            self.shell.setVisibility(4)
+            self.geometry = None
+            return
+        if self.amount and self.is_forum and self.topic_tabs is not None:
+            edge = round(self.topic_tabs.getTabsVisibleSpaceWithPadding(self.tabs_position.LEFT, float(self.dp(7))))
+            if edge > left:
+                width -= edge-left
+                left = edge
+        grip = self.dp(22)
+        height = grip + self.amount
+        bottom = top + grip//2
+        geometry = (left, bottom-height, width, height)
+        if geometry == self.geometry:
+            return
+        self.geometry = geometry
+        x, y, width, height = geometry
+        lp = self.shell.getLayoutParams()
+        if lp.width != width or lp.height != height:
+            lp.width, lp.height = width, height
+            self.shell.setLayoutParams(lp)
+        self.shell.setX(float(x))
+        self.shell.setY(float(y))
+        self.shell.setVisibility(0)
+
+    def shift_topic_strip(self, lift):
+        if lift == self.topic_shift:
+            return
+        tabs = self.topic_tabs
+        tabs.setTranslationY(float(tabs.getTranslationY() + self.topic_shift - lift))
+        self.topic_shift = lift
+
+    def reserve_space(self, amount):
+        if self.reserved == amount:
+            return
+        if not self.reserved:
+            self.base_bottom = float(self.messages.getPaddingBottom())
+        self.reserved = amount
+        self.paddings.setPaddings(self.messages.getPaddingTop(), self.base_bottom, False)
+
+    def stop_motion(self):
+        if self.motion is not None:
+            self.motion.cancel()
+            self.motion.removeAllUpdateListeners()
+            self.motion = None
+
+    def settle(self, target):
+        self.stop_motion()
+        distance = abs(target - self.amount)
+        if not distance:
+            self.reveal(target)
+            return
+        animator = jclass("android.animation.ValueAnimator").ofInt(jarray(jint)([0, 1]))
+        animator.setInterpolator(jclass("android.view.animation.DecelerateInterpolator")())
+        animator.setDuration(round(85 + 125 * distance / self.height))
+        animator.addUpdateListener(ShelfMotion(self, self.amount, target))
+        self.motion = animator
+        animator.start()
+
+    def reveal(self, amount):
+        self.amount = int(amount)
+        self.grip.setTranslationY(-float(self.dp(self.row_dp) + self.dp(4)) * self.amount / self.height)
+        self.row.setVisibility(0 if self.amount or self.open else 4)
+        progress = self.amount / self.height
+        self.row.setAlpha(float(progress))
+        self.handle_line.setScaleX(1.0 + 0.16 * (4 * progress * (1 - progress)))
+        self.position()
+
+    def sync_scope(self):
+        key = chat_key(self.frag)
+        if key == self.key:
+            return False
+        if self.open:
+            self.save_editor()
+        self.stop_motion()
+        self.key = self.store.key = key
+        if self.touch.tracking:
+            self.touch.tracking = False
+            parent = self.grip.getParent()
+            if parent is not None:
+                parent.requestDisallowInterceptTouchEvent(False)
+        self.load_row(self.store.latest() if self.open else [])
+        self.reveal(self.height if self.open else 0)
+        return True
+
+    def new_draft(self):
+        if self.sync_scope() or not self.edit.length():
+            return
+        self.save_editor()
+        self.load_row([])
+        self.edit.requestFocus()
+
+    def release_emoji(self):
+        if get_private_field(self.enter, "mOverrideEditTextView") == self.edit:
+            self.enter.overrideEditTextView(None)
+
+    def set_quote_layout(self, quoted):
+        height = max(76, round(self.edit.getLineHeight()*3/self.density)+8) if quoted else 48
+        if height == self.row_dp:
+            return
+        self.row_dp = height
+        self.edit.setHorizontallyScrolling(not quoted)
+        self.edit.setMaxLines(3 if quoted else 1)
+        params = self.row.getLayoutParams()
+        params.height = self.dp(height)
+        self.row.setLayoutParams(params)
+        self.height = self.dp(height+8)
+        if self.open:
+            self.stop_motion()
+            self.reveal(self.height)
+
+    def put_edit(self, text):
+        self.muted = True
+        try:
+            value = self.formatted(text, self.edit)
+            quoted = False
+            if isinstance(text, bytes):
+                cls = jclass("java.lang.Class").forName("org.telegram.ui.Components.QuoteSpan")
+                quoted = bool(len(value.getSpans(0, value.length(), cls)))
+            self.set_quote_layout(quoted)
+            self.edit.setText(value)
+            if isinstance(text, bytes):
+                self.edit.invalidateQuotes(True)
+            self.edit.setSelection(self.edit.length())
+        finally:
+            self.muted = False
+
+    def snapshot(self, editable):
+        plain = str(editable.toString())
+        if not plain:
+            return ""
+        span_class = jclass("java.lang.Class")
+        length = editable.length()
+        def spans(kind):
+            return editable.getSpans(0, length, span_class.forName(kind))
+        character = spans("android.text.style.CharacterStyle")
+        paragraph = spans("android.text.style.ParagraphStyle")
+        if not len(character) and not len(paragraph):
+            return plain
+        Builder = jclass("android.text.SpannableStringBuilder")
+        clean = Builder(plain)
+        for span in list(character) + list(paragraph):
+            start, end = editable.getSpanStart(span), editable.getSpanEnd(span)
+            flags = editable.getSpanFlags(span)
+            if 0 <= start < end and not (flags & 256):
+                clean.setSpan(span, start, end, flags)
+        if "x" in plain:
+            loading = spans("org.telegram.ui.Components.LoadingSpan")
+            ranges = {(editable.getSpanStart(span), editable.getSpanEnd(span)) for span in loading}
+            placeholders = []
+            for start, end in sorted(ranges):
+                if 0 <= start < end <= clean.length() and not str(clean.subSequence(start, end)).strip("x"):
+                    if placeholders and start <= placeholders[-1][1]:
+                        placeholders[-1] = (placeholders[-1][0], max(placeholders[-1][1], end))
+                    else:
+                        placeholders.append((start, end))
+            for start, end in reversed(placeholders):
+                clean.delete(start, end)
+            if placeholders:
+                plain = str(clean.toString())
+                if not plain:
+                    return ""
+        chars = jarray(jclass("java.lang.CharSequence"))([clean])
+        items = self.frag.getMediaDataController().getEntities(chars, True, False)
+        if items is None or not items.size():
+            return plain
+        leading = len(plain) - len(plain.lstrip(" \n"))
+        trailing = len(plain) - len(plain.rstrip(" \n"))
+        content_length = clean.length() - leading - trailing
+        stream = jclass("org.telegram.tgnet.SerializedData")()
+        try:
+            count = 0
+            for i in range(items.size()):
+                entity = items.get(i)
+                start = max(0, entity.offset)
+                end = min(content_length, entity.offset + entity.length)
+                if start < end:
+                    entity.offset, entity.length = leading + start, end-start
+                    entity.serializeToStream(stream)
+                    count += 1
+            if not count:
+                return plain
+            encoded = jclass("org.telegram.messenger.Utilities").bytesToHex(stream.toByteArray())
+            return json.dumps([plain, count, str(encoded)], ensure_ascii=False).encode("utf-8")
+        finally:
+            stream.cleanup()
+
+    def formatted(self, value, editor):
+        if not isinstance(value, bytes):
+            return value
+        text, count, encoded = rich_parts(json.loads(value))
+        raw = jclass("org.telegram.messenger.Utilities").hexToBytes(encoded)
+        stream = jclass("org.telegram.tgnet.SerializedData")(raw)
+        try:
+            items = jclass("java.util.ArrayList")()
+            entity = jclass("org.telegram.tgnet.TLRPC$MessageEntity")
+            for _ in range(count):
+                items.add(entity.TLdeserialize(stream, stream.readInt32(True), True))
+            return jclass("org.telegram.ui.Components.ChatActivityEnterView").applyMessageEntities(
+                items, text, editor.getPaint().getFontMetricsInt())
+        finally:
+            stream.cleanup()
+
+    def save_editor(self):
+        self.edit.removeCallbacks(self.autosave)
+        body = self.snapshot(self.edit.getText())
+        if self.saved_note == (self.key, self.ident, body):
+            return
+        self.ident = self.store.put(self.ident, body, remember_empty=True)
+        self.saved_note = (self.key, self.ident, body)
+
+    def safe_lower(self):
+        if self.enter.isRecordingAudioVideo() or self.enter.isEditingMessage():
+            raise ValueError(label("Busy"))
+        return self.snapshot(self.field.getText())
+
+    def set_lower(self, text):
+        value = self.formatted(text, self.field)
+        self.enter.setFieldText(value)
+        if str(self.field.getText().toString()) != str(value):
+            raise ValueError(label("Rejected"))
+
+    def load_row(self, rows, index=0):
+        self.edit.removeCallbacks(self.autosave)
+        self.ident, text = rows[index] if rows else (None, "")
+        self.put_edit(text)
+        self.edit.animate().cancel()
+        if self.open and text:
+            self.edit.setTranslationY(float(self.dp(4)))
+            self.edit.setAlpha(0.55)
+            self.edit.animate().translationY(0.0).alpha(1.0).setDuration(160).start()
+        else:
+            self.edit.setTranslationY(0.0)
+            self.edit.setAlpha(1.0)
+        self.saved_note = (self.key, self.ident, text) if rows else None
+
+    def toggle(self, target):
+        if self.sync_scope():
+            return
+        if target != self.open:
+            try:
+                if target:
+                    self.load_row(self.store.latest())
+                    self.edit.setFocusableInTouchMode(True)
+                else:
+                    self.save_editor()
+                    owned = self.edit.hasFocus() or get_private_field(self.enter, "mOverrideEditTextView") == self.edit
+                    self.open = False
+                    self.release_emoji()
+                    self.edit.setFocusable(False)
+                    if owned:
+                        self.field.requestFocus()
+                        self.ctx.getSystemService("input_method").restartInput(self.field)
+                self.open = target
+                self.grip.performHapticFeedback(1)
+            except Exception as exc:
+                self.edit.setError(str(exc)[:140])
+        self.settle(self.height if self.open else 0)
+
+    def next_note(self):
+        if self.sync_scope():
+            return
+        self.save_editor()
+        rows = self.store.rows()
+        index = next((i for i,r in enumerate(rows) if r[0] == self.ident), -1)
+        self.load_row(rows, (index+1)%len(rows) if rows else 0)
+
+    def exchange(self):
+        if self.swapping or self.sync_scope():
+            return
+        self.swapping = True
+        try:
+            self.edit.removeCallbacks(self.autosave)
+            lower = self.safe_lower()
+            upper = self.snapshot(self.edit.getText())
+            if upper != lower:
+                self.ident = self.store.put(self.ident, upper)
+                original_id = self.ident
+                parked_text = repair_frame(lower)
+                parked = self.store.put(None, parked_text)
+                try:
+                    self.set_lower(upper)
+                except Exception:
+                    if self.safe_lower() == lower:
+                        self.store.put(parked, "")
+                    raise
+                self.load_row([(parked, parked_text)] if parked_text else [])
+                self.store.put(original_id, "", remember_empty=not parked_text)
+                tap_feedback(self.swap, -28)
+            self.focus_editor()
+        except Exception as exc:
+            self.edit.setError(str(exc)[:140])
+        finally:
+            self.swapping = False
+
+    def detach(self):
+        self.stop_motion()
+        if hasattr(self, "pencil_hold"):
+            self.pencil_hold.close()
+        self.shift_topic_strip(0)
+        self.release_emoji()
+        self.edit.setOnFocusChangeListener(None)
+        self.edit.removeCallbacks(self.autosave)
+        if self.open:
+            try:
+                self.save_editor()
+            except Exception as exc:
+                jclass("android.util.Log").e("DraftShelf", "Draft save on detach: " + type(exc).__name__)
+        self.reserve_space(0)
+        observer = self.host.getViewTreeObserver()
+        if observer.isAlive():
+            observer.removeOnPreDrawListener(self.layout)
+        self.edit.removeTextChangedListener(self.watcher)
+        self.grip.setOnTouchListener(None)
+        if self.shell.getParent() is not None:
+            self.host.removeView(self.shell)
+        self.clicks.clear()
