@@ -3,12 +3,14 @@ import time
 import traceback
 import threading
 import uuid
+from collections import deque
 
 from java import jclass, jarray, jint, jlong, jfloat
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
 from android_utils import run_on_ui_thread, copy_to_clipboard
-from client_utils import get_last_fragment
+from client_utils import get_last_fragment, get_messages_controller, get_selected_account
+from file_utils import get_cache_dir, get_files_dir, ensure_dir_exists
 from android.widget import LinearLayout, TextView
 from org.telegram.ui.ActionBar import Theme
 from ui.bulletin import BulletinHelper
@@ -18,7 +20,7 @@ __id__ = "round_face_blur"
 __name__ = "Round Face Blur"
 __description__ = "Скрывает лица пиксельной мозаикой в видеокружках перед отправкой."
 __author__ = "@Dkaq1"
-__version__ = "1.3"
+__version__ = "1.4"
 __icon__ = "hfglhjkfgopkhjfgikoph/0"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.5.0"
@@ -78,6 +80,8 @@ class PrepareVideoHook(MethodHook):
             path = str(param.args[path_idx]) if path_idx >= 0 else str(edited_info.originalPath or "")
             if not path or not os.path.isfile(path):
                 return
+            if plugin.is_already_processed(path):
+                return
             if os.path.getsize(path) < 16384 and int(getattr(edited_info, "estimatedDuration", 0) or 0) <= 0:
                 return
             if plugin.is_whitelisted(param):
@@ -90,11 +94,11 @@ class PrepareVideoHook(MethodHook):
                     plugin.show_info("Очередь размытия заполнена. Дождитесь обработки и повторите отправку.")
                     return
                 plugin.active_paths.add(job_id)
-            plugin.register_temp_dir(os.path.dirname(path))
+
             method = param.method
             receiver = param.thisObject
             args = self.copy_invocation_args(method, list(param.args))
-            output = os.path.splitext(path)[0] + "_blurred_" + uuid.uuid4().hex + ".mp4"
+            output = plugin.make_output_path()
 
             def worker():
                 changes = {}
@@ -126,6 +130,7 @@ class PrepareVideoHook(MethodHook):
                             setattr(edited_info, name, value)
                     if path_idx >= 0:
                         args[path_idx] = output
+                    plugin.mark_processed(output)
                     send = True
                     plugin.debug_log(f"Готово за {time.monotonic() - started:.1f} с: {output}")
                 except Exception as error:
@@ -171,15 +176,8 @@ class PrepareVideoHook(MethodHook):
                         with plugin.state_lock:
                             plugin.active_paths.discard(job_id)
 
-            ready = threading.Event()
-
-            def queued_worker():
-                ready.wait()
-                worker()
-
-            threading.Thread(target=queued_worker, name="RoundFaceBlur", daemon=True).start()
             param.setResult(None)
-            ready.set()
+            threading.Thread(target=worker, name="RoundFaceBlur", daemon=True).start()
         except Exception as error:
             if path and job_id is not None:
                 with plugin.state_lock:
@@ -229,86 +227,90 @@ class EglSurfaceRenderer:
         self.display = self.EGL14.EGL_NO_DISPLAY
         self.context = self.EGL14.EGL_NO_CONTEXT
         self.egl_surface = self.EGL14.EGL_NO_SURFACE
-        self.display = self.EGL14.eglGetDisplay(self.EGL14.EGL_DEFAULT_DISPLAY)
-        if self.display == self.EGL14.EGL_NO_DISPLAY:
-            raise RuntimeError("eglGetDisplay failed")
-        version = jarray(jint)(2)
-        if not self.EGL14.eglInitialize(self.display, version, 0, version, 1):
-            raise RuntimeError("eglInitialize failed")
-        attrib_list = jarray(jint)([
-            self.EGL14.EGL_RED_SIZE, 8,
-            self.EGL14.EGL_GREEN_SIZE, 8,
-            self.EGL14.EGL_BLUE_SIZE, 8,
-            self.EGL14.EGL_ALPHA_SIZE, 8,
-            self.EGL14.EGL_RENDERABLE_TYPE, self.EGL14.EGL_OPENGL_ES2_BIT,
-            0x3142, 1,
-            self.EGL14.EGL_NONE,
-        ])
-        configs = jarray(EGLConfig)(1)
-        num_configs = jarray(jint)(1)
-        if not self.EGL14.eglChooseConfig(self.display, attrib_list, 0, configs, 0, 1, num_configs, 0):
-            raise RuntimeError("eglChooseConfig failed")
-        if num_configs[0] <= 0 or configs[0] is None:
-            raise RuntimeError("No matching EGLConfig found")
-        ctx_attribs = jarray(jint)([self.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, self.EGL14.EGL_NONE])
-        self.context = self.EGL14.eglCreateContext(
-            self.display, configs[0], self.EGL14.EGL_NO_CONTEXT, ctx_attribs, 0
-        )
-        if self.context == self.EGL14.EGL_NO_CONTEXT:
-            raise RuntimeError("eglCreateContext failed")
-        surf_attribs = jarray(jint)([self.EGL14.EGL_NONE])
-        self.egl_surface = self.EGL14.eglCreateWindowSurface(
-            self.display, configs[0], surface, surf_attribs, 0
-        )
-        if self.egl_surface == self.EGL14.EGL_NO_SURFACE:
-            raise RuntimeError("eglCreateWindowSurface failed")
-        if not self.EGL14.eglMakeCurrent(self.display, self.egl_surface, self.egl_surface, self.context):
-            raise RuntimeError("eglMakeCurrent failed")
-        self.program = self._create_program(self.VERTEX_SHADER, self.FRAGMENT_SHADER)
-        self.GLES20.glUseProgram(self.program)
-        pos_data = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
-        tex_data = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
-        bb_pos = ByteBuffer.allocateDirect(len(pos_data) * 4).order(ByteOrder.nativeOrder())
-        pos_buf = bb_pos.asFloatBuffer()
-        pos_buf.put(jarray(jfloat)(pos_data))
-        pos_buf.position(0)
-        bb_tex = ByteBuffer.allocateDirect(len(tex_data) * 4).order(ByteOrder.nativeOrder())
-        tex_buf = bb_tex.asFloatBuffer()
-        tex_buf.put(jarray(jfloat)(tex_data))
-        tex_buf.position(0)
-        vbos = jarray(jint)(2)
-        self.GLES20.glGenBuffers(2, vbos, 0)
-        self.pos_vbo = vbos[0]
-        self.tex_vbo = vbos[1]
-        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.pos_vbo)
-        self.GLES20.glBufferData(
-            self.GLES20.GL_ARRAY_BUFFER, len(pos_data) * 4, pos_buf, self.GLES20.GL_STATIC_DRAW
-        )
-        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.tex_vbo)
-        self.GLES20.glBufferData(
-            self.GLES20.GL_ARRAY_BUFFER, len(tex_data) * 4, tex_buf, self.GLES20.GL_STATIC_DRAW
-        )
-        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, 0)
-        self.pos_loc = self.GLES20.glGetAttribLocation(self.program, "aPos")
-        self.tex_loc = self.GLES20.glGetAttribLocation(self.program, "aTex")
-        self.sampler_loc = self.GLES20.glGetUniformLocation(self.program, "uTex")
-        textures = jarray(jint)(1)
-        self.GLES20.glGenTextures(1, textures, 0)
-        self.tex_id = textures[0]
-        self.GLES20.glActiveTexture(self.GLES20.GL_TEXTURE0)
-        self.GLES20.glBindTexture(self.GLES20.GL_TEXTURE_2D, self.tex_id)
-        self.GLES20.glTexParameteri(
-            self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MIN_FILTER, self.GLES20.GL_LINEAR
-        )
-        self.GLES20.glTexParameteri(
-            self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MAG_FILTER, self.GLES20.GL_LINEAR
-        )
-        self.GLES20.glTexParameteri(
-            self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_S, self.GLES20.GL_CLAMP_TO_EDGE
-        )
-        self.GLES20.glTexParameteri(
-            self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_T, self.GLES20.GL_CLAMP_TO_EDGE
-        )
+        try:
+            self.display = self.EGL14.eglGetDisplay(self.EGL14.EGL_DEFAULT_DISPLAY)
+            if self.display == self.EGL14.EGL_NO_DISPLAY:
+                raise RuntimeError("eglGetDisplay failed")
+            version = jarray(jint)(2)
+            if not self.EGL14.eglInitialize(self.display, version, 0, version, 1):
+                raise RuntimeError("eglInitialize failed")
+            attrib_list = jarray(jint)([
+                self.EGL14.EGL_RED_SIZE, 8,
+                self.EGL14.EGL_GREEN_SIZE, 8,
+                self.EGL14.EGL_BLUE_SIZE, 8,
+                self.EGL14.EGL_ALPHA_SIZE, 8,
+                self.EGL14.EGL_RENDERABLE_TYPE, self.EGL14.EGL_OPENGL_ES2_BIT,
+                0x3142, 1,
+                self.EGL14.EGL_NONE,
+            ])
+            configs = jarray(EGLConfig)(1)
+            num_configs = jarray(jint)(1)
+            if not self.EGL14.eglChooseConfig(self.display, attrib_list, 0, configs, 0, 1, num_configs, 0):
+                raise RuntimeError("eglChooseConfig failed")
+            if num_configs[0] <= 0 or configs[0] is None:
+                raise RuntimeError("No matching EGLConfig found")
+            ctx_attribs = jarray(jint)([self.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, self.EGL14.EGL_NONE])
+            self.context = self.EGL14.eglCreateContext(
+                self.display, configs[0], self.EGL14.EGL_NO_CONTEXT, ctx_attribs, 0
+            )
+            if self.context == self.EGL14.EGL_NO_CONTEXT:
+                raise RuntimeError("eglCreateContext failed")
+            surf_attribs = jarray(jint)([self.EGL14.EGL_NONE])
+            self.egl_surface = self.EGL14.eglCreateWindowSurface(
+                self.display, configs[0], surface, surf_attribs, 0
+            )
+            if self.egl_surface == self.EGL14.EGL_NO_SURFACE:
+                raise RuntimeError("eglCreateWindowSurface failed")
+            if not self.EGL14.eglMakeCurrent(self.display, self.egl_surface, self.egl_surface, self.context):
+                raise RuntimeError("eglMakeCurrent failed")
+            self.program = self._create_program(self.VERTEX_SHADER, self.FRAGMENT_SHADER)
+            self.GLES20.glUseProgram(self.program)
+            pos_data = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+            tex_data = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+            bb_pos = ByteBuffer.allocateDirect(len(pos_data) * 4).order(ByteOrder.nativeOrder())
+            pos_buf = bb_pos.asFloatBuffer()
+            pos_buf.put(jarray(jfloat)(pos_data))
+            pos_buf.position(0)
+            bb_tex = ByteBuffer.allocateDirect(len(tex_data) * 4).order(ByteOrder.nativeOrder())
+            tex_buf = bb_tex.asFloatBuffer()
+            tex_buf.put(jarray(jfloat)(tex_data))
+            tex_buf.position(0)
+            vbos = jarray(jint)(2)
+            self.GLES20.glGenBuffers(2, vbos, 0)
+            self.pos_vbo = vbos[0]
+            self.tex_vbo = vbos[1]
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.pos_vbo)
+            self.GLES20.glBufferData(
+                self.GLES20.GL_ARRAY_BUFFER, len(pos_data) * 4, pos_buf, self.GLES20.GL_STATIC_DRAW
+            )
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.tex_vbo)
+            self.GLES20.glBufferData(
+                self.GLES20.GL_ARRAY_BUFFER, len(tex_data) * 4, tex_buf, self.GLES20.GL_STATIC_DRAW
+            )
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, 0)
+            self.pos_loc = self.GLES20.glGetAttribLocation(self.program, "aPos")
+            self.tex_loc = self.GLES20.glGetAttribLocation(self.program, "aTex")
+            self.sampler_loc = self.GLES20.glGetUniformLocation(self.program, "uTex")
+            textures = jarray(jint)(1)
+            self.GLES20.glGenTextures(1, textures, 0)
+            self.tex_id = textures[0]
+            self.GLES20.glActiveTexture(self.GLES20.GL_TEXTURE0)
+            self.GLES20.glBindTexture(self.GLES20.GL_TEXTURE_2D, self.tex_id)
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MIN_FILTER, self.GLES20.GL_LINEAR
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MAG_FILTER, self.GLES20.GL_LINEAR
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_S, self.GLES20.GL_CLAMP_TO_EDGE
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_T, self.GLES20.GL_CLAMP_TO_EDGE
+            )
+        except Exception:
+            self.release()
+            raise
 
     def _compile_shader(self, shader_type, source):
         shader = self.GLES20.glCreateShader(shader_type)
@@ -404,6 +406,8 @@ class RoundFaceBlurPlugin(BasePlugin):
         self.hook_handles = []
         self.mlkit_detector = None
         self.mlkit_checked = False
+        self.mlkit_warmed_up = False
+        self.mlkit_failures = 0
         self.InputImageCls = None
         self.TasksCls = None
         self.TimeUnitCls = None
@@ -411,16 +415,16 @@ class RoundFaceBlurPlugin(BasePlugin):
         self.gms_checked = False
         self.FrameBuilder = None
         self.log_file_path = None
-        self.memory_logs = []
-        self.known_temp_dirs = set()
+        self.memory_logs = deque(maxlen=200)
+        self.log_lock = threading.Lock()
         self.active_paths = set()
+        self.processed_outputs = deque(maxlen=32)
         self.state_lock = threading.Lock()
         self.render_lock = threading.Lock()
         self.dispatch_context = threading.local()
 
     def on_plugin_load(self):
         self._init_log_path()
-        self._register_default_temp_dirs()
         self._hook_send_video()
         threading.Thread(target=self._cleanup_stale_temp_files, name="RoundBlurCleanup", daemon=True).start()
         self.debug_log(f"Плагин загружен (v{__version__})")
@@ -440,84 +444,69 @@ class RoundFaceBlurPlugin(BasePlugin):
             except Exception:
                 pass
         self.hook_handles.clear()
-        self.unhook_all_methods()
 
     def _init_log_path(self):
-        try:
-            ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
-            ctx = ApplicationLoader.applicationContext
-            if ctx is not None:
-                ext_dir = ctx.getExternalFilesDir(None)
-                if ext_dir is not None:
-                    self.log_file_path = os.path.join(str(ext_dir.getAbsolutePath()), "round_face_blur_debug.txt")
+        for getter in (get_files_dir, get_cache_dir):
+            try:
+                base_dir = getter()
+                if base_dir:
+                    ensure_dir_exists(base_dir)
+                    self.log_file_path = os.path.join(base_dir, "round_face_blur_debug.txt")
                     return
-                cache_dir = ctx.getCacheDir()
-                if cache_dir is not None:
-                    self.log_file_path = os.path.join(str(cache_dir.getAbsolutePath()), "round_face_blur_debug.txt")
-        except Exception:
-            pass
+            except Exception:
+                continue
 
-    def _register_default_temp_dirs(self):
-        try:
-            ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
-            ctx = ApplicationLoader.applicationContext
-            if ctx is not None:
-                for dir_obj in (ctx.getCacheDir(), ctx.getExternalCacheDir(), ctx.getExternalFilesDir(None)):
-                    if dir_obj is not None:
-                        self.register_temp_dir(str(dir_obj.getAbsolutePath()))
-        except Exception:
-            pass
-        try:
-            FileLoader = jclass("org.telegram.messenger.FileLoader")
-            cache_dir = FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE)
-            if cache_dir is not None:
-                self.register_temp_dir(str(cache_dir.getAbsolutePath()))
-            video_dir = FileLoader.getDirectory(FileLoader.MEDIA_DIR_VIDEO)
-            if video_dir is not None:
-                self.register_temp_dir(str(video_dir.getAbsolutePath()))
-        except Exception:
-            pass
+    def make_output_path(self):
+        cache_dir = get_cache_dir()
+        ensure_dir_exists(cache_dir)
+        return os.path.join(cache_dir, f"round_blurred_{uuid.uuid4().hex}.mp4")
 
-    def register_temp_dir(self, directory):
-        if directory and os.path.isdir(directory):
-            with self.state_lock:
-                self.known_temp_dirs.add(directory)
+    def mark_processed(self, path):
+        with self.state_lock:
+            self.processed_outputs.append(path)
+
+    def is_already_processed(self, path):
+        name = os.path.basename(path)
+        if name.startswith("round_blurred_"):
+            return True
+        with self.state_lock:
+            return path in self.processed_outputs
 
     def _cleanup_stale_temp_files(self):
         cutoff = time.time() - 1800.0
-        with self.state_lock:
-            dirs = list(self.known_temp_dirs)
-        for directory in dirs:
-            try:
-                for entry in os.scandir(directory):
-                    if not entry.is_file():
-                        continue
-                    name = entry.name
-                    if "_blurred_" in name and name.endswith(".mp4"):
-                        try:
-                            if entry.stat().st_mtime < cutoff:
-                                os.remove(entry.path)
-                        except OSError:
-                            pass
-            except OSError:
-                pass
+        try:
+            cache_dir = get_cache_dir()
+            if not cache_dir or not os.path.isdir(cache_dir):
+                return
+            for entry in os.scandir(cache_dir):
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if (name.startswith("round_blurred_") or "_blurred_" in name) and name.endswith(".mp4"):
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            os.remove(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     def debug_log(self, msg):
         line = f"[RoundFaceBlur] {msg}"
         if hasattr(self, "logger") and self.logger is not None:
             self.logger.info("%s", msg)
-        self.memory_logs.append(line)
-        if len(self.memory_logs) > 200:
-            self.memory_logs.pop(0)
-        if self.log_file_path and self.get_setting("debug_file_log", False):
-            try:
-                with open(self.log_file_path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception:
-                pass
+        with self.log_lock:
+            self.memory_logs.append(line)
+            if self.log_file_path and self.get_setting("debug_file_log", False):
+                try:
+                    with open(self.log_file_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
 
     def _copy_log_to_clipboard(self, *args):
-        content = "\n".join(self.memory_logs)
+        with self.log_lock:
+            content = "\n".join(self.memory_logs)
         if not content.strip() and self.log_file_path and os.path.exists(self.log_file_path):
             try:
                 with open(self.log_file_path, "r", encoding="utf-8") as f:
@@ -530,17 +519,18 @@ class RoundFaceBlurPlugin(BasePlugin):
         copy_to_clipboard(content[-4000:])
 
     def _clear_log(self, *args):
-        self.memory_logs.clear()
-        if self.log_file_path and os.path.exists(self.log_file_path):
-            try:
-                with open(self.log_file_path, "w", encoding="utf-8") as f:
-                    f.write("")
-            except Exception:
-                pass
+        with self.log_lock:
+            self.memory_logs.clear()
+            if self.log_file_path and os.path.exists(self.log_file_path):
+                try:
+                    with open(self.log_file_path, "w", encoding="utf-8") as f:
+                        f.write("")
+                except Exception:
+                    pass
         self.show_info("Лог очищен")
 
     def show_info(self, text):
-        run_on_ui_thread(lambda: BulletinHelper.show_info(str(text)))
+        BulletinHelper.show_info(str(text))
 
     def _wl_entries(self):
         raw = str(self.get_setting("wl_list", "") or "")
@@ -580,13 +570,33 @@ class RoundFaceBlurPlugin(BasePlugin):
         return None
 
     @staticmethod
-    def _wl_match(entries, kinds_on, did, peer, kind, username):
+    def _extract_usernames(obj):
+        names = set()
+        if obj is None:
+            return names
+        primary = getattr(obj, "username", None)
+        if primary:
+            names.add(str(primary).lower())
+        extra = getattr(obj, "usernames", None)
+        if extra is not None:
+            try:
+                for i in range(extra.size()):
+                    item = extra.get(i)
+                    if item is not None and bool(getattr(item, "active", True)):
+                        uname = getattr(item, "username", None)
+                        if uname:
+                            names.add(str(uname).lower())
+            except Exception:
+                pass
+        return names
+
+    @staticmethod
+    def _wl_match(entries, kinds_on, did, peer, kind, usernames):
         if kind and kind in kinds_on:
             return True
-        uname = (username or "").lower()
         for e in entries:
             if e.startswith("@"):
-                if uname and e[1:] == uname:
+                if e[1:] in usernames:
                     return True
             else:
                 try:
@@ -600,8 +610,7 @@ class RoundFaceBlurPlugin(BasePlugin):
         return False
 
     def _wl_dialog_info(self, param):
-        UserConfig = jclass("org.telegram.messenger.UserConfig")
-        MessagesController = jclass("org.telegram.messenger.MessagesController")
+        ChatObject = jclass("org.telegram.messenger.ChatObject")
         ptypes = param.method.getParameterTypes()
         did = None
         for i, pt in enumerate(ptypes):
@@ -610,20 +619,32 @@ class RoundFaceBlurPlugin(BasePlugin):
                 break
         if did is None or did == 0:
             return None
-        mc = MessagesController.getInstance(UserConfig.selectedAccount)
+
+        account = get_selected_account()
+        if param.thisObject is not None and hasattr(param.thisObject, "getCurrentAccount"):
+            try:
+                account = int(param.thisObject.getCurrentAccount())
+            except Exception:
+                pass
+
+        mc = get_messages_controller(account)
         if did > 0:
             user = mc.getUser(did)
             if user is None:
-                return did, did, None, ""
-            return did, did, "pm", str(user.username or "")
+                return did, did, None, set()
+            return did, did, "pm", self._extract_usernames(user)
+
         peer = -did
-        if mc.getChat(peer) is not None:
-            return did, peer, "group", ""
-        ch = mc.getChannel(peer)
-        if ch is not None:
-            kind = "supergroup" if bool(ch.megagroup) else "channel"
-            return did, peer, kind, str(ch.username or "")
-        return did, peer, None, ""
+        chat = mc.getChat(peer)
+        if chat is None:
+            return did, peer, None, set()
+
+        usernames = self._extract_usernames(chat)
+        if ChatObject.isChannel(chat):
+            kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
+        else:
+            kind = "group"
+        return did, peer, kind, usernames
 
     def is_whitelisted(self, param):
         try:
@@ -634,8 +655,8 @@ class RoundFaceBlurPlugin(BasePlugin):
             info = self._wl_dialog_info(param)
             if info is None:
                 return False
-            did, peer, kind, username = info
-            matched = self._wl_match(entries, kinds_on, did, peer, kind, username)
+            did, peer, kind, usernames = info
+            matched = self._wl_match(entries, kinds_on, did, peer, kind, usernames)
             if matched:
                 self.debug_log(f"Белый список: совпадение did={did}, тип={kind or 'неизвестен'}")
             return matched
@@ -692,19 +713,19 @@ class RoundFaceBlurPlugin(BasePlugin):
                 key="wl_group",
                 text="Группы (обычные чаты)",
                 default=False,
-                icon="msg_settings",
+                icon="msg_groups",
             ),
             Switch(
                 key="wl_supergroup",
                 text="Супергруппы",
                 default=False,
-                icon="msg_settings",
+                icon="msg_groups",
             ),
             Switch(
                 key="wl_channel",
                 text="Каналы",
                 default=False,
-                icon="msg_settings",
+                icon="msg_channel",
             ),
             Header(text="Отдельные чаты"),
             Input(
@@ -712,12 +733,12 @@ class RoundFaceBlurPlugin(BasePlugin):
                 text="ID, @username или ссылка",
                 default="",
                 subtext="Например: -1001234567890, @durov, t.me/c/1234567890/1",
-                icon="msg_settings",
+                icon="msg_link",
             ),
             Text(
                 text="Добавить в белый список",
                 accent=True,
-                icon="msg_settings",
+                icon="msg_add",
                 on_click=self._wl_add_from_input,
             ),
         ]
@@ -851,7 +872,7 @@ class RoundFaceBlurPlugin(BasePlugin):
                 text="Сохранять лог отладки в файл",
                 default=False,
                 subtext="Запись в приватную папку приложения",
-                icon="msg_settings",
+                icon="msg_log",
             ),
             Text(
                 text="Скопировать лог отладки",
@@ -872,20 +893,22 @@ class RoundFaceBlurPlugin(BasePlugin):
             return self.mlkit_detector is not None
         self.mlkit_checked = True
         try:
+            FaceDetectorOptions = jclass("com.google.mlkit.vision.face.FaceDetectorOptions")
             OptionsBuilder = jclass("com.google.mlkit.vision.face.FaceDetectorOptions$Builder")
             FaceDetection = jclass("com.google.mlkit.vision.face.FaceDetection")
             self.InputImageCls = jclass("com.google.mlkit.vision.common.InputImage")
             self.TasksCls = jclass("com.google.android.gms.tasks.Tasks")
             self.TimeUnitCls = jclass("java.util.concurrent.TimeUnit")
             builder = OptionsBuilder()
-            builder.setPerformanceMode(1)
-            builder.setLandmarkMode(1)
-            builder.setClassificationMode(1)
+            builder.setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            builder.setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+            builder.setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
             builder.setMinFaceSize(jfloat(0.1))
             builder.enableTracking()
             detector = FaceDetection.getClient(builder.build())
             if detector is not None:
                 self.mlkit_detector = detector
+                self.mlkit_failures = 0
                 self.debug_log("Детектор: ML Kit Face Detection инициализирован")
                 return True
         except Exception as e:
@@ -939,7 +962,7 @@ class RoundFaceBlurPlugin(BasePlugin):
             self.hook_handles.extend(unhooks)
         self.debug_log(f"Установлено хуков на prepareSendingVideo: {len(self.hook_handles)}")
 
-    def detect_faces(self, sw_bitmap):
+    def detect_faces(self, sw_bitmap, android_state=None):
         Rect = jclass("android.graphics.Rect")
         Bitmap = jclass("android.graphics.Bitmap")
         rects = []
@@ -952,7 +975,7 @@ class RoundFaceBlurPlugin(BasePlugin):
         scale = orig_w / float(target_w)
         target_h = max(2, int(orig_h / scale))
         scaled = None
-        rgb565 = None
+        temp_rgb565 = None
         try:
             scaled = (
                 Bitmap.createScaledBitmap(sw_bitmap, target_w, target_h, True)
@@ -965,7 +988,10 @@ class RoundFaceBlurPlugin(BasePlugin):
                         image = self.InputImageCls.fromBitmap(scaled, 0)
                         task = self.mlkit_detector.process(image)
                         await_task = getattr(self.TasksCls, "await")
-                        faces_list = await_task(task, jlong(500), self.TimeUnitCls.MILLISECONDS)
+                        timeout_ms = 1000 if self.mlkit_warmed_up else 3000
+                        faces_list = await_task(task, jlong(timeout_ms), self.TimeUnitCls.MILLISECONDS)
+                        self.mlkit_warmed_up = True
+                        self.mlkit_failures = 0
                         count = int(faces_list.size()) if faces_list is not None else 0
                         for i in range(count):
                             box = faces_list.get(i).getBoundingBox()
@@ -979,12 +1005,14 @@ class RoundFaceBlurPlugin(BasePlugin):
                             )
                         return rects
                     except Exception as ml_err:
-                        self.debug_log(f"Ошибка ML Kit при детекции: {ml_err}")
-                        try:
-                            self.mlkit_detector.close()
-                        except Exception:
-                            pass
-                        self.mlkit_detector = None
+                        self.mlkit_failures += 1
+                        self.debug_log(f"Ошибка ML Kit ({self.mlkit_failures}/3): {ml_err}")
+                        if self.mlkit_failures >= 3:
+                            try:
+                                self.mlkit_detector.close()
+                            except Exception:
+                                pass
+                            self.mlkit_detector = None
 
                 if self._ensure_gms_vision():
                     try:
@@ -1018,21 +1046,47 @@ class RoundFaceBlurPlugin(BasePlugin):
             AndroidFaceDetector = jclass("android.media.FaceDetector")
             FaceCls = jclass("android.media.FaceDetector$Face")
             PointF = jclass("android.graphics.PointF")
+            max_faces = 5
             first_android_call = not getattr(self, "android_detector_logged", False)
             if first_android_call:
                 self.debug_log("Детектор Android SDK: подготовка RGB_565 и поиск лиц")
-            rgb565 = Bitmap.createBitmap(target_w, target_h, Config.RGB_565)
-            c565 = Canvas(rgb565)
-            p565 = Paint(Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG)
+
+            if android_state is not None:
+                if android_state.get("size") != (target_w, target_h):
+                    old_bmp = android_state.get("rgb565")
+                    if old_bmp is not None:
+                        try:
+                            old_bmp.recycle()
+                        except Exception:
+                            pass
+                    rgb565 = Bitmap.createBitmap(target_w, target_h, Config.RGB_565)
+                    android_state["size"] = (target_w, target_h)
+                    android_state["rgb565"] = rgb565
+                    android_state["canvas"] = Canvas(rgb565)
+                    android_state["paint"] = Paint(Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG)
+                    android_state["detector"] = AndroidFaceDetector(target_w, target_h, max_faces)
+                    android_state["faces"] = jarray(FaceCls)(max_faces)
+                    android_state["mid"] = PointF()
+                rgb565 = android_state["rgb565"]
+                c565 = android_state["canvas"]
+                p565 = android_state["paint"]
+                detector = android_state["detector"]
+                faces = android_state["faces"]
+                mid = android_state["mid"]
+            else:
+                temp_rgb565 = Bitmap.createBitmap(target_w, target_h, Config.RGB_565)
+                rgb565 = temp_rgb565
+                c565 = Canvas(rgb565)
+                p565 = Paint(Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG)
+                detector = AndroidFaceDetector(target_w, target_h, max_faces)
+                faces = jarray(FaceCls)(max_faces)
+                mid = PointF()
+
             c565.drawBitmap(scaled, 0.0, 0.0, p565)
-            max_faces = 5
-            detector = AndroidFaceDetector(target_w, target_h, max_faces)
-            faces = jarray(FaceCls)(max_faces)
             found = detector.findFaces(rgb565, faces)
             if first_android_call:
                 self.debug_log(f"Детектор Android SDK работает, найдено лиц: {found}")
                 self.android_detector_logged = True
-            mid = PointF()
             for i in range(found):
                 faces[i].getMidPoint(mid)
                 eye_dist = faces[i].eyesDistance()
@@ -1048,8 +1102,8 @@ class RoundFaceBlurPlugin(BasePlugin):
         finally:
             if scaled is not None and scaled != sw_bitmap:
                 scaled.recycle()
-            if rgb565 is not None:
-                rgb565.recycle()
+            if temp_rgb565 is not None:
+                temp_rgb565.recycle()
 
     @staticmethod
     def update_face_mask(cached_rects, hold_until_us, detected, pts_us, hold_us):
@@ -1119,8 +1173,9 @@ class RoundFaceBlurPlugin(BasePlugin):
         hold_us,
         strength,
         mosaic_paint,
+        android_state=None,
     ):
-        detected = self.detect_faces(work_bitmap) if run_detection else None
+        detected = self.detect_faces(work_bitmap, android_state) if run_detection else None
         cached_rects, hold_until_us = self.update_face_mask(
             cached_rects, hold_until_us, detected, pts_us, hold_us
         )
@@ -1154,6 +1209,7 @@ class RoundFaceBlurPlugin(BasePlugin):
         muxer_started = False
         work_bitmap = None
         batch_cache = {}
+        android_state = {}
         deadline = time.monotonic() + 180.0
 
         def check_deadline():
@@ -1217,9 +1273,10 @@ class RoundFaceBlurPlugin(BasePlugin):
                         use_batch_frames = True
                 except Exception:
                     use_batch_frames = False
+            batch_size = 4 if (src_w * src_h) >= 500_000 else 8
             self.debug_log(
                 f"2/6 Настройка энкодера {width}x{height} (из {src_w}x{src_h}), {duration_ms} мс, "
-                f"пакетное чтение: {use_batch_frames}"
+                f"пакетное чтение: {use_batch_frames} (пакет: {batch_size})"
             )
             fps = 25
             frame_interval_us = 1_000_000 // fps
@@ -1279,7 +1336,6 @@ class RoundFaceBlurPlugin(BasePlugin):
             strength = max(0, min(int(self.get_setting("blur_strength", 1)), 3))
             frame_step = [1, 2, 3][max(0, min(int(self.get_setting("frame_step", 1)), 2))]
             total_faces_found = 0
-            batch_size = 12
 
             def fetch_source_frame(current_pts_us):
                 nonlocal use_batch_frames
@@ -1327,10 +1383,11 @@ class RoundFaceBlurPlugin(BasePlugin):
                         if not end_of_stream:
                             break
                     elif status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
-                        new_format = encoder.getOutputFormat()
-                        video_track_idx = muxer.addTrack(new_format)
-                        muxer.start()
-                        muxer_started = True
+                        if not muxer_started:
+                            new_format = encoder.getOutputFormat()
+                            video_track_idx = muxer.addTrack(new_format)
+                            muxer.start()
+                            muxer_started = True
                     elif status >= 0:
                         idle_deadline = time.monotonic() + 10.0
                         encoded_data = encoder.getOutputBuffer(status)
@@ -1366,6 +1423,7 @@ class RoundFaceBlurPlugin(BasePlugin):
                     hold_us,
                     strength,
                     mosaic_paint,
+                    android_state,
                 )
                 if run_detection and cached_rects:
                     total_faces_found += len(cached_rects)
@@ -1396,10 +1454,15 @@ class RoundFaceBlurPlugin(BasePlugin):
                         extractor.advance()
                         continue
                     last_audio_pts = sample_time
+                    sample_flags = extractor.getSampleFlags()
                     audio_info.offset = 0
                     audio_info.size = sample_size
                     audio_info.presentationTimeUs = sample_time
-                    audio_info.flags = extractor.getSampleFlags()
+                    audio_info.flags = (
+                        MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        if (sample_flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        else 0
+                    )
                     muxer.writeSampleData(audio_track_idx, audio_buf, audio_info)
                     extractor.advance()
             if not muxer_started or video_track_idx < 0:
@@ -1410,6 +1473,13 @@ class RoundFaceBlurPlugin(BasePlugin):
             return (width, height)
         finally:
             clear_batch_cache()
+            old_rgb565 = android_state.pop("rgb565", None)
+            if old_rgb565 is not None:
+                try:
+                    old_rgb565.recycle()
+                except Exception:
+                    pass
+            android_state.clear()
             if work_bitmap is not None:
                 try:
                     work_bitmap.recycle()
