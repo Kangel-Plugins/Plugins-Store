@@ -1,0 +1,1405 @@
+"""One Line Chats — компактный список чатов.
+
+Плагин убирает из ячейки списка чатов строку с последним сообщением
+(`DialogCell`), выравнивает название, время и все значки по центру ячейки
+и может уменьшать аватарки вместе с высотой строки.
+
+Как это работает (по исходникам Telegram 12.x, org.telegram.ui.Cells.DialogCell):
+
+* высота ячейки считается в `onMeasure` (`computeHeight`), строки рисуются
+  в `onDraw`;
+* строка предпросмотра — `StaticLayout`-поля `messageLayout`, `typingLayout`
+  (статус «печатает…»), `messageNameLayout` (автор в режиме трёх строк),
+  плюс миниатюры вложений `thumbImage`, которые рисуются по `thumbsCount`.
+  Почти все обращения к ним в `onDraw` проверяются на null, поэтому на время
+  кадра их можно обнулить и вернуть обратно. Исключение — форумные ячейки
+  (темы): там `messageLayout` используется без проверки, их не трогаем;
+* название рисуется по ЛОКАЛЬНОЙ переменной
+  `nameTop = dp(useForceThreeLines || SharedConfig.useThreeLinesLayout ? 10 : 14)`,
+  поэтому полем класса его не сдвинуть. Сдвиг делается на уровне отрисовки
+  текста: нужный `Layout` помечается в `WeakHashMap`, а хук
+  `SpoilerEffect.layoutDrawMaybe(Layout, Canvas)` сдвигает канвас только для
+  помеченного `Layout` — цвета, шрифт, обрезка и эмодзи остаются родными;
+* время и нижние значки рисуются по полям (`timeTop`, `countTop`, `pinTop`,
+  `errorTop`), поэтому сдвигаются прямым изменением поля на время кадра;
+* время можно не рисовать вовсе: его `Layout` помечается в `_shift_tags`
+  меткой HIDE_MARKER, и хук `layoutDrawMaybe` пропускает отрисовку; галочки
+  «доставлено/прочитано» прячутся хуком `DialogCell.drawCheckStatus`;
+* верхние значки (premium, «без звука», верификация, скам, замок, галочки)
+  позиционируются фиксированными dp-координатами. Их сдвигает хук
+  `BaseCell.setDrawableBounds` ПО ГЕОМЕТРИИ: всё, что нарисовано выше
+  `TOP_BAND_DP`, едет вместе со строкой. Аргументы хука не подменяются —
+  только готовые bounds, иначе вызов ломается на float-параметрах;
+* аватарка рисуется по `storyParams.originalAvatarRect`: уменьшение — это inset
+  прямоугольника, а высота строки уменьшается в `onMeasure` через
+  `setMeasuredDimension` (минимум MIN_ROW_DP, чтобы счётчик не наезжал на текст),
+  после чего нижние значки подтягиваются вверх на ту же величину.
+"""
+
+import time
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java.util import Locale
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "one_line_chats"
+__name__ = "One Line Chats"
+__description__ = "Однострочный список чатов: скрывает превью сообщения, время и галочки, по желанию центрирует название, время, значки и кнопку «Открыть», уменьшает аватарки и высоту строк. Как пользоваться: включите плагин и откройте Настройки exteraGram → Плагины → One Line Chats."
+__author__ = "@ExtraFoxyplugins"
+__version__ = "2.5.1"
+__icon__ = "ExtraFoxyplugins/0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["appearance"]
+
+DEVELOPER_CHANNEL = "https://t.me/ExtraFoxyplugins"
+
+# Классы клиента, которые нужны плагину.
+DIALOG_CELL_CLASS = "org.telegram.ui.Cells.DialogCell"
+BASE_CELL_CLASS = "org.telegram.ui.Cells.BaseCell"
+SPOILER_EFFECT_CLASS = "org.telegram.ui.Components.spoilers.SpoilerEffect"
+SHARED_CONFIG_CLASS = "org.telegram.messenger.SharedConfig"
+ANDROID_UTILITIES_CLASS = "org.telegram.messenger.AndroidUtilities"
+SWAP_EMOJI_CLASS = "org.telegram.ui.Components.AnimatedEmojiDrawable$SwapAnimatedEmojiDrawable"
+
+# Поля DialogCell со строкой предпросмотра: обнуляем на время кадра.
+PREVIEW_FIELDS = ("messageLayout", "typingLayout", "messageNameLayout")
+
+# Отступы названия от верха ячейки (см. DialogCell.onDraw).
+NAME_TOP_TWO_LINES = 14
+NAME_TOP_THREE_LINES = 10
+TAGS_OFFSET_TWO_LINES = 9
+TAGS_OFFSET_FORUM = 8
+
+# Размер аватарки в dp для обычного и трёхстрочного режима.
+AVATAR_TWO_LINES = 52
+AVATAR_THREE_LINES = 56
+
+# Всё, что нарисовано выше этой линии, считается верхней строкой и едет вместе с ней.
+TOP_BAND_DP = 26
+
+# Ниже этой высоты строку не сжимаем: иначе счётчик непрочитанных наедет на текст.
+MIN_ROW_DP = 40
+
+# Метка в _shift_tags: этот Layout не сдвигаем, а не рисуем вовсе.
+HIDE_MARKER = -1
+
+# Индекс настройки -> коэффициент размера аватарки.
+AVATAR_SCALES = (1.0, 0.75, 0.5)
+
+# Индексы старого выпадающего списка скрытия -> (время, галочки).
+LEGACY_HIDE_PRESETS = (
+    (False, False),
+    (False, False),
+    (True, False),
+    (False, True),
+    (True, True),
+)
+
+# Страховка от «залипшего» стека, если чужой onDraw бросит исключение.
+MAX_STACK = 64
+
+_STRINGS = {
+    "ru": {
+        "main": "Основное",
+        "enabled": "Включить плагин",
+        "enabled_sub": "Мастер-выключатель, применяется сразу",
+        "hide_group": "Скрытие элементов",
+        "hide_time": "Скрывать время",
+        "hide_time_sub": "Время последнего сообщения и значок закрепа",
+        "hide_checks": "Скрывать галочки",
+        "hide_checks_sub": "Отметки «доставлено/прочитано» и часики",
+        "layout": "Оформление",
+        "center_line": "Центрирование элементов",
+        "center_line_sub": "Название, время, значки и кнопка «Открыть» — к середине строки",
+        "avatar_scale": "Маленькие иконки чатов",
+        "avatar_scale_sub": "Размер аватарок (строки станут ниже)",
+        "avatar_items": ["Нет", "−25%", "−50%"],
+        "channel": "Канал разработчика",
+        "channel_sub": "@ExtraFoxyplugins — новости и обновления",
+    },
+    "en": {
+        "main": "General",
+        "enabled": "Enable plugin",
+        "enabled_sub": "Master switch, applied immediately",
+        "hide_group": "Hide elements",
+        "hide_time": "Hide the time",
+        "hide_time_sub": "Time of the last message and the pin badge",
+        "hide_checks": "Hide read marks",
+        "hide_checks_sub": "Delivered/read marks and the clock",
+        "layout": "Appearance",
+        "center_line": "Center the elements",
+        "center_line_sub": "Name, time, icons and the Open button go to the middle of the row",
+        "avatar_scale": "Small chat icons",
+        "avatar_scale_sub": "Avatar size (rows become shorter)",
+        "avatar_items": ["Off", "−25%", "−50%"],
+        "channel": "Developer channel",
+        "channel_sub": "@ExtraFoxyplugins — news and updates",
+    },
+}
+
+# Кэши reflection: ключ -> найденное поле/метод (или None, если не нашли).
+_FIELD_CACHE = {}
+_METHOD_CACHE = {}
+_CLASS_CACHE = {}
+_MISSING = object()
+
+
+def _reflection_class(java_class, class_name):
+    """java.lang.Class для reflection.
+
+    `find_class()` возвращает Java-класс Chaquopy (Python-тип), у которого видны
+    только статические члены класса, поэтому `getName()`/`getDeclaredField()`
+    на нём напрямую не вызываются. Reflection-объект берём через `getClass()`
+    (как это делает сам Chaquopy), с запасными вариантами.
+    """
+    cached = _CLASS_CACHE.get(class_name, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    if java_class is None:
+        _CLASS_CACHE[class_name] = None
+        return None
+
+    candidates = []
+    try:
+        candidates.append(("getClass", java_class.getClass()))
+    except Exception:
+        pass
+    class_class = find_class("java.lang.Class")
+    if class_class is not None:
+        try:
+            candidates.append(("forName", class_class.forName(class_name)))
+        except Exception:
+            pass
+    candidates.append(("self", java_class))
+
+    for variant, candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            if getattr(candidate, "getDeclaredMethods", None) is None:
+                continue
+        except Exception:
+            continue
+        _CLASS_CACHE[class_name] = candidate
+        _CLASS_CACHE[class_name + "?"] = variant
+        return candidate
+
+    _CLASS_CACHE[class_name] = None
+    return None
+
+
+def _strings():
+    """Подписи настроек на языке системы (fallback — английский)."""
+    try:
+        language = Locale.getDefault().getLanguage()
+    except Exception:
+        language = "en"
+    return _STRINGS.get(language, _STRINGS["en"])
+
+
+def _as_int(value):
+    """java.lang.Integer / int / None -> int."""
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value.intValue())
+    except Exception:
+        pass
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _as_float(value):
+    """java.lang.Float / float / None -> float или None."""
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value
+    if isinstance(value, int):
+        return float(value)
+    try:
+        return float(value.floatValue())
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _same_cell(first, second):
+    """Одна и та же Java-ячейка (сравнение через equals объекта View)."""
+    if first is second:
+        return True
+    try:
+        return bool(first == second)
+    except Exception:
+        return False
+
+
+def _find_field(java_class, class_name, name):
+    """Поле по имени с поиском по иерархии и кэшем."""
+    key = (class_name, name)
+    cached = _FIELD_CACHE.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    found = None
+    current = _reflection_class(java_class, class_name)
+    while current is not None and found is None:
+        try:
+            field = current.getDeclaredField(name)
+        except Exception:
+            current = current.getSuperclass()
+            continue
+        try:
+            field.setAccessible(True)
+        except Exception:
+            pass
+        found = field
+    _FIELD_CACHE[key] = found
+    return found
+
+
+def _find_method(java_class, class_name, name, arg_count):
+    """Метод по имени и числу аргументов с поиском по иерархии и кэшем."""
+    key = (class_name, name, arg_count)
+    cached = _METHOD_CACHE.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    found = None
+    current = _reflection_class(java_class, class_name)
+    while current is not None and found is None:
+        try:
+            methods = current.getDeclaredMethods()
+        except Exception:
+            methods = []
+        for method in methods:
+            try:
+                if method.getName() != name:
+                    continue
+                if len(method.getParameterTypes()) != arg_count:
+                    continue
+            except Exception:
+                continue
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            found = method
+            break
+        current = current.getSuperclass()
+    _METHOD_CACHE[key] = found
+    return found
+
+
+class _CellDrawHook(MethodHook):
+    """Готовит ячейку к кадру и возвращает поля после отрисовки."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+        except Exception:
+            return
+        self.plugin.begin_cell_draw(cell)
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+        except Exception:
+            cell = None
+        self.plugin.end_cell_draw(cell)
+
+
+class _MeasureHook(MethodHook):
+    """Уменьшает высоту строки вместе с аватаркой."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+        except Exception:
+            return
+        self.plugin.apply_row_height(cell)
+
+
+class _LayoutPassHook(MethodHook):
+    """После раскладки ячейки ставит кнопку «Открыть» (мини-аппы) в центр."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+        except Exception:
+            return
+        self.plugin.center_open_button(cell)
+
+
+class _PinnedHook(MethodHook):
+    """Прячет значок закрепа: во время отрисовки ячейки «закреплён» = false."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if plugin._enabled and plugin._hide_time and plugin._current_cell is not None:
+            try:
+                param.setResult(False)
+            except Exception:
+                pass
+
+
+class _LayoutDrawHook(MethodHook):
+    """Сдвигает канвас только для помеченных Layout (название чата)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._stack = []
+
+    def before_hooked_method(self, param):
+        marker = None
+        tags = self.plugin._shift_tags
+        if tags is not None and self.plugin._enabled:
+            try:
+                layout = param.args[0]
+                dy = _as_int(tags.get(layout))
+            except Exception:
+                dy = 0
+            if dy < 0:
+                # HIDE_MARKER: этот Layout вообще не рисуем (время последнего сообщения).
+                try:
+                    param.setResult(None)
+                except Exception:
+                    pass
+                dy = 0
+            elif dy:
+                try:
+                    canvas = param.args[1]
+                    save_count = int(canvas.getSaveCount())
+                    canvas.save()
+                    canvas.translate(0.0, float(dy))
+                    marker = (canvas, save_count)
+                except Exception:
+                    marker = None
+        stack = self._stack
+        if len(stack) > MAX_STACK:
+            del stack[: MAX_STACK // 2]
+        stack.append(marker)
+
+    def after_hooked_method(self, param):
+        stack = self._stack
+        if not stack:
+            return
+        marker = stack.pop()
+        if marker is None:
+            return
+        canvas, save_count = marker
+        try:
+            canvas.restoreToCount(save_count)
+        except Exception:
+            pass
+
+
+class _BoundsHook(MethodHook):
+    """Ставит верхние значки ровно в вертикальный центр строки.
+
+    Аргументы метода не трогаем (подмена float-аргумента питоновским float
+    ломала вызов), работаем с готовыми bounds drawable: берём их и
+    переставляем так, чтобы центр значка совпал с центром ячейки.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        plugin = self.plugin
+        center = plugin._draw_center
+        if center <= 0:
+            return
+        try:
+            drawable = param.args[0]
+            bounds = drawable.getBounds()
+            top = bounds.top
+            height = bounds.height()
+            if top < 0 or top >= plugin._top_band or height <= 0:
+                return
+            target = int(round(center - height / 2.0))
+            if target != top:
+                drawable.setBounds(bounds.left, target, bounds.right, target + height)
+        except Exception:
+            pass
+
+
+class _ChecksHook(MethodHook):
+    """Пропускает отрисовку галочек «доставлено/прочитано» и часиков."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if not (plugin._enabled and plugin._hide_checks):
+            return
+        try:
+            param.setResult(None)
+        except Exception:
+            pass
+
+
+class _EmojiBadgeHook(MethodHook):
+    """Ставит значок верификации бота в центр строки вместе с остальными."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._stack = []
+
+    def before_hooked_method(self, param):
+        marker = None
+        plugin = self.plugin
+        center = plugin._draw_center
+        if center > 0 and plugin._current_cell is not None:
+            try:
+                drawable = param.thisObject
+                bounds = drawable.getBounds()
+                top = bounds.top
+                height = bounds.height()
+                if 0 <= top < plugin._top_band and height > 0:
+                    shift = int(round(center - height / 2.0)) - top
+                    if shift:
+                        canvas = param.args[0]
+                        save_count = int(canvas.getSaveCount())
+                        canvas.save()
+                        canvas.translate(0.0, float(shift))
+                        marker = (canvas, save_count)
+            except Exception:
+                marker = None
+        stack = self._stack
+        if len(stack) > MAX_STACK:
+            del stack[: MAX_STACK // 2]
+        stack.append(marker)
+
+    def after_hooked_method(self, param):
+        stack = self._stack
+        if not stack:
+            return
+        marker = stack.pop()
+        if marker is None:
+            return
+        canvas, save_count = marker
+        try:
+            canvas.restoreToCount(save_count)
+        except Exception:
+            pass
+
+
+class OneLineChatsPlugin(BasePlugin):
+    """Список чатов в одну строку: скрытие превью, центрирование, мелкие аватарки."""
+
+    _enabled = True
+    _center_line = False
+    _hide_time = True
+    _hide_checks = True
+    _avatar_scale = 0
+    _avatar_factor = 1.0
+
+    _shift_tags = None
+    _emoji_shift = None
+    _row_shift = None
+    _remeasure_until = 0.0
+    _draw_stack = None
+    _fields = {}
+    _hooks = {}
+    _draw_dy = 0
+    _draw_center = 0.0
+    _current_cell = None
+    _top_band = 0
+    _density = 0.0
+    _android_utilities = None
+    _dp_method = None
+    _three_lines_field = None
+    _set_measured = None
+
+    # ------------------------------------------------------------------ life
+
+    def on_plugin_load(self):
+        self._shift_tags = None
+        self._emoji_shift = None
+        self._row_shift = None
+        self._draw_stack = []
+        self._fields = {}
+        self._hooks = {}
+        self._draw_dy = 0
+        self._current_cell = None
+        self._reload_flags()
+
+        dialog_cell = find_class(DIALOG_CELL_CLASS)
+        if dialog_cell is None:
+            self.logger.warning("%s not found, plugin inactive", DIALOG_CELL_CLASS)
+            return
+
+        try:
+            from java.util import WeakHashMap
+
+            self._shift_tags = WeakHashMap()
+            self._emoji_shift = WeakHashMap()
+            self._row_shift = WeakHashMap()
+        except Exception:
+            self._shift_tags = None
+            self._emoji_shift = None
+            self._row_shift = None
+            self.logger.exception("WeakHashMap is not available, centering disabled")
+
+        for name in PREVIEW_FIELDS:
+            self._fields[name] = _find_field(dialog_cell, DIALOG_CELL_CLASS, name)
+        for name in (
+            "thumbsCount",
+            "timeTop",
+            "timeLayout",
+            "countTop",
+            "pinTop",
+            "errorTop",
+            "lastTopicMessageUnread",
+            "emojiStatusView",
+            "openButtonRect",
+        ):
+            self._fields[name] = _find_field(dialog_cell, DIALOG_CELL_CLASS, name)
+
+        missing = [name for name in self._fields if self._fields[name] is None]
+        if missing:
+            self.logger.warning("DialogCell fields not found: %s", ", ".join(missing))
+
+        self._resolve_helpers()
+        self._set_measured = _find_method(
+            dialog_cell, DIALOG_CELL_CLASS, "setMeasuredDimension", 2
+        )
+        if self._set_measured is None:
+            self.logger.warning("setMeasuredDimension not found, rows stay tall")
+
+        self._install_cell_hook(dialog_cell)
+        self._install_measure_hook(dialog_cell)
+        self._install_layout_pass_hook(dialog_cell)
+        self._sync_hooks()
+
+        self.logger.info(
+            "reflection for DialogCell via %s",
+            _CLASS_CACHE.get(DIALOG_CELL_CLASS + "?", "unknown"),
+        )
+        self.logger.info(
+            "loaded v%s: hide_time=%s hide_checks=%s center_line=%s avatar=%.2f",
+            __version__,
+            self._hide_time,
+            self._hide_checks,
+            self._center_line,
+            self._avatar_factor,
+        )
+
+    def on_plugin_unload(self):
+        for key, state in list(self._hooks.items()):
+            for handle in state.get("handles") or []:
+                try:
+                    self.unhook_method(handle)
+                except Exception:
+                    self.logger.warning("failed to unhook %s", key)
+        self._hooks = {}
+        for tags in (self._shift_tags, self._emoji_shift, self._row_shift):
+            try:
+                if tags is not None:
+                    tags.clear()
+            except Exception:
+                pass
+        self._shift_tags = None
+        self._emoji_shift = None
+        self._row_shift = None
+        if self._draw_stack:
+            self._draw_stack.clear()
+        self._current_cell = None
+        self._draw_dy = 0
+        self.logger.info("unloaded")
+
+    # -------------------------------------------------------------- helpers
+
+    def _resolve_helpers(self):
+        """Плотность экрана и флаг трёхстрочного режима — один раз при загрузке."""
+        self._density = 0.0
+        self._dp_method = None
+        utilities = find_class(ANDROID_UTILITIES_CLASS)
+        self._android_utilities = utilities
+        if utilities is not None:
+            density_field = _find_field(utilities, ANDROID_UTILITIES_CLASS, "density")
+            if density_field is not None:
+                try:
+                    self._density = float(density_field.getFloat(None))
+                except Exception:
+                    self._density = 0.0
+            if not self._density:
+                self._dp_method = _find_method(
+                    utilities, ANDROID_UTILITIES_CLASS, "dp", 1
+                )
+
+        shared_config = find_class(SHARED_CONFIG_CLASS)
+        self._three_lines_field = (
+            _find_field(shared_config, SHARED_CONFIG_CLASS, "useThreeLinesLayout")
+            if shared_config is not None
+            else None
+        )
+        self._top_band = self._dp(TOP_BAND_DP)
+
+    def _dp(self, value):
+        """dp -> px так же, как AndroidUtilities.dp."""
+        if self._density:
+            return int(value * self._density + 0.5)
+        method = self._dp_method
+        if method is not None:
+            try:
+                return int(method.invoke(None, float(value)))
+            except Exception:
+                pass
+        return int(value)
+
+    def _three_lines(self):
+        field = self._three_lines_field
+        if field is None:
+            return False
+        try:
+            return bool(field.getBoolean(None))
+        except Exception:
+            return False
+
+    def _three_line_mode(self, cell):
+        try:
+            if getattr(cell, "useForceThreeLines", False):
+                return True
+        except Exception:
+            pass
+        return self._three_lines()
+
+    def _reload_flags(self):
+        self._enabled = bool(self.get_setting("enabled", True))
+        # Старые версии хранили три отдельных переключателя — переносим их.
+        legacy = (
+            bool(self.get_setting("center_name", False))
+            or bool(self.get_setting("center_time", False))
+            or bool(self.get_setting("center_icons", False))
+        )
+        self._center_line = bool(self.get_setting("center_line", legacy))
+        # Миграция: в 2.4.0 скрытия были одним списком (hide_items),
+        # в 2.3.x — одним переключателем hide_time.
+        legacy_time, legacy_checks = self._legacy_hide_flags()
+        self._hide_time = bool(self.get_setting("hide_time", legacy_time))
+        self._hide_checks = bool(self.get_setting("hide_checks", legacy_checks))
+        try:
+            index = int(self.get_setting("avatar_scale", 0))
+        except Exception:
+            index = 0
+        if index < 0 or index >= len(AVATAR_SCALES):
+            index = 0
+        self._avatar_scale = index
+        self._avatar_factor = AVATAR_SCALES[index]
+
+    def _legacy_hide_flags(self):
+        """(время, галочки) из настроек старых версий."""
+        try:
+            index = int(self.get_setting("hide_items", -1))
+        except Exception:
+            index = -1
+        if 0 <= index < len(LEGACY_HIDE_PRESETS):
+            return LEGACY_HIDE_PRESETS[index]
+        stored_time = bool(self.get_setting("hide_time", True))
+        return stored_time, stored_time
+
+    # ---------------------------------------------------------------- hooks
+
+    def _store_hooks(self, key, handles):
+        """Запоминает хук. handle может быть None — тогда снять его не сможем,
+        но запись останется, чтобы не поставить хук второй раз."""
+        handles = [handle for handle in handles if handle is not None]
+        self._hooks[key] = {"handles": handles, "hooked": True}
+        return True
+
+    def _methods_named(self, java_class, class_name, name):
+        """Все объявленные методы с таким именем (по иерархии)."""
+        result = []
+        current = _reflection_class(java_class, class_name)
+        guard = 0
+        while current is not None and guard < 16:
+            guard += 1
+            try:
+                methods = current.getDeclaredMethods()
+            except Exception:
+                methods = []
+            for method in methods:
+                try:
+                    if method.getName() != name:
+                        continue
+                    method.setAccessible(True)
+                except Exception:
+                    continue
+                result.append(method)
+            try:
+                current = current.getSuperclass()
+            except Exception:
+                current = None
+        return result
+
+    def _install_cell_hook(self, dialog_cell):
+        method = _find_method(dialog_cell, DIALOG_CELL_CLASS, "onDraw", 1)
+        if method is None:
+            self.logger.warning("DialogCell.onDraw not found, nothing hooked")
+            return False
+        try:
+            self._store_hooks("cell", [self.hook_method(method, _CellDrawHook(self))])
+        except Exception:
+            self.logger.exception("failed to hook DialogCell.onDraw")
+            return False
+        self.logger.info("hooked DialogCell.onDraw")
+        return True
+
+    def _install_measure_hook(self, dialog_cell):
+        method = _find_method(dialog_cell, DIALOG_CELL_CLASS, "onMeasure", 2)
+        if method is None:
+            self.logger.warning("DialogCell.onMeasure not found, rows stay tall")
+            return False
+        try:
+            self._store_hooks("measure", [self.hook_method(method, _MeasureHook(self))])
+        except Exception:
+            self.logger.exception("failed to hook DialogCell.onMeasure")
+            return False
+        self.logger.info("hooked DialogCell.onMeasure")
+        return True
+
+    def _install_layout_pass_hook(self, dialog_cell):
+        method = _find_method(dialog_cell, DIALOG_CELL_CLASS, "onLayout", 5)
+        if method is None:
+            self.logger.warning("DialogCell.onLayout not found, Open button stays put")
+            return False
+        try:
+            self._store_hooks(
+                "layout_pass", [self.hook_method(method, _LayoutPassHook(self))]
+            )
+        except Exception:
+            self.logger.exception("failed to hook DialogCell.onLayout")
+            return False
+        self.logger.info("hooked DialogCell.onLayout")
+        return True
+
+    def _install_pinned_hook(self):
+        dialog_cell = find_class(DIALOG_CELL_CLASS)
+        if dialog_cell is None:
+            return False
+        method = _find_method(dialog_cell, DIALOG_CELL_CLASS, "getIsPinned", 0)
+        if method is None:
+            self.logger.warning("getIsPinned not found, pin badge stays visible")
+            return False
+        try:
+            self._store_hooks(
+                "pinned", [self.hook_method(method, _PinnedHook(self))]
+            )
+        except Exception:
+            self.logger.exception("failed to hook getIsPinned")
+            return False
+        self.logger.info("hooked DialogCell.getIsPinned")
+        return True
+
+    def _install_layout_hook(self):
+        if self._shift_tags is None:
+            return False
+        spoiler_effect = find_class(SPOILER_EFFECT_CLASS)
+        if spoiler_effect is None:
+            self.logger.warning("%s not found, centering disabled", SPOILER_EFFECT_CLASS)
+            return False
+        method = _find_method(spoiler_effect, SPOILER_EFFECT_CLASS, "layoutDrawMaybe", 2)
+        if method is None:
+            self.logger.warning("layoutDrawMaybe not found, centering disabled")
+            return False
+        try:
+            self._store_hooks(
+                "layout", [self.hook_method(method, _LayoutDrawHook(self))]
+            )
+        except Exception:
+            self.logger.exception("failed to hook layoutDrawMaybe")
+            return False
+        self.logger.info("hooked SpoilerEffect.layoutDrawMaybe")
+        return True
+
+    def _install_bounds_hook(self):
+        hook = _BoundsHook(self)
+        handles = []
+        installed = 0
+        seen = set()
+        for class_name in (BASE_CELL_CLASS, DIALOG_CELL_CLASS):
+            java_class = find_class(class_name)
+            if java_class is None:
+                continue
+            for method in self._methods_named(java_class, class_name, "setDrawableBounds"):
+                try:
+                    params = method.getParameterTypes()
+                    if len(params) != 3:
+                        continue
+                    signature = method.getDeclaringClass().getName() + "|" + ",".join(
+                        str(param.getName()) for param in params
+                    )
+                except Exception:
+                    continue
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                try:
+                    handle = self.hook_method(method, hook)
+                except Exception:
+                    self.logger.exception("failed to hook setDrawableBounds")
+                    continue
+                installed += 1
+                if handle is not None:
+                    handles.append(handle)
+        if installed:
+            self.logger.info("hooked %s setDrawableBounds overload(s)", installed)
+            return self._store_hooks("bounds", handles)
+        self.logger.warning("setDrawableBounds not found, icons stay in place")
+        return False
+
+    def _install_emoji_hook(self):
+        swap_emoji = find_class(SWAP_EMOJI_CLASS)
+        if swap_emoji is None:
+            self.logger.warning("%s not found, bot badge stays in place", SWAP_EMOJI_CLASS)
+            return False
+        method = _find_method(swap_emoji, SWAP_EMOJI_CLASS, "draw", 1)
+        if method is None:
+            self.logger.warning("SwapAnimatedEmojiDrawable.draw not found")
+            return False
+        try:
+            self._store_hooks(
+                "emoji", [self.hook_method(method, _EmojiBadgeHook(self))]
+            )
+        except Exception:
+            self.logger.exception("failed to hook SwapAnimatedEmojiDrawable.draw")
+            return False
+        self.logger.info("hooked SwapAnimatedEmojiDrawable.draw")
+        return True
+
+    def _install_checks_hook(self):
+        dialog_cell = find_class(DIALOG_CELL_CLASS)
+        if dialog_cell is None:
+            return False
+        method = _find_method(dialog_cell, DIALOG_CELL_CLASS, "drawCheckStatus", 6)
+        if method is None:
+            self.logger.warning("drawCheckStatus not found, marks stay visible")
+            return False
+        try:
+            self._store_hooks("checks", [self.hook_method(method, _ChecksHook(self))])
+        except Exception:
+            self.logger.exception("failed to hook drawCheckStatus")
+            return False
+        self.logger.info("hooked DialogCell.drawCheckStatus")
+        return True
+
+    def _sync_hooks(self):
+        """Ставит/снимает вспомогательные хуки по текущим настройкам."""
+        center = self._enabled and self._center_line
+        hide_time = self._enabled and self._hide_time
+        hide_checks = self._enabled and self._hide_checks
+        self._toggle_hook("layout", center or hide_time, self._install_layout_hook)
+        self._toggle_hook("checks", hide_checks, self._install_checks_hook)
+        self._toggle_hook("pinned", hide_time, self._install_pinned_hook)
+        self._toggle_hook("bounds", center, self._install_bounds_hook)
+        self._toggle_hook("emoji", center, self._install_emoji_hook)
+
+    def _toggle_hook(self, key, needed, installer):
+        state = self._hooks.get(key)
+        hooked = bool(state and state.get("hooked"))
+        if needed:
+            if not hooked:
+                installer()
+            return
+        if not hooked:
+            return
+        handles = state.get("handles") or []
+        if not handles:
+            self.logger.warning("%s has no handle, keeping it idle", key)
+            return
+        failed = False
+        for handle in handles:
+            try:
+                self.unhook_method(handle)
+            except Exception:
+                failed = True
+        if failed:
+            # Оставляем запись, чтобы не поставить хук второй раз:
+            # при нулевом сдвиге он безвреден.
+            self.logger.warning("failed to unhook %s, keeping it idle", key)
+        else:
+            self._hooks.pop(key, None)
+
+    # ----------------------------------------------------------- cell layout
+
+    def _row_delta(self, cell):
+        """Насколько уменьшится высота строки при уменьшенной аватарке (px)."""
+        factor = self._avatar_factor
+        if factor >= 1.0:
+            return 0
+        avatar_dp = AVATAR_THREE_LINES if self._three_line_mode(cell) else AVATAR_TWO_LINES
+        return int(self._dp(avatar_dp) * (1.0 - factor))
+
+    def apply_row_height(self, cell):
+        """После штатного onMeasure уменьшает высоту строки под аватарку."""
+        delta = self._row_delta(cell)
+        if not delta or self._set_measured is None:
+            return
+        try:
+            height = int(cell.getMeasuredHeight())
+            width = int(cell.getMeasuredWidth())
+            new_height = max(self._dp(MIN_ROW_DP), height - delta)
+            if new_height >= height:
+                return
+            self._set_measured.invoke(cell, width, new_height)
+            if self._row_shift is not None:
+                # запоминаем, насколько строка реально стала ниже:
+                # понадобится, чтобы подтянуть нижние значки
+                self._row_shift.put(cell, height - new_height)
+        except Exception:
+            self.logger.exception("failed to shrink the row")
+
+    # ----------------------------------------------------------- cell draw
+
+    def begin_cell_draw(self, cell):
+        """Перед отрисовкой ячейки: прячем превью, считаем сдвиг и размеры."""
+        self._draw_dy = 0
+        self._draw_center = 0.0
+        self._current_cell = cell
+        state = []
+        try:
+            if self._enabled:
+                if self._remeasure_until and time.monotonic() < self._remeasure_until:
+                    # после смены размера аватарок просим пересчитать высоту строк
+                    try:
+                        cell.requestLayout()
+                    except Exception:
+                        pass
+                # превью последнего сообщения скрывается всегда
+                self._hide_preview_rows(cell, state)
+                if self._hide_time:
+                    self._hide_time_row(cell)
+                height = cell.getMeasuredHeight()
+                # Центрировать строку имеет смысл только когда превью скрыто,
+                # иначе название наедет на текст сообщения.
+                if self._center_line and height > 0:
+                    self._center_top_line(cell, height, state)
+                if self._avatar_factor < 1.0:
+                    self._shrink_row(cell, state)
+                    self._shift_bottom_badges(cell, state)
+        except Exception:
+            self.logger.exception("failed to prepare dialog cell")
+        if self._draw_stack is None:
+            self._draw_stack = []
+        if len(self._draw_stack) > MAX_STACK:
+            del self._draw_stack[: MAX_STACK // 2]
+        self._draw_stack.append((cell, state))
+
+    def end_cell_draw(self, cell):
+        """После отрисовки ячейки вернуть поля как было."""
+        stack = self._draw_stack
+        state = None
+        if stack:
+            # Ищем состояние именно этой ячейки: если предыдущий кадр прервался
+            # исключением внутри onDraw, устаревшие записи просто выбрасываем.
+            while stack:
+                entry_cell, entry_state = stack.pop()
+                if cell is None or _same_cell(entry_cell, cell):
+                    state = entry_state
+                    break
+        center = self._draw_center
+        self._current_cell = None
+        self._draw_dy = 0
+        self._draw_center = 0.0
+        if cell is None:
+            return
+        if state:
+            self._restore_state(cell, state)
+        if center > 0:
+            self._shift_emoji_status(cell, center)
+
+    def _restore_state(self, cell, state):
+        for entry in state:
+            try:
+                if entry[0] == "rect":
+                    _, rect, box = entry
+                    rect.set(box[0], box[1], box[2], box[3])
+                    continue
+                _, field, value = entry
+                try:
+                    field.set(cell, value)
+                except Exception:
+                    # примитив (timeTop, thumbsCount) возвращаем через setInt
+                    field.setInt(cell, int(value))
+            except Exception:
+                self.logger.warning("failed to restore a DialogCell state")
+
+    def _hide_preview_rows(self, cell, state):
+        """Убирает текст предпросмотра и миниатюры вложений на время кадра."""
+        if self._skip_preview_hiding(cell):
+            # В форумных ячейках (темы) строка предпросмотра используется в onDraw
+            # при расчёте области кнопки темы без проверки на null — не трогаем.
+            return
+        for name in PREVIEW_FIELDS:
+            field = self._fields.get(name)
+            if field is None:
+                continue
+            try:
+                value = field.get(cell)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            try:
+                field.set(cell, None)
+            except Exception:
+                continue
+            state.append(("field", field, value))
+
+        thumbs = self._fields.get("thumbsCount")
+        if thumbs is not None:
+            try:
+                count = int(thumbs.getInt(cell))
+            except Exception:
+                count = 0
+            if count:
+                try:
+                    thumbs.setInt(cell, 0)
+                    state.append(("field", thumbs, count))
+                except Exception:
+                    pass
+
+    def _skip_preview_hiding(self, cell):
+        try:
+            if cell.isForumCell():
+                return True
+        except Exception:
+            pass
+        field = self._fields.get("lastTopicMessageUnread")
+        if field is not None:
+            try:
+                return bool(field.getBoolean(cell))
+            except Exception:
+                pass
+        return False
+
+    def _center_top_line(self, cell, height, state):
+        """Сдвигает вниз всю верхнюю строку: название, время и значки."""
+        layout = getattr(cell, "nameLayout", None)
+        if layout is None:
+            return
+        # Центр ячейки без учёта 1px разделителя — к нему выравниваем всё.
+        center = (height - 1) / 2.0
+        self._draw_center = center
+        dy = int(round(center - layout.getHeight() / 2.0)) - self._name_top(cell)
+        if dy > 0:
+            self._draw_dy = dy
+            if self._shift_tags is not None:
+                try:
+                    self._shift_tags.put(layout, dy)
+                except Exception:
+                    self.logger.exception("failed to tag name layout")
+
+        # Время ставим так, чтобы его собственный центр совпал с центром строки.
+        top_field = self._fields.get("timeTop")
+        layout_field = self._fields.get("timeLayout")
+        if top_field is None or layout_field is None:
+            return
+        try:
+            time_layout = layout_field.get(cell)
+            if time_layout is None:
+                return
+            original = int(top_field.getInt(cell))
+            target = int(round(center - time_layout.getHeight() / 2.0))
+            if target != original:
+                top_field.setInt(cell, target)
+                state.append(("field", top_field, original))
+        except Exception:
+            self.logger.exception("failed to shift time")
+
+    def _shrink_row(self, cell, state):
+        """Уменьшает аватарку и подтягивает её к центру укороченной строки."""
+        try:
+            rect = cell.storyParams.originalAvatarRect
+        except Exception:
+            return
+        if rect is None:
+            return
+        try:
+            size = rect.width()
+        except Exception:
+            return
+        if size <= 0:
+            return
+        inset = size * (1.0 - self._avatar_factor) / 2.0
+        if inset <= 0:
+            return
+        box = (rect.left, rect.top, rect.right, rect.bottom)
+        try:
+            center_y = rect.centerY()
+            height = float(cell.getMeasuredHeight())
+            rect.inset(inset, inset)
+            # Аватарка должна остаться в середине уже укороченной строки
+            # (высота ячейки включает 1px разделителя).
+            shift = (height - 1.0) / 2.0 - center_y
+            if abs(shift) > 0.5:
+                rect.offset(0.0, shift)
+        except Exception:
+            return
+        state.append(("rect", rect, box))
+
+    def center_open_button(self, cell):
+        """Ставит кнопку «Открыть» мини-аппа в вертикальный центр строки."""
+        if not (self._enabled and self._center_line):
+            return
+        field = self._fields.get("openButtonRect")
+        if field is None:
+            return
+        try:
+            rect = field.get(cell)
+            if rect is None:
+                return
+            height = float(cell.getMeasuredHeight())
+            button_height = float(rect.height())
+            if height <= 0 or button_height <= 0:
+                return
+            target = (height - 1.0) / 2.0 - button_height / 2.0
+            delta = target - float(rect.top)
+            if abs(delta) > 0.5:
+                # idempotent: повторный вызов при том же размере ничего не сдвинет
+                rect.offset(0.0, delta)
+        except Exception:
+            pass
+
+    def _hide_time_row(self, cell):
+        """Помечает Layout времени так, чтобы он не рисовался."""
+        if self._shift_tags is None:
+            return
+        layout_field = self._fields.get("timeLayout")
+        if layout_field is None:
+            return
+        try:
+            layout = layout_field.get(cell)
+            if layout is None:
+                return
+            self._shift_tags.put(layout, HIDE_MARKER)
+        except Exception:
+            pass
+
+    def _shift_bottom_badges(self, cell, state):
+        """Подтягивает счётчик непрочитанных и закреп вверх вместе со строкой."""
+        if self._row_shift is None:
+            return
+        shift = _as_int(self._row_shift.get(cell))
+        if shift <= 0:
+            return
+        for name in ("countTop", "pinTop", "errorTop"):
+            field = self._fields.get(name)
+            if field is None:
+                continue
+            try:
+                value = int(field.getInt(cell))
+            except Exception:
+                continue
+            if not value:
+                continue
+            try:
+                field.setInt(cell, value - shift)
+                state.append(("field", field, value))
+            except Exception:
+                continue
+
+    def _shift_emoji_status(self, cell, center):
+        """Ставит premium-статус (дочерний View) в центр строки после onDraw."""
+        field = self._fields.get("emojiStatusView")
+        if field is None or self._emoji_shift is None:
+            return
+        try:
+            view = field.get(cell)
+            if view is None:
+                return
+            current = float(view.getTranslationY())
+            height = float(view.getHeight())
+            if height <= 0:
+                return
+            last = _as_float(self._emoji_shift.get(cell))
+            if last is not None and abs(current - last) < 0.5:
+                # значение не менялось с прошлого кадра — уже выровнено
+                return
+            shifted = current + (center - (current + height / 2.0))
+            view.setTranslationY(shifted)
+            self._emoji_shift.put(cell, float(shifted))
+        except Exception:
+            pass
+
+    def _name_top(self, cell):
+        """Позиция названия от верха ячейки — та же формула, что в DialogCell.onDraw."""
+        three_lines = self._three_line_mode(cell)
+        forum = False
+        try:
+            forum = bool(cell.isForumCell())
+        except Exception:
+            pass
+        top = self._dp(NAME_TOP_THREE_LINES if three_lines else NAME_TOP_TWO_LINES)
+        try:
+            if (not three_lines or forum) and cell.hasTags():
+                top -= self._dp(TAGS_OFFSET_FORUM if forum else TAGS_OFFSET_TWO_LINES)
+        except Exception:
+            pass
+        return top
+
+    # ------------------------------------------------------------- settings
+
+    def _after_change(self):
+        """Общая реакция на любую настройку."""
+        if self._shift_tags is not None:
+            try:
+                self._shift_tags.clear()
+            except Exception:
+                pass
+        if self._emoji_shift is not None:
+            try:
+                self._emoji_shift.clear()
+            except Exception:
+                pass
+        self._remeasure_until = time.monotonic() + 2.0
+        self._sync_hooks()
+
+    def _on_enabled_change(self, value=True):
+        self._enabled = bool(value)
+        self._after_change()
+
+    def _on_center_change(self, value=False):
+        self._center_line = bool(value)
+        self._after_change()
+
+    def _on_hide_time_change(self, value=True):
+        self._hide_time = bool(value)
+        self._after_change()
+
+    def _on_hide_checks_change(self, value=True):
+        self._hide_checks = bool(value)
+        self._after_change()
+
+    def _on_avatar_change(self, value=0):
+        try:
+            index = int(value)
+        except Exception:
+            index = 0
+        if 0 <= index < len(AVATAR_SCALES):
+            self._avatar_scale = index
+            self._avatar_factor = AVATAR_SCALES[index]
+        self._after_change()
+
+    def _open_developer_channel(self, _view=None):
+        try:
+            from android.net import Uri
+            from client_utils import get_last_fragment
+            from org.telegram.messenger.browser import Browser
+
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                self.logger.warning("no activity to open the developer channel")
+                return
+            Browser.openUrl(activity, Uri.parse(DEVELOPER_CHANNEL))
+        except Exception:
+            self.logger.exception("failed to open the developer channel")
+
+    def create_settings(self) -> List[Any]:
+        strings = _strings()
+        rows = [
+            (Header, {"text": strings["main"]}),
+            (
+                Switch,
+                {
+                    "key": "enabled",
+                    "text": strings["enabled"],
+                    "default": True,
+                    "subtext": strings["enabled_sub"],
+                    "icon": "msg_settings",
+                    "on_change": self._on_enabled_change,
+                },
+            ),
+            (Divider, {}),
+            (Header, {"text": strings["hide_group"]}),
+            (
+                Switch,
+                {
+                    "key": "hide_time",
+                    "text": strings["hide_time"],
+                    "default": True,
+                    "subtext": strings["hide_time_sub"],
+                    "on_change": self._on_hide_time_change,
+                },
+            ),
+            (
+                Switch,
+                {
+                    "key": "hide_checks",
+                    "text": strings["hide_checks"],
+                    "default": True,
+                    "subtext": strings["hide_checks_sub"],
+                    "on_change": self._on_hide_checks_change,
+                },
+            ),
+            (Divider, {}),
+            (Header, {"text": strings["layout"]}),
+            (
+                Switch,
+                {
+                    "key": "center_line",
+                    "text": strings["center_line"],
+                    "default": False,
+                    "subtext": strings["center_line_sub"],
+                    "on_change": self._on_center_change,
+                },
+            ),
+            (Header, {"text": strings["avatar_scale"]}),
+            (
+                Selector,
+                {
+                    "key": "avatar_scale",
+                    "text": strings["avatar_scale_sub"],
+                    "default": 0,
+                    "items": strings["avatar_items"],
+                    "on_change": self._on_avatar_change,
+                },
+            ),
+            (Divider, {}),
+            (
+                Text,
+                {
+                    "text": strings["channel"],
+                    "subtext": strings["channel_sub"],
+                    "icon": "msg_link",
+                    "on_click": self._open_developer_channel,
+                },
+            ),
+        ]
+
+        # Строки собираем по одной: если виджет в этой версии клиента не
+        # принимает какой-то параметр, теряем только его строку, а не экран.
+        result = []
+        for widget, kwargs in rows:
+            try:
+                result.append(widget(**kwargs))
+            except Exception:
+                self.logger.exception(
+                    "failed to build a settings row %s",
+                    getattr(widget, "__name__", widget),
+                )
+        return result
