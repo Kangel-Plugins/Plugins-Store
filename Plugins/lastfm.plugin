@@ -12,21 +12,27 @@ from org.telegram.messenger import R as R_tg
 from org.telegram.tgnet.tl import TL_account
 from ui.settings import Header, Input, Switch, Divider, Selector, Text
 from client_utils import send_message, get_send_messages_helper, get_last_fragment, get_messages_controller, get_user_config, send_request
-from base_plugin import BasePlugin, HookResult, HookStrategy
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from java import dynamic_proxy, jclass, jarray, jbyte
+from java.util import ArrayList
+from java.util.function import BiConsumer
 from org.telegram.ui.ActionBar import AlertDialog
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 import threading
+import json
+import hashlib
+from urllib.parse import urljoin, urlparse
 from typing import Optional, Any
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
 from markdown_utils import parse_markdown
 
 __id__ = "lastfm"
-__name__ = "LastFM"
-__version__ = "1.7.0 [Release]"
-__description__ = "Shows the current song from LastFM. [.np]"
+__name__ = "ScrobblerFM"
+__version__ = "1.8.0"
+__description__ = "Shows the current song from last.fm/SelfHosted Koito [.np]"
 __author__ = "@ArThirtyFour | @KangelPlugins"
-__min_version__ = "11.9.0"
+__min_version__ = "12.10.6"
 __icon__ = "OMGKAWAIIANGELGOD/0"
 
 GENIUS_API_TOKEN = "9JiBRxKAEgfssIWg3Yw8uxKyDO0HZr1IQS5qVYQiKMLwJ4d_9tEMxxYlm3w_mIML"
@@ -126,17 +132,320 @@ class LocalizationManager:
 locali = LocalizationManager()
 
 
+class _NowPlayingCallback(dynamic_proxy(BiConsumer)):
+    def __init__(self, plugin, original):
+        super().__init__()
+        self.plugin = plugin
+        self.original = original
+
+    def accept(self, track, elapsed):
+        try:
+            data = self.plugin._local_track
+            if (self.plugin._running and self.plugin.get_setting("music_source", 0) == 1
+                    and self.plugin.get_setting("koito_profile_card", False) and data
+                    and time.monotonic() - self.plugin._local_track_time < 45):
+                dto = jclass("com.exteragram.messenger.api.dto.NowPlayingDTO")
+                artists = ArrayList()
+                artists.add(data["artist"])
+                track = dto(data["name"], artists, None, data.get("profile_image") or self.plugin._fallback_cover(),
+                            None, data.get("track_url"), True, None, "KOITO", None)
+        except Exception as e:
+            log(f"[LastFM] Local Now Playing callback: {e}")
+        self.original.accept(track, elapsed)
+
+
+class _NowPlayingHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if (self.plugin._running and self.plugin.get_setting("music_source", 0) == 1
+                    and self.plugin.get_setting("koito_profile_card", False)
+                    and int(param.args[0]) == int(get_user_config().getClientUserId())):
+                param.args[3] = _NowPlayingCallback(self.plugin, param.args[3])
+        except Exception as e:
+            log(f"[LastFM] Local Now Playing hook: {e}")
+
+
+class _CoverPickerHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if int(param.args[0]) in (0x6A53, 0x6A54):
+            param.setResult(None)
+            self.plugin._cover_picker_result(param.args[0], param.args[1], param.args[2])
+
+
+class _KoitoCardClickHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            dto = param.args[0]
+            if (self.plugin._running and self.plugin.get_setting("music_source", 0) == 1
+                    and self.plugin.get_setting("koito_profile_card", False)
+                    and dto and str(dto.getPlatform()) == "KOITO" and dto.getSongUrl()):
+                from org.telegram.messenger.browser import Browser
+                Browser.openUrl(param.args[3].getContext(), dto.getSongUrl())
+                param.setResult(None)
+        except Exception as e:
+            log(f"[LastFM] Koito card click: {e}")
+
+
 class LastFMPlugin(BasePlugin):
 
     def __init__(self):
         super().__init__()
         self._temp_dir = None
         self.alert_manager = AlertManager()
-        threading.Thread(target=self._streamer, daemon=True).start()
+        self._running = False
+        self._stop_event = threading.Event()
+        self._local_track = None
+        self._local_track_time = 0
+        self._cover_picker_hook = None
+
+    def _fallback_cover(self):
+        if not self._temp_dir:
+            return None
+        path = File(self._temp_dir, "fallback_cover.png").getAbsolutePath()
+        return path if os.path.isfile(path) else None
+
+    def _pick_fallback_cover(self, view):
+        self._pick_file(False)
+
+    def _pick_font(self, view):
+        self._pick_file(True)
+
+    def _pick_file(self, is_font):
+        try:
+            from hook_utils import find_class
+            from android.content import Intent
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                raise RuntimeError("Activity unavailable")
+            if self._cover_picker_hook:
+                self.unhook_method(self._cover_picker_hook)
+            integer = find_class("java.lang.Integer")
+            intent_class = find_class("android.content.Intent")
+            method = activity.getClass().getDeclaredMethod("onActivityResult", integer.TYPE, integer.TYPE, intent_class)
+            self._cover_picker_hook = self.hook_method(method, _CoverPickerHook(self))
+            intent = Intent(Intent.ACTION_GET_CONTENT).setType("*/*" if is_font else "image/*")
+            activity.startActivityForResult(Intent.createChooser(intent, "Choose font" if is_font else "Choose cover"), 0x6A54 if is_font else 0x6A53)
+        except Exception as e:
+            self._remove_cover_picker_hook()
+            log(f"[LastFM] Cover picker: {e}")
+            BulletinHelper.show_error("Не удалось открыть галерею / Could not open gallery")
+
+    def _remove_cover_picker_hook(self):
+        if self._cover_picker_hook:
+            try:
+                self.unhook_method(self._cover_picker_hook)
+            finally:
+                self._cover_picker_hook = None
+
+    def _cover_picker_result(self, request, result, data):
+        self._remove_cover_picker_hook()
+        if int(result) == -1 and data and data.getData():
+            uri = data.getData()
+            target = self._save_font if int(request) == 0x6A54 else self._save_fallback_cover
+            threading.Thread(target=lambda: target(uri), daemon=True).start()
+
+    def _save_font(self, uri):
+        stream = None
+        temp_path = None
+        try:
+            if not self._temp_dir:
+                raise ValueError("Storage unavailable")
+            temp_path = File(self._temp_dir, "font_" + str(uuid.uuid4()) + ".tmp").getAbsolutePath()
+            stream = ApplicationLoader.applicationContext.getContentResolver().openInputStream(uri)
+            if not stream:
+                raise ValueError("Cannot open font")
+            buf = jarray(jbyte)(8192)
+            total = 0
+            with open(temp_path, "wb") as output:
+                while True:
+                    count = stream.read(buf)
+                    if count == -1:
+                        break
+                    total += count
+                    if total > 20 * 1024 * 1024:
+                        raise ValueError("Font too large")
+                    output.write(bytes((int(value) & 255 for value in buf[:count])))
+            ImageFont.truetype(temp_path, 35)
+            os.replace(temp_path, File(self._temp_dir, "selected_font.ttf").getAbsolutePath())
+            temp_path = None
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Шрифт сохранён / Font saved"))
+        except Exception as e:
+            log(f"[LastFM] Font import failed: {type(e).__name__}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть шрифт / Invalid font file"))
+        finally:
+            if stream:
+                stream.close()
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _save_fallback_cover(self, uri):
+        stream = None
+        temp_path = None
+        try:
+            if not self._temp_dir:
+                raise ValueError("Storage unavailable")
+            temp_path = File(self._temp_dir, "fallback_" + str(uuid.uuid4()) + ".tmp").getAbsolutePath()
+            stream = ApplicationLoader.applicationContext.getContentResolver().openInputStream(uri)
+            if not stream:
+                raise ValueError("Cannot open image")
+            buf = jarray(jbyte)(8192)
+            total = 0
+            with open(temp_path, "wb") as output:
+                while True:
+                    count = stream.read(buf)
+                    if count == -1:
+                        break
+                    total += count
+                    if total > 10 * 1024 * 1024:
+                        raise ValueError("Image too large")
+                    output.write(bytes((int(value) & 255 for value in buf[:count])))
+            with Image.open(temp_path) as image:
+                if image.width * image.height > 25000000:
+                    raise ValueError("Image dimensions too large")
+                image.verify()
+            target = File(self._temp_dir, "fallback_cover.png").getAbsolutePath()
+            converted_path = temp_path + ".png"
+            try:
+                with Image.open(temp_path) as image:
+                    image.convert("RGB").save(converted_path, "PNG")
+                os.replace(converted_path, target)
+            finally:
+                if os.path.exists(converted_path):
+                    os.remove(converted_path)
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Обложка-заглушка сохранена / Fallback cover saved"))
+        except Exception as e:
+            log(f"[LastFM] Fallback cover: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сохранить фото / Could not save photo"))
+        finally:
+            if stream:
+                stream.close()
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _clear_fallback_cover(self, view):
+        path = self._fallback_cover()
+        if path:
+            os.remove(path)
+        BulletinHelper.show_info("Заглушка удалена / Fallback cover removed")
+
+    def _fetch_koito(self):
+        base = self.get_setting("koito_url", "").strip().rstrip("/")
+        parsed = urlparse(base)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("Koito URL must be an HTTPS address without credentials or query")
+        token = self.get_setting("koito_token", "").strip()
+        headers = {"Authorization": "Token " + token} if token else {}
+        response = requests.get(base + "/apis/web/v1/now-playing", headers=headers,
+                                timeout=10, allow_redirects=False)
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise ValueError("Unexpected Koito response")
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("currently_playing"), bool):
+            raise ValueError("Invalid Koito response")
+        if not data["currently_playing"]:
+            return None
+        track = data.get("track")
+        if not isinstance(track, dict) or not isinstance(track.get("title"), str) or not track["title"].strip():
+            raise ValueError("Invalid Koito track")
+        artists = track.get("artists") or []
+        if not isinstance(artists, list):
+            artists = []
+        names = [a["name"].strip() for a in artists if isinstance(a, dict)
+                 and isinstance(a.get("name"), str) and a["name"].strip()]
+        images = track.get("image") or {}
+        image = next((images.get(size) for size in ("xl", "large", "medium", "small", "xs")
+                      if isinstance(images, dict) and isinstance(images.get(size), str) and images.get(size)), None)
+        if image:
+            image = urljoin(base + "/", image)
+            image_url = urlparse(image)
+            if image_url.scheme != "https" or image_url.netloc != parsed.netloc:
+                image = None
+        track_id = track.get("id")
+        track_url = base + "/track/" + str(track_id) if isinstance(track_id, int) and not isinstance(track_id, bool) and track_id > 0 else None
+        return {"name": track["title"].strip(), "artist": ", ".join(names) or "Unknown Artist", "album_image": image, "track_url": track_url}
+
+    def _fetch_recent_tracks(self, username):
+        if self.get_setting("music_source", 0) == 1:
+            track = self._fetch_koito()
+            if not track:
+                return {"recenttracks": {"track": [{"name": "", "artist": {"#text": ""}}]}}
+            return {"recenttracks": {"track": [{"name": track["name"],
+                "artist": {"#text": track["artist"]}, "@attr": {"nowplaying": "true"},
+                "image": [{"size": "large", "#text": track["album_image"] or ""}]}]}}
+        response = requests.get("https://ws.audioscrobbler.com/2.0/", params={
+            "method": "user.getrecenttracks", "nowplaying": "true", "user": username,
+            "api_key": self.get_setting("lastfm_api_key", "").strip() or API_KEY,
+            "format": "json"}, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    def _recent_response(self, username):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(self._fetch_recent_tracks(username)).encode("utf-8")
+        return response
+
+    def _update_local_track(self):
+        while not self._stop_event.is_set():
+            if self.get_setting("music_source", 0) == 1 and self.get_setting("koito_profile_card", False):
+                try:
+                    track = self._fetch_koito()
+                    if track:
+                        track["profile_image"] = self._profile_cover(track.get("album_image"))
+                    self._local_track = track
+                    self._local_track_time = time.monotonic()
+                except Exception as e:
+                    log(f"[LastFM] Koito profile update failed: {type(e).__name__}")
+            else:
+                self._local_track = None
+            self._stop_event.wait(15)
+
+    def _profile_cover(self, url):
+        if not url or not self._temp_dir:
+            return None
+        path = File(self._temp_dir, "koito_" + hashlib.sha256(url.encode("utf-8")).hexdigest() + ".png").getAbsolutePath()
+        if os.path.isfile(path):
+            return path
+        temp = path + "." + str(uuid.uuid4()) + ".tmp"
+        try:
+            with requests.get(url, timeout=5, stream=True, allow_redirects=False) as response:
+                response.raise_for_status()
+                if response.status_code != 200 or not response.headers.get("Content-Type", "").lower().startswith("image/"):
+                    return None
+                content = bytearray()
+                for chunk in response.iter_content(8192):
+                    content.extend(chunk)
+                    if len(content) > 5 * 1024 * 1024:
+                        return None
+            with Image.open(io.BytesIO(content)) as image:
+                if image.width * image.height > 25000000:
+                    return None
+                image.convert("RGB").save(temp, "PNG")
+            os.replace(temp, path)
+            return path
+        except Exception as e:
+            log(f"[LastFM] Koito cover unavailable: {type(e).__name__}")
+            return None
+        finally:
+            if os.path.exists(temp):
+                os.remove(temp)
 
     def _streamer(self):
         log("[LastFM] Streamer started")
-        while True:
+        while self._running:
             try:
                 try:
                     update_interval = int(self.get_setting("update_interval", "30"))
@@ -150,21 +459,20 @@ class LastFMPlugin(BasePlugin):
                     userFull = get_messages_controller().getUserFull(get_user_config().getClientUserId())
                     if not userFull:
                         log("[LastFM] Failed to get userFull")
-                        time.sleep(update_interval)
+                        self._stop_event.wait(update_interval)
                         continue
 
                     stream_place = self.get_setting("stream_place", 1 if get_user_config().isPremium() else 0)
                     max_len = 140 if get_user_config().isPremium() else 70
 
                     username = self.get_setting("lastfm_username", "")
-                    if not username:
+                    if not username and self.get_setting("music_source", 0) == 0:
                         log("[LastFM] LastFM username is not set")
-                        time.sleep(update_interval)
+                        self._stop_event.wait(update_interval)
                         continue
 
                     log(f"[LastFM] Fetching track for user {username}")
-                    current_track_url = f'http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&nowplaying=true&user={username}&api_key={API_KEY}&format=json'
-                    response = requests.get(current_track_url)
+                    response = self._recent_response(username)
                     
                     if response.status_code == 200:
                         data = response.json()
@@ -220,7 +528,7 @@ class LastFMPlugin(BasePlugin):
                                     else:
                                         if not get_user_config().isPremium():
                                             log("[LastFM] User is not premium, can't update business location")
-                                            time.sleep(update_interval)
+                                            self._stop_event.wait(update_interval)
                                             continue
                                         try:
                                             req = TL_account.updateBusinessLocation()
@@ -252,7 +560,7 @@ class LastFMPlugin(BasePlugin):
                                 else:
                                     if not get_user_config().isPremium():
                                         log("[LastFM] User is not premium, can't update business location")
-                                        time.sleep(update_interval)
+                                        self._stop_event.wait(update_interval)
                                         continue
                                     try:
                                         req = TL_account.updateBusinessLocation()
@@ -280,7 +588,7 @@ class LastFMPlugin(BasePlugin):
                         else:
                             if not get_user_config().isPremium():
                                 log("[LastFM] User is not premium, can't update business location")
-                                time.sleep(update_interval)
+                                self._stop_event.wait(update_interval)
                                 continue
                             try:
                                 req = TL_account.updateBusinessLocation()
@@ -291,10 +599,10 @@ class LastFMPlugin(BasePlugin):
                             except Exception as e:
                                 log(f"[LastFM] Error setting default bio in business location after bad response: {e}")
 
-                time.sleep(update_interval)
+                self._stop_event.wait(update_interval)
             except Exception as e:
                 log(f"[LastFM] Streamer error: {e}")
-                time.sleep(10)
+                self._stop_event.wait(10)
 
     def _dismiss_dialog(self):
         global progress_dialog
@@ -307,6 +615,51 @@ class LastFMPlugin(BasePlugin):
             progress_dialog = None
 
     def on_plugin_load(self):
+        self._running = True
+        self._stop_event.clear()
+        threading.Thread(target=self._streamer, daemon=True).start()
+        threading.Thread(target=self._update_local_track, daemon=True).start()
+        try:
+            from hook_utils import find_class
+            controller = find_class("com.exteragram.messenger.nowplaying.NowPlayingController")
+            if controller is None:
+                raise RuntimeError("NowPlayingController class not found")
+            try:
+                methods = controller.getDeclaredMethods()
+            except Exception:
+                try:
+                    methods = controller.class_.getDeclaredMethods()
+                except Exception:
+                    methods = jclass("java.lang.Class").forName("com.exteragram.messenger.nowplaying.NowPlayingController").getDeclaredMethods()
+            installed = False
+            for method in methods:
+                if method.getName() == "getCurrentPlayingTrack" and len(method.getParameterTypes()) == 4:
+                    self.hook_method(method, _NowPlayingHook(self))
+                    installed = True
+                    log("[LastFM] Local Now Playing hook installed")
+                    break
+            if not installed:
+                log("[LastFM] Local Now Playing method not found")
+        except Exception as e:
+            log(f"[LastFM] Local Now Playing unavailable: {e}")
+        try:
+            from hook_utils import find_class
+            card = find_class("com.exteragram.messenger.nowplaying.ui.components.NowPlayingCard")
+            methods = card.getDeclaredMethods()
+            installed = False
+            for method in methods:
+                types = method.getParameterTypes()
+                if (len(types) == 6 and str(types[0].getName()) == "com.exteragram.messenger.api.dto.NowPlayingDTO"
+                        and str(types[2].getName()) == "boolean"
+                        and str(types[3].getName()) == "android.widget.FrameLayout"
+                        and str(types[4].getName()) == "com.exteragram.messenger.nowplaying.ui.components.NowPlayingCardData"):
+                    self.hook_method(method, _KoitoCardClickHook(self))
+                    installed = True
+                    break
+            if not installed:
+                log("[LastFM] Koito click hook unavailable; long press still works")
+        except Exception as e:
+            log(f"[LastFM] Koito click hook unavailable: {e}")
         self.add_on_send_message_hook()
         self._temp_dir = self._get_temp_dir()
         if self._temp_dir:
@@ -316,6 +669,10 @@ class LastFMPlugin(BasePlugin):
             log("Failed to initialize temp directory for LastFM")
 
     def on_plugin_unload(self):
+        self._running = False
+        self._stop_event.set()
+        self._local_track = None
+        self._remove_cover_picker_hook()
         log("LastFM plugin unloaded")
         self.alert_manager.dismiss_dialog()
 
@@ -337,9 +694,16 @@ class LastFMPlugin(BasePlugin):
         close_button = locali.get_string("ALERT_CLOSE_BUTTON")
         self.alert_manager.show_info_alert(title, text, close_button)
 
+    def _show_koito_installation(self, view):
+        from org.telegram.messenger.browser import Browser
+        fragment = get_last_fragment()
+        if fragment and fragment.getParentActivity():
+            Browser.openUrl(fragment.getParentActivity(), "https://koito.io/guides/installation/")
+
     def create_settings(self):
         lang = Locale.getDefault().getLanguage()
         update_bio = self.get_setting("update_bio", False)
+        is_koito = self.get_setting("music_source", 0) == 1
 
         if lang.startswith('ru'):
             user_header = "Пользователь LastFM"
@@ -392,17 +756,39 @@ class LastFMPlugin(BasePlugin):
             update_interval_text = "Update Interval"
             update_interval_subtext = "How often to update profile text (in seconds)"
 
-        font_items = ["Noto Sans JP", "Zpix", "Impact", "Кастомный шрифт" if lang.startswith('ru') else "Custom font"]
+        font_items = ["Noto Sans JP", "Zpix", "Impact", "Шрифт из файла" if lang.startswith('ru') else "Font from file"]
 
         settings = [
-            Header(text=user_header),
+            Header(text="Источник музыки" if lang.startswith('ru') else "Music source"),
+            Selector(key="music_source", text="Источник" if lang.startswith('ru') else "Source",
+                     default=0, items=["Last.fm", "Koito"], icon="msg_audio",
+                     on_change=lambda value: self.set_setting("music_source", value, reload_settings=True)),
+            Input(key="koito_url", text="Koito URL", default="",
+                  subtext="HTTPS-адрес сервера" if lang.startswith('ru') else "Server HTTPS address",
+                  icon="msg_link") if is_koito else None,
+            Input(key="koito_token", text="Koito API key", default="",
+                  subtext="Только для закрытого сервера; хранится в настройках плагина" if lang.startswith('ru') else "Only for a private server; stored in plugin settings",
+                  icon="msg_permissions") if is_koito else None,
+            Switch(key="koito_profile_card", text="Карточка Koito в профиле" if lang.startswith('ru') else "Koito profile card",
+                   subtext="Только на этом устройстве; экспериментально" if lang.startswith('ru') else "Only on this device; experimental",
+                   default=False, icon="msg_photos") if is_koito else None,
+            Text(text="Как установить Koito" if lang.startswith('ru') else "How to install Koito",
+                 icon="msg_info", on_click=self._show_koito_installation) if is_koito else None,
+            Header(text=user_header) if not is_koito else None,
             Input(
                 key="lastfm_username",
                 text=user_input_text,
                 default="",
                 subtext=user_input_subtext,
                 icon="menu_username_change"
-            ),
+            ) if not is_koito else None,
+            Input(
+                key="lastfm_api_key",
+                text="API-ключ Last.fm" if lang.startswith('ru') else "Last.fm API key",
+                default="",
+                subtext="Необязательно: если пусто, используется встроенный ключ. Хранится в настройках плагина." if lang.startswith('ru') else "Optional: uses the built-in key when empty. Stored in plugin settings.",
+                icon="msg_permissions"
+            ) if not is_koito else None,
             Header(text=photo_header),
             Switch(
                 key="send_album_cover",
@@ -411,6 +797,10 @@ class LastFMPlugin(BasePlugin):
                 subtext=photo_subtext,
                 icon="msg_photos"
             ),
+            Text(text="Выбрать фото-заглушку" if lang.startswith('ru') else "Choose fallback cover",
+                 icon="msg_photos", on_click=self._pick_fallback_cover),
+            Text(text="Удалить фото-заглушку" if lang.startswith('ru') else "Remove fallback cover",
+                 icon="msg_delete", on_click=self._clear_fallback_cover),
             Input(
                 key="np_display_format",
                 text=np_format_text,
@@ -427,17 +817,10 @@ class LastFMPlugin(BasePlugin):
                 items=font_items,
                 icon="msg_photo_text_regular"
             ),
-            Input(
-                key="custom_font_path",
-                text=custom_font_text,
-                subtext=custom_font_subtext,
-                default="",
-                icon="msg_photo_text_regular"
-            ),
             Text(
-                text="Как использовать кастомные шрифты" if lang.startswith('ru') else "How to use custom fonts",
-                icon="msg_info",
-                on_click=self._handle_show_faq_alert_click
+                text="Выбрать шрифт из файла (.ttf/.otf)" if lang.startswith('ru') else "Choose font file (.ttf/.otf)",
+                icon="msg_photo_text_regular",
+                on_click=self._pick_font
             ),
             Switch(
                 key="show_promo",
@@ -618,7 +1001,7 @@ class LastFMPlugin(BasePlugin):
 
         if message_text == command_prefix_now:
             log("[LastFM] Command .np detected!")
-            if not lastfm_username or lastfm_username == "":
+            if (not lastfm_username or lastfm_username == "") and self.get_setting("music_source", 0) == 0:
                 log("[LastFM] No LastFM username set")
                 response_text = "❌ Ник LastFM не установлен в настройках плагина."
                 params.message = response_text
@@ -628,9 +1011,7 @@ class LastFMPlugin(BasePlugin):
                 def search_and_reply(peer):
                     log(f"[LastFM] search_and_reply started for peer: {peer}")
                     try:
-                        current_track_url = f'http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&nowplaying=true&user={lastfm_username}&api_key={API_KEY}&format=json'
-                        log(f"[LastFM] Requesting URL: {current_track_url}")
-                        response = requests.get(current_track_url)
+                        response = self._recent_response(lastfm_username)
                         log(f"[LastFM] Response status: {response.status_code}")
                         
                         if response.status_code != 200:
@@ -805,24 +1186,22 @@ class LastFMPlugin(BasePlugin):
                             log("[LastFM] No tracks found in response")
                             send_message({
                                 "peer": peer,
-                                "message": "🤷‍♂️ Не удалось получить информацию о треке. Проверьте ник LastFM в настройках."
+                                "message": "▶️ Сейчас ничего не играет." if self.get_setting("music_source", 0) == 1 else "🤷‍♂️ Не удалось получить информацию о треке. Проверьте ник LastFM в настройках."
                             })
                             return
 
                     except requests.exceptions.RequestException as e:
-                        log(f"[LastFM] Request exception: {e}")
+                        log(f"[LastFM] Request exception: {type(e).__name__}")
                         send_message({
                             "peer": peer,
-                            "message": f"❌ Ошибка при запросе к LastFM API: {e}"
+                            "message": "❌ Ошибка запроса к музыкальному сервису. Проверьте настройки и соединение."
                         })
                         return
                     except Exception as e:
-                        log(f"[LastFM] Unexpected exception: {e}")
-                        import traceback
-                        log(f"[LastFM] Traceback: {traceback.format_exc()}")
+                        log(f"[LastFM] Track request failed: {type(e).__name__}")
                         send_message({
                             "peer": peer,
-                            "message": f"❌ Неожиданная ошибка: {e}"
+                            "message": "❌ Не удалось получить трек. Проверьте настройки музыкального сервиса."
                         })
                         return
 
@@ -852,25 +1231,25 @@ class LastFMPlugin(BasePlugin):
         background_color = "#000000"
         title_text_color = "#FFFFFF"
         subtext_color = "#FFFFFF"
-        default_cover_url = "https://external-content.duckduckgo.com/iu/?u=https%3A%2F%2Fplay-lh.googleusercontent.com%2FVFmAfWqcuV3aReZG8MMQdHRSdKWx85IW22f4RQ5xhR5U-o1_u03P7TVwsnTYa26Q1No&f=1&nofb=1&ipt=4449ba66d57828b42c006e2a6c19d76deae54a97f2485f28b3fbe695883dc7cc"
-
         log(f"[LastFM] Creating card with dimensions: {width}x{height}")
         
         album_image_url = track_info.get('album_image')
         log(f"[LastFM] Album image URL: {album_image_url}")
-        if not album_image_url or not album_image_url.strip():
-            album_image_url = default_cover_url
-            log(f"[LastFM] Using default cover URL: {album_image_url}")
-
         original_image = None
-        try:
-            log(f"[LastFM] Downloading original image for background and thumbnail from: {album_image_url}")
-            response = requests.get(album_image_url, timeout=10)
-            response.raise_for_status()
-            original_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-        except Exception as e:
-            log(f"[LastFM] Error downloading original cover image: {e}")
-            original_image = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+        if album_image_url and album_image_url.strip():
+            try:
+                response = requests.get(album_image_url, timeout=10)
+                response.raise_for_status()
+                original_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+            except Exception as e:
+                log(f"[LastFM] Error downloading original cover image: {e}")
+        if original_image is None:
+            try:
+                fallback = self._fallback_cover()
+                if fallback:
+                    original_image = Image.open(fallback).convert("RGBA")
+            except Exception as e:
+                log(f"[LastFM] Error loading fallback cover: {e}")
 
         full_background = Image.new('RGB', (width, height), background_color)
         if original_image:
@@ -932,46 +1311,16 @@ class LastFMPlugin(BasePlugin):
         plugins_font = None
         
         if font_index == 3:
-            log("[LastFM] Using custom font")
-            custom_font_url = self.get_setting("custom_font_path", "").strip()
-            log(f"[LastFM] Custom font URL: {custom_font_url}")
-            if custom_font_url and custom_font_url.startswith(('http://', 'https://')):
-                try:
-                    custom_font_file = File(self._temp_dir, "custom_font.ttf").getAbsolutePath()
-                    custom_url_file = File(self._temp_dir, "custom_font_url.txt").getAbsolutePath()
-                    log(f"[LastFM] Custom font file path: {custom_font_file}")
-                    
-                    should_download = True
-                    if os.path.exists(custom_font_file) and os.path.exists(custom_url_file):
-                        try:
-                            with open(custom_url_file, 'r') as f:
-                                saved_url = f.read().strip()
-                            if saved_url == custom_font_url:
-                                should_download = False
-                                log(f"[LastFM] Custom font URL unchanged, using cached font")
-                        except Exception as e:
-                            log(f"[LastFM] Error reading saved URL: {e}")
-                    
-                    if should_download:
-                        log(f"[LastFM] Downloading custom font from: {custom_font_url}")
-                        response = requests.get(custom_font_url, verify=False)
-                        with open(custom_font_file, 'wb') as f:
-                            f.write(response.content)
-                        with open(custom_url_file, 'w') as f:
-                            f.write(custom_font_url)
-                        log(f"[LastFM] Downloaded new custom font from: {custom_font_url}")
-                    
-                    if os.path.exists(custom_font_file):
-                        title_font = ImageFont.truetype(custom_font_file, 50)
-                        artist_font = ImageFont.truetype(custom_font_file, 35)
-                        info_font = ImageFont.truetype(custom_font_file, 35)
-                        plugins_font = ImageFont.truetype(custom_font_file, 30)
-                        log(f"[LastFM] Using custom font: {custom_font_file}")
-                    else:
-                        raise Exception("Custom font file not found")
-                except Exception as e:
-                    log(f"[LastFM] Failed to load custom font: {e}")
-                    font_index = 0
+            try:
+                custom_font_file = File(self._temp_dir, "selected_font.ttf").getAbsolutePath()
+                title_font = ImageFont.truetype(custom_font_file, 50)
+                artist_font = ImageFont.truetype(custom_font_file, 35)
+                info_font = ImageFont.truetype(custom_font_file, 35)
+                plugins_font = ImageFont.truetype(custom_font_file, 30)
+            except Exception as e:
+                log(f"[LastFM] Failed to load selected font: {e}")
+                title_font = None
+                font_index = 0
         
         if not title_font:
             log(f"[LastFM] Loading standard font with index: {font_index}")
