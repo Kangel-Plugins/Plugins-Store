@@ -1,20 +1,30 @@
 __id__ = 'auto_read'
 __name__ = 'Auto Read'
-__description__ = 'Авто-чтение выбранных чатов.'
-__author__ = '~GRED~(@GREDpl)'
-__version__ = '2.1'
+__description__ = 'Авто-чтение выбранных чатов, папок и тем форумов.'
+__author__ = '~GRED~(@GREDpl) модификацияот @l_Nuril_l'
+__version__ = '2.2'
 __icon__ = 'exteraPlugins/0'
 __min_version__ = '11.12.0'
 
 import json
+import threading
 import time
 from typing import Any
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult
 from client_utils import get_last_fragment, get_messages_controller, send_request, RequestCallback
+try:
+    from client_utils import get_account_instance
+except Exception:
+    get_account_instance = None
 from android_utils import run_on_ui_thread
+try:
+    from android_utils import copy_to_clipboard
+except Exception:
+    copy_to_clipboard = None
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
 from org.telegram.tgnet import TLRPC
 
 try:
@@ -26,6 +36,13 @@ except Exception:
 class AutoReadPlugin(BasePlugin):
 
     MENU_ITEM_ID = "auto_read_toggle"
+    MENU_PROFILE_ID = "auto_read_toggle_profile"
+    MENU_FOLDERS_ID = "auto_read_folders"
+    MENU_FOLDERS_MAIN_ID = "auto_read_folders_main"
+
+    _stopped = False
+    _last_sweep = 0.0
+    _chain = 0
 
     def on_plugin_load(self):
         self._load_chats()
@@ -40,13 +57,27 @@ class AutoReadPlugin(BasePlugin):
             self._refresh_menu(0)
         except Exception:
             pass
+        self._stopped = False
+        self._schedule_sweeps()
+        self._start_periodic()
+
+    def on_plugin_unload(self):
+        self._stopped = True
         try:
-            run_on_ui_thread(self._read_all_on_startup)
+            t = getattr(self, "_periodic_timer", None)
+            if t is not None:
+                t.cancel()
         except Exception:
             pass
 
-    def on_plugin_unload(self):
-        pass
+    def on_app_event(self, event_type):
+        """Возврат из фона / запуск приложения -> добираем непрочитанное."""
+        try:
+            name = str(event_type).upper()
+            if "RESUME" in name or "START" in name:
+                self._schedule_sweeps()
+        except Exception:
+            pass
 
     # ── Хранение списка чатов ──────────────────────────────────────────
 
@@ -56,6 +87,10 @@ class AutoReadPlugin(BasePlugin):
             self._chats = set(json.loads(raw))
         except Exception:
             self._chats = set()
+        try:
+            self._folders = set(json.loads(self.get_setting("folder_ids", "[]")))
+        except Exception:
+            self._folders = set()
 
     def _save_chats(self):
         try:
@@ -63,31 +98,264 @@ class AutoReadPlugin(BasePlugin):
         except Exception:
             pass
 
-    def _is_enabled(self, dialog_id: int) -> bool:
-        return int(dialog_id) in self._chats
+    def _save_folders(self):
+        try:
+            self.set_setting("folder_ids", json.dumps(list(self._folders)), reload_settings=False)
+        except Exception:
+            pass
+
+    def _is_enabled(self, dialog_id: int, quiet: bool = False) -> bool:
+        did = int(dialog_id)
+        if did in self._chats:
+            if not quiet:
+                self._dbg("msg did=%s -> chat enabled" % did)
+            return True
+        res = self._in_enabled_folder(did, quiet)
+        if not quiet:
+            self._dbg("msg did=%s -> %s [%s]" % (did, "folder enabled" if res else "ignored", self._folder_trace))
+        return res
+
+    def _dbg(self, msg):
+        """Лог в памяти (кнопка 'Скопировать лог' в настройках) + logcat."""
+        try:
+            buf = getattr(self, "_dbg_buf", None)
+            if buf is None:
+                buf = self._dbg_buf = []
+            buf.append(time.strftime("%H:%M:%S ") + str(msg))
+            if len(buf) > 1200:
+                del buf[:400]
+        except Exception:
+            pass
+        try:
+            self.logger.info("%s", str(msg))
+        except Exception:
+            pass
+
+    def _log(self, msg: str):
+        self._dbg("ERR " + str(msg))
+
+    @staticmethod
+    def _jlist(lst) -> list:
+        if lst is None:
+            return []
+        try:
+            return [lst.get(i) for i in range(lst.size())]
+        except Exception:
+            pass
+        try:
+            return list(lst)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _field(obj, name, default=None):
+        """Публичное java-поле; если имя перекрыто методом - берём через рефлексию."""
+        try:
+            v = getattr(obj, name)
+        except Exception:
+            v = None
+        try:
+            if v is not None and callable(v):
+                try:
+                    return obj.getClass().getField(name).get(obj)
+                except Exception:
+                    return v()
+        except Exception:
+            return default
+        return default if v is None else v
+
+    def _filters_raw(self) -> list:
+        """Список java-объектов папок (без 'Все чаты')."""
+        self._folders_error = ""
+        mc = get_messages_controller()
+        lst = None
+        try:
+            lst = mc.getDialogFilters()
+        except Exception as e:
+            self._folders_error = "getDialogFilters: " + repr(e)
+        if lst is None:
+            try:
+                lst = mc.dialogFilters
+            except Exception as e:
+                self._folders_error += " | dialogFilters: " + repr(e)
+        if lst is None:
+            return []
+        res = []
+        for f in self._jlist(lst):
+            try:
+                if f.isDefault():
+                    continue
+            except Exception:
+                pass
+            res.append(f)
+        return res
+
+    def _folder_name(self, f) -> str:
+        try:
+            n = self._field(f, "name")
+            t = getattr(n, "text", None)
+            name = str(t if t is not None else n).strip()
+            return name or ("Папка " + str(int(self._field(f, "id"))))
+        except Exception:
+            return "Папка"
+
+    def _get_folders(self) -> list:
+        """[(id, name)]"""
+        try:
+            return [(int(self._field(f, "id")), self._folder_name(f)) for f in self._filters_raw()]
+        except Exception as e:
+            self._folders_error = repr(e)
+            self._log("auto_read folders: " + repr(e))
+            return []
+
+    def _filter_includes(self, f, did: int):
+        """-> (bool, причина)"""
+        notes = []
+        try:
+            if did in [int(x) for x in self._jlist(self._field(f, "neverShow"))]:
+                return False, "neverShow"
+        except Exception as e:
+            notes.append("never:" + repr(e))
+        try:
+            if did in [int(x) for x in self._jlist(self._field(f, "alwaysShow"))]:
+                return True, "alwaysShow"
+        except Exception as e:
+            notes.append("always:" + repr(e))
+        try:
+            if get_account_instance is None:
+                notes.append("no get_account_instance")
+            elif f.includesDialog(get_account_instance(), did):
+                return True, "includesDialog"
+            else:
+                notes.append("includesDialog=False")
+        except Exception as e:
+            notes.append("includes:" + repr(e))
+        try:
+            ds = self._jlist(self._field(f, "dialogs"))
+            if any(int(d.id) == did for d in ds):
+                return True, "dialogs"
+            notes.append("dialogs(%d) no" % len(ds))
+        except Exception as e:
+            notes.append("dialogs:" + repr(e))
+        return False, "; ".join(notes)
+
+    def _in_enabled_folder(self, did: int, quiet: bool = False) -> bool:
+        self._folder_trace = ""
+        if not self._folders:
+            return False
+        trace = []
+        try:
+            for f in self._filters_raw():
+                fid = int(self._field(f, "id"))
+                if fid not in self._folders:
+                    continue
+                ok, why = self._filter_includes(f, did)
+                trace.append("%s=%s[%s]" % (fid, ok, why))
+                if ok:
+                    self._folder_trace = "папка %s" % fid
+                    return True
+        except Exception as e:
+            self._log("in_enabled_folder: " + repr(e))
+        self._folder_trace = "; ".join(trace)
+        return False
+
+    def _folder_dialog_ids(self) -> set:
+        ids = set()
+        try:
+            for f in self._filters_raw():
+                if int(self._field(f, "id")) in self._folders:
+                    for d in self._jlist(self._field(f, "dialogs")):
+                        ids.add(int(d.id))
+                    for x in self._jlist(self._field(f, "alwaysShow")):
+                        ids.add(int(x))
+        except Exception:
+            pass
+        return ids
+
+    def _toggle_folder(self, fid: int) -> bool:
+        if fid in self._folders:
+            self._folders.discard(fid)
+            on = False
+        else:
+            self._folders.add(fid)
+            on = True
+        self._save_folders()
+        if on:
+            self._sweep_async()
+        return on
+
+    def _on_folders_click(self, context=None):
+        try:
+            self._load_chats()
+            folders = self._get_folders()
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                BulletinHelper.show_error("Нет активного экрана")
+                return
+            b = AlertDialogBuilder(activity)
+            b.set_title("Авто-чтение: папки")
+            if not folders:
+                msg = "Папки не найдены."
+                if self._folders_error:
+                    msg += "\n" + self._folders_error
+                b.set_message(msg)
+                b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+            else:
+                names = [("✅ " if fid in self._folders else "") + name for fid, name in folders]
+
+                def on_item(bld, which):
+                    try:
+                        on = self._toggle_folder(folders[which][0])
+                        BulletinHelper.show_info(("✅ Папка включена: " if on else "❌ Папка отключена: ") + folders[which][1])
+                    except Exception as e:
+                        self._log("auto_read folder toggle: " + repr(e))
+                    bld.dismiss()
+
+                b.set_items(names, on_item)
+                b.set_negative_button("Закрыть", lambda bld, w: bld.dismiss())
+            b.show()
+        except Exception as e:
+            self._log("auto_read folders dialog: " + repr(e))
 
     # ── Меню чата ───────────────────────────────────────────────────────
 
     def _refresh_menu(self, dialog_id: int):
-        try:
-            self.remove_menu_item(self.MENU_ITEM_ID)
-        except Exception:
-            pass
-        enabled = self._is_enabled(dialog_id) if dialog_id else False
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="✅ Авто-чтение" if enabled else "Авто-чтение",
-            on_click=self._on_add_click,
-            icon="msg_markread",
-            item_id=self.MENU_ITEM_ID,
-        ))
+        enabled = (int(dialog_id) in self._chats) if dialog_id else False
+        text = "✅ Авто-чтение" if enabled else "Авто-чтение"
+        for mtype, iid in ((MenuItemType.CHAT_ACTION_MENU, self.MENU_ITEM_ID),
+                           (MenuItemType.PROFILE_ACTION_MENU, self.MENU_PROFILE_ID)):
+            try:
+                self.remove_menu_item(iid)
+            except Exception:
+                pass
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=mtype, text=text, on_click=self._on_add_click,
+                    icon="msg_markread", item_id=iid,
+                ))
+            except Exception as e:
+                self._log("auto_read menu: " + repr(e))
+        for mtype, iid in ((MenuItemType.DRAWER_MENU, self.MENU_FOLDERS_ID),
+                           (MenuItemType.MAIN_MENU, self.MENU_FOLDERS_MAIN_ID)):
+            try:
+                self.remove_menu_item(iid)
+            except Exception:
+                pass
+            try:
+                self.add_menu_item(MenuItemData(
+                    menu_type=mtype, text="Авто-чтение: папки", on_click=self._on_folders_click,
+                    icon="msg_markread", item_id=iid,
+                ))
+            except Exception as e:
+                self._log("auto_read folders menu: " + repr(e))
 
     def _get_dialog_id(self, context) -> int:
         try:
-            for key in ("dialog_id", "dialogId", "chatId", "chat_id", "userId", "user_id"):
+            for key in ("dialog_id", "dialogId"):
                 try:
                     val = context.get(key)
-                    if val is not None:
+                    if val:
                         return int(val)
                 except Exception:
                     pass
@@ -97,12 +365,26 @@ class AutoReadPlugin(BasePlugin):
                     return -int(chat.id)
             except Exception:
                 pass
+            for key in ("chatId", "chat_id"):
+                try:
+                    val = context.get(key)
+                    if val:
+                        return -abs(int(val))
+                except Exception:
+                    pass
             try:
                 user = context.get("user")
                 if user is not None:
                     return int(user.id)
             except Exception:
                 pass
+            for key in ("userId", "user_id"):
+                try:
+                    val = context.get(key)
+                    if val:
+                        return int(val)
+                except Exception:
+                    pass
             fragment = get_last_fragment()
             if fragment and hasattr(fragment, "getDialogId"):
                 return int(fragment.getDialogId())
@@ -116,7 +398,7 @@ class AutoReadPlugin(BasePlugin):
             if did == 0:
                 BulletinHelper.show_error("Не удалось определить чат")
                 return
-            if self._is_enabled(did):
+            if did in self._chats:
                 self._chats.discard(did)
                 self._save_chats()
                 BulletinHelper.show_info("❌ Авто-чтение отключено")
@@ -124,6 +406,7 @@ class AutoReadPlugin(BasePlugin):
                 self._chats.add(did)
                 self._save_chats()
                 BulletinHelper.show_info("✅ Авто-чтение включено")
+                self._sweep_async()
             self._refresh_menu(did)
         except Exception:
             pass
@@ -132,6 +415,7 @@ class AutoReadPlugin(BasePlugin):
 
     def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
         try:
+            self._maybe_sweep()
             if update_name in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
                 msg = getattr(update, "message", None)
                 if msg is None or getattr(msg, "out", False):
@@ -140,7 +424,8 @@ class AutoReadPlugin(BasePlugin):
                 if not dialog_id or not self._is_enabled(dialog_id):
                     return HookResult()
                 msg_id = getattr(msg, "id", 0)
-                run_on_ui_thread(lambda: self._mark_read(account, dialog_id, msg_id))
+                topic_id = self._get_topic_id(msg)
+                run_on_ui_thread(lambda: self._mark_read(account, dialog_id, msg_id, topic_id))
 
             elif update_name == "TL_updateMessageReactions":
                 if not self.get_setting("read_reactions", False):
@@ -158,6 +443,7 @@ class AutoReadPlugin(BasePlugin):
 
     def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
         try:
+            self._maybe_sweep()
             if container_name == "TL_updateShortMessage":
                 if getattr(updates, "out", False):
                     return HookResult()
@@ -194,7 +480,7 @@ class AutoReadPlugin(BasePlugin):
                         if not dialog_id or not self._is_enabled(dialog_id):
                             continue
                         msg_id = getattr(msg, "id", 0)
-                        run_on_ui_thread(lambda d=dialog_id, m=msg_id: self._mark_read(account, d, m))
+                        run_on_ui_thread(lambda d=dialog_id, m=msg_id, t=self._get_topic_id(msg): self._mark_read(account, d, m, t))
                     elif "Reaction" in upd_name:
                         if not self.get_setting("read_reactions", False):
                             continue
@@ -226,6 +512,18 @@ class AutoReadPlugin(BasePlugin):
                 return -peer.chat_id
             if hasattr(peer, "user_id") and peer.user_id:
                 return peer.user_id
+        except Exception:
+            pass
+        return 0
+
+    def _get_topic_id(self, msg) -> int:
+        try:
+            rt = getattr(msg, "reply_to", None)
+            if rt is not None and getattr(rt, "forum_topic", False):
+                return int(getattr(rt, "reply_to_top_id", 0) or getattr(rt, "reply_to_msg_id", 0))
+            act = getattr(msg, "action", None)
+            if act is not None and type(act).__name__ == "TL_messageActionTopicCreate":
+                return int(msg.id)
         except Exception:
             pass
         return 0
@@ -291,44 +589,80 @@ class AutoReadPlugin(BasePlugin):
 
     # ── Отметка прочитанным ──────────────────────────────────────────────
 
-    def _mark_read(self, account: int, dialog_id: int, msg_id: int):
+    def _mark_read(self, account: int, dialog_id: int, msg_id: int, topic_id: int = 0):
         try:
+            now = time.time()
+            seen = getattr(self, "_seen_msgs", None)
+            if seen is None:
+                seen = self._seen_msgs = {}
+            key = (dialog_id, topic_id, msg_id)
+            if now - seen.get(key, 0) < 3.0:
+                return
+            seen[key] = now
+            if len(seen) > 300:
+                for k in [k for k, t in seen.items() if now - t > 10]:
+                    seen.pop(k, None)
+            if dialog_id < 0 and not topic_id:
+                chat = get_messages_controller().getChat(-dialog_id)
+                if chat is not None and getattr(chat, "forum", False):
+                    topic_id = 1  # General
             if self.get_setting("read_messages", True):
-                if self._should_read_local_for(account, dialog_id):
-                    self._update_local_read(dialog_id, msg_id)
-                if self._should_read_online_for(account, dialog_id):
-                    self._send_read_request(dialog_id, msg_id)
+                loc = self._should_read_local_for(account, dialog_id)
+                onl = self._should_read_online_for(account, dialog_id)
+                self._dbg("mark_read did=%s msg=%s topic=%s local=%s online=%s" % (dialog_id, msg_id, topic_id, loc, onl))
+                if loc:
+                    self._update_local_read(dialog_id, msg_id, topic_id)
+                if onl:
+                    self._send_read_request(dialog_id, msg_id, topic_id)
             if self.get_setting("read_reactions", False):
                 self._read_reactions(account, dialog_id, msg_id)
             if self.get_setting("read_stories", False):
                 self._read_stories(account, dialog_id)
+            self._followup_sweep()
         except Exception:
             pass
 
-    def _send_read_request(self, dialog_id: int, max_id: int):
+    def _send_read_request(self, dialog_id: int, max_id: int, topic_id: int = 0):
         try:
             mc = get_messages_controller()
-            if dialog_id < 0:
+            if topic_id:
+                req = TLRPC.TL_messages_readDiscussion()
+                req.peer = mc.getInputPeer(dialog_id)
+                req.msg_id = topic_id
+                req.read_max_id = max_id
+            elif dialog_id < 0:
                 req = TLRPC.TL_channels_readHistory()
                 req.channel = mc.getInputChannel(-dialog_id)
                 req.max_id = max_id
-                send_request(req, RequestCallback(lambda r, e: None))
             else:
                 req = TLRPC.TL_messages_readHistory()
                 req.peer = mc.getInputPeer(dialog_id)
                 req.max_id = max_id
-                send_request(req, RequestCallback(lambda r, e: None))
-        except Exception:
-            pass
+            send_request(req, RequestCallback(self._on_read_resp))
+        except Exception as e:
+            self._log("send_read_request: " + repr(e))
 
-    def _update_local_read(self, dialog_id: int, max_id: int):
+    def _on_read_resp(self, r, e):
+        if e:
+            self._dbg("read response error: " + str(getattr(e, "text", e)))
+
+    def _update_local_read(self, dialog_id: int, max_id: int, topic_id: int = 0):
         try:
             from org.telegram.messenger import NotificationCenter
             mc = get_messages_controller()
             try:
-                mc.markDialogAsRead(dialog_id, max_id, max_id, 0, False, 0, 0, True, 0)
+                mc.markDialogAsRead(dialog_id, max_id, max_id, 0, False, topic_id, 0, True, 0)
             except Exception:
                 pass
+            if topic_id and dialog_id < 0:
+                # Для тем markDialogAsRead локально ничего не меняет (только ставит задачу на сервер):
+                # счётчик темы сбрасываем так же, как приложение при updateReadChannelDiscussionInbox.
+                try:
+                    from org.telegram.messenger import MessagesStorage
+                    MessagesStorage.getInstance(mc.currentAccount).updateRepliesMaxReadId(
+                        -dialog_id, topic_id, max_id, -1, True)
+                except Exception as e:
+                    self._log("topic local read: " + repr(e))
             try:
                 nc = NotificationCenter.getInstance(mc.currentAccount)
                 nc.postNotificationName(NotificationCenter.dialogsUnreadCounterChanged)
@@ -390,23 +724,220 @@ class AutoReadPlugin(BasePlugin):
         except Exception:
             pass
 
-    def _read_all_on_startup(self):
+    # ── Добор непрочитанного (старт / возврат из фона / таймер) ─────────
+
+    SWEEP_INTERVAL = 45   # сек: периодическая проверка
+    SWEEP_MIN_GAP = 30    # сек: минимум между проверками, запускаемыми хуками
+
+    def _schedule_sweeps(self):
+        """Несколько проверок подряд: после старта/возврата из фона диалоги подгружаются не сразу."""
+        for delay in (0.5, 3, 8, 20):
+            try:
+                t = threading.Timer(delay, self._sweep_async)
+                t.daemon = True
+                t.start()
+            except Exception:
+                pass
+
+    def _start_periodic(self):
+        def tick():
+            if self._stopped:
+                return
+            self._sweep_async()
+            self._start_periodic()
         try:
-            account = self._current_account()
-            mc = get_messages_controller()
-            for dialog_id in list(self._chats):
-                try:
-                    dialog = mc.dialogs.get(dialog_id) if hasattr(mc, "dialogs") else None
-                    max_id = getattr(dialog, "top_message", 0) if dialog else 0
-                    if max_id > 0:
-                        if self._should_read_local_for(account, dialog_id):
-                            self._update_local_read(dialog_id, max_id)
-                        if self._should_read_online_for(account, dialog_id):
-                            self._send_read_request(dialog_id, max_id)
-                except Exception:
-                    pass
+            t = threading.Timer(self.SWEEP_INTERVAL, tick)
+            t.daemon = True
+            self._periodic_timer = t
+            t.start()
         except Exception:
             pass
+
+    def _sweep_async(self, *_):
+        if self._stopped:
+            return
+        try:
+            run_on_ui_thread(self._sweep)
+        except Exception:
+            pass
+
+    def _maybe_sweep(self):
+        if time.time() - self._last_sweep < self.SWEEP_MIN_GAP:
+            return
+        self._last_sweep = time.time()
+        self._sweep_async()
+
+    def _dialog_obj(self, mc, did: int):
+        for attr in ("dialogs_dict", "dialogs"):
+            try:
+                d = getattr(mc, attr).get(did)
+                if d is not None:
+                    return d
+            except Exception:
+                pass
+        return None
+
+    def _sweep_candidates(self, mc) -> set:
+        ids = set(self._chats) | self._folder_dialog_ids()
+        if self._folders:
+            try:
+                for d in self._jlist(getattr(mc, "allDialogs", None)):
+                    try:
+                        if int(getattr(d, "unread_count", 0) or 0) <= 0:
+                            continue
+                        did = int(d.id)
+                        if did in ids:
+                            continue
+                        if self._in_enabled_folder(did, True):
+                            ids.add(did)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return ids
+
+    def _followup_sweep(self):
+        """Хук срабатывает раньше, чем приложение обработало сообщение: проверяем ещё раз чуть позже."""
+        try:
+            t = getattr(self, "_followup_timer", None)
+            if t is not None:
+                t.cancel()
+            t = threading.Timer(2.5, self._sweep_async)
+            t.daemon = True
+            self._followup_timer = t
+            t.start()
+        except Exception:
+            pass
+
+    def _topics_missing(self, mc, did: int, now: float):
+        """Темы форума не загружены - просим загрузить (не чаще раза в 5 минут на чат)."""
+        tried = getattr(self, "_topics_tried", None)
+        if tried is None:
+            tried = self._topics_tried = {}
+        if now - tried.get(did, 0) < 300:
+            return
+        tried[did] = now
+        self._dbg("sweep did=%s forum: темы не загружены, запрашиваю" % did)
+        try:
+            mc.getTopicsController().loadTopics(-did)
+        except Exception as e:
+            self._dbg("loadTopics: " + repr(e))
+
+    def _sweep(self):
+        """Читает всё непрочитанное в включённых чатах и папках."""
+        if self._stopped:
+            return
+        self._last_sweep = time.time()
+        did_read = 0
+        try:
+            if not self.get_setting("read_messages", True):
+                return
+            account = self._current_account()
+            mc = get_messages_controller()
+            now = time.time()
+            sent = getattr(self, "_sweep_sent", None)
+            if sent is None:
+                sent = self._sweep_sent = {}
+            for did in self._sweep_candidates(mc):
+                try:
+                    chat = mc.getChat(-did) if did < 0 else None
+                    if chat is not None and getattr(chat, "forum", False):
+                        tl = self._jlist(mc.getTopicsController().getTopics(-did))
+                        if not tl:
+                            self._topics_missing(mc, did, now)
+                            continue
+                        for t in tl:
+                            unread = int(getattr(t, "unread_count", 0) or 0)
+                            if unread <= 0:
+                                continue
+                            tmax = int(getattr(t, "top_message", 0) or 0)
+                            if tmax > 0 and self._sweep_read(account, did, tmax, int(t.id), unread, sent, now):
+                                did_read += 1
+                        continue
+                    dialog = self._dialog_obj(mc, did)
+                    if dialog is None:
+                        continue
+                    unread = int(getattr(dialog, "unread_count", 0) or 0)
+                    if unread <= 0:
+                        continue
+                    top = int(getattr(dialog, "top_message", 0) or 0)
+                    if top > 0 and self._sweep_read(account, did, top, 0, unread, sent, now):
+                        did_read += 1
+                except Exception:
+                    pass
+            if len(sent) > 500:
+                sent.clear()
+        except Exception as e:
+            self._log("sweep: " + repr(e))
+        # Что-то читали -> перепроверяем через 3 сек (до 3 раз подряд):
+        # приложение могло обработать сообщения уже после нашего чтения.
+        try:
+            if did_read:
+                if self._chain < 3:
+                    self._chain += 1
+                    t = threading.Timer(3.0, self._sweep_async)
+                    t.daemon = True
+                    t.start()
+            else:
+                self._chain = 0
+        except Exception:
+            pass
+
+    def _sweep_read(self, account: int, did: int, max_id: int, topic_id: int, unread: int, sent: dict, now: float) -> bool:
+        key = (did, topic_id)
+        prev = sent.get(key)
+        if prev and prev[0] == max_id and now - prev[1] < 2.0:
+            return False
+        sent[key] = (max_id, now)
+        self._dbg("sweep did=%s max=%s topic=%s unread=%s" % (did, max_id, topic_id, unread))
+        self._read_pair(account, did, max_id, topic_id)
+        return True
+
+    def _read_pair(self, account: int, dialog_id: int, max_id: int, topic_id: int):
+        if self._should_read_local_for(account, dialog_id):
+            self._update_local_read(dialog_id, max_id, topic_id)
+        if self._should_read_online_for(account, dialog_id):
+            self._send_read_request(dialog_id, max_id, topic_id)
+
+    # ── Диагностика ─────────────────────────────────────────────────────
+
+    def _diagnose(self):
+        self._dbg("=== диагностика v%s ===" % __version__)
+        self._dbg("chats=%s folders_on=%s read_local=%s read_messages=%s" % (
+            sorted(self._chats), sorted(self._folders),
+            self.get_setting("read_local", True), self.get_setting("read_messages", True)))
+        self._dbg("get_account_instance=%s account=%s" % (get_account_instance is not None, self._current_account()))
+        try:
+            mc = get_messages_controller()
+            self._dbg("dialogs_dict=%s allDialogs=%d" % (
+                hasattr(mc, "dialogs_dict"), len(self._jlist(getattr(mc, "allDialogs", None)))))
+        except Exception as e:
+            self._log("diagnose dialogs: " + repr(e))
+        try:
+            raw = self._filters_raw()
+            self._dbg("filters=%d err=%s" % (len(raw), self._folders_error))
+            for f in raw:
+                ds = self._jlist(self._field(f, "dialogs"))
+                al = self._jlist(self._field(f, "alwaysShow"))
+                self._dbg("folder id=%s name=%s on=%s flags=%s dialogs=%d always=%d sample=%s" % (
+                    int(self._field(f, "id")), self._folder_name(f), int(self._field(f, "id")) in self._folders, self._field(f, "flags", "?"),
+                    len(ds), len(al), [int(d.id) for d in ds[:5]]))
+                for d in ds[:3]:
+                    d0 = int(d.id)
+                    self._dbg("  check %s -> %s" % (d0, self._filter_includes(f, d0)))
+        except Exception as e:
+            self._log("diagnose: " + repr(e))
+        self._dbg("=== конец ===")
+
+    def _copy_log(self):
+        text = "\n".join(getattr(self, "_dbg_buf", []) or ["(лог пуст)"])
+        try:
+            if copy_to_clipboard is None:
+                raise RuntimeError("copy_to_clipboard недоступен")
+            copy_to_clipboard(text)
+            BulletinHelper.show_info("Лог скопирован (%d строк)" % text.count("\n"))
+        except Exception as e:
+            BulletinHelper.show_error("Не удалось скопировать: " + repr(e))
 
     # ── Вспомогательное для UI ───────────────────────────────────────────
 
@@ -426,6 +957,8 @@ class AutoReadPlugin(BasePlugin):
                 if chat:
                     name = str(getattr(chat, "title", "") or "")
                     if name:
+                        if getattr(chat, "forum", False):
+                            name += " (темы)"
                         return name
         except Exception:
             pass
@@ -450,7 +983,7 @@ class AutoReadPlugin(BasePlugin):
             Divider(),
             Header(text="Режим чтения по умолчанию"),
             Switch(key="read_local", text="Читать локально",
-                   subtext="Не отправялет данные о прочтение в ТГ",
+                   subtext="Сразу убирать счётчик непрочитанных в приложении",
                    default=True),
         ]
 
@@ -462,6 +995,43 @@ class AutoReadPlugin(BasePlugin):
                        subtext="для AyuGram",
                        default=False),
             ]
+
+        entries += [Divider(), Header(text="Диагностика")]
+        entries.append(Text(
+            text="Проверить папки",
+            subtext="Записать в лог состояние папок",
+            on_click=lambda v: (self._diagnose(), BulletinHelper.show_info("Готово, скопируй лог")),
+        ))
+        entries.append(Text(
+            text="Скопировать лог",
+            subtext="Строк в логе: " + str(len(getattr(self, "_dbg_buf", []) or [])),
+            icon="msg_copy",
+            on_click=lambda v: self._copy_log(),
+        ))
+        entries.append(Text(
+            text="Очистить лог",
+            on_click=lambda v: (setattr(self, "_dbg_buf", []), BulletinHelper.show_info("Лог очищен")),
+        ))
+
+        entries += [Divider(), Header(text="Папки")]
+        folders = self._get_folders()
+        if not folders:
+            entries.append(Text(
+                text="Папки не найдены",
+                subtext=self._folders_error or "Создай папки в Telegram или открой экран чатов",
+            ))
+        for fid, fname in folders:
+            def make_folder_click(i):
+                def on_folder_click(v):
+                    self._toggle_folder(i)
+                    self.set_setting("_r", "f" + str(i), reload_settings=True)
+                return on_folder_click
+
+            entries.append(Text(
+                text=("✅ " if fid in self._folders else "") + fname,
+                subtext="Авто-чтение всех чатов папки",
+                on_click=make_folder_click(fid),
+            ))
 
         entries += [
             Divider(),
