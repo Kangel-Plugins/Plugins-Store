@@ -1,0 +1,2765 @@
+"""Voice Chapters — local timestamp bookmarks for Telegram voice messages.
+
+Single-file exteraGram / AyuGram Python plugin (plugin SDK >= 1.4.4.3).
+The UI uses documented SDK menu and alert-dialog helpers. Uses a lightweight cell-binding hook to add interactive waveform chapter markers.
+"""
+
+import json
+import hashlib
+import time
+from collections.abc import Mapping
+from typing import Any
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+
+__id__ = "voice_chapters"
+__name__ = "Voice Message Bookmarks"
+__description__ = "Закладки на нужных секундах голосовых сообщений Telegram. Быстрый переход по меткам над звуковой волной, каталог сохранённых голосовых по чатам, настройка оформления и резервные копии JSON."
+__author__ = "@ghoulbananarank"
+__version__ = "0.2.16"
+__icon__ = "pluginiconssss/1"
+__category__ = ["tools", "chats"]
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+
+_DB_KEY = "voice_chapters_database_v1"
+_META_KEY = "voice_chapters_message_metadata_v1"
+_MAX_CHAPTERS_PER_VOICE = 30
+_MAX_VOICES = 1500
+_MAX_BACKUP_BYTES = 12 * 1024 * 1024
+_BACKUP_FOLDER_REQUEST = 22051
+_BACKUP_RESTORE_REQUEST = 22052
+_BACKUP_CREATE_REQUEST = 22053  # Android 9 fallback
+_BACKUP_FOLDER_KEY = "backup_tree_uri_v1"
+
+
+def format_time(seconds: int) -> str:
+    s = max(0, int(seconds))
+    if s >= 3600:
+        return "%d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60)
+    return "%02d:%02d" % (s // 60, s % 60)
+
+
+def parse_time(value: str) -> int:
+    """Parse seconds, MM:SS or HH:MM:SS; reject invalid input."""
+    parts = str(value).strip().split(":")
+    if not 1 <= len(parts) <= 3 or any(not p.isdigit() for p in parts):
+        raise ValueError("Enter seconds, MM:SS or HH:MM:SS")
+    numbers = [int(x) for x in parts]
+    if len(numbers) == 1:
+        return numbers[0]
+    if any(x >= 60 for x in numbers[1:]):
+        raise ValueError("Seconds and minutes must be below 60")
+    if len(numbers) == 2:
+        return numbers[0] * 60 + numbers[1]
+    return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+
+
+def valid_chapter(time_s: int, duration: int) -> bool:
+    return isinstance(time_s, int) and duration >= 1 and 0 <= time_s < duration
+
+
+def append_chapter(chapters, seconds: int, label: str, duration: int, default_prefix="Метка"):
+    """Returns a new sorted list. Raises ValueError for invalid edits."""
+    if not valid_chapter(seconds, duration):
+        raise ValueError("Timestamp is outside the voice message")
+    if len(chapters) >= _MAX_CHAPTERS_PER_VOICE:
+        raise ValueError("Maximum number of chapters reached")
+    if any(int(item["t"]) == seconds for item in chapters):
+        raise ValueError("A chapter already exists at that second")
+    clean = " ".join(str(label).split())[:48] or (str(default_prefix) + " " + format_time(seconds))
+    result = [dict(x) for x in chapters]
+    result.append({"t": int(seconds), "name": clean})
+    result.sort(key=lambda x: int(x["t"]))
+    return result
+
+
+def safe_decode_database(raw):
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(data, dict):
+            return {}
+        cleaned = {}
+        for key, entries in list(data.items())[:_MAX_VOICES]:
+            if not isinstance(key, str) or not isinstance(entries, list):
+                continue
+            valid = []
+            for item in entries[:_MAX_CHAPTERS_PER_VOICE]:
+                if not isinstance(item, dict):
+                    continue
+                t, name = item.get("t"), item.get("name", "")
+                if type(t) is int and t >= 0 and t <= 86400 and isinstance(name, str):
+                    valid.append({"t": t, "name": name[:48]})
+            if valid:
+                cleaned[key] = sorted(valid, key=lambda e: e["t"])
+        return cleaned
+    except (ValueError, TypeError):
+        return {}
+
+
+
+# Portable, versioned backup format. v1 backups produced by previous versions
+# remain readable; v2 includes a SHA-256 checksum for integrity verification.
+def backup_document(chapters, metadata):
+    content = {"chapters": chapters, "metadata": metadata}
+    canonical = json.dumps(content, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+    payload = {"format": "voice_chapters_backup_v2",
+               "created_unix": int(time.time()),
+               "chapters": chapters, "metadata": metadata,
+               "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def backup_filename(now=None):
+    stamp = time.localtime(time.time() if now is None else now)
+    return "Voice_Chapters_%s.json" % time.strftime("%Y-%m-%d_%H-%M-%S", stamp)
+
+
+def parse_backup_document(raw_text):
+    if not isinstance(raw_text, str):
+        raise ValueError("Backup must be UTF-8 JSON")
+    raw_text = raw_text.lstrip("\ufeff")
+    if len(raw_text.encode("utf-8")) > _MAX_BACKUP_BYTES:
+        raise ValueError("Backup exceeds 12 MiB")
+    doc = json.loads(raw_text)
+    if not isinstance(doc, dict):
+        raise ValueError("Invalid backup format")
+    version = doc.get("format")
+    if version not in ("voice_chapters_backup_v1", "voice_chapters_backup_v2"):
+        raise ValueError("Not a Voice Chapters backup")
+    chapters = doc.get("chapters")
+    metadata = doc.get("metadata", {})
+    if not isinstance(chapters, dict) or not isinstance(metadata, dict):
+        raise ValueError("Malformed chapters or dates")
+    if version == "voice_chapters_backup_v2":
+        digest = doc.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("Missing backup checksum")
+        canonical = json.dumps({"chapters": chapters, "metadata": metadata},
+                               ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"))
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
+            raise ValueError("Backup checksum mismatch")
+    if len(chapters) > _MAX_VOICES:
+        raise ValueError("More than 1500 voice messages in backup")
+    for key, marks in chapters.items():
+        if not isinstance(key, str) or len(key.split(":")) != 3:
+            raise ValueError("Invalid voice message identifier")
+        try:
+            for part in key.split(":"):
+                int(part)
+        except ValueError:
+            raise ValueError("Invalid voice message identifier")
+        if not isinstance(marks, list) or len(marks) > _MAX_CHAPTERS_PER_VOICE:
+            raise ValueError("Invalid chapter count")
+        times = set()
+        for mark in marks:
+            if not isinstance(mark, dict):
+                raise ValueError("Malformed chapter")
+            t, name = mark.get("t"), mark.get("name")
+            if type(t) is not int or not (0 <= t <= 86400):
+                raise ValueError("Invalid timestamp")
+            if not isinstance(name, str) or len(name) > 48 or t in times:
+                raise ValueError("Invalid or duplicate chapter name/time")
+            times.add(t)
+    return chapters, metadata
+
+
+def merge_backup_chapters(current, incoming):
+    """Validate ALL capacity limits before writing; never silently drop marks."""
+    merged = {k: [dict(mark) for mark in marks] for k, marks in current.items()}
+    added = 0
+    for key, marks in incoming.items():
+        if key not in merged:
+            if len(merged) >= _MAX_VOICES:
+                raise ValueError("Too many voice messages after restore")
+            merged[key] = [dict(mark) for mark in marks]
+            added += len(marks)
+        else:
+            times = {int(mark["t"]) for mark in merged[key]}
+            for mark in marks:
+                if mark["t"] not in times:
+                    if len(merged[key]) >= _MAX_CHAPTERS_PER_VOICE:
+                        raise ValueError("Too many chapters in a voice message")
+                    merged[key].append(dict(mark))
+                    times.add(mark["t"])
+                    added += 1
+            merged[key].sort(key=lambda mark: int(mark["t"]))
+    return merged, added
+
+
+
+
+def group_waveform_chapters(entries, duration, width, min_spacing=19.0):
+    """Return stable (x, group) items. Close chapters share one clickable dot.
+
+    This runs only on message binding, not during rendering or audio progress.
+    """
+    if duration <= 0 or width <= 0:
+        return []
+    groups = []
+    for entry in sorted(entries, key=lambda e: int(e["t"])):
+        x = max(0.0, min(float(width), float(entry["t"]) / float(duration) * float(width)))
+        if groups and x - groups[-1][0] < min_spacing:
+            prev_x, members = groups[-1]
+            members.append(entry)
+            groups[-1] = (sum(float(e["t"]) / duration * width for e in members) / len(members), members)
+        else:
+            groups.append((x, [entry]))
+    return groups
+
+
+_LANG_TEXT = {
+    "en": {
+        'seek_success': 'Jumped to {}',
+        'play_first_simple': 'Play this voice message first',
+        'open_success': 'Chapter list opened',
+        'clear_desc': 'Delete all bookmarks in this chat',
+        "context_voice": "Voice Chapters · Chapters", "context_voice_sub": "Bookmarks for voice messages",
+        "context_chat": "Voice Chapters · All bookmarks", "context_chat_sub": "All bookmarked voice messages in this chat",
+        "setting_marks": "Chapter markers on voice messages", "setting_marks_sub": "Show tappable markers above voice waveforms",
+        "setting_style": "Marker appearance", "style_ticks": "Lines", "style_dots": "Dots",
+        "setting_bubbles": "Material Bubbles in chapter menus", "setting_bubbles_sub": "Rounded translucent rows in both menus",
+        "setting_ask": "Ask for a bookmark name", "setting_ask_sub": "On: ask for a name when bookmarking. Off: save immediately with an automatic name.",
+        "setting_auto_play": "Play audio when jumping", "setting_auto_play_sub": "Start the voice message before jumping if it is not playing",
+        "setting_guide": "How to use", "setting_guide_sub": "Tap to open the complete guide →",
+        "setting_storage": "Storage", "setting_storage_sub": "Bookmarks are stored locally in the plugin settings. Voice audio is neither saved nor transmitted.",
+        "setting_diag": "Latest diagnostic", "setting_diag_none": "No errors yet", "setting_language": "Plugin language",
+        "lang_auto": "Telegram language (automatic)",
+        "guide_header": "Voice Chapters · guide",
+        "guide1_title": "1. Open voice message chapters", "guide1_body": "Tap the voice message time below the waveform (for example, 00:07) to open chapter controls. This works even without bookmarks. You can also long-press a chapter marker or use the message context menu.",
+        "guide2_title": "2. Bookmark the current second", "guide2_body": "Play the voice message and move to the right moment. Choose Add current second. With name prompts off, the bookmark saves instantly.",
+        "guide3_title": "3. Enter a timestamp manually", "guide3_body": "Choose Add time manually and type MM:SS (for example 01:24). A name is optional.",
+        "guide4_title": "4. Jump to a chapter", "guide4_body": "Tap a marker above the waveform or select a chapter in the menu. Long-press a marker to manage chapters.",
+        "guide5_title": "5. Find all chapters in this chat", "guide5_body": "Open chat ⋮ → Plugins → Voice Chapters · All bookmarks. Choose a voice message to jump to its original message.",
+        "guide6_title": "6. Back up your bookmarks", "guide6_body": "In the chat catalog, tap Save file to create a complete JSON backup in Downloads or your selected folder. Import file restores it. Set the backup folder in settings. Old clipboard backups can also be imported from settings.",
+        "guide7_title": "7. Language and appearance", "guide7_body": "By default the plugin follows the language and colors of Telegram. You can override the language and enable Material Bubbles in plugin settings.",
+        "open_button": "Tap the voice time to open chapter controls", "select_chapter": "Select a chapter", "jump_error": "Could not jump to chapter",
+        "open_chat_first": "Open a chat to view bookmarks", "catalog_error": "Could not open voice catalog",
+        "wrong_chat": "Open the original chat to jump to this voice message", "jump_message_error": "Telegram could not find that message",
+        "voice_one": "voice message", "voice_many": "voice messages", "unknown_date": "Date unavailable", "chapter_count": "{} chapters", "empty_catalog": "No bookmarked voice messages yet",
+        "clear_title": "Delete all bookmarks in this chat?", "clear_detail": "This will delete {} chapters in {} voice messages. Other chats will be unaffected. Recovery requires a backup.",
+        "clear_none": "No saved chapters in this chat", "clear_error": "Could not delete chapters. Check storage.", "clear_result": "Deleted chapters: {}",
+        "copy": "Save file", "restore": "Import file", "close": "Close", "cancel": "Cancel", "delete": "Delete", "save": "Save",
+        "backup_ok": "Backup copied. Save it to a file.", "backup_error": "Could not copy backup",
+        "backup_empty": "Clipboard is empty", "backup_not_found": "No Voice Chapters backup found", "backup_too_big": "Backup is too large",
+        "backup_none": "No new chapters to restore", "backup_restored": "Restored chapters: {}", "backup_invalid": "Invalid backup or save failed",
+        "add_current": "+ Add current second", "add_manual": "+ Add time manually", "remove_marks": "Delete bookmarks…",
+        "open_voice_error": "Could not open voice menu", "voice_only": "Chapters are only available for voice messages",
+        "not_sent": "Wait until the voice message has been sent", "invalid_duration": "Invalid voice message duration",
+        "saved": "Bookmark saved: {}", "play_first": "Play this voice message and select a moment first",
+        "save_position_error": "Could not save playback position", "new_chapter": "New chapter", "chapter_time": "Chapter timestamp",
+        "time_hint": "Time: 01:20 or 80", "name_hint": "Bookmark name (optional)", "save_error": "Could not save bookmark", "editor_error": "Could not open bookmark editor",
+        "delete_title": "Delete chapters", "delete_selected": "Delete selected", "none_selected": "Select at least one chapter", "deleted": "Deleted chapters: {}", "delete_error": "Could not delete chapters",
+        "group_chapter": "Chapter", "marker_prefix": "Bookmark", "error_prefix": "Error: ",
+        "seek_wait": "Wait for the voice message to load, then try again", "seek_unsupported": "Seeking is unavailable for this message", "seek_error": "Could not seek voice message",
+        "setting_backup_header": "Backup files", "setting_backup_folder": "Backup folder",
+        "setting_backup_default": "Use Downloads folder", "setting_backup_default_sub": "Reset the destination to Downloads",
+        "setting_backup_legacy": "Import old backup from clipboard", "setting_backup_legacy_sub": "For backups copied in earlier versions",
+        "backup_downloads": "Downloads (default)", "backup_chosen_folder": "Selected: {}",
+        "backup_custom_folder": "Custom folder", "backup_folder_reset": "Destination reset to Downloads",
+        "backup_folder_selected": "Backup folder selected", "backup_picker_unavailable": "System folder/file picker unavailable",
+        "backup_file_saved": "Backup saved: {}", "backup_dates_warning": "Chapters restored; some dates could not be saved",
+    },
+    "ru": {
+        'seek_success': 'Переход: {}',
+        'play_first_simple': 'Сначала включите это голосовое',
+        'open_success': 'Список глав открыт',
+        'clear_desc': 'Удалить все главы в этом чате',
+        "context_voice": "Voice Chapters · Главы", "context_voice_sub": "Закладки для голосовых сообщений",
+        "context_chat": "Voice Chapters · Все отметки", "context_chat_sub": "Все голосовые с главами в этом чате",
+        "setting_marks": "Метки глав над голосовыми", "setting_marks_sub": "Показывать интерактивные метки над звуковой волной",
+        "setting_style": "Вид меток", "style_ticks": "Палочки", "style_dots": "Кружочки",
+        "setting_bubbles": "Material Bubbles в меню глав", "setting_bubbles_sub": "Полупрозрачные округлые пункты в обоих меню",
+        "setting_ask": "Спрашивать название метки", "setting_ask_sub": "Включено: ввод названия при добавлении. Выключено: мгновенное сохранение с автоматическим названием.",
+        "setting_auto_play": "Воспроизводить при переходе", "setting_auto_play_sub": "Запускать голосовое перед переходом, если оно не играет",
+        "setting_guide": "Как пользоваться", "setting_guide_sub": "Нажмите, чтобы открыть инструкцию →",
+        "setting_storage": "Хранение", "setting_storage_sub": "Закладки хранятся локально в настройках плагина. Аудио не сохраняется и не передаётся.",
+        "setting_diag": "Последняя диагностика", "setting_diag_none": "Ошибок пока нет", "setting_language": "Язык плагина",
+        "lang_auto": "Язык Telegram (автоматически)", "guide_header": "Voice Chapters · инструкция",
+        "guide1_title": "1. Открыть главы голосового", "guide1_body": "Нажмите на время голосового под звуковой волной (например, 00:07), чтобы открыть управление главами. Это работает даже без меток. Также можно удержать метку или воспользоваться меню сообщения.",
+        "guide2_title": "2. Сохранить текущую секунду", "guide2_body": "Запустите голосовое и выберите момент. Нажмите «Добавить текущую секунду». Если запрос названия выключен, метка сохраняется сразу.",
+        "guide3_title": "3. Указать секунду вручную", "guide3_body": "Выберите «Добавить время вручную» и введите MM:SS, например 01:24. Название необязательно.",
+        "guide4_title": "4. Перейти к главе", "guide4_body": "Нажмите метку над волной или главу в меню. Удержание метки открывает управление.",
+        "guide5_title": "5. Найти все главы в чате", "guide5_body": "Откройте ⋮ чата → Плагины → Voice Chapters · Все отметки. Нажмите на голосовое для перехода к сообщению.",
+        "guide6_title": "6. Сохранить резервную копию", "guide6_body": "В каталоге нажмите «Сохранить»: полный JSON-файл появится в «Загрузках» или выбранной папке. «Импорт файла» восстанавливает главы. Папку можно выбрать в настройках. Старые копии из буфера тоже можно импортировать в настройках.",
+        "guide7_title": "7. Язык и оформление", "guide7_body": "По умолчанию язык и цвета берутся из Telegram. В настройках можно выбрать язык вручную и включить Material Bubbles.",
+        "open_button": "Нажмите на время голосового для открытия глав", "select_chapter": "Выбрать главу", "jump_error": "Не удалось перейти к главе",
+        "open_chat_first": "Откройте переписку для просмотра глав", "catalog_error": "Не удалось открыть список голосовых",
+        "wrong_chat": "Откройте исходный чат для перехода к голосовому", "jump_message_error": "Telegram не смог перейти к сообщению",
+        "voice_one": "голосовое", "voice_many": "голосовых", "unknown_date": "Дата не сохранена", "chapter_count": "{} глав", "empty_catalog": "Здесь пока нет голосовых с главами",
+        "clear_title": "Удалить все главы в этом чате?", "clear_detail": "Будут удалены {} глав у {} голосовых сообщений. Другие чаты не затронуты. Восстановление только из резервной копии.",
+        "clear_none": "В этом чате нет сохранённых глав", "clear_error": "Не удалось удалить главы: проверьте сохранение", "clear_result": "Удалено глав: {}",
+        "copy": "Сохранить", "restore": "Импорт файла", "close": "Закрыть", "cancel": "Отмена", "delete": "Удалить", "save": "Сохранить",
+        "backup_ok": "Резервная копия скопирована. Сохраните её в файл.", "backup_error": "Не удалось скопировать резервную копию",
+        "backup_empty": "Буфер обмена пуст", "backup_not_found": "Не найдена резервная копия Voice Chapters", "backup_too_big": "Слишком большой файл резервной копии",
+        "backup_none": "Новых глав для восстановления нет", "backup_restored": "Восстановлено глав: {}", "backup_invalid": "Неверная резервная копия или ошибка сохранения",
+        "add_current": "＋ Добавить текущую секунду", "add_manual": "＋ Добавить время вручную", "remove_marks": "Удалить отметку…",
+        "open_voice_error": "Не удалось открыть меню голосового", "voice_only": "Главы доступны только для обычных голосовых сообщений",
+        "not_sent": "Сначала дождитесь отправки голосового сообщения", "invalid_duration": "У голосового нет корректной длительности",
+        "saved": "Глава сохранена: {}", "play_first": "Сначала включите это голосовое и выберите момент",
+        "save_position_error": "Не удалось сохранить позицию", "new_chapter": "Новая глава", "chapter_time": "Время главы",
+        "time_hint": "Время: 01:20 или 80", "name_hint": "Название главы (необязательно)", "save_error": "Не удалось сохранить главу", "editor_error": "Не удалось открыть редактор главы",
+        "delete_title": "Удалить главы", "delete_selected": "Удалить выбранные", "none_selected": "Выберите хотя бы одну главу", "deleted": "Удалено глав: {}", "delete_error": "Не удалось удалить главы",
+        "group_chapter": "Глава", "marker_prefix": "Метка", "error_prefix": "Ошибка: ",
+        "seek_wait": "Дождитесь загрузки голосового и повторите переход", "seek_unsupported": "Перемотка не поддерживается в этом сообщении", "seek_error": "Не удалось перемотать голосовое",
+        "setting_backup_header": "Резервные копии", "setting_backup_folder": "Папка резервных копий",
+        "setting_backup_default": "Использовать Загрузки", "setting_backup_default_sub": "Вернуться к стандартной папке Downloads",
+        "setting_backup_legacy": "Импорт старой копии из буфера", "setting_backup_legacy_sub": "Для копий, созданных прошлыми версиями",
+        "backup_downloads": "Загрузки / Downloads (по умолчанию)", "backup_chosen_folder": "Выбрано: {}",
+        "backup_custom_folder": "Выбранная папка", "backup_folder_reset": "Папка снова: Загрузки",
+        "backup_folder_selected": "Папка резервных копий выбрана", "backup_picker_unavailable": "Системный выбор папки/файла недоступен",
+        "backup_file_saved": "Копия сохранена: {}", "backup_dates_warning": "Главы восстановлены, но часть дат не сохранилась",
+    },
+    "uk": {
+        'seek_success': 'Перехід: {}',
+        'play_first_simple': 'Спочатку ввімкніть це голосове',
+        'open_success': 'Список глав відкрито',
+        'clear_desc': 'Видалити всі глави в цьому чаті',
+        "context_voice": "Voice Chapters · Глави", "context_voice_sub": "Закладки для голосових повідомлень",
+        "context_chat": "Voice Chapters · Усі позначки", "context_chat_sub": "Усі голосові з главами в цьому чаті",
+        "setting_marks": "Позначки глав над голосовими", "setting_marks_sub": "Показувати інтерактивні позначки над звуковою хвилею",
+        "setting_style": "Вигляд позначок", "style_ticks": "Риски", "style_dots": "Кружечки",
+        "setting_bubbles": "Material Bubbles у меню глав", "setting_bubbles_sub": "Напівпрозорі заокруглені пункти в обох меню",
+        "setting_ask": "Запитувати назву позначки", "setting_ask_sub": "Увімкнено: введення назви під час додавання. Вимкнено: миттєве збереження з автоматичною назвою.",
+        "setting_auto_play": "Відтворювати під час переходу", "setting_auto_play_sub": "Запускати голосове перед переходом, якщо воно не відтворюється",
+        "setting_guide": "Як користуватися", "setting_guide_sub": "Натисніть, щоб відкрити інструкцію →",
+        "setting_storage": "Зберігання", "setting_storage_sub": "Позначки зберігаються локально в налаштуваннях плагіна. Аудіо не зберігається й не передається.",
+        "setting_diag": "Остання діагностика", "setting_diag_none": "Помилок поки немає", "setting_language": "Мова плагіна",
+        "lang_auto": "Мова Telegram (автоматично)", "guide_header": "Voice Chapters · інструкція",
+        "guide1_title": "1. Відкрити глави голосового", "guide1_body": "Натисніть на час голосового під звуковою хвилею (наприклад, 00:07), щоб відкрити керування главами. Це працює навіть без позначок. Також можна утримати позначку або скористатися меню повідомлення.",
+        "guide2_title": "2. Зберегти поточну секунду", "guide2_body": "Увімкніть голосове й оберіть потрібний момент. Натисніть «Додати поточну секунду». Якщо запит назви вимкнено, позначка зберігається одразу.",
+        "guide3_title": "3. Вказати секунду вручну", "guide3_body": "Оберіть «Додати час вручну» та введіть MM:SS, наприклад 01:24. Назва необов'язкова.",
+        "guide4_title": "4. Перейти до глави", "guide4_body": "Натисніть позначку над хвилею або главу в меню. Утримання позначки відкриває керування.",
+        "guide5_title": "5. Знайти всі глави в чаті", "guide5_body": "Відкрийте ⋮ чату → Плагіни → Voice Chapters · Усі позначки. Натисніть голосове для переходу до повідомлення.",
+        "guide6_title": "6. Зберегти резервну копію", "guide6_body": "У каталозі натисніть «Зберегти»: повний JSON-файл з’явиться у «Завантаженнях» або вибраній теці. «Імпорт файлу» відновлює глави. Теку можна обрати в налаштуваннях. Старі копії з буфера також можна імпортувати в налаштуваннях.",
+        "guide7_title": "7. Мова та оформлення", "guide7_body": "За замовчуванням мова й кольори беруться з Telegram. У налаштуваннях можна вибрати мову вручну та ввімкнути Material Bubbles.",
+        "open_button": "Натисніть на час голосового для відкриття глав", "select_chapter": "Вибрати главу", "jump_error": "Не вдалося перейти до глави",
+        "open_chat_first": "Відкрийте чат для перегляду глав", "catalog_error": "Не вдалося відкрити список голосових",
+        "wrong_chat": "Відкрийте початковий чат для переходу до голосового", "jump_message_error": "Telegram не зміг перейти до повідомлення",
+        "voice_one": "голосове", "voice_many": "голосових", "unknown_date": "Дата невідома", "chapter_count": "{} глав", "empty_catalog": "Поки немає голосових із главами",
+        "clear_title": "Видалити всі глави в цьому чаті?", "clear_detail": "Буде видалено {} глав у {} голосових повідомленнях. Інші чати не постраждають. Відновлення лише з резервної копії.",
+        "clear_none": "У цьому чаті немає збережених глав", "clear_error": "Не вдалося видалити глави: перевірте збереження", "clear_result": "Видалено глав: {}",
+        "copy": "Зберегти", "restore": "Імпорт файлу", "close": "Закрити", "cancel": "Скасувати", "delete": "Видалити", "save": "Зберегти",
+        "backup_ok": "Резервну копію скопійовано. Збережіть її у файл.", "backup_error": "Не вдалося скопіювати резервну копію",
+        "backup_empty": "Буфер обміну порожній", "backup_not_found": "Не знайдено резервну копію Voice Chapters", "backup_too_big": "Завелика резервна копія",
+        "backup_none": "Нових глав для відновлення немає", "backup_restored": "Відновлено глав: {}", "backup_invalid": "Неправильна резервна копія або помилка збереження",
+        "add_current": "＋ Додати поточну секунду", "add_manual": "＋ Додати час вручну", "remove_marks": "Видалити позначку…",
+        "open_voice_error": "Не вдалося відкрити меню голосового", "voice_only": "Глави доступні лише для звичайних голосових повідомлень",
+        "not_sent": "Дочекайтеся надсилання голосового повідомлення", "invalid_duration": "Некоректна тривалість голосового",
+        "saved": "Позначку збережено: {}", "play_first": "Спочатку ввімкніть це голосове й оберіть момент",
+        "save_position_error": "Не вдалося зберегти позицію", "new_chapter": "Нова глава", "chapter_time": "Час глави",
+        "time_hint": "Час: 01:20 або 80", "name_hint": "Назва глави (необов'язково)", "save_error": "Не вдалося зберегти главу", "editor_error": "Не вдалося відкрити редактор глави",
+        "delete_title": "Видалити глави", "delete_selected": "Видалити вибрані", "none_selected": "Виберіть хоча б одну главу", "deleted": "Видалено глав: {}", "delete_error": "Не вдалося видалити глави",
+        "group_chapter": "Глава", "marker_prefix": "Позначка", "error_prefix": "Помилка: ",
+        "seek_wait": "Дочекайтеся завантаження голосового й повторіть перехід", "seek_unsupported": "Перемотування недоступне в цьому повідомленні", "seek_error": "Не вдалося перемотати голосове",
+        "setting_backup_header": "Резервні копії", "setting_backup_folder": "Тека резервних копій",
+        "setting_backup_default": "Використовувати Завантаження", "setting_backup_default_sub": "Повернути типову теку Downloads",
+        "setting_backup_legacy": "Імпорт старої копії з буфера", "setting_backup_legacy_sub": "Для копій, створених попередніми версіями",
+        "backup_downloads": "Завантаження / Downloads (типово)", "backup_chosen_folder": "Обрано: {}",
+        "backup_custom_folder": "Обрана тека", "backup_folder_reset": "Теку змінено на Завантаження",
+        "backup_folder_selected": "Теку резервних копій обрано", "backup_picker_unavailable": "Системний вибір теки/файлу недоступний",
+        "backup_file_saved": "Копію збережено: {}", "backup_dates_warning": "Глави відновлено, але частину дат не збережено",
+    },
+}
+
+class _VoiceCellBoundHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.owner._disposed:
+                self.owner._update_marker_cell(param.thisObject)
+        except Exception:
+            self.owner.logger.exception("Voice Chapters: cell bind hook failed")
+
+
+class _VoiceCellLayoutHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        try:
+            if self.owner._marker_cells:
+                cell = param.thisObject
+                if self.owner._cell_id(cell) in self.owner._marker_cells:
+                    self.owner._layout_marker_cell(cell)
+        except Exception:
+            self.owner.logger.exception("Voice Chapters: cell layout hook failed")
+
+
+class _VoiceCellDetachHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        try:
+            self.owner._remove_marker_cell(param.thisObject)
+        except Exception:
+            self.owner.logger.exception("Voice Chapters: detach cleanup failed")
+
+
+class _VoiceCellAttachHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.owner._disposed:
+                self.owner._update_marker_cell(param.thisObject)
+        except Exception:
+            self.owner.logger.exception("Voice Chapters: attach refresh failed")
+
+
+class _VoiceMenuTouchHook(MethodHook):
+    """Tap the native voice duration text without inserting a new View."""
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def before_hooked_method(self, param):
+        if self.owner._disposed:
+            return
+        try:
+            from android.view import MotionEvent
+            event = param.args[0]
+            cell = param.thisObject
+            state = self.owner._marker_cells.get(self.owner._cell_id(cell))
+            if state is None:
+                return
+            rect = state.get("menu_bounds")
+            if rect is None:
+                return
+            action = int(event.getActionMasked())
+            hit = rect[0] <= event.getX() <= rect[2] and rect[1] <= event.getY() <= rect[3]
+            if action == MotionEvent.ACTION_DOWN:
+                state["menu_pressed"] = bool(hit)
+                state["menu_cancelled"] = False
+                if hit:
+                    state["menu_down_x"] = float(event.getX())
+                    state["menu_down_y"] = float(event.getY())
+                if hit:
+                    # Do not requestDisallowInterceptTouchEvent: a vertical
+                    # swipe must still be able to scroll the message list.
+                    param.setResult(True)
+            elif action == MotionEvent.ACTION_MOVE:
+                if state.get("menu_pressed"):
+                    dx = float(event.getX()) - state.get("menu_down_x", float(event.getX()))
+                    dy = float(event.getY()) - state.get("menu_down_y", float(event.getY()))
+                    slop = self.owner._dp(cell, 8)
+                    if not hit or dx * dx + dy * dy > slop * slop:
+                        state["menu_cancelled"] = True
+                    # Consume the rest of the gesture at cell level; the
+                    # parent RecyclerView may still intercept real swipes.
+                    param.setResult(True)
+            elif action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                was_pressed = state.pop("menu_pressed", False)
+                cancelled = state.pop("menu_cancelled", False)
+                state.pop("menu_down_x", None)
+                state.pop("menu_down_y", None)
+                if was_pressed:
+                    param.setResult(True)
+                    if action == MotionEvent.ACTION_UP and hit and not cancelled:
+                        # Native message touch callback can run while Telegram
+                        # is dispatching ACTION_UP; launch after it completes.
+                        from android_utils import run_on_ui_thread
+                        msg, dur = state["message"], state["duration"]
+                        context = cell.getContext()
+                        run_on_ui_thread(lambda: self.owner._open_from_button(context, msg, dur), 50)
+        except Exception:
+            # Never interrupt Telegram's own touch handling if a hook differs.
+            pass
+
+
+class _BackupPickerResultHook(MethodHook):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def after_hooked_method(self, param):
+        if self.owner._disposed:
+            return
+        try:
+            req = int(param.args[0])
+            if req in (_BACKUP_FOLDER_REQUEST, _BACKUP_RESTORE_REQUEST,
+                       _BACKUP_CREATE_REQUEST):
+                self.owner._on_backup_picker_result(
+                    param.thisObject, req, int(param.args[1]), param.args[2])
+        except Exception:
+            self.owner.logger.exception("Voice Chapters: file picker result")
+
+
+class VoiceChaptersPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._disposed = False
+        self._menu_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text=self._tr("context_voice"),
+            subtext=self._tr("context_voice_sub"),
+            on_click=self._on_message_click,
+            item_id="voice_chapters_open",
+            priority=0,
+        ))
+        self._chat_menu_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text=self._tr("context_chat"),
+            subtext=self._tr("context_chat_sub"),
+            on_click=self._on_chat_catalog_click,
+            item_id="voice_chapters_chat_catalog",
+            priority=0,
+        ))
+        self._marker_cells = {}
+        self._marker_supported = False
+        self._marker_setup_state = "Not initialized"
+        self._db_cache = None
+        self._meta_cache = None
+        self._backup_picker_hook = False
+        self._db_integrity_fault = None
+        # A currently visible chat catalog can refresh after an import. No
+        # observer or timer: updates run only after successful data writes.
+        self._active_catalog = None
+        self._restore_catalog_context = None
+        self._show_ticks_cache = None
+        self._install_backup_picker_hook()
+        self._marker_click_type = None
+        self._marker_long_click_type = None
+        self._menu_touch_enabled = False
+        self._marker_views_created = 0
+        self._marker_style_cache = None
+        self._theme_listener = None
+        self._theme_events = []
+        self._setup_marker_support()
+        self._register_theme_notifications()
+        self.logger.info("Voice Message Bookmarks 0.2.15 loaded; marker state: %s", self._marker_setup_state)
+
+    def on_plugin_unload(self):
+        self._disposed = True
+        self._active_catalog = None
+        self._restore_catalog_context = None
+        self._unregister_theme_notifications()
+        try:
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(self._clear_all_markers)
+        except Exception:
+            self.logger.exception("Marker cleanup failed")
+        if getattr(self, "_menu_id", None):
+            try:
+                self.remove_menu_item(self._menu_id)
+            except Exception:
+                self.logger.exception("Could not explicitly remove menu item")
+        self._menu_id = None
+        if getattr(self, "_chat_menu_id", None):
+            try:
+                self.remove_menu_item(self._chat_menu_id)
+            except Exception:
+                self.logger.exception("Could not remove chat catalog menu")
+        self._chat_menu_id = None
+
+    def _language(self):
+        try:
+            selected = int(self.get_setting("plugin_language", 0))
+        except (ValueError, TypeError):
+            selected = 0
+        if selected in (1, 2, 3):
+            return {1: "uk", 2: "en", 3: "ru"}[selected]
+        try:
+            from org.telegram.messenger import LocaleController
+            selected_locale = LocaleController.getInstance().getCurrentLocale()
+            if selected_locale is not None:
+                tag = str(selected_locale.getLanguage()).strip().lower().split("-")[0].split("_")[0]
+                if tag in _LANG_TEXT:
+                    return tag
+        except Exception:
+            pass
+        # The phone language is only a fallback if Telegram's LocaleController
+        # isn't accessible on this exteraGram build.
+        try:
+            from java.util import Locale
+            tag = str(Locale.getDefault().getLanguage()).lower()
+            if tag in _LANG_TEXT:
+                return tag
+        except Exception:
+            pass
+        return "en"
+
+    def _tr(self, key, *args):
+        lang = self._language()
+        text = _LANG_TEXT.get(lang, _LANG_TEXT["en"]).get(key,
+                     _LANG_TEXT["en"].get(key, key))
+        return str(text).format(*args) if args else str(text)
+
+    def _display_chapter_name(self, chapter):
+        """Translate old auto-generated titles without changing saved labels."""
+        name = str(chapter.get("name", ""))
+        timestamp = format_time(int(chapter["t"]))
+        if name in ("Метка " + timestamp, "Позначка " + timestamp,
+                    "Bookmark " + timestamp):
+            return self._tr("marker_prefix") + " " + timestamp
+        return name
+
+    def _language_changed(self, selected):
+        # SDK persists the Selector value; rebuilding the settings page is
+        # supported by BasePlugin.set_setting(reload_settings=True).
+        try:
+            self.set_setting("plugin_language", int(selected), reload_settings=True)
+        except Exception:
+            self.logger.exception("Unable to reload localized settings")
+        self._marker_setting_changed()
+
+    def create_settings(self):
+        from ui.settings import Header, Switch, Selector, Text
+        tr = self._tr
+        return [
+            Header(text="Voice Chapters"),
+            Selector(key="plugin_language", text=tr("setting_language"), default=0,
+                     items=[tr("lang_auto"), "Українська", "English", "Русский"],
+                     on_change=self._language_changed),
+            Switch(key="waveform_markers", text=tr("setting_marks"), default=True,
+                   subtext=tr("setting_marks_sub"), on_change=self._marker_setting_changed),
+            Selector(key="waveform_marker_style", text=tr("setting_style"),
+                     default=0, items=[tr("style_ticks"), tr("style_dots")],
+                     on_change=self._marker_style_changed),
+            Switch(key="catalog_material_bubbles", text=tr("setting_bubbles"),
+                   default=False, subtext=tr("setting_bubbles_sub")),
+            Switch(key="ask_chapter_name", text=tr("setting_ask"), default=False,
+                   subtext=tr("setting_ask_sub")),
+            Switch(key="auto_play_on_seek", text=tr("setting_auto_play"),
+                   default=True, subtext=tr("setting_auto_play_sub")),
+            Text(text=tr("setting_guide"), subtext=tr("setting_guide_sub"),
+                 create_sub_fragment=self._usage_settings_page),
+            Header(text=tr("setting_backup_header")),
+            Text(text=tr("setting_backup_folder"),
+                 subtext=self._backup_folder_summary(),
+                 icon="msg_folder", on_click=self._select_backup_folder),
+            Text(text=tr("setting_backup_default"),
+                 subtext=tr("setting_backup_default_sub"),
+                 on_click=self._reset_backup_folder),
+            Text(text=tr("setting_backup_legacy"),
+                 subtext=tr("setting_backup_legacy_sub"),
+                 on_click=self._restore_from_clipboard_setting),
+            Text(text=tr("setting_storage"), subtext=tr("setting_storage_sub")),
+            Text(text=tr("setting_diag"),
+                 subtext=str(self.get_setting("last_error", tr("setting_diag_none")))),
+        ]
+
+    def _usage_settings_page(self):
+        from ui.settings import Header, Text
+        tr = self._tr
+        items = [Header(text=tr("guide_header"))]
+        for number in range(1, 8):
+            items.append(Text(text=tr("guide%d_title" % number),
+                              subtext=tr("guide%d_body" % number)))
+        return items
+
+    def _register_theme_notifications(self):
+        """Update visible markers only on Telegram theme changes; no polling."""
+        if not self._marker_supported:
+            return
+        try:
+            from java import dynamic_proxy, jarray
+            from java.lang import Object
+            from org.telegram.messenger import NotificationCenter
+
+            class ThemeDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+                def __init__(self, owner):
+                    super().__init__()
+                    self.owner = owner
+
+                def didReceivedNotification(self, event_id: int, account: int,
+                                            args: jarray(Object)):
+                    if self.owner._disposed:
+                        return
+                    from android_utils import run_on_ui_thread
+                    run_on_ui_thread(self.owner._refresh_visible_marker_cells)
+
+            delegate = ThemeDelegate(self)
+            center = NotificationCenter.getGlobalInstance()
+            registered = []
+            for event_name in ("didSetNewTheme", "didApplyNewTheme"):
+                if hasattr(NotificationCenter, event_name):
+                    event_id = getattr(NotificationCenter, event_name)
+                    try:
+                        center.addObserver(delegate, event_id)
+                        registered.append((center, event_id))
+                    except Exception:
+                        self.logger.exception("Could not register theme event: %s", event_name)
+            self._theme_listener = delegate
+            self._theme_events = registered
+        except Exception:
+            self.logger.exception("Theme observer unavailable; native dialogs still follow theme")
+
+    def _unregister_theme_notifications(self):
+        delegate = getattr(self, "_theme_listener", None)
+        for center, event_id in getattr(self, "_theme_events", ()):
+            try:
+                center.removeObserver(delegate, event_id)
+            except Exception:
+                self.logger.exception("Could not remove theme observer")
+        self._theme_events = []
+        self._theme_listener = None
+
+    def _ask_chapter_name(self):
+        """A persistent opt-in setting; disabled by default for one-tap saves."""
+        return bool(self.get_setting("ask_chapter_name", False))
+
+    # --- Lightweight markers located *inside* each ChatMessageCell ------------
+    # ChatMessageCell inherits ViewGroup (via BaseCell). Native child Views scroll
+    # together with their message, so no full-screen overlay, polling or frame hook.
+    def _marker_setting_changed(self, *args):
+        # Some SDK builds call on_change before committing the new switch.
+        self._show_ticks_cache = bool(args[0]) if args and isinstance(args[0], bool) else None
+        try:
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(self._refresh_visible_marker_cells)
+        except Exception:
+            self.logger.exception("Cannot refresh marker setting")
+
+    def _marker_style_changed(self, index):
+        # Settings on_change receives the new Selector index. Use it immediately
+        # even if the SDK commits the value after invoking the callback.
+        try:
+            self._marker_style_cache = 1 if int(index) == 1 else 0
+        except (TypeError, ValueError):
+            self._marker_style_cache = None
+        self._marker_setting_changed()
+
+    def _marker_style(self):
+        cached = getattr(self, "_marker_style_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            return 1 if int(self.get_setting("waveform_marker_style", 0)) == 1 else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _setup_marker_support(self):
+        try:
+            from java import dynamic_proxy
+            from android.view import View
+            from hook_utils import find_class
+            cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            if cls is None:
+                self._marker_setup_state = "ChatMessageCell class missing; menu only"
+                return
+
+            class MarkerClick(dynamic_proxy(View.OnClickListener)):
+                def __init__(self, plugin, message, duration, members):
+                    super().__init__()
+                    self.plugin = plugin
+                    self.message = message
+                    self.duration = duration
+                    self.members = tuple(members)
+
+                def onClick(self, view):
+                    if self.plugin._disposed:
+                        return
+                    self.plugin._marker_tapped(view, self.message, self.duration, self.members)
+
+            class MarkerLongClick(dynamic_proxy(View.OnLongClickListener)):
+                def __init__(self, plugin, message, duration):
+                    super().__init__()
+                    self.plugin = plugin
+                    self.message = message
+                    self.duration = duration
+
+                def onLongClick(self, view):
+                    if self.plugin._disposed:
+                        return False
+                    return bool(self.plugin._marker_long_pressed(view, self.message, self.duration))
+
+            self._marker_click_type = MarkerClick
+            self._marker_long_click_type = MarkerLongClick
+            # setMessageObject can have different overloads across Telegram APKs.
+            bind_hooks = self.hook_all_methods(cls, "setMessageObject", _VoiceCellBoundHook(self))
+            layout_hooks = self.hook_all_methods(cls, "onLayout", _VoiceCellLayoutHook(self))
+            if not bind_hooks or not layout_hooks:
+                self._marker_setup_state = "Cell binding or layout hook unavailable; menu still works"
+                return
+            try:
+                self._menu_touch_enabled = bool(self.hook_all_methods(
+                    cls, "onTouchEvent", _VoiceMenuTouchHook(self)))
+            except Exception:
+                self._menu_touch_enabled = False
+                self.logger.debug("Native touch fallback unavailable; using standard message menu")
+            # Optional cleanup and reattachment for RecyclerView recycling.
+            try:
+                self.hook_all_methods(cls, "onDetachedFromWindow", _VoiceCellDetachHook(self))
+                self.hook_all_methods(cls, "onAttachedToWindow", _VoiceCellAttachHook(self))
+            except Exception:
+                self.logger.exception("Optional marker lifecycle hook unavailable")
+            self._marker_supported = True
+            self._marker_setup_state = "Hooks installed; waiting for bookmarked voice cells"
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(self._refresh_visible_marker_cells, 130)
+        except Exception as exc:
+            self._marker_setup_state = "Marker setup failed: %s: %s" % (type(exc).__name__, str(exc)[:90])
+            self.logger.exception("Voice Chapters waveform marker setup failed")
+
+    @staticmethod
+    def _cell_id(cell):
+        from java.lang import System
+        return int(System.identityHashCode(cell))
+
+    @staticmethod
+    def _cell_message(cell):
+        msg = None
+        for method in ("getMessageObject", "getPrimaryMessageObject"):
+            try:
+                getter = getattr(cell, method, None)
+                if callable(getter):
+                    msg = getter()
+                    if msg is not None:
+                        break
+            except Exception:
+                continue
+        if msg is None:
+            from hook_utils import get_private_field
+            msg = get_private_field(cell, "currentMessageObject")
+        return msg
+
+    def _dp(self, cell, d):
+        return int(float(d) * float(cell.getResources().getDisplayMetrics().density) + 0.5)
+
+    def _marker_color(self, message):
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            outgoing = bool(message.isOutOwner())
+            key = Theme.key_chat_outAudioProgress if outgoing else Theme.key_chat_inAudioProgress
+            return int(Theme.getColor(key))
+        except Exception:
+            # Neutral fallback; not a hardcoded arbitrary brand accent.
+            return -1
+
+    def _remove_marker_cell(self, cell):
+        if not self._marker_cells or cell is None:
+            return
+        cid = self._cell_id(cell)
+        state = self._marker_cells.pop(cid, None)
+        if state is None:
+            return
+        for view in state["views"]:
+            try:
+                view.setOnClickListener(None)
+                view.setOnLongClickListener(None)
+                parent = view.getParent()
+                if parent is not None:
+                    parent.removeView(view)
+            except Exception:
+                self.logger.debug("Marker view already detached")
+        state["views"].clear()
+        state["listeners"].clear()
+
+    def _clear_all_markers(self):
+        for state in tuple(self._marker_cells.values()):
+            try:
+                for view in state["views"]:
+                    try:
+                        view.setOnClickListener(None)
+                        view.setOnLongClickListener(None)
+                        if view.getParent() is not None:
+                            view.getParent().removeView(view)
+                    except Exception:
+                        pass
+                state["views"].clear()
+                state["listeners"].clear()
+            except Exception:
+                self.logger.exception("Cannot clear voice cell overlays")
+        self._marker_cells.clear()
+
+    def _update_marker_cell(self, cell):
+        if cell is None or not self._marker_supported or self._disposed:
+            return
+        # Panel shortcut works even before the first bookmark is created;
+        # the waveform_markers switch hides only visible chapter ticks.
+        try:
+            msg = self._cell_message(cell)
+            if not self._looks_like_message(msg) or not self._voice(msg):
+                self._remove_marker_cell(cell)
+                return
+            duration = self._duration(msg)
+            key = self._voice_id(msg, {})
+            if duration <= 1 or int(msg.getId()) <= 0:
+                self._remove_marker_cell(cell)
+                return
+            if self._show_ticks_cache is None:
+                self._show_ticks_cache = bool(self.get_setting("waveform_markers", True))
+            show_ticks = self._show_ticks_cache
+            chapters = self._get_entries(key) if show_ticks else []
+            signature = (key, show_ticks,
+                         tuple((int(ch["t"]), str(ch["name"])) for ch in chapters))
+            cid = self._cell_id(cell)
+            state = self._marker_cells.get(cid)
+            if state is not None and state["signature"] == signature:
+                self._layout_marker_cell(cell)
+                return
+            if state is not None:
+                self._remove_marker_cell(cell)
+            self._marker_cells[cid] = {"cell": cell, "message": msg, "duration": duration,
+                                       "chapters": tuple(chapters), "signature": signature,
+                                       "views": [], "listeners": [], "layout": None}
+            self._layout_marker_cell(cell)
+        except Exception:
+            self.logger.exception("Cannot bind markers to voice cell")
+
+    def _waveform_bounds(self, cell):
+        """Native seekbar coordinates in ChatMessageCell's local coordinate space.
+
+        Do not invent coordinates when reflection fails; the menu remains usable.
+        """
+        from hook_utils import get_private_field
+        width_cell = int(cell.getWidth())
+        if width_cell <= 0:
+            return None
+        waveform = get_private_field(cell, "seekBarWaveform")
+        if waveform is None:
+            return None
+        try:
+            w = int(get_private_field(waveform, "width"))
+            x = int(get_private_field(cell, "seekBarX"))
+            y = int(get_private_field(cell, "seekBarY"))
+        except Exception:
+            return None
+        try:
+            x += self._dp(cell, 13) - int(get_private_field(cell, "seekBarWaveformTranslateX") or 0)
+        except Exception:
+            x += self._dp(cell, 13)
+        if w < self._dp(cell, 32) or x < 0 or x + w > width_cell + self._dp(cell, 12):
+            return None
+        # Place visual markers just above the waveform, not across its bars.
+        # 0.2.2: seekBarY + 1dp. Move up 6dp to seekBarY - 5dp.
+        y -= self._dp(cell, 5)
+        if y < 0 or y > int(cell.getHeight()) - self._dp(cell, 12):
+            return None
+        return x, y, min(w, width_cell - x)
+
+    def _layout_marker_cell(self, cell):
+        if cell is None or not self._marker_cells or self._disposed:
+            return
+        cid = self._cell_id(cell)
+        state = self._marker_cells.get(cid)
+        if state is None:
+            return
+        bounds = self._waveform_bounds(cell)
+        if bounds is None:
+            # E.g. setMessageObject ran before its first onLayout.
+            return
+        x, y, w = bounds
+        spacing = self._dp(cell, 16)
+        grouped = group_waveform_chapters(state["chapters"], state["duration"], w, spacing)
+        style = self._marker_style()  # 0 = default vertical markers, 1 = dots
+        color = self._marker_color(state["message"])
+        # Native duration/elapsed-time text below the waveform is the menu
+        # shortcut. The target is only the displayed timestamp, never the
+        # waveform, play control, transcription icon or bubble margins.
+        # No overlay View is added: Telegram draws the timestamp itself.
+        from hook_utils import get_private_field
+        try:
+            seek_y = int(get_private_field(cell, "seekBarY"))
+        except Exception:
+            seek_y = int(y) + self._dp(cell, 5)
+        try:
+            time_x = int(get_private_field(cell, "timeAudioX"))
+            if time_x <= 0:
+                raise ValueError("No audio time position")
+        except Exception:
+            time_x = int(x) - self._dp(cell, 2)
+        try:
+            time_width = int(get_private_field(cell, "timeWidthAudio"))
+        except Exception:
+            time_width = 0
+        # Keep at least a normal thumb-sized text target, but avoid extending
+        # into the waveform/transcription button or unrelated message UI.
+        tap_width = max(self._dp(cell, 48), min(self._dp(cell, 76),
+                                               time_width + self._dp(cell, 12)))
+        left = max(0, time_x - self._dp(cell, 5))
+        right = min(int(cell.getWidth()), left + tap_width)
+        top = seek_y + self._dp(cell, 26)
+        bottom = min(int(cell.getHeight()), seek_y + self._dp(cell, 49))
+        if right > left and bottom > top:
+            state["menu_bounds"] = (left, top, right, bottom)
+        else:
+            state["menu_bounds"] = None
+        signature = (x, y, w, style, color, state["menu_bounds"],
+                     tuple((round(pos, 1), len(group)) for pos, group in grouped))
+        if state["layout"] == signature:
+            return
+        from android.view import View, ViewGroup
+        from android.widget import FrameLayout
+        from android.graphics.drawable import GradientDrawable
+        from android.view import Gravity
+        for v in state["views"]:
+            try:
+                v.setOnClickListener(None)
+                v.setOnLongClickListener(None)
+                if v.getParent() is not None:
+                    v.getParent().removeView(v)
+            except Exception:
+                pass
+        state["views"].clear()
+        state["listeners"].clear()
+        marker_width = self._dp(cell, 4)
+        marker_height = self._dp(cell, 12)
+        touch_width = self._dp(cell, 18)
+        touch_height = self._dp(cell, 20)
+        anchor_bottom = y + self._dp(cell, 11)
+        if style == 1:
+            # Circular marks sat too high above the waveform. Lower only
+            # circles by 3dp; do not move the native waveform or tick style.
+            anchor_bottom += self._dp(cell, 3)
+        for pos, group in grouped:
+            clickable = FrameLayout(cell.getContext())
+            clickable.setClickable(True)
+            clickable.setContentDescription("Voice chapter " + (group[0]["name"] if len(group) == 1 else "%d chapters" % len(group)))
+            marker = View(cell.getContext())
+            background = GradientDrawable()
+            grouped_extra = self._dp(cell, 2) if len(group) > 1 else 0
+            if style == 1:  # Small circular dots, same touch target.
+                diameter = self._dp(cell, 7) + grouped_extra
+                background.setShape(GradientDrawable.OVAL)
+                width = height = diameter
+                lp = FrameLayout.LayoutParams(width, height, Gravity.CENTER)
+            else:  # Default: vertical rounded chapter tick.
+                width = marker_width + grouped_extra
+                height = marker_height + grouped_extra
+                background.setShape(GradientDrawable.RECTANGLE)
+                background.setCornerRadius(float(width))
+                lp = FrameLayout.LayoutParams(width, height, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL)
+                lp.bottomMargin = self._dp(cell, 1)
+            background.setColor(color)
+            marker.setBackground(background)
+            clickable.addView(marker, lp)
+            listener = self._marker_click_type(self, state["message"], state["duration"], group)
+            clickable.setOnClickListener(listener)
+            long_listener = self._marker_long_click_type(self, state["message"], state["duration"])
+            clickable.setOnLongClickListener(long_listener)
+            clickable.setLongClickable(True)
+            cell.addView(clickable, ViewGroup.LayoutParams(touch_width, touch_height))
+            w_spec = View.MeasureSpec.makeMeasureSpec(touch_width, View.MeasureSpec.EXACTLY)
+            h_spec = View.MeasureSpec.makeMeasureSpec(touch_height, View.MeasureSpec.EXACTLY)
+            clickable.measure(w_spec, h_spec)
+            clickable.layout(int(x + pos - touch_width / 2), int(anchor_bottom - touch_height),
+                             int(x + pos + touch_width / 2), int(anchor_bottom))
+            clickable.bringToFront()
+            state["views"].append(clickable)
+            state["listeners"].extend((listener, long_listener))
+        state["layout"] = signature
+        self._marker_views_created += len(grouped)
+        self._marker_setup_state = "Tap native voice time to open chapters; %d bookmarked ticks" % sum(
+            len(s["chapters"]) for s in self._marker_cells.values())
+
+    def _open_from_button(self, context, message, duration):
+        if self._disposed:
+            return
+        try:
+            activity = self._activity({"context": context})
+            if activity is not None:
+                self._open_chapters(activity, message, self._voice_id(message, {}), duration)
+        except Exception:
+            self.logger.exception("Voice Chapters: native time shortcut failed")
+
+    def _marker_long_pressed(self, view, message, duration):
+        """Open chapter controls from an existing marker; no background watchers."""
+        try:
+            activity = self._activity({"context": view.getContext()})
+            if activity is None:
+                return False
+            key = self._voice_id(message, {})
+            self._open_chapters(activity, message, key, duration)
+            return True
+        except Exception:
+            self.logger.exception("Voice Chapters: marker long press failed")
+            return False
+
+    def _marker_tapped(self, view, message, duration, group):
+        if self._disposed:
+            return
+        try:
+            if len(group) == 1:
+                self._seek_to(message, int(group[0]["t"]), duration)
+                return
+            from ui.alert import AlertDialogBuilder
+            activity = self._activity({"context": view.getContext()}) or view.getContext()
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(self._tr("select_chapter"))
+            def choose(dialog, index):
+                dialog.dismiss()
+                if not self._disposed and 0 <= index < len(group):
+                    self._seek_to(message, int(group[index]["t"]), duration)
+            builder.set_items(["%s · %s" % (format_time(ch["t"]), self._display_chapter_name(ch)) for ch in group], choose)
+            builder.show()
+        except Exception:
+            self.logger.exception("Marker click failed")
+            self._notice(self._tr("jump_error"), True)
+
+    def _refresh_visible_marker_cells(self):
+        if self._disposed or not self._marker_supported:
+            return
+        try:
+            from client_utils import get_last_fragment
+            from hook_utils import get_private_field
+            frag = get_last_fragment()
+            if frag is None or not str(frag.getClass().getName()).endswith("ChatActivity"):
+                return
+            rv = get_private_field(frag, "chatListView")
+            if rv is None:
+                return
+            for idx in range(int(rv.getChildCount())):
+                cell = rv.getChildAt(idx)
+                if cell is not None and str(cell.getClass().getName()).endswith("ChatMessageCell"):
+                    self._update_marker_cell(cell)
+        except Exception:
+            self.logger.exception("Visible marker refresh failed")
+
+    def _notice(self, text: str, error: bool = False):
+        try:
+            from ui.bulletin import BulletinHelper
+            (BulletinHelper.show_error if error else BulletinHelper.show_info)(str(text))
+        except Exception:
+            self.logger.info("Notice: %s", text)
+
+    def _activity(self, context):
+        """Resolve an Android Activity, not a Telegram BaseFragment or a menu holder.
+
+        SDK menus may supply a fragment, a raw Activity context, or both. An
+        object which is not actually a Context cannot be passed to an AlertDialog.
+        """
+        menu_fragment = context.get("fragment") if isinstance(context, dict) else None
+        candidates = []
+        try:
+            from client_utils import get_last_fragment
+            candidates.append(get_last_fragment())
+        except Exception:
+            self.logger.exception("Cannot get current fragment")
+        candidates.append(menu_fragment)
+        for frag in candidates:
+            if frag is None:
+                continue
+            try:
+                activity = frag.getParentActivity()
+                if activity is not None:
+                    return activity
+            except Exception:
+                # Keep trying a newer fragment rather than failing the whole action.
+                self.logger.debug("Fragment has no parent Activity")
+        menu_context = context.get("context") if isinstance(context, dict) else None
+        if menu_context is not None:
+            try:
+                # Real Android Activity exposes getWindow(). Never return a
+                # Telegram Fragment masquerading as 'context'.
+                if menu_context.getWindow() is not None:
+                    return menu_context
+            except Exception:
+                pass
+        return None
+
+    def _report_failure(self, stage, exc):
+        """Make real on-device Java/Python failures diagnosable without logcat."""
+        short = "%s: %s" % (type(exc).__name__, str(exc).replace("\n", " "))
+        detail = "[%s] %s" % (stage, short[:180])
+        self.logger.exception("Voice Chapters failed at %s", stage)
+        try:
+            self.set_setting("last_error", detail)
+        except Exception:
+            self.logger.exception("Failed storing diagnostic")
+        self._notice("Ошибка Voice Chapters " + detail, True)
+
+    @staticmethod
+    def _looks_like_message(obj):
+        """Only accept a real message-like object, never an arbitrary UI context."""
+        return (obj is not None
+                and callable(getattr(obj, "getId", None))
+                and callable(getattr(obj, "getDialogId", None))
+                and callable(getattr(obj, "isVoice", None)))
+
+    @classmethod
+    def _normalize_menu_context(cls, raw):
+        """Unpack the documented dict or a Java Map-like callback argument.
+
+        An SDK callback is not guaranteed to arrive as a built-in Python dict
+        at the Chaquopy bridge. Keep all attempts explicit and side-effect-free.
+        Do not infer a message from the currently visible chat.
+        """
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        if cls._looks_like_message(raw):
+            return {"message": raw}
+        if raw is None:
+            return {}
+
+        keys = ("message", "fragment", "context", "account", "dialog_id",
+                "messageObject", "selectedMessage")
+        result = {}
+        # Java Map, or a duck-typed object with get(String).
+        getter = getattr(raw, "get", None)
+        if callable(getter):
+            for key in keys:
+                try:
+                    value = getter(key)
+                    if value is not None:
+                        result[key] = value
+                except Exception:
+                    continue
+        if result:
+            if "message" not in result:
+                for alias in ("messageObject", "selectedMessage"):
+                    candidate = result.get(alias)
+                    if cls._looks_like_message(candidate):
+                        result["message"] = candidate
+                        break
+            return result
+
+        # Some Java callback wrappers expose properties rather than Map.get().
+        for attr in keys:
+            try:
+                value = getattr(raw, attr, None)
+                if value is not None:
+                    result[attr] = value
+            except Exception:
+                continue
+        if "message" not in result:
+            for alias in ("messageObject", "selectedMessage"):
+                if cls._looks_like_message(result.get(alias)):
+                    result["message"] = result[alias]
+                    break
+        if result:
+            return result
+
+        # A message cell wrapper can expose getMessageObject(), not a Python map.
+        method = getattr(raw, "getMessageObject", None)
+        if callable(method):
+            try:
+                candidate = method()
+                if cls._looks_like_message(candidate):
+                    return {"message": candidate}
+            except Exception:
+                pass
+        return {}
+
+    @staticmethod
+    def _context_shape(raw):
+        """Type and field *names* only. Never log message contents."""
+        kind = type(raw)
+        type_name = "%s.%s" % (getattr(kind, "__module__", "?"),
+                                getattr(kind, "__name__", "?"))
+        try:
+            if hasattr(raw, "keySet"):
+                names = sorted(str(k) for k in raw.keySet())[:20]
+            elif isinstance(raw, Mapping):
+                names = sorted(str(k) for k in raw.keys())[:20]
+            else:
+                names = []
+        except Exception:
+            names = []
+        return "type=%s keys=%s" % (type_name[:90], ",".join(names)[:120])
+
+    @staticmethod
+    def _voice(message):
+        if message is None or not bool(message.isVoice()):
+            return False
+        # Never save local references to one-time / ephemeral audio.
+        is_once = getattr(message, "isVoiceOnce", None)
+        if callable(is_once) and bool(is_once()):
+            return False
+        return True
+
+    @staticmethod
+    def _duration(message):
+        return int(round(float(message.getDuration())))
+
+    @staticmethod
+    def _voice_id(message, context):
+        # MessageObject.currentAccount is authoritative for a selected message.
+        # The menu context may omit 'account' or supply a non-numeric object.
+        account = getattr(message, "currentAccount", None)
+        if account is None:
+            account = context.get("account")
+        if account is None:
+            from org.telegram.messenger import UserConfig
+            account = UserConfig.selectedAccount
+        return "%d:%d:%d" % (int(account), int(message.getDialogId()), int(message.getId()))
+
+    def _read(self):
+        if getattr(self, "_db_integrity_fault", None):
+            raise ValueError("Saved chapter database is damaged; refusing to overwrite")
+        if getattr(self, "_db_cache", None) is None:
+            raw = self.get_setting(_DB_KEY, "{}")
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(data, dict):
+                    raise ValueError("Database root must be an object")
+            except (ValueError, TypeError) as exc:
+                self._db_integrity_fault = str(exc)
+                raise ValueError("Saved chapter database is damaged; refusing to overwrite") from exc
+            # Previous versions silently truncated malformed/oversized data.
+            # Refuse to overwrite a damaged store with a partial decoding.
+            try:
+                if len(data) > _MAX_VOICES:
+                    raise ValueError("Database exceeds voice limit")
+                for key, entries in data.items():
+                    if not isinstance(key, str) or not isinstance(entries, list):
+                        raise ValueError("Invalid voice entry")
+                    if len(entries) > _MAX_CHAPTERS_PER_VOICE:
+                        raise ValueError("Database exceeds chapter limit")
+                    for item in entries:
+                        if not isinstance(item, dict):
+                            raise ValueError("Invalid chapter entry")
+                        t, label = item.get("t"), item.get("name")
+                        if type(t) is not int or not (0 <= t <= 86400):
+                            raise ValueError("Invalid saved chapter timestamp")
+                        if not isinstance(label, str):
+                            raise ValueError("Invalid saved chapter label")
+            except ValueError as exc:
+                self._db_integrity_fault = str(exc)
+                raise ValueError("Saved chapter database is damaged; refusing to overwrite") from exc
+            self._db_cache = safe_decode_database(data)
+        return self._db_cache
+
+    def _get_entries(self, key):
+        return self._read().get(key, [])
+
+    def _write_entries(self, key, entries, message=None):
+        # Copy-on-write: a failed settings flush must not corrupt the RAM cache.
+        database = dict(self._read())
+        if entries:
+            if key not in database and len(database) >= _MAX_VOICES:
+                raise ValueError("Too many bookmarked voice messages")
+            database[key] = [dict(x) for x in entries]
+        else:
+            database.pop(key, None)
+        serialized = json.dumps(database, ensure_ascii=False, separators=(",", ":"))
+        self.set_setting(_DB_KEY, serialized)
+        self._db_cache = database
+        if entries and message is not None:
+            self._remember_voice_info(key, message)
+        self._refresh_visible_marker_cells()
+
+    @staticmethod
+    def _message_timestamp(message):
+        try:
+            owner = getattr(message, "messageOwner", None)
+            stamp = int(getattr(owner, "date", 0))
+            if 0 < stamp < 4102444800:
+                return stamp
+        except Exception:
+            pass
+        return 0
+
+    def _metadata(self):
+        if self._meta_cache is None:
+            try:
+                raw = json.loads(self.get_setting(_META_KEY, "{}"))
+                self._meta_cache = raw if isinstance(raw, dict) else {}
+            except (ValueError, TypeError):
+                self._meta_cache = {}
+        return self._meta_cache
+
+    def _remember_voice_info(self, key, message):
+        stamp = self._message_timestamp(message)
+        if not stamp:
+            return
+        old = self._metadata().get(key)
+        if isinstance(old, dict) and old.get("date") == stamp:
+            return
+        meta = dict(self._metadata())
+        meta[key] = {"date": stamp}
+        try:
+            self.set_setting(_META_KEY, json.dumps(meta, separators=(",", ":")))
+            self._meta_cache = meta
+        except Exception:
+            # Date is supplementary; never fail a saved chapter because of it.
+            self.logger.exception("Could not persist voice date metadata")
+
+    @staticmethod
+    def _split_voice_key(key):
+        try:
+            account, dialog, mid = str(key).split(":")
+            return int(account), int(dialog), int(mid)
+        except (TypeError, ValueError):
+            return None
+
+    def _current_chat_identity(self, context):
+        from client_utils import get_last_fragment
+        frag = get_last_fragment()
+        if frag is None or not str(frag.getClass().getName()).endswith("ChatActivity"):
+            return None
+        # Current screen, not a possibly stale callback context, is authoritative.
+        dialog = int(frag.getDialogId())
+        account = getattr(frag, "currentAccount", None)
+        if account is None:
+            from org.telegram.messenger import UserConfig
+            account = UserConfig.selectedAccount
+        return frag, int(account), dialog
+
+    def _date_title(self, epoch):
+        if not epoch:
+            return self._tr("unknown_date")
+        try:
+            from java.text import SimpleDateFormat
+            from java.util import Date, Locale
+            return str(SimpleDateFormat("dd.MM.yyyy · HH:mm", Locale.getDefault()).format(Date(int(epoch) * 1000)))
+        except Exception:
+            return self._tr("unknown_date")
+
+    def _on_chat_catalog_click(self, context):
+        if self._disposed:
+            return
+        from android_utils import run_on_ui_thread
+        def open_catalog():
+            try:
+                identity = self._current_chat_identity(context)
+                if identity is None:
+                    self._notice(self._tr("open_chat_first"), True)
+                    return
+                fragment, account, dialog = identity
+                activity = self._activity(context)
+                if activity is not None:
+                    self._show_chat_catalog(activity, fragment, account, dialog, 0)
+            except Exception:
+                self.logger.exception("Could not open voice chapter catalog")
+                self._notice(self._tr("catalog_error"), True)
+        run_on_ui_thread(open_catalog, 80)
+
+    def _jump_to_bookmarked_voice(self, account, dialog, message_id):
+        try:
+            current = self._current_chat_identity({})
+            if current is None or current[1:] != (account, dialog):
+                self._notice(self._tr("wrong_chat"), True)
+                return
+            fragment = current[0]
+            fragment.scrollToMessageId(int(message_id), 0, False, 0, True, 0)
+        except Exception:
+            self.logger.exception("Could not jump to bookmarked voice")
+            self._notice(self._tr("jump_message_error"), True)
+
+    @staticmethod
+    def _chat_voice_keys(database, account, dialog):
+        """Select only this account + this chat; never affect other dialogs."""
+        result = []
+        for key, chapters in database.items():
+            parsed = VoiceChaptersPlugin._split_voice_key(key)
+            if parsed is not None and parsed[:2] == (account, dialog) and chapters:
+                result.append(key)
+        return result
+
+    def _chat_count_label(self, count):
+        lang = self._language()
+        if lang == "en":
+            return "%d %s" % (count, self._tr("voice_one" if count == 1 else "voice_many"))
+        # Russian and Ukrainian share the 1 / 2-4 / other numeric patterns.
+        forms = ("голосове", "голосові", "голосових") if lang == "uk" else ("голосовое", "голосовых", "голосовых")
+        noun = forms[0] if count % 10 == 1 and count % 100 != 11 else (
+            forms[1] if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14 else forms[2])
+        return "%d %s" % (count, noun)
+
+    def _clear_chat_chapters(self, account, dialog):
+        """Save first; only after success update RAM, metadata and visible marks."""
+        original = self._read()
+        keys = self._chat_voice_keys(original, account, dialog)
+        if not keys:
+            return 0, 0
+        deleted_chapters = sum(len(original[k]) for k in keys)
+        next_db = {key: value for key, value in original.items() if key not in keys}
+        self.set_setting(_DB_KEY, json.dumps(next_db, ensure_ascii=False, separators=(",", ":")))
+        self._db_cache = next_db
+        # Supplementary timestamps need not block successful chapter deletion.
+        try:
+            new_meta = {key: value for key, value in self._metadata().items()
+                        if key not in keys}
+            self.set_setting(_META_KEY, json.dumps(new_meta, separators=(",", ":")))
+            self._meta_cache = new_meta
+        except Exception:
+            self.logger.exception("Could not prune deleted chat date metadata")
+        self._refresh_visible_marker_cells()
+        return len(keys), deleted_chapters
+
+    def _confirm_clear_chat_chapters(self, activity, account, dialog, catalog_dialog):
+        from ui.alert import AlertDialogBuilder
+        from android_utils import run_on_ui_thread
+        keys = self._chat_voice_keys(self._read(), account, dialog)
+        if not keys:
+            self._notice(self._tr("clear_none"))
+            return
+        count = sum(len(self._get_entries(k)) for k in keys)
+        confirm = AlertDialogBuilder(activity)
+        confirm.set_title(self._tr("clear_title"))
+        confirm.set_message(self._tr("clear_detail", count, len(keys)))
+        confirm.set_negative_button(self._tr("cancel"), lambda b, which: b.dismiss())
+
+        def clear(b, which):
+            b.dismiss()
+            try:
+                removed_voices, removed_marks = self._clear_chat_chapters(account, dialog)
+            except Exception:
+                self.logger.exception("Chat chapter clear failed")
+                self._notice(self._tr("clear_error"), True)
+                return
+            self._notice(self._tr("clear_result", removed_marks))
+            try:
+                catalog_dialog.dismiss()
+            except Exception:
+                pass
+            current = self._current_chat_identity({})
+            if current is not None and current[1:] == (account, dialog):
+                run_on_ui_thread(lambda: self._show_chat_catalog(
+                    activity, current[0], account, dialog), 80)
+
+        confirm.set_positive_button(self._tr("delete"), clear)
+        confirm.show()
+        try:
+            confirm.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
+
+    def _show_chat_catalog(self, activity, fragment, account, dialog, page=0):
+        """Theme-aware scrollable catalog: no full-history scans or polling.
+
+        At most ~55 chapter rows are inflated first; more are added only
+        when the *visible dialog* is scrolled near its bottom. This protects
+        chat FPS even if the local database contains 1500 voice recordings.
+        """
+        from android_utils import run_on_ui_thread
+        from ui.alert import AlertDialogBuilder
+        from java import dynamic_proxy
+        from android.view import View, Gravity
+        from android.widget import (LinearLayout, FrameLayout, ScrollView,
+                                    TextView, ImageView)
+        from android.graphics import Typeface
+        from android.content.res import ColorStateList
+        from org.telegram.messenger import AndroidUtilities, R
+        from org.telegram.ui.ActionBar import Theme
+
+        dp = lambda n: int(AndroidUtilities.dp(float(n)))
+        def native_color(key, fallback):
+            try:
+                return int(Theme.getColor(getattr(Theme, key)))
+            except Exception:
+                return fallback
+
+        fg = native_color("key_dialogTextBlack", -1)
+        muted = native_color("key_dialogTextGray2", -7829368)
+        accent = native_color("key_dialogButton", -12627531)
+        danger = native_color("key_text_RedBold", -4380456)
+
+        def transparency(color, alpha):
+            packed = ((int(alpha) & 255) << 24) | (int(color) & 0xFFFFFF)
+            return packed - (1 << 32) if packed & 0x80000000 else packed
+
+        bubbles_enabled = bool(self.get_setting("catalog_material_bubbles", False))
+
+        def bubble(view, tint, radius=14):
+            """Material-style filled ripple, allocated only for visible rows."""
+            if not bubbles_enabled:
+                ripple(view)
+                return
+            try:
+                from android.graphics.drawable import GradientDrawable, RippleDrawable
+                base = GradientDrawable()
+                base.setShape(GradientDrawable.RECTANGLE)
+                base.setColor(transparency(tint, 24))
+                base.setCornerRadius(float(dp(radius)))
+                view.setBackground(RippleDrawable(
+                    ColorStateList.valueOf(transparency(accent, 45)), base, None))
+            except Exception:
+                # Never lose click handling when a firmware lacks a drawable API.
+                ripple(view)
+
+        def read_catalog_records():
+            result = []
+            metadata = self._metadata()
+            for key in self._chat_voice_keys(self._read(), account, dialog):
+                parsed = self._split_voice_key(key)
+                info = metadata.get(key, {})
+                try:
+                    stamp = int(info.get("date", 0)) if isinstance(info, dict) else 0
+                except (TypeError, ValueError):
+                    stamp = 0
+                result.append((key, parsed[2], stamp,
+                               tuple(self._get_entries(key))))
+            result.sort(key=lambda r: (r[2], r[1]), reverse=True)
+            return result
+
+        records = read_catalog_records()
+
+        # Keep row listeners separate so replacing the catalog contents
+        # actually releases old views and their Python click callbacks.
+        listeners = []
+        row_listeners = []
+        class CatalogClick(dynamic_proxy(View.OnClickListener)):
+            def __init__(self, action):
+                super().__init__()
+                self.action = action
+
+            def onClick(self, v):
+                self.action()
+
+        def listen(view, callback, row=False):
+            listener = CatalogClick(callback)
+            (row_listeners if row else listeners).append(listener)
+            view.setOnClickListener(listener)
+            view.setClickable(True)
+            return view
+
+        def text_view(text, size=15, color=None, weight=False):
+            label = TextView(activity)
+            label.setText(str(text))
+            label.setTextSize(float(size))
+            label.setTextColor(fg if color is None else color)
+            label.setGravity(Gravity.CENTER_VERTICAL)
+            if weight:
+                label.setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            return label
+
+        def ripple(view):
+            try:
+                from android.util import TypedValue
+                from android import R as AndroidR
+                value = TypedValue()
+                activity.getTheme().resolveAttribute(AndroidR.attr.selectableItemBackground,
+                                                     value, True)
+                if value.resourceId:
+                    view.setBackgroundResource(int(value.resourceId))
+            except Exception:
+                pass
+
+        def jump(message_id):
+            if self._disposed:
+                return
+            catalog.dismiss()
+            run_on_ui_thread(lambda: self._jump_to_bookmarked_voice(
+                account, dialog, int(message_id)), 90)
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(8), dp(0), dp(8), dp(0))
+
+        # Fixed header, independent of scroll position. True center alignment
+        # is supplied by FrameLayout, not a left-weighted LinearLayout row.
+        header = FrameLayout(activity)
+        title = text_view(self._chat_count_label(len(records)), 18, fg, True)
+        title.setGravity(Gravity.CENTER)
+        header.addView(title, FrameLayout.LayoutParams(-2, -1, Gravity.CENTER))
+        trash = ImageView(activity)
+        trash.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+        trash.setPadding(dp(12), dp(12), dp(12), dp(12))
+        trash.setContentDescription(self._tr("clear_desc"))
+        try:
+            trash.setImageResource(int(R.drawable.msg_delete))
+        except Exception:
+            # Non-emoji system icon if an unusual Telegram build removes it.
+            from android import R as AndroidR
+            trash.setImageResource(int(AndroidR.drawable.ic_menu_delete))
+        trash.setImageTintList(ColorStateList.valueOf(danger))
+        # Attach once even for an empty chat; import can enable it later.
+        trash.setAlpha(1.0 if records else 0.35)
+        trash.setEnabled(bool(records))
+        listen(trash, lambda: self._confirm_clear_chat_chapters(
+            activity, account, dialog, catalog))
+        header.addView(trash, FrameLayout.LayoutParams(dp(48), dp(52),
+                                                    Gravity.RIGHT | Gravity.CENTER_VERTICAL))
+        root.addView(header, LinearLayout.LayoutParams(-1, dp(58)))
+
+        scroll = ScrollView(activity)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(True)
+        scroll.setScrollbarFadingEnabled(False)
+        try:
+            from android.graphics.drawable import GradientDrawable
+            thumb = GradientDrawable()
+            thumb.setColor(transparency(accent, 145))
+            thumb.setCornerRadius(float(dp(4)))
+            scroll.setVerticalScrollbarThumbDrawable(thumb)
+            track = GradientDrawable()
+            track.setColor(transparency(muted, 24))
+            track.setCornerRadius(float(dp(4)))
+            scroll.setVerticalScrollbarTrackDrawable(track)
+            scroll.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET)
+        except Exception:
+            # Older Android skins retain their built-in scrollbar.
+            pass
+        content = LinearLayout(activity)
+        content.setOrientation(LinearLayout.VERTICAL)
+        content.setPadding(dp(8), dp(0), dp(8), dp(8))
+        scroll.addView(content, FrameLayout.LayoutParams(-1, -2))
+        # Explicit inner scroll height. A weighted match-parent View caused
+        # Telegram's dialog layout to expand almost to full-screen on devices.
+        screen_h = int(activity.getResources().getDisplayMetrics().heightPixels)
+        def catalog_scroll_height(items):
+            preview_rows = sum(1 + len(rec[3]) for rec in items[:6])
+            estimated_dp = max(105, min(240, preview_rows * 48 +
+                                        min(len(items), 6) * 12))
+            return max(dp(100), min(dp(estimated_dp), dp(240),
+                                    int(screen_h * 0.29)))
+        root.addView(scroll, LinearLayout.LayoutParams(
+            -1, catalog_scroll_height(records)))
+
+        def voice_group(record):
+            key, mid, stamp, chapters = record
+            group = LinearLayout(activity)
+            group.setOrientation(LinearLayout.VERTICAL)
+            group.setPadding(dp(0), dp(4), dp(0), dp(11))
+
+            row = LinearLayout(activity)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            row.setMinimumHeight(dp(46))
+            bubble(row, accent, 15)
+            icon_holder = FrameLayout(activity)
+            mic = ImageView(activity)
+            # Use Telegram's own drawable IDs, not Android's unrelated
+            # ic_btn_speak_now or an emoji. Extera may skin these IDs through
+            # its icon-pack system, depending on how that build replaces assets.
+            # Favour the compose microphone over audio-file/media icons.
+            resource = None
+            for name in ("input_mic", "input_mic_pressed", "msg_mic",
+                         "msg_voice", "msg_mini_voice", "msg_audio"):
+                try:
+                    candidate = getattr(R.drawable, name, None)
+                    if candidate is not None and int(candidate) > 0:
+                        resource = int(candidate)
+                        break
+                except Exception:
+                    continue
+            if resource is not None:
+                mic.setImageResource(resource)
+                mic.setImageTintList(ColorStateList.valueOf(accent))
+            else:
+                # Supported Telegram builds always include at least one
+                # candidate above. Don't show a mismatched Android glyph.
+                mic.setVisibility(View.GONE)
+            # Center the icon with the date line; it previously sat at top=0.
+            icon_holder.addView(mic, FrameLayout.LayoutParams(dp(19), dp(19),
+                                         Gravity.CENTER))
+            row.addView(icon_holder, LinearLayout.LayoutParams(dp(36), dp(46)))
+            heading = text_view("%s  ·  %s" % (self._date_title(stamp), self._tr("chapter_count", len(chapters))),
+                                15, fg, True)
+            heading.setSingleLine(True)
+            try:
+                from android.text import TextUtils
+                heading.setEllipsize(TextUtils.TruncateAt.END)
+            except Exception:
+                pass
+            row.addView(heading, LinearLayout.LayoutParams(0, dp(46), 1.0))
+            listen(row, lambda target=mid: jump(target), row=True)
+            rp = LinearLayout.LayoutParams(-1, dp(46))
+            if bubbles_enabled:
+                rp.topMargin, rp.bottomMargin = dp(2), dp(3)
+            group.addView(row, rp)
+
+            for index, chapter in enumerate(chapters):
+                item = LinearLayout(activity)
+                item.setGravity(Gravity.CENTER_VERTICAL)
+                item.setOrientation(LinearLayout.HORIZONTAL)
+                item.setMinimumHeight(dp(45))
+                bubble(item, muted, 13)
+                # Plain indentation without any connecting branches/lines.
+                item.setPadding(dp(36), dp(0), dp(0), dp(0))
+                stamp_text = format_time(int(chapter["t"]))
+                chapter_name = self._display_chapter_name(chapter)
+                label = text_view("%s  ·  %s" % (stamp_text, chapter_name), 15, fg)
+                label.setPadding(dp(0), dp(0), dp(4), dp(0))
+                item.addView(label, LinearLayout.LayoutParams(0, dp(45), 1.0))
+                item.setContentDescription("%s %s: %s" % (self._tr("group_chapter"), stamp_text, chapter_name))
+                listen(item, lambda target=mid: jump(target), row=True)
+                ip = LinearLayout.LayoutParams(-1, dp(45))
+                if bubbles_enabled:
+                    ip.topMargin, ip.bottomMargin = dp(2), dp(2)
+                group.addView(item, ip)
+
+            content.addView(group, LinearLayout.LayoutParams(-1, -2))
+
+        # Progressive construction only while this dialog is visible.
+        loaded = [0]
+        adding = [False]
+        def append_chunk():
+            if adding[0] or self._disposed or loaded[0] >= len(records):
+                return
+            adding[0] = True
+            try:
+                # Bounded by actual chapter rows (not just voice count).
+                # A voice may have up to 30 chapters, so a 24-voice chunk
+                # could inflate 720+ Android views in one UI-thread callback.
+                end = loaded[0]
+                line_count = 0
+                while end < len(records) and end - loaded[0] < 12:
+                    line_count += 1 + len(records[end][3])
+                    end += 1
+                    if line_count >= 55:
+                        break
+                for rec in records[loaded[0]:end]:
+                    voice_group(rec)
+                loaded[0] = end
+            finally:
+                adding[0] = False
+
+        if records:
+            append_chunk()
+        else:
+            empty = text_view(self._tr("empty_catalog"), 15, muted)
+            empty.setGravity(Gravity.CENTER)
+            content.addView(empty, LinearLayout.LayoutParams(-1, dp(115)))
+
+        def refresh_catalog():
+            """Rebuild this *open* catalog once after a successful import.
+
+            Never dismiss/reopen the dialog. The header, footer, and scroll
+            listener remain installed; chapter rows/listeners are discarded.
+            """
+            if self._disposed:
+                return
+            updated = read_catalog_records()
+            # Prepare data first: if reading fails, keep the old UI intact.
+            records[:] = updated
+            title.setText(self._chat_count_label(len(records)))
+            trash.setAlpha(1.0 if records else 0.35)
+            trash.setEnabled(bool(records))
+            # Detach old views before removing their strong listener roots.
+            content.removeAllViews()
+            row_listeners.clear()
+            loaded[0] = 0
+            adding[0] = False
+            lp = scroll.getLayoutParams()
+            lp.height = catalog_scroll_height(records)
+            scroll.setLayoutParams(lp)
+            scroll.scrollTo(0, 0)
+            if records:
+                append_chunk()
+            else:
+                empty = text_view(self._tr("empty_catalog"), 15, muted)
+                empty.setGravity(Gravity.CENTER)
+                content.addView(empty, LinearLayout.LayoutParams(-1, dp(115)))
+
+        # Scroll listener exists only as long as the catalog dialog is shown.
+        class LoadOnScroll(dynamic_proxy(View.OnScrollChangeListener)):
+            def __init__(self):
+                super().__init__()
+
+            def onScrollChange(self, view, scroll_x, scroll_y, old_x, old_y):
+                if scroll_y <= old_y or loaded[0] >= len(records):
+                    return
+                try:
+                    child = scroll.getChildAt(0)
+                    remaining = int(child.getHeight()) - int(scroll_y) - int(scroll.getHeight())
+                    if remaining < dp(220):
+                        append_chunk()
+                except Exception:
+                    # UI may be detaching; do not disturb scrolling.
+                    pass
+
+        scroll_listener = LoadOnScroll()
+        scroll.setOnScrollChangeListener(scroll_listener)
+
+        # Footer actions stay at opposite edges (not centered in half-width
+        # columns). This matches the native left/right dialog action rhythm.
+        footer = FrameLayout(activity)
+        backup = text_view(self._tr("copy"), 14, accent, True)
+        restore = text_view(self._tr("restore"), 14, accent, True)
+        backup.setGravity(Gravity.CENTER_VERTICAL)
+        restore.setGravity(Gravity.CENTER_VERTICAL)
+        backup.setPadding(dp(8), dp(0), dp(12), dp(0))
+        restore.setPadding(dp(12), dp(0), dp(8), dp(0))
+        ripple(backup)
+        ripple(restore)
+        listen(backup, lambda: self._copy_chapters_backup(activity))
+        listen(restore, lambda: self._pick_restore_file(
+            activity, (account, dialog)))
+        footer.addView(backup, FrameLayout.LayoutParams(
+            -2, dp(42), Gravity.START | Gravity.CENTER_VERTICAL))
+        footer.addView(restore, FrameLayout.LayoutParams(
+            -2, dp(42), Gravity.END | Gravity.CENTER_VERTICAL))
+        root.addView(footer, LinearLayout.LayoutParams(-1, dp(46)))
+
+        # Let root wrap its explicit inner scroll height. Supplying a tall
+        # root height to set_view caused full-screen-looking dialogs on devices.
+        catalog = AlertDialogBuilder(activity)
+        catalog.set_view(root)
+        catalog.set_negative_button(self._tr("close"), lambda b, which: b.dismiss())
+        catalog_state = {"account": account, "dialog": dialog,
+                         "refresh": refresh_catalog, "activity": activity}
+        def release(b):
+            try:
+                scroll.setOnScrollChangeListener(None)
+            except Exception:
+                pass
+            listeners.clear()
+            row_listeners.clear()
+            if self._active_catalog is catalog_state:
+                self._active_catalog = None
+        catalog.set_on_dismiss_listener(release)
+        catalog.show()
+        self._active_catalog = catalog_state
+
+    def _install_backup_picker_hook(self):
+        """One lifecycle hook; it runs only when an Android activity result arrives."""
+        try:
+            from hook_utils import find_class
+            cls = find_class("org.telegram.ui.LaunchActivity")
+            if cls is not None:
+                self._backup_picker_hook = bool(self.hook_all_methods(
+                    cls, "onActivityResult", _BackupPickerResultHook(self)))
+        except Exception:
+            self.logger.exception("Cannot register folder picker callback")
+            self._backup_picker_hook = False
+
+    def _backup_folder_summary(self):
+        uri = str(self.get_setting(_BACKUP_FOLDER_KEY, "") or "")
+        if not uri:
+            return self._tr("backup_downloads")
+        try:
+            from android.net import Uri
+            from android.provider import DocumentsContract
+            path = str(DocumentsContract.getTreeDocumentId(Uri.parse(uri)))
+            return self._tr("backup_chosen_folder", path[:75])
+        except Exception:
+            return self._tr("backup_custom_folder")
+
+    def _backup_activity(self, view=None):
+        activity = self._activity({})
+        if activity is not None:
+            return activity
+        try:
+            ctx = view.getContext()
+            for _ in range(5):
+                try:
+                    if ctx.getWindow() is not None:
+                        return ctx
+                except Exception:
+                    pass
+                ctx = ctx.getBaseContext()
+        except Exception:
+            pass
+        return None
+
+    def _select_backup_folder(self, view=None):
+        if not self._backup_picker_hook:
+            self._notice(self._tr("backup_picker_unavailable"), True)
+            return
+        activity = self._backup_activity(view)
+        if activity is None:
+            self._notice(self._tr("backup_picker_unavailable"), True)
+            return
+        try:
+            from android.content import Intent
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            activity.startActivityForResult(intent, _BACKUP_FOLDER_REQUEST)
+        except Exception:
+            self.logger.exception("Could not launch backup folder picker")
+            self._notice(self._tr("backup_picker_unavailable"), True)
+
+    def _reset_backup_folder(self, view=None):
+        try:
+            self.set_setting(_BACKUP_FOLDER_KEY, "", reload_settings=True)
+            self._notice(self._tr("backup_folder_reset"))
+        except Exception:
+            self.logger.exception("Could not reset backup directory")
+            self._notice(self._tr("backup_error"), True)
+
+    def _restore_from_clipboard_setting(self, view=None):
+        activity = self._backup_activity(view)
+        if activity is not None:
+            self._restore_chapters_backup(activity)
+
+    def _pick_restore_file(self, activity, catalog_identity=None):
+        if not self._backup_picker_hook:
+            self._notice(self._tr("backup_picker_unavailable"), True)
+            return
+        try:
+            self._restore_catalog_context = (tuple(catalog_identity)
+                                             if catalog_identity is not None else None)
+            from android.content import Intent
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            from java import jarray
+            from java.lang import String
+            intent.putExtra(Intent.EXTRA_MIME_TYPES,
+                            jarray(String)(["application/json", "text/plain", "application/octet-stream"]))
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            activity.startActivityForResult(intent, _BACKUP_RESTORE_REQUEST)
+        except Exception:
+            self._restore_catalog_context = None
+            self.logger.exception("Cannot launch backup file picker")
+            self._notice(self._tr("backup_picker_unavailable"), True)
+
+    def _on_backup_picker_result(self, activity, request, result, intent):
+        from android.app import Activity
+        if result != Activity.RESULT_OK or intent is None:
+            if request == _BACKUP_RESTORE_REQUEST:
+                self._restore_catalog_context = None
+            return
+        uri = intent.getData()
+        if uri is None:
+            if request == _BACKUP_RESTORE_REQUEST:
+                self._restore_catalog_context = None
+            return
+        try:
+            if request == _BACKUP_FOLDER_REQUEST:
+                from android.content import Intent
+                flags = int(intent.getFlags()) & (Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                                                   Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                if not (flags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION):
+                    raise ValueError("Selected folder does not grant write access")
+                activity.getContentResolver().takePersistableUriPermission(uri, flags)
+                self.set_setting(_BACKUP_FOLDER_KEY, str(uri.toString()),
+                                 reload_settings=True)
+                self._notice(self._tr("backup_folder_selected"))
+            elif request == _BACKUP_RESTORE_REQUEST:
+                self._restore_backup_from_uri(activity, uri)
+            elif request == _BACKUP_CREATE_REQUEST:
+                self._write_backup_to_uri_async(activity, uri, None, None)
+        except Exception:
+            if request == _BACKUP_RESTORE_REQUEST:
+                self._restore_catalog_context = None
+            self.logger.exception("Backup file picker action failed")
+            self._notice(self._tr("backup_picker_unavailable"), True)
+
+    def _backup_contents(self):
+        # Snapshot while on the UI thread; serialization/write run off-thread.
+        chapters = {k: [dict(mark) for mark in marks]
+                    for k, marks in self._read().items()}
+        metadata = {k: dict(info) if isinstance(info, dict) else info
+                    for k, info in self._metadata().items()}
+        return chapters, metadata
+
+    def _copy_chapters_backup(self, activity):
+        """One tap -> an actual UTF-8 JSON file in Downloads or a SAF folder."""
+        try:
+            from android.os import Build
+            folder_uri = str(self.get_setting(_BACKUP_FOLDER_KEY, "") or "")
+            if not folder_uri and int(Build.VERSION.SDK_INT) < 29:
+                if not self._backup_picker_hook:
+                    self._notice(self._tr("backup_picker_unavailable"), True)
+                    return
+                from android.content import Intent
+                intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("application/json")
+                intent.putExtra(Intent.EXTRA_TITLE, backup_filename())
+                activity.startActivityForResult(intent, _BACKUP_CREATE_REQUEST)
+                return
+            contents = self._backup_contents()
+            self._write_backup_to_uri_async(activity, None, contents, folder_uri)
+        except Exception:
+            self.logger.exception("Could not start backup save")
+            self._notice(self._tr("backup_error"), True)
+
+    def _write_backup_to_uri_async(self, activity, uri, contents, folder_uri):
+        import threading
+        if contents is None:
+            try:
+                contents = self._backup_contents()
+            except Exception:
+                self.logger.exception("Cannot snapshot backup")
+                self._notice(self._tr("backup_error"), True)
+                return
+        name = backup_filename()
+        def worker():
+            try:
+                payload = backup_document(*contents)
+                if len(payload.encode("utf-8")) > _MAX_BACKUP_BYTES:
+                    raise ValueError("Backup is larger than 12 MiB")
+                resolver = activity.getContentResolver()
+                target_uri = uri
+                pending = False
+                if target_uri is None and folder_uri:
+                    from android.net import Uri
+                    from android.provider import DocumentsContract
+                    tree = Uri.parse(folder_uri)
+                    parent = DocumentsContract.buildDocumentUriUsingTree(
+                        tree, DocumentsContract.getTreeDocumentId(tree))
+                    target_uri = DocumentsContract.createDocument(
+                        resolver, parent, "application/json", name)
+                elif target_uri is None:
+                    from android.provider import MediaStore
+                    from android.content import ContentValues
+                    from android.os import Environment
+                    from java import jint
+                    values = ContentValues()
+                    values.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    values.put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                    values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                               Environment.DIRECTORY_DOWNLOADS + "/")
+                    values.put(MediaStore.MediaColumns.IS_PENDING, jint(1))
+                    target_uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                                                 values)
+                    pending = True
+                if target_uri is None:
+                    raise IOError("Android did not create a backup document")
+                from java.io import OutputStreamWriter
+                stream = None
+                try:
+                    stream = resolver.openOutputStream(target_uri, "w")
+                    if stream is None:
+                        raise IOError("Cannot open backup destination")
+                    writer = OutputStreamWriter(stream, "UTF-8")
+                    try:
+                        writer.write(payload)
+                        writer.flush()
+                    finally:
+                        writer.close()
+                    stream = None
+                    if pending:
+                        from android.content import ContentValues
+                        from android.provider import MediaStore
+                        from java import jint
+                        ready = ContentValues()
+                        ready.put(MediaStore.MediaColumns.IS_PENDING, jint(0))
+                        if int(resolver.update(target_uri, ready, None, None)) < 1:
+                            raise IOError("Backup could not be published")
+                    from android_utils import run_on_ui_thread
+                    if not self._disposed:
+                        run_on_ui_thread(lambda: self._notice(
+                            self._tr("backup_file_saved", name)))
+                except Exception:
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
+                    try:
+                        resolver.delete(target_uri, None, None)
+                    except Exception:
+                        pass
+                    raise
+            except Exception:
+                self.logger.exception("Backup file write failed")
+                if not self._disposed:
+                    from android_utils import run_on_ui_thread
+                    run_on_ui_thread(lambda: self._notice(self._tr("backup_error"), True))
+        threading.Thread(target=worker, name="VoiceChaptersBackup", daemon=True).start()
+
+    @staticmethod
+    def _read_backup_uri(activity, uri):
+        from java.io import BufferedReader, InputStreamReader
+        stream = activity.getContentResolver().openInputStream(uri)
+        if stream is None:
+            raise IOError("Backup file cannot be opened")
+        reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        pieces = []
+        size = 0
+        try:
+            while True:
+                line = reader.readLine()
+                if line is None:
+                    break
+                size += len(str(line).encode("utf-8")) + 1
+                if size > _MAX_BACKUP_BYTES:
+                    raise ValueError("Backup is larger than 12 MiB")
+                pieces.append(str(line))
+        finally:
+            reader.close()
+        return "\n".join(pieces)
+
+    def _restore_backup_from_uri(self, activity, uri):
+        import threading
+        def worker():
+            try:
+                text = self._read_backup_uri(activity, uri)
+                incoming, dates = parse_backup_document(text)
+                if not self._disposed:
+                    from android_utils import run_on_ui_thread
+                    run_on_ui_thread(lambda: self._apply_backup_data(incoming, dates))
+            except Exception:
+                self.logger.exception("Backup file import failed")
+                if not self._disposed:
+                    from android_utils import run_on_ui_thread
+                    def report_failure():
+                        self._restore_catalog_context = None
+                        self._notice(self._tr("backup_invalid"), True)
+                    run_on_ui_thread(report_failure)
+        threading.Thread(target=worker, name="VoiceChaptersRestore", daemon=True).start()
+
+    def _apply_backup_data(self, incoming, incoming_meta):
+        """All-or-nothing merge: no truncation, existing names have priority."""
+        try:
+            merged, count = merge_backup_chapters(self._read(), incoming)
+            if count == 0:
+                self._restore_catalog_context = None
+                self._notice(self._tr("backup_none"))
+                return
+            meta = dict(self._metadata())
+            for key in merged:
+                value = incoming_meta.get(key)
+                if key not in meta and isinstance(value, dict):
+                    try:
+                        stamp = int(value.get("date", 0))
+                        if 0 < stamp < 4102444800:
+                            meta[key] = {"date": stamp}
+                    except (TypeError, ValueError):
+                        pass
+            self.set_setting(_DB_KEY, json.dumps(merged, ensure_ascii=False,
+                                                 separators=(",", ":")))
+            self._db_cache = merged
+            try:
+                self.set_setting(_META_KEY, json.dumps(meta, separators=(",", ":")))
+                self._meta_cache = meta
+            except Exception:
+                self.logger.exception("Backup chapters restored but date metadata failed")
+                self._notice(self._tr("backup_dates_warning"), True)
+            self._refresh_visible_marker_cells()
+            self._refresh_catalog_after_restore()
+            self._notice(self._tr("backup_restored", count))
+        except Exception:
+            self._restore_catalog_context = None
+            self.logger.exception("Backup merge rejected")
+            self._notice(self._tr("backup_invalid"), True)
+
+    def _refresh_catalog_after_restore(self):
+        """Single event-driven catalog update, never polling or re-scanning chat.
+
+        If the Android document picker dismissed the original dialog, reopen
+        it only when that import was initiated from the current chat's list.
+        """
+        pending = self._restore_catalog_context
+        self._restore_catalog_context = None
+        state = self._active_catalog
+        if state is not None:
+            try:
+                state["refresh"]()
+                return
+            except Exception:
+                self.logger.exception("Could not refresh visible chapter catalog")
+        if pending is None or self._disposed:
+            return
+        try:
+            identity = self._current_chat_identity({})
+            if identity is None or identity[1:] != pending:
+                return
+            activity = self._activity({})
+            if activity is None:
+                return
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(lambda: self._show_chat_catalog(
+                activity, identity[0], pending[0], pending[1]), 100)
+        except Exception:
+            self.logger.exception("Cannot reopen catalog after file picker")
+
+    def _restore_chapters_backup(self, activity):
+        """Legacy clipboard import for old backups; never discards valid marks."""
+        try:
+            from android.content import Context
+            clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
+            clip = clipboard.getPrimaryClip()
+            if clip is None or clip.getItemCount() < 1:
+                self._notice(self._tr("backup_empty"), True)
+                return
+            raw_text = str(clip.getItemAt(0).coerceToText(activity))
+            incoming, dates = parse_backup_document(raw_text)
+            self._apply_backup_data(incoming, dates)
+        except Exception:
+            self.logger.exception("Legacy clipboard import failed")
+            self._notice(self._tr("backup_invalid"), True)
+
+    def _on_message_click(self, context: dict):
+        if self._disposed:
+            return
+        stage = "context"
+        try:
+            raw_context = context
+            context = self._normalize_menu_context(raw_context)
+            if "message" not in context:
+                raise ValueError("Selected message missing; " + self._context_shape(raw_context))
+            message = context["message"]
+            if not self._looks_like_message(message):
+                raise TypeError("Invalid message type in context: " + self._context_shape(message))
+            stage = "voice-check"
+            if not self._voice(message):
+                self._notice(self._tr("voice_only"), True)
+                return
+            stage = "duration"
+            duration = self._duration(message)
+            if duration <= 1:
+                self._notice(self._tr("invalid_duration"), True)
+                return
+            stage = "message-id"
+            if int(message.getId()) <= 0:
+                self._notice(self._tr("not_sent"), True)
+                return
+            stage = "voice-key"
+            key = self._voice_id(message, context)
+            def show_chapters():
+                if self._disposed:
+                    return
+                ui_stage = "activity"
+                try:
+                    # Resolve again once the native message menu has closed.
+                    activity = self._activity(context)
+                    if activity is None:
+                        raise RuntimeError("Could not resolve active Android Activity")
+                    ui_stage = "dialog"
+                    self._open_chapters(activity, message, key, duration)
+                    try:
+                        self.set_setting("last_error", self._tr("open_success"))
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    self._report_failure(ui_stage, exc)
+
+            stage = "ui-dispatch"
+            try:
+                # SDK menus may still be dismissing on ACTION_UP; schedule
+                # the new dialog after the menu finishes its own transition.
+                from android_utils import run_on_ui_thread
+            except ImportError:
+                # Keeps pure-Python simulated tests independent of Android.
+                show_chapters()
+            else:
+                run_on_ui_thread(show_chapters, 80)
+        except Exception as exc:
+            self._report_failure(stage, exc)
+
+    def _open_chapters(self, activity, message, key: str, duration: int):
+        if self._disposed:
+            return
+        entries = self._get_entries(key)
+        items = [self._tr("add_current"), self._tr("add_manual")]
+        items += ["▶ %s  ·  %s" % (format_time(ch["t"]), self._display_chapter_name(ch)) for ch in entries]
+        if entries:
+            items.append(self._tr("remove_marks"))
+
+        def clicked(dialog, position):
+            dialog.dismiss()
+            if self._disposed:
+                return
+            if position == 0:
+                self._add_current(activity, message, key, duration)
+            elif position == 1:
+                self._edit_entry(activity, message, key, duration)
+            elif 2 <= position < 2 + len(entries):
+                self._seek_to(message, int(entries[position - 2]["t"]), duration)
+            elif position == 2 + len(entries):
+                self._delete_dialog(activity, message, key, duration)
+
+        # Both styles use the same compact, bounded scrollable list.
+        # The setting only changes row appearance, not menu geometry.
+        self._open_chapters_list_menu(activity, duration, items, clicked, has_delete=bool(entries))
+
+    def _open_chapters_list_menu(self, activity, duration, items, clicked, has_delete=False):
+        """Compact, bounded message menu with an always enabled scrollbar.
+
+        The ScrollView lives inside an explicitly sized LinearLayout. Passing
+        the scroll view directly to AlertDialogBuilder.set_view(scroll, height)
+        made Telegram dialogs expand almost to screen height on some clients.
+        No listeners/timers survive dialog dismissal.
+        """
+        from java import dynamic_proxy
+        from android.view import View, Gravity
+        from android.widget import LinearLayout, ScrollView, TextView, FrameLayout
+        from android.graphics.drawable import GradientDrawable, RippleDrawable
+        from android.content.res import ColorStateList
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        from ui.alert import AlertDialogBuilder
+
+        dp = lambda n: int(AndroidUtilities.dp(float(n)))
+        def theme_color(name, fallback):
+            try:
+                return int(Theme.getColor(getattr(Theme, name)))
+            except Exception:
+                return fallback
+        fg = theme_color("key_dialogTextBlack", -1)
+        accent = theme_color("key_dialogButton", -12627531)
+        muted = theme_color("key_dialogTextGray2", -7829368)
+        bubbles = bool(self.get_setting("catalog_material_bubbles", False))
+
+        def translucent(color, alpha):
+            c = ((int(alpha) & 255) << 24) | (int(color) & 0xFFFFFF)
+            return c - 0x100000000 if c >= 0x80000000 else c
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Voice Chapters  ·  " + format_time(duration))
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(dp(6), dp(0), dp(6), dp(0))
+
+        scroll = ScrollView(activity)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(True)
+        scroll.setScrollbarFadingEnabled(False)
+        try:
+            scroll.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET)
+            thumb = GradientDrawable()
+            thumb.setColor(translucent(accent, 150))
+            thumb.setCornerRadius(float(dp(4)))
+            scroll.setVerticalScrollbarThumbDrawable(thumb)
+            track = GradientDrawable()
+            track.setColor(translucent(muted, 22))
+            track.setCornerRadius(float(dp(4)))
+            scroll.setVerticalScrollbarTrackDrawable(track)
+        except Exception:
+            # Use platform scrollbar if the current Android APIs differ.
+            pass
+
+        group = LinearLayout(activity)
+        group.setOrientation(LinearLayout.VERTICAL)
+        # Leave a small gutter to the right for the scroll thumb.
+        group.setPadding(dp(12), dp(4), dp(17), dp(6))
+        scroll.addView(group, FrameLayout.LayoutParams(-1, -2))
+
+        callbacks = []
+        class RowClick(dynamic_proxy(View.OnClickListener)):
+            def __init__(self, number):
+                super().__init__()
+                self.number = number
+
+            def onClick(self, view):
+                clicked(builder, self.number)
+
+        def default_ripple(view):
+            try:
+                from android.util import TypedValue
+                from android import R as AndroidR
+                value = TypedValue()
+                activity.getTheme().resolveAttribute(
+                    AndroidR.attr.selectableItemBackground, value, True)
+                if value.resourceId:
+                    view.setBackgroundResource(int(value.resourceId))
+            except Exception:
+                pass
+
+        for index, caption in enumerate(items):
+            label = TextView(activity)
+            label.setText(str(caption))
+            label.setTextSize(15)
+            label.setSingleLine(True)
+            label.setGravity(Gravity.CENTER_VERTICAL)
+            is_delete = has_delete and index == len(items) - 1
+            label.setTextColor(accent if index <= 1 else (muted if is_delete else fg))
+            label.setPadding(dp(18), dp(0), dp(12), dp(0))
+            if bubbles:
+                bg = GradientDrawable()
+                bg.setShape(GradientDrawable.RECTANGLE)
+                bg.setColor(translucent(accent if index <= 1 else muted, 26))
+                bg.setCornerRadius(float(dp(14)))
+                try:
+                    label.setBackground(RippleDrawable(
+                        ColorStateList.valueOf(translucent(accent, 46)), bg, None))
+                except Exception:
+                    label.setBackground(bg)
+            else:
+                default_ripple(label)
+            listener = RowClick(index)
+            callbacks.append(listener)
+            label.setOnClickListener(listener)
+            label.setClickable(True)
+            lp = LinearLayout.LayoutParams(-1, dp(46))
+            lp.bottomMargin = dp(6 if bubbles else 2)
+            group.addView(label, lp)
+
+        # Only the *inner* scroll area has a height. Never give the entire
+        # alert dialog a MATCH_PARENT or fixed full-screen measurement.
+        screen_h = int(activity.getResources().getDisplayMetrics().heightPixels)
+        wanted_h = dp(len(items) * (52 if bubbles else 48) + 10)
+        max_h = min(dp(225), int(screen_h * 0.29))
+        list_h = min(wanted_h, max_h)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, max(dp(55), list_h)))
+
+        builder.set_view(root)
+        builder.set_negative_button(self._tr("close"), lambda b, w: b.dismiss())
+        def release(dialog):
+            for row in range(int(group.getChildCount())):
+                try:
+                    group.getChildAt(row).setOnClickListener(None)
+                except Exception:
+                    pass
+            callbacks.clear()
+        builder.set_on_dismiss_listener(release)
+        builder.show()
+
+    @staticmethod
+    def _playing_matches(message, current):
+        if current is None:
+            return False
+        try:
+            return (int(message.getId()) == int(current.getId())
+                    and int(message.getDialogId()) == int(current.getDialogId())
+                    and int(getattr(message, "currentAccount", -1)) == int(getattr(current, "currentAccount", -2)))
+        except Exception:
+            return False
+
+    def _save_chapter(self, message, key, duration, seconds, name=""):
+        """Persist immediately; preserve existing database format and timestamps."""
+        edited = append_chapter(self._get_entries(key), int(seconds), name, duration, self._tr("marker_prefix"))
+        self._write_entries(key, edited, message)
+        self._notice(self._tr("saved", format_time(int(seconds))))
+
+    def _add_current(self, activity, message, key, duration):
+        try:
+            from client_utils import get_media_controller
+            controller = get_media_controller()
+            playing = controller.getPlayingMessageObject()
+            if not self._playing_matches(message, playing):
+                self._notice(self._tr("play_first"), True)
+                return
+            seconds = min(max(0, int(playing.audioProgressSec)), duration - 1)
+            if self._ask_chapter_name():
+                self._edit_entry(activity, message, key, duration, seconds=seconds)
+            else:
+                self._save_chapter(message, key, duration, seconds)
+        except ValueError as exc:
+            self._notice(self._tr("error_prefix") + str(exc), True)
+        except Exception:
+            self.logger.exception("Failed to save current playback position")
+            self._notice(self._tr("save_position_error"), True)
+
+
+    @staticmethod
+    def _dialog_text_colors():
+        """Read real Telegram dialog text color instead of Android EditText default.
+
+        The fallback key is Telegram's general readable text color.  Hint
+        text is the same hue at lower opacity, so dark themes do not inherit
+        the black system hint and light themes do not inherit white.
+        """
+        from org.telegram.ui.ActionBar import Theme
+        try:
+            fg = int(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            fg = int(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        # Java ARGB colors are signed int32; 58% alpha for the hint.
+        hint_unsigned = (fg & 0x00FFFFFF) | 0x94000000
+        hint = hint_unsigned if hint_unsigned < 0x80000000 else hint_unsigned - 0x100000000
+        return fg, hint
+
+    def _theme_input(self, field):
+        """Match Telegram's current light/dark dialog palette."""
+        text_color, hint_color = self._dialog_text_colors()
+        field.setTextColor(text_color)
+        field.setHintTextColor(hint_color)
+        # Cursor / underline tinting is optional and may not be present on
+        # some client versions. Never break the chapter editor for cosmetics.
+        try:
+            from android.content.res import ColorStateList
+            from org.telegram.ui.ActionBar import Theme
+            accent = int(Theme.getColor(Theme.key_dialogButton))
+            field.setBackgroundTintList(ColorStateList.valueOf(accent))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _filter_deleted_chapters(current, selected_seconds):
+        """Keep all chapters except user-selected timestamps, atomically."""
+        selected = set(int(s) for s in selected_seconds)
+        return [item for item in current if int(item["t"]) not in selected]
+
+    def _edit_entry(self, activity, message, key, duration, seconds=None):
+        try:
+            from android.widget import LinearLayout, EditText
+            from org.telegram.messenger import AndroidUtilities
+            from ui.alert import AlertDialogBuilder
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            dp = AndroidUtilities.dp
+            layout.setPadding(dp(20), dp(8), dp(20), dp(6))
+            time_field = EditText(activity)
+            self._theme_input(time_field)
+            time_field.setSingleLine(True)
+            time_field.setHint(self._tr("time_hint"))
+            if seconds is not None:
+                time_field.setText(format_time(seconds))
+            layout.addView(time_field, LinearLayout.LayoutParams(-1, -2))
+            name_field = None
+            if self._ask_chapter_name():
+                name_field = EditText(activity)
+                self._theme_input(name_field)
+                name_field.setSingleLine(True)
+                name_field.setHint(self._tr("name_hint"))
+                layout.addView(name_field, LinearLayout.LayoutParams(-1, -2))
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(self._tr("new_chapter") if name_field is not None else self._tr("chapter_time"))
+            builder.set_view(layout)
+            def save(dialog, which):
+                try:
+                    sec = parse_time(str(time_field.getText()))
+                    name = str(name_field.getText()) if name_field is not None else ""
+                    self._save_chapter(message, key, duration, sec, name)
+                except ValueError as exc:
+                    self._notice(self._tr("error_prefix") + str(exc), True)
+                except Exception:
+                    self.logger.exception("Unable to save chapter")
+                    self._notice(self._tr("save_error"), True)
+                dialog.dismiss()
+            builder.set_positive_button(self._tr("save"), save)
+            builder.set_negative_button(self._tr("cancel"), lambda b, w: b.dismiss())
+            builder.show()
+        except Exception:
+            self.logger.exception("Failed to open chapter editor")
+            self._notice(self._tr("editor_error"), True)
+
+    def _delete_dialog(self, activity, message, key, duration):
+        entries = list(self._get_entries(key))
+        if not entries:
+            return
+        try:
+            from android.widget import LinearLayout, CheckBox, ScrollView, FrameLayout
+            from android.content.res import ColorStateList
+            from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
+            from ui.alert import AlertDialogBuilder
+
+            dp = AndroidUtilities.dp
+            lang = self._language()
+            main_text_color, _ = self._dialog_text_colors()
+            list_area = ScrollView(activity)
+            list_area.setFillViewport(False)
+            list_area.setVerticalScrollBarEnabled(len(entries) > 6)
+            container = LinearLayout(activity)
+            container.setOrientation(LinearLayout.VERTICAL)
+            container.setPadding(dp(20), dp(4), dp(20), dp(4))
+            list_area.addView(container, FrameLayout.LayoutParams(-1, -2))
+
+            # Each row remains selected until confirmation; never delete on tap.
+            checkboxes = []
+            for entry in entries:
+                check = CheckBox(activity)
+                check.setText("%s  ·  %s" % (format_time(int(entry["t"])), self._display_chapter_name(entry)))
+                check.setTextSize(15)
+                check.setTextColor(main_text_color)
+                check.setChecked(False)
+                check.setMinHeight(dp(48))
+                try:
+                    check.setButtonTintList(ColorStateList.valueOf(
+                        int(Theme.getColor(Theme.key_dialogButton))))
+                except Exception:
+                    # The native checkbox still works without custom tinting.
+                    pass
+                container.addView(check, LinearLayout.LayoutParams(-1, dp(48)))
+                checkboxes.append(check)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(self._tr("delete_title"))
+            # Limit height for long lists; native ScrollView handles > 7 rows.
+            builder.set_view(list_area, dp(min(7, len(entries)) * 48 + 8))
+
+            def confirm(dialog, which):
+                try:
+                    selected = {int(entry["t"]) for entry, check in zip(entries, checkboxes)
+                                if bool(check.isChecked())}
+                    if not selected:
+                        self._notice(self._tr("none_selected"), True)
+                        return
+                    # Resolve the latest data by timestamps to avoid undoing
+                    # changes from another dialog or menu action.
+                    current = self._get_entries(key)
+                    kept = self._filter_deleted_chapters(current, selected)
+                    removed = len(current) - len(kept)
+                    if removed:
+                        self._write_entries(key, kept)
+                        self._notice(self._tr("deleted", removed))
+                except Exception:
+                    self.logger.exception("Bulk chapter deletion failed")
+                    self._notice(self._tr("delete_error"), True)
+                finally:
+                    dialog.dismiss()
+
+            builder.set_negative_button(self._tr("cancel"), lambda b, w: b.dismiss())
+            builder.set_positive_button(self._tr("delete_selected"), confirm)
+            dialog = builder.show()
+            # Telegram groups dialog actions toward the trailing edge. Shift only
+            # the Cancel touch target to the left without replacing native buttons.
+            try:
+                from android.content import DialogInterface
+                cancel_button = dialog.getButton(DialogInterface.BUTTON_NEGATIVE)
+                if cancel_button is not None:
+                    cancel_button.setTranslationX(-float(dp(24)))
+            except Exception:
+                # Older SDK wrappers may not expose native AlertDialog buttons.
+                pass
+        except Exception:
+            self.logger.exception("Failed to open multi-select chapter deletion")
+            self._notice(self._tr("delete_error"), True)
+
+    @staticmethod
+    def _set_message_progress(message, seconds, duration):
+        """Mirror the native seekbar model: Java fields drive waveform + elapsed time."""
+        message.audioProgress = float(seconds) / float(duration)
+        message.audioProgressSec = int(seconds)
+
+    def _refresh_visible_playback(self, message, seconds, duration):
+        """Update only matching, already-visible message cells after a user tap.
+
+        No per-frame polling, NotificationCenter spoofing, or player recreation.
+        The native ChatMessageCell method synchronizes waveform and time text.
+        """
+        try:
+            from client_utils import get_last_fragment
+            from hook_utils import get_private_field
+            frag = get_last_fragment()
+            if frag is None or not str(frag.getClass().getName()).endswith("ChatActivity"):
+                return
+            list_view = get_private_field(frag, "chatListView")
+            if list_view is None:
+                return
+            for i in range(int(list_view.getChildCount())):
+                cell = list_view.getChildAt(i)
+                if cell is None or not str(cell.getClass().getName()).endswith("ChatMessageCell"):
+                    continue
+                shown = self._cell_message(cell)
+                if not self._playing_matches(message, shown):
+                    continue
+                # Cells sometimes hold a different wrapper for the same message.
+                self._set_message_progress(shown, seconds, duration)
+                cell.updatePlayingMessageProgress()
+        except Exception:
+            self.logger.exception("Voice Chapters: immediate waveform refresh failed")
+
+    def _seek_active_voice(self, controller, selected, playing, seconds, duration):
+        """Seek the native player and immediately refresh the UI, even if paused.
+
+        Does NOT call playMessage for an already active (possibly paused) voice.
+        """
+        progress = float(seconds) / float(duration)
+        controller.seekToProgress(playing, progress)
+        self._set_message_progress(playing, seconds, duration)
+        # The menu's selected object may differ from MediaController's wrapper.
+        if selected is not playing:
+            self._set_message_progress(selected, seconds, duration)
+        self._refresh_visible_playback(playing, seconds, duration)
+
+    def _seek_to(self, message, seconds, duration):
+        """Navigate chapters without resuming audio that is already paused."""
+        if not valid_chapter(int(seconds), duration) or self._disposed:
+            return
+        try:
+            from client_utils import get_media_controller
+            controller = get_media_controller()
+            playing = controller.getPlayingMessageObject()
+            if self._playing_matches(message, playing):
+                self._seek_active_voice(controller, message, playing, seconds, duration)
+                self._notice(self._tr("seek_success", format_time(seconds)))
+                return
+            if not self.get_setting("auto_play_on_seek", True):
+                self._notice(self._tr("play_first_simple"), True)
+                return
+            controller.playMessage(message)
+            from android_utils import run_on_ui_thread
+            # Preparing an as-yet unplayed message may be asynchronous.
+            def try_seek(attempt=0):
+                if self._disposed:
+                    return
+                try:
+                    playing = controller.getPlayingMessageObject()
+                    if self._playing_matches(message, playing):
+                        self._seek_active_voice(controller, message, playing, seconds, duration)
+                        self._notice(self._tr("seek_success", format_time(seconds)))
+                    elif attempt < 2:
+                        run_on_ui_thread(lambda: try_seek(attempt + 1), 260)
+                    else:
+                        self._notice(self._tr("seek_wait"), True)
+                except Exception:
+                    self.logger.exception("Seek failed")
+                    self._notice(self._tr("seek_error"), True)
+            run_on_ui_thread(lambda: try_seek(0), 180)
+        except Exception:
+            self.logger.exception("Playback or seeking failed")
+            self._notice(self._tr("seek_unsupported"), True)
