@@ -1,0 +1,1235 @@
+from typing import Any, List
+import os
+import time
+import threading
+from collections import deque
+
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
+from hook_utils import find_class
+from client_utils import run_on_queue, PLUGINS_QUEUE, get_notification_center
+from ui.settings import Header, Switch, Input, Text
+from ui.bulletin import BulletinHelper
+
+from java import dynamic_proxy, jarray, jclass
+from java.lang import Runnable, Long, Integer, Boolean, Double, Float, String as JString
+from java.lang import Short, Byte
+from java.lang.reflect import Array as JArray
+from java.nio import ByteBuffer
+from android.media import MediaExtractor, MediaMuxer, MediaCodec, MediaMetadataRetriever
+from android.content import Context, ClipData
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+from org.telegram.messenger import NotificationCenter as NCJ
+
+__id__ = "unlimited_rounds"
+__name__ = "Unlimited Rounds"
+__description__ = "Убирает ограничение на длительность кружка, а затем отправляет его несколькими частями"
+__author__ = "@Vernyak6"
+__version__ = "1.0"
+__icon__ = "UtyaDuckFull/21"
+__app_version__ = ">=12.10.6"
+__category__ = ["media"]
+
+BUILD_TAG = "UR/1.0"
+VEI_NAME = "org.telegram.messenger.VideoEditedInfo"
+HARD_LIMIT_US = 60 * 1000000
+UNLIMITED_MS = 12 * 3600 * 1000
+HOOK_PRIORITY = 10000
+LOG_MAX = 1500
+
+
+class _UiRunnable(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception:
+            pass
+
+
+class UnlimitedRoundsPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._log_lock = threading.Lock()
+        self._logs = deque(maxlen=LOG_MAX)
+        self._log_path = None
+        self._init_log_file()
+        self._load_log_tail()
+
+        self._list_cls = jclass("java.util.List")
+        self._str_cls = jclass("java.lang.String")
+        self._obj_arr = jarray(jclass("java.lang.Object"))
+
+        self._sent_paths = set()
+        self._replaying = False
+        self._busy = False
+        self._menu_done = False
+        self._dur_logged = {}
+        self._last_decision = "ещё не было записи"
+        self._hook_counts = {}
+
+        self._nc = None
+        self._fid_uploaded = None
+        self._fid_msg_ok = None
+        self._fid_upload_fail = None
+        self._fid_send_fail = None
+
+        self._log("INFO", "%s загрузка, автор @Vernyak6" % BUILD_TAG)
+        self._install_hooks()
+        self._subscribe_nc()
+        self._log("INFO", "загружен. хуки: %s" % self._hook_counts)
+        if not self._hook_counts.get("sendMedia"):
+            BulletinHelper.show_error("UR: sendMedia не захукан, смотри лог")
+
+    def on_plugin_unload(self):
+        try:
+            nc = get_notification_center()
+            if self._nc is not None:
+                for fid in (self._fid_uploaded, self._fid_msg_ok,
+                            self._fid_upload_fail, self._fid_send_fail):
+                    if fid is not None:
+                        nc.removeObserver(self._nc, fid)
+        except Exception:
+            pass
+        self._log("INFO", "выгружен")
+
+    def _is_vei(self, a):
+        if a is None:
+            return False
+        try:
+            c = a.getClass()
+            while c is not None:
+                if str(c.getName()) == VEI_NAME:
+                    return True
+                c = c.getSuperclass()
+        except Exception:
+            return False
+        return False
+
+    def _is_list(self, a):
+        if a is None:
+            return False
+        try:
+            if self._list_cls.isInstance(a):
+                return True
+        except Exception:
+            pass
+        try:
+            n = str(a.getClass().getName())
+            return n.startswith("java.util.") and "List" in n
+        except Exception:
+            return False
+
+    def _is_str(self, a):
+        if a is None:
+            return False
+        try:
+            if self._str_cls.isInstance(a):
+                return True
+        except Exception:
+            pass
+        try:
+            return str(a.getClass().getName()) == "java.lang.String"
+        except Exception:
+            return False
+
+    def _init_log_file(self):
+        try:
+            base = str(ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath())
+            d = os.path.join(base, "long_round")
+            os.makedirs(d, exist_ok=True)
+            self._log_path = os.path.join(d, "logs.txt")
+        except Exception:
+            self._log_path = None
+
+    def _load_log_tail(self):
+        if not self._log_path or not os.path.isfile(self._log_path):
+            return
+        try:
+            with open(self._log_path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 262144))
+                data = fh.read().decode("utf-8", "ignore")
+            for line in data.splitlines()[-LOG_MAX:]:
+                self._logs.append(line)
+        except Exception:
+            pass
+
+    def _log(self, level, msg):
+        try:
+            line = "%s.%03d [%s] %s" % (
+                time.strftime("%H:%M:%S"), int((time.time() % 1) * 1000), level, msg)
+        except Exception:
+            line = "[%s] %s" % (level, msg)
+        try:
+            with self._log_lock:
+                self._logs.append(line)
+        except Exception:
+            pass
+        if self._log_path:
+            try:
+                with open(self._log_path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception:
+                pass
+        try:
+            if level == "ERROR":
+                self.logger.error(line)
+            elif level == "WARN":
+                self.logger.warning(line)
+            else:
+                self.logger.info(line)
+        except Exception:
+            pass
+
+    def _log_exc(self, where):
+        import traceback
+        self._log("ERROR", "%s: %s" % (where, traceback.format_exc()))
+
+    def _dbg(self, msg):
+        if self._b("debug", False):
+            self._log("DEBUG", msg)
+
+    def _log_text(self):
+        head = [
+            "%s  автор @Vernyak6" % BUILD_TAG,
+            "настройки: enabled=%s max_minutes=%s segment=%s fallback=%s debug=%s" % (
+                self._b("enabled", True), self.get_setting("max_minutes", "5"),
+                self.get_setting("segment_seconds", "59"),
+                self._b("fallback_original", True), self._b("debug", False)),
+            "хуки: %s" % self._hook_counts,
+            "последнее решение: %s" % self._last_decision,
+            "файл лога: %s" % self._log_path,
+            "-" * 40,
+        ]
+        with self._log_lock:
+            body = list(self._logs)
+        return "\n".join(head + body)
+
+    def _log_tail(self, n=8):
+        with self._log_lock:
+            body = list(self._logs)[-n:]
+        return "\n".join(body) if body else "лог пуст"
+
+    def _copy_logs(self, context=None):
+        text = self._log_text()
+        ok = self._clipboard(text)
+        self._log("INFO", "копирование логов: %s (%d символов)" % ("ок" if ok else "ОШИБКА", len(text)))
+        if ok:
+            BulletinHelper.show_info("Логи скопированы")
+        else:
+            BulletinHelper.show_error("Не удалось скопировать. Файл: " + str(self._log_path))
+        self._refresh_settings()
+
+    def _clear_logs(self, context=None):
+        with self._log_lock:
+            self._logs.clear()
+        if self._log_path:
+            try:
+                with open(self._log_path, "w", encoding="utf-8") as fh:
+                    fh.write("")
+            except Exception:
+                pass
+        self._log("INFO", "логи очищены")
+        BulletinHelper.show_info("Логи очищены")
+        self._refresh_settings()
+
+    def _clear_temp(self, context=None):
+        removed = 0
+        try:
+            roots = []
+            try:
+                roots.append(str(ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()))
+            except Exception:
+                pass
+            roots.append("/storage/emulated/0/Android/data/com.exteragram.messenger/files")
+            for base in roots:
+                for sub in ("long_round", "LRV_parts"):
+                    root = os.path.join(base, sub)
+                    if not os.path.isdir(root):
+                        continue
+                    for name in os.listdir(root):
+                        d = os.path.join(root, name)
+                        if not os.path.isdir(d):
+                            continue
+                        for f in os.listdir(d):
+                            try:
+                                os.remove(os.path.join(d, f))
+                                removed += 1
+                            except Exception:
+                                pass
+                        try:
+                            os.rmdir(d)
+                        except Exception:
+                            pass
+        except Exception:
+            self._log_exc("clear_temp")
+        self._log("INFO", "очистка временных файлов: удалено %d" % removed)
+        BulletinHelper.show_info("Удалено файлов: %d" % removed)
+        self._refresh_settings()
+
+    def _clipboard(self, text):
+        try:
+            import android_utils
+            for nm in ("copy_to_clipboard", "set_clipboard", "clipboard_copy", "copy_text"):
+                fn = getattr(android_utils, nm, None)
+                if fn is not None:
+                    fn(text)
+                    return True
+        except Exception:
+            pass
+        try:
+            cm = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+            cm.setPrimaryClip(ClipData.newPlainText("unlimited_rounds", text))
+            return True
+        except Exception as e:
+            self._log("ERROR", "clipboard: %s" % e)
+            return False
+
+    def _refresh_settings(self):
+        try:
+            self.set_setting("_refresh", int(time.time()), reload_settings=True)
+        except Exception:
+            pass
+
+    def create_settings(self) -> List[Any]:
+        enabled = self._b("enabled", True)
+        debug = self._b("debug", False)
+
+        rows = [
+            Header(text="Unlimited Rounds"),
+            Switch(key="enabled", text="Включить длинные кружки", default=True),
+        ]
+        if not enabled:
+            return rows
+
+        rows += [
+            Input(key="max_minutes", text="Макс. запись, минут", default="5",
+                  subtext="0 = без лимита (предохранитель 12 часов)"),
+            Input(key="segment_seconds", text="Длина одного кружка, секунд", default="59",
+                  subtext="Не больше 60 — ограничение сервера Telegram"),
+            Switch(key="fallback_original", text="При ошибке отправлять исходник", default=True,
+                   subtext="Если нарезка не удалась — запись уйдёт одним кружком"),
+            Switch(key="debug", text="Подробный лог и диагностика", default=False),
+        ]
+
+        if not debug:
+            return rows
+
+        rows += [
+            Header(text="Диагностика"),
+            Text(text="Хуки", subtext=str(self._hook_counts)),
+            Text(text="Последнее решение", subtext=str(self._last_decision)),
+        ]
+        b1 = self._row_button("Скопировать логи", "Весь лог в буфер", self._copy_logs, "msg_copy")
+        b2 = self._row_button("Очистить логи", "Стереть память и файл", self._clear_logs, "msg_delete")
+        b3 = self._row_button("Очистить временные файлы", "Удалить куски", self._clear_temp, "msg_delete")
+        for b in (b1, b2, b3):
+            if b is not None:
+                rows.append(b)
+        if b1 is None or b2 is None:
+            self._ensure_menu_buttons()
+            rows.append(Text(text="Кнопки недоступны в этом SDK",
+                             subtext="Используй пункты UR в боковом меню"))
+        rows.append(Text(text="Лог (последние строки)", subtext=self._log_tail(8)))
+        rows.append(Text(text="Файл лога", subtext=str(self._log_path)))
+        return rows
+
+    def _row_button(self, text, subtext, cb, icon):
+        cands = []
+        try:
+            from ui.settings import Button as B
+            cands.append(B)
+        except Exception:
+            pass
+        cands.append(Text)
+        for cls in cands:
+            for kw in (
+                {"text": text, "subtext": subtext, "on_click": cb, "icon": icon},
+                {"text": text, "on_click": cb, "icon": icon},
+                {"text": text, "on_click": cb},
+                {"text": text, "subtext": subtext, "on_click": cb},
+            ):
+                try:
+                    return cls(**kw)
+                except Exception:
+                    continue
+        return None
+
+    def _ensure_menu_buttons(self):
+        if self._menu_done:
+            return
+        self._menu_done = True
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU, text="UR: скопировать логи", on_click=self._copy_logs))
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU, text="UR: очистить логи", on_click=self._clear_logs))
+            self._log("INFO", "кнопки логов добавлены в боковое меню")
+        except Exception as e:
+            self._log("WARN", "menu buttons: %s" % e)
+
+    def _b(self, key, default):
+        try:
+            v = self.get_setting(key, default)
+            if isinstance(v, str):
+                return v.strip().lower() in ("true", "1", "yes", "on")
+            return bool(v)
+        except Exception:
+            return default
+
+    def _i(self, key, default, lo, hi):
+        try:
+            v = int(str(self.get_setting(key, default)).strip())
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    def _target_ms(self):
+        v = self._i("max_minutes", 5, 0, 720)
+        if v == 0:
+            return UNLIMITED_MS
+        return v * 60000
+
+    def _install_hooks(self):
+        plugin = self
+
+        class DurationHook(MethodHook):
+            def after_hooked_method(self, param):
+                if not plugin._b("enabled", True):
+                    return
+                ms = plugin._target_ms()
+                try:
+                    old = param.getResult()
+                    rt = str(param.method.getReturnType().getName())
+                    if rt == "long":
+                        param.setResult(Long(ms))
+                    elif rt == "double":
+                        param.setResult(Double(float(ms)))
+                    elif rt == "float":
+                        param.setResult(Float(float(ms)))
+                    else:
+                        param.setResult(Integer(ms))
+                    key = "%s/%s" % (param.method.getName(), old)
+                    if key not in plugin._dur_logged:
+                        plugin._dur_logged[key] = True
+                        plugin._log("INFO", "лимит записи: %s -> %d мс (%s)" % (old, ms, rt))
+                except Exception:
+                    plugin._log_exc("duration hook")
+
+        class EarlySendHook(MethodHook):
+            def before_hooked_method(self, param):
+                if plugin._b("enabled", True):
+                    plugin._dbg("sendMediaBeforeDone заглушен")
+                    plugin._skip_original(param)
+
+        class SendMediaHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    plugin._maybe_takeover(param)
+                except Exception:
+                    plugin._log_exc("takeover")
+
+        class EncoderDoneHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._log("INFO", "handleEncoderFinished: " +
+                                plugin._args_summary(list(param.args)))
+                except Exception:
+                    pass
+
+        self._hook_counts["duration"] = self._hook_named(
+            "com.exteragram.messenger.utils.system.SystemUtils",
+            ["getRoundVideoMaxDurationMs"], DurationHook())
+        self._hook_counts["sendMedia"] = self._hook_named(
+            "org.telegram.ui.ChatActivity", ["sendMedia"], SendMediaHook(), prefix=True)
+        self._hook_counts["earlySend"] = self._hook_named(
+            "org.telegram.ui.Components.InstantCameraView", ["sendMediaBeforeDone"], EarlySendHook())
+        self._hook_counts["encoderDone"] = self._hook_named(
+            "org.telegram.ui.Components.InstantCameraView", ["handleEncoderFinished"], EncoderDoneHook())
+
+    def _hook_named(self, cname, names, handler, prefix=False, priority=HOOK_PRIORITY):
+        count = 0
+        short = cname.rsplit(".", 1)[-1]
+        fc = None
+        try:
+            fc = find_class(cname)
+        except Exception as e:
+            self._log("ERROR", "%s find_class: %s" % (short, e))
+        if fc is None:
+            self._log("ERROR", "класс не найден: " + cname)
+            return 0
+        for nm in names:
+            try:
+                u = self.hook_all_methods(fc, nm, handler)
+                n = len(u) if u else 0
+                if n:
+                    count += n
+                    self._log("INFO", "хук: %s.%s x%d" % (short, nm, n))
+                else:
+                    self._log("WARN", "hook_all_methods пусто: %s.%s" % (short, nm))
+            except Exception as e:
+                self._log("ERROR", "hook %s.%s: %s" % (short, nm, e))
+        return count
+
+    def _skip_original(self, param):
+        try:
+            rt = str(param.method.getReturnType().getName())
+        except Exception:
+            param.setResult(None)
+            return
+        if rt == "boolean":
+            param.setResult(Boolean(False))
+        elif rt in ("int", "long", "short", "byte", "char"):
+            param.setResult(Integer(0))
+        elif rt == "double":
+            param.setResult(Double(0.0))
+        elif rt == "float":
+            param.setResult(Float(0.0))
+        else:
+            param.setResult(None)
+
+    def _subscribe_nc(self):
+        self._fid_uploaded = getattr(NCJ, "fileUploaded", None)
+        self._fid_msg_ok = getattr(NCJ, "messageReceivedByServer", None)
+        self._fid_upload_fail = getattr(NCJ, "fileUploadFailed", None)
+        self._fid_send_fail = getattr(NCJ, "messageSendFailed", None)
+        if self._fid_uploaded is None and self._fid_msg_ok is None:
+            return
+        plugin = self
+        iface = jclass("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate")
+
+        class Delegate(dynamic_proxy(iface)):
+            def __init__(self):
+                super().__init__()
+
+            def didReceivedNotification(self, id, account, *args):
+                try:
+                    payload = args[0] if len(args) == 1 else args
+                    plugin._on_notification(id, payload)
+                except Exception:
+                    pass
+
+        try:
+            self._nc = Delegate()
+            nc = get_notification_center()
+            for fid in (self._fid_uploaded, self._fid_msg_ok,
+                        self._fid_upload_fail, self._fid_send_fail):
+                if fid is not None:
+                    nc.addObserver(self._nc, fid)
+        except Exception:
+            self._log_exc("subscribe_nc")
+
+    def _args_strings(self, args):
+        out = []
+        try:
+            for a in args:
+                if a is not None:
+                    out.append(str(a))
+        except Exception:
+            pass
+        return out
+
+    def _match_sent(self, args):
+        for s in self._args_strings(args):
+            for p in list(self._sent_paths):
+                if p in s or (os.path.basename(p) and os.path.basename(p) in s):
+                    return p
+        return None
+
+    def _on_notification(self, nid, args):
+        if not self._sent_paths:
+            return
+        p = self._match_sent(args)
+        if p is None:
+            return
+        if nid == self._fid_uploaded:
+            self._log("INFO", "загрузка подтверждена: %s" % os.path.basename(p))
+            self._sent_paths.discard(p)
+        elif nid == self._fid_upload_fail:
+            self._log("ERROR", "ошибка загрузки: %s" % os.path.basename(p))
+        elif nid == self._fid_send_fail:
+            self._log("ERROR", "ошибка отправки сообщения: %s" % os.path.basename(p))
+
+    def _type_name(self, a):
+        if a is None:
+            return "null"
+        try:
+            return str(a.getClass().getName())
+        except Exception:
+            return type(a).__name__
+
+    def _args_summary(self, args):
+        parts = []
+        for i, a in enumerate(args):
+            t = self._type_name(a)
+            extra = ""
+            try:
+                if self._is_vei(a):
+                    extra = " <VEI>"
+                elif self._is_list(a):
+                    extra = " size=%d" % a.size()
+                elif a.getClass().isArray():
+                    extra = " len=%d" % JArray.getLength(a)
+                elif self._is_str(a):
+                    s = str(a)
+                    extra = " '%s'" % (s[-50:] if len(s) > 50 else s)
+            except Exception:
+                pass
+            parts.append("%d:%s%s" % (i, t, extra))
+        return " | ".join(parts) if parts else "(нет аргументов)"
+
+    def _find_vei(self, args):
+        for i, a in enumerate(args):
+            if self._is_vei(a):
+                return ("arg", i), a
+        for i, a in enumerate(args):
+            if a is None:
+                continue
+            try:
+                if self._is_list(a):
+                    for j in range(a.size()):
+                        e = a.get(j)
+                        if self._is_vei(e):
+                            return ("list", i, j), e
+                elif a.getClass().isArray():
+                    for j in range(JArray.getLength(a)):
+                        e = JArray.get(a, j)
+                        if self._is_vei(e):
+                            return ("array", i, j), e
+            except Exception:
+                continue
+        return None, None
+
+    def _find_media_arg(self, args, skip_idx, src_path):
+        for i, a in enumerate(args):
+            if a is None or i == skip_idx:
+                continue
+            try:
+                if self._is_str(a) or self._is_list(a) or a.getClass().isArray():
+                    continue
+                cls = a.getClass()
+                while cls is not None and str(cls.getName()) != "java.lang.Object":
+                    for f in cls.getDeclaredFields():
+                        try:
+                            if str(f.getType().getName()) != "java.lang.String":
+                                continue
+                            f.setAccessible(True)
+                            v = f.get(a)
+                            if v is not None and str(v) == src_path:
+                                return i
+                        except Exception:
+                            continue
+                    cls = cls.getSuperclass()
+            except Exception:
+                continue
+        return None
+
+    def _get_field(self, obj, name):
+        try:
+            cls = obj.getClass()
+            while cls is not None:
+                try:
+                    f = cls.getDeclaredField(name)
+                    f.setAccessible(True)
+                    return f.get(obj)
+                except Exception:
+                    cls = cls.getSuperclass()
+        except Exception:
+            pass
+        return None
+
+    def _round_flag(self, info):
+        v = self._get_field(info, "roundVideo")
+        if v is not None:
+            return bool(v)
+        return None
+
+    def _read_path(self, info):
+        for name in ("originalPath", "videoPath", "path", "resultPath", "filePath"):
+            try:
+                v = self._get_field(info, name)
+                if v and os.path.isfile(str(v)):
+                    return str(v), name
+            except Exception:
+                continue
+        try:
+            cls = info.getClass()
+            while cls is not None and str(cls.getName()) != "java.lang.Object":
+                for f in cls.getDeclaredFields():
+                    try:
+                        if str(f.getType().getName()) != "java.lang.String":
+                            continue
+                        f.setAccessible(True)
+                        v = f.get(info)
+                        if v is not None and str(v).endswith(".mp4") and os.path.isfile(str(v)):
+                            return str(v), str(f.getName())
+                    except Exception:
+                        continue
+                cls = cls.getSuperclass()
+        except Exception:
+            pass
+        return None, None
+
+    def _set_field(self, obj, name, value):
+        try:
+            cls = obj.getClass()
+            field = None
+            while cls is not None:
+                try:
+                    field = cls.getDeclaredField(name)
+                    break
+                except Exception:
+                    cls = cls.getSuperclass()
+            if field is None:
+                return False
+            field.setAccessible(True)
+            t = str(field.getType().getName())
+            if t == "long":
+                v = Long(int(value))
+            elif t == "int":
+                v = Integer(int(value))
+            elif t == "boolean":
+                v = Boolean(bool(value))
+            elif t == "double":
+                v = Double(float(value))
+            elif t == "float":
+                v = Float(float(value))
+            elif t == "java.lang.String":
+                v = JString(str(value))
+            else:
+                v = value
+            field.set(obj, v)
+            return True
+        except Exception:
+            return False
+
+    def _maybe_takeover(self, param):
+        if not self._b("enabled", True):
+            return
+        args = list(param.args)
+
+        if self._replaying:
+            return
+        self._log("INFO", "sendMedia: " + self._args_summary(args))
+        if self._busy:
+            self._log("WARN", "занят предыдущей обработкой")
+            return
+
+        loc, info = self._find_vei(args)
+        if info is None:
+            self._last_decision = "sendMedia без VideoEditedInfo"
+            self._log("WARN", self._last_decision)
+            return
+
+        flag = self._round_flag(info)
+        if flag is False:
+            self._last_decision = "не кружок (roundVideo=false)"
+            self._log("INFO", self._last_decision)
+            return
+
+        path, path_field = self._read_path(info)
+        if not path:
+            self._last_decision = "путь к mp4 не найден"
+            self._log("ERROR", self._last_decision)
+            return
+
+        vei_idx = loc[1] if loc[0] == "arg" else -1
+        media_idx = self._find_media_arg(args, vei_idx, path)
+        if media_idx is not None:
+            self._log("INFO", "media-аргумент: %d (%s)" % (media_idx, self._type_name(args[media_idx])))
+        else:
+            self._log("WARN", "media-аргумент с путём не найден")
+
+        method = param.method
+        chat = param.thisObject
+        self._skip_original(param)
+        self._busy = True
+        self._last_decision = "перехват: " + os.path.basename(path)
+        self._log("INFO", "ПЕРЕХВАТ %s (поле %s, loc=%s)" % (path, path_field, loc))
+        run_on_queue(
+            lambda: self._pipeline(method, chat, args, info, path, path_field,
+                                   flag, media_idx),
+            PLUGINS_QUEUE)
+
+    def _pipeline(self, method, chat, args, src_info, src_path, path_field,
+                  flag, media_idx):
+        workdir = None
+        chunks = []
+        sent = [0]
+        media_obj = args[media_idx] if media_idx is not None else None
+        saved = []
+        try:
+            probe = self._await_ready(src_path)
+            if probe is None:
+                self._last_decision = "файл не готов"
+                self._log("ERROR", self._last_decision + ": " + src_path)
+                self._fallback(method, chat, args, "файл не готов")
+                return
+            dur_ms, w, h = probe
+            self._log("INFO", "исходник: %d мс, %sx%s" % (dur_ms, w, h))
+
+            if flag is None and w and h and w != h:
+                self._log("INFO", "не квадратное — отправляю как обычно")
+                self._fallback(method, chat, args, "не кружок")
+                return
+
+            seg_us = min(self._i("segment_seconds", 59, 5, 60) * 1000000, HARD_LIMIT_US)
+            if dur_ms * 1000 <= seg_us + 1000000:
+                self._last_decision = "короткая запись (%d мс) — как обычно" % dur_ms
+                self._log("INFO", self._last_decision)
+                self._fallback(method, chat, args, "короткая запись")
+                return
+
+            workdir = self._make_workdir(src_path)
+            if not self._space_ok(src_path):
+                self._last_decision = "мало места"
+                self._log("ERROR", self._last_decision)
+                self._fallback(method, chat, args, "мало места")
+                return
+
+            bounds = self._keyframe_boundaries(src_path, seg_us, dur_ms * 1000)
+            if not bounds or len(bounds) < 2:
+                self._last_decision = "границы нарезки не найдены"
+                self._log("ERROR", self._last_decision)
+                self._fallback(method, chat, args, "границы не найдены")
+                return
+            self._log("INFO", "план: кусок %.1f с, частей %d, границы %s" % (
+                seg_us / 1e6, len(bounds) - 1, bounds))
+
+            total = len(bounds) - 1
+            for n, (s_us, e_us) in enumerate(zip(bounds[:-1], bounds[1:]), 1):
+                if n == total:
+                    e_us += 250000
+                out = os.path.join(workdir, "part_%03d.mp4" % n)
+                d_us = self._remux(src_path, out, s_us, e_us, True)
+                if not d_us:
+                    self._last_decision = "кусок %d не создан" % n
+                    self._log("ERROR", self._last_decision)
+                    self._fallback(method, chat, args, "кусок %d не создан" % n)
+                    return
+                self._log("INFO", "кусок %d/%d: %d мс, %s" % (n, total, d_us // 1000, out))
+                chunks.append((out, d_us))
+
+            BulletinHelper.show_info("UR: отправляю %d кружков…" % len(chunks))
+            ok = self._send_chunks(method, chat, args, src_info, media_obj, chunks, sent, saved)
+            if ok:
+                self._last_decision = "отправлено %d кружков" % len(chunks)
+                self._log("INFO", self._last_decision + ", файлы: " + str(workdir))
+                BulletinHelper.show_info("UR: отправлено %d кружков" % len(chunks))
+            else:
+                self._last_decision = "очередь остановлена"
+                self._log("ERROR", self._last_decision + ": " + str(workdir))
+                if sent[0] == 0:
+                    self._restore(saved)
+                    self._fallback(method, chat, args, "очередь не стартовала")
+                else:
+                    BulletinHelper.show_error("UR: очередь остановлена. Файлы: " + str(workdir))
+        except Exception:
+            self._log_exc("pipeline")
+            self._last_decision = "исключение в pipeline"
+            if sent[0] == 0:
+                self._restore(saved)
+                self._fallback(method, chat, args, "исключение")
+            else:
+                BulletinHelper.show_error("UR: ошибка. Файлы сохранены")
+        finally:
+            self._restore(saved)
+            self._busy = False
+
+    def _fallback(self, method, chat, args, reason):
+        if not self._b("fallback_original", True):
+            self._log("WARN", "fallback выключен (%s)" % reason)
+            BulletinHelper.show_error("UR: %s. Исходник сохранён" % reason)
+            return
+        self._log("WARN", "fallback: отправляю исходник (%s)" % reason)
+        self._invoke_send(method, chat, args)
+
+    def _await_ready(self, path, max_wait_s=12.0):
+        deadline = time.time() + max_wait_s
+        last = -1
+        while time.time() < deadline:
+            try:
+                sz = os.path.getsize(path)
+            except Exception:
+                return None
+            if sz > 0 and sz == last:
+                probe = self._probe(path)
+                if probe[0]:
+                    return probe
+            last = sz
+            time.sleep(0.2)
+        return None
+
+    def _save(self, saved, obj, name):
+        saved.append((obj, name, self._get_field(obj, name)))
+
+    def _restore(self, saved):
+        for obj, name, old in reversed(saved):
+            try:
+                self._set_field(obj, name, old)
+            except Exception:
+                pass
+        if saved:
+            self._dbg("восстановлено полей: %d" % len(saved))
+
+    def _apply_chunk(self, saved, src_info, media_obj, chunk_path, chunk_us):
+        ms = int(chunk_us // 1000)
+        w, h = self._probe_wh(chunk_path)
+        try:
+            size = os.path.getsize(chunk_path)
+        except Exception:
+            size = 0
+
+        targets = [src_info]
+        if media_obj is not None:
+            targets.append(media_obj)
+
+        for obj in targets:
+            for name in ("originalPath", "path", "videoPath", "resultPath", "filePath"):
+                if self._get_field(obj, name) is not None:
+                    self._save(saved, obj, name)
+                    self._set_field(obj, name, chunk_path)
+
+        for obj in targets:
+            for name in ("size", "estimatedSize"):
+                if self._get_field(obj, name) is not None:
+                    self._save(saved, obj, name)
+                    self._set_field(obj, name, size)
+            for name in ("duration", "originalDuration", "estimatedDuration", "averageDuration"):
+                if self._get_field(obj, name) is not None:
+                    self._save(saved, obj, name)
+                    self._set_field(obj, name, ms)
+            for name in ("width", "originalWidth", "resultWidth"):
+                if w and self._get_field(obj, name) is not None:
+                    self._save(saved, obj, name)
+                    self._set_field(obj, name, w)
+            for name in ("height", "originalHeight", "resultHeight"):
+                if h and self._get_field(obj, name) is not None:
+                    self._save(saved, obj, name)
+                    self._set_field(obj, name, h)
+
+        if self._get_field(src_info, "roundVideo") is not None:
+            self._set_field(src_info, "roundVideo", True)
+        return True
+
+    def _send_chunks(self, method, chat, args, src_info, media_obj, chunks, sent, saved):
+        try:
+            method.setAccessible(True)
+        except Exception:
+            pass
+        self._log("INFO", "режим очереди: подряд (мутация оригиналов)")
+
+        for n, (path, d_us) in enumerate(chunks, 1):
+            if not os.path.isfile(path):
+                self._log("ERROR", "кусок %d исчез с диска: %s" % (n, path))
+                return False
+            self._log("INFO", "кусок %d: %d байт, применяю к оригиналам" % (
+                n, os.path.getsize(path)))
+            self._apply_chunk(saved, src_info, media_obj, path, d_us)
+            self._sent_paths.add(path)
+
+            if not self._invoke_send(method, chat, args):
+                return False
+            sent[0] += 1
+            self._log("INFO", "кусок %d/%d передан в sendMedia" % (n, len(chunks)))
+            time.sleep(1.5)
+        return True
+
+    def _coerce_for_invoke(self, method, args):
+        try:
+            param_types = method.getParameterTypes()
+        except Exception:
+            return args
+        new_args = list(args)
+        changed = []
+        for i, a in enumerate(new_args):
+            if i >= len(param_types) or a is None:
+                continue
+            try:
+                pt = str(param_types[i].getName())
+            except Exception:
+                continue
+            if not isinstance(a, bool) and isinstance(a, int):
+                if pt == "int" or pt == "java.lang.Integer":
+                    new_args[i] = Integer(int(a))
+                    changed.append("%d->Integer" % i)
+                elif pt == "long" or pt == "java.lang.Long":
+                    new_args[i] = Long(int(a))
+                    changed.append("%d->Long" % i)
+                elif pt == "short" or pt == "java.lang.Short":
+                    new_args[i] = Short(int(a))
+                elif pt == "byte" or pt == "java.lang.Byte":
+                    new_args[i] = Byte(int(a))
+            elif isinstance(a, bool):
+                if pt == "boolean" or pt == "java.lang.Boolean":
+                    new_args[i] = Boolean(bool(a))
+                    changed.append("%d->Boolean" % i)
+            elif isinstance(a, float):
+                if pt == "float" or pt == "java.lang.Float":
+                    new_args[i] = Float(float(a))
+                elif pt == "double" or pt == "java.lang.Double":
+                    new_args[i] = Double(float(a))
+        if changed:
+            self._dbg("coerce: " + ", ".join(changed))
+        return new_args
+
+    def _invoke_send(self, method, chat, send_args):
+        done = threading.Event()
+        result = {"ok": False}
+
+        def call():
+            try:
+                coerced = self._coerce_for_invoke(method, send_args)
+                method.invoke(chat, self._obj_arr(coerced))
+                result["ok"] = True
+            except Exception as e:
+                self._log("ERROR", "invoke sendMedia: %s" % e)
+            finally:
+                done.set()
+
+        self._replaying = True
+        try:
+            AndroidUtilities.runOnUIThread(_UiRunnable(call))
+        except Exception as e:
+            self._replaying = False
+            self._log("ERROR", "runOnUIThread: %s" % e)
+            return False
+        if not done.wait(30):
+            self._replaying = False
+            self._log("ERROR", "sendMedia не выполнился за 30 с")
+            return False
+        self._replaying = False
+        return result["ok"]
+
+    def _probe(self, path):
+        r = MediaMetadataRetriever()
+        try:
+            r.setDataSource(path)
+            d = int(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION))
+            w = int(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH))
+            h = int(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT))
+            return d, w, h
+        except Exception:
+            return None, None, None
+        finally:
+            try:
+                r.release()
+            except Exception:
+                pass
+
+    def _probe_wh(self, path):
+        _, w, h = self._probe(path)
+        return w, h
+
+    def _track(self, ext, prefix):
+        for i in range(ext.getTrackCount()):
+            try:
+                if str(ext.getTrackFormat(i).getString("mime")).startswith(prefix):
+                    return i
+            except Exception:
+                pass
+        return -1
+
+    def _max_input_size(self, fmt, default=1048576):
+        try:
+            v = int(fmt.getInteger("max-input-size"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        return default
+
+    def _make_workdir(self, src_path):
+        ts = str(int(time.time()))
+        try:
+            d = os.path.join(os.path.dirname(src_path), "LRV_parts", ts)
+            os.makedirs(d, exist_ok=True)
+            probe_f = os.path.join(d, ".w")
+            with open(probe_f, "wb") as fh:
+                fh.write(b"1")
+            os.remove(probe_f)
+            self._log("INFO", "рабочая папка: " + d)
+            return d
+        except Exception:
+            pass
+        base = str(ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath())
+        d = os.path.join(base, "long_round", ts)
+        os.makedirs(d, exist_ok=True)
+        self._log("INFO", "рабочая папка (cache): " + d)
+        return d
+
+    def _keyframe_boundaries(self, path, seg_us, total_us):
+        ext = MediaExtractor()
+        try:
+            ext.setDataSource(path)
+            vt = self._track(ext, "video/")
+            if vt < 0:
+                return None
+            ext.selectTrack(vt)
+            keys = []
+            while True:
+                pts = ext.getSampleTime()
+                if pts < 0:
+                    break
+                if ext.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC:
+                    keys.append(int(pts))
+                if not ext.advance():
+                    break
+            if not keys:
+                return None
+            self._log("INFO", "ключевых кадров: %d, последний=%d" % (len(keys), keys[-1]))
+
+            seg_us = min(seg_us, HARD_LIMIT_US)
+            bounds = [0]
+            cur = 0
+            guard = 0
+            while total_us - cur > seg_us:
+                guard += 1
+                if guard > 500:
+                    self._log("ERROR", "слишком много кусков, стоп")
+                    return None
+                le = [k for k in keys if cur < k <= cur + seg_us]
+                if le:
+                    b = max(le)
+                else:
+                    nxt = [k for k in keys if cur < k <= cur + HARD_LIMIT_US]
+                    if not nxt:
+                        self._log("ERROR", "ключевые кадры реже 60 с — lossless невозможен")
+                        return None
+                    b = min(nxt)
+                bounds.append(b)
+                cur = b
+            bounds.append(total_us)
+            if len(bounds) >= 3 and (bounds[-1] - bounds[-2]) < 1500000:
+                if (bounds[-1] - bounds[-3]) <= HARD_LIMIT_US:
+                    bounds.pop(-2)
+            return bounds
+        except Exception:
+            self._log_exc("keyframe scan")
+            return None
+        finally:
+            try:
+                ext.release()
+            except Exception:
+                pass
+
+    def _remux(self, src, out, s_us, e_us, keep_audio):
+        ext = MediaExtractor()
+        mux = None
+        started = False
+        want_audio = False
+        try:
+            ext.setDataSource(src)
+            vt = self._track(ext, "video/")
+            has_audio = self._track(ext, "audio/") >= 0
+            at = self._track(ext, "audio/") if keep_audio else -1
+            want_audio = keep_audio and has_audio
+            if vt < 0:
+                return 0
+
+            v_fmt = ext.getTrackFormat(vt)
+            cap = max(self._max_input_size(v_fmt), 1048576)
+            if at >= 0:
+                cap = max(cap, self._max_input_size(ext.getTrackFormat(at)))
+            buf = ByteBuffer.allocateDirect(cap)
+
+            mux = MediaMuxer(out, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            v_idx = mux.addTrack(v_fmt)
+            a_idx = mux.addTrack(ext.getTrackFormat(at)) if at >= 0 else -1
+            if v_idx < 0 or (at >= 0 and a_idx < 0):
+                self._log("ERROR", "addTrack не удался")
+                return 0
+            mux.start()
+            started = True
+
+            ext.selectTrack(vt)
+            if at >= 0:
+                ext.selectTrack(at)
+            ext.seekTo(s_us, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+
+            info = MediaCodec.BufferInfo()
+            wrote_video = 0
+            wrote_audio = 0
+            while True:
+                ti = ext.getSampleTrackIndex()
+                if ti < 0:
+                    break
+                pts = int(ext.getSampleTime())
+                if ti == vt and pts >= e_us:
+                    break
+                if s_us <= pts < e_us and ti in (vt, at):
+                    buf.clear()
+                    size = ext.readSampleData(buf, 0)
+                    if size < 0:
+                        cap *= 2
+                        buf = ByteBuffer.allocateDirect(cap)
+                        size = ext.readSampleData(buf, 0)
+                    if size > 0:
+                        info.offset = 0
+                        info.size = size
+                        info.presentationTimeUs = pts - s_us
+                        info.flags = ext.getSampleFlags()
+                        mux.writeSampleData(v_idx if ti == vt else a_idx, buf, info)
+                        if ti == vt:
+                            wrote_video += 1
+                        else:
+                            wrote_audio += 1
+                if not ext.advance():
+                    break
+
+            mux.stop()
+            started = False
+            if wrote_video == 0 or (want_audio and wrote_audio == 0):
+                self._log("ERROR", "пустой кусок: video=%d audio=%d" % (wrote_video, wrote_audio))
+                return 0
+        except Exception:
+            self._log_exc("remux")
+            return 0
+        finally:
+            try:
+                ext.release()
+            except Exception:
+                pass
+            if mux is not None:
+                try:
+                    if started:
+                        mux.stop()
+                except Exception:
+                    pass
+                try:
+                    mux.release()
+                except Exception:
+                    pass
+
+        check = MediaExtractor()
+        try:
+            check.setDataSource(out)
+            has_v = self._track(check, "video/") >= 0
+            has_a = self._track(check, "audio/") >= 0
+            if not has_v or (want_audio and not has_a):
+                self._log("ERROR", "валидация куска: v=%s a=%s" % (has_v, has_a))
+                return 0
+        except Exception:
+            return 0
+        finally:
+            try:
+                check.release()
+            except Exception:
+                pass
+        d_ms, _, _ = self._probe(out)
+        if not d_ms or d_ms <= 0 or d_ms > 60000:
+            self._log("ERROR", "длительность куска вне допуска: %s мс" % d_ms)
+            return 0
+        return d_ms * 1000
+
+    def _space_ok(self, src):
+        try:
+            free = int(ApplicationLoader.applicationContext.getCacheDir().getUsableSpace())
+            need = int(os.path.getsize(src) * 1.2) + 16 * 1048576
+            return free > need
+        except Exception:
+            return True
