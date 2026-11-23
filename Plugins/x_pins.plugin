@@ -1,0 +1,3005 @@
+__name__ = "X-Pins"
+__description__ = "Локальные закреплённые чаты сверх лимита Telegram."
+__version__ = "1.0"
+__author__ = "@Somewhat_empty"
+__id__ = "x_pins"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+__icon__ = "Remilia_Scarlet_by_fStikBot/16"
+__category__ = ["chats", "tools"]
+
+locales = {
+    "en": {"desc": "Local pinned chats beyond the Telegram limit, no server calls."},
+    "ru": {"desc": "Локальные закреплённые чаты сверх лимита, без запросов к серверу."},
+}
+
+import threading
+import time
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class, get_private_field
+from ui.settings import Divider, Header, Text
+from ui.bulletin import BulletinHelper
+from android_utils import OnClickListener, run_on_ui_thread
+from client_utils import get_last_fragment
+from java import dynamic_proxy, jclass, jint, jlong
+
+MENU_ID = "x_pins_toggle"
+DIALOG_MENU_ID = "x_pins_dialog"
+AUTHOR_USER_ID = 7667805183
+
+HEADER_STICKER_SET = "Remilia_Scarlet_by_fStikBot"
+HEADER_STICKER_INDEX = 12
+
+_PROXY_CLS = {}
+
+
+def variants(core):
+    out = [core, -core]
+    for base in (core, -core):
+        v = base + (1 << 63)
+        if v >= (1 << 63):
+            v -= (1 << 64)
+        out.append(v)
+    res = []
+    for x in out:
+        if x not in res:
+            res.append(x)
+    return res
+
+
+def _as_int(v):
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def elem_id(e):
+    if e is None:
+        return None
+    if isinstance(e, int):
+        return e if e else None
+    for attr in ("id", "dialog_id", "peerId"):
+        try:
+            v = getattr(e, attr)
+        except Exception:
+            continue
+        iv = _as_int(v)
+        if iv:
+            return iv
+    v = _as_int(e)
+    if v:
+        return v
+    try:
+        v = _as_int(e.getDialogId())
+    except Exception:
+        v = None
+    return v if v else None
+
+
+def _is_real_dialog(did):
+    if not did:
+        return False
+    try:
+        return 0 < abs(int(did)) < (1 << 52)
+    except Exception:
+        return False
+
+
+def _runnable_proxy(fn):
+    cls = _PROXY_CLS.get("runnable")
+    if cls is None:
+        Runnable = jclass("java.lang.Runnable")
+
+        class _PyRunnable(dynamic_proxy(Runnable)):
+            def __init__(self, cb):
+                super().__init__()
+                self._cb = cb
+
+            def run(self):
+                self._cb()
+
+        cls = _PyRunnable
+        _PROXY_CLS["runnable"] = cls
+    return cls(fn)
+
+
+def _touch_proxy(fn):
+    cls = _PROXY_CLS.get("touch")
+    if cls is None:
+        OnTouchListener = jclass("android.view.View$OnTouchListener")
+
+        class _PyTouch(dynamic_proxy(OnTouchListener)):
+            def __init__(self, cb):
+                super().__init__()
+                self._cb = cb
+
+            def onTouch(self, v, ev):
+                return bool(self._cb(v, ev))
+
+        cls = _PyTouch
+        _PROXY_CLS["touch"] = cls
+    return cls(fn)
+
+
+class XPinsPlugin(BasePlugin):
+    AUTO_EVERY = 2.0
+    MEDIA_LABELS = {0: "", 1: "фото", 2: "видео", 3: "gif", 4: "фото",
+                    5: "видео", 6: "файл", 7: "аудио", 8: "голос",
+                    9: "стикер", 10: "документ", 11: "опрос", 12: "опрос",
+                    13: "игра", 14: "контакт", 15: "место", 16: "веб-страница",
+                    17: "гео", 18: "редактируется"}
+
+    def __init__(self):
+        super().__init__()
+        self._ui_proxies = []
+        self._header_hooks = []
+        self._unloaded = False
+        self.log_lines = []
+        self.last_chat = 0
+        self._idx_cache = {}
+        self._last_active_fid = 0
+        self._menu_label = None
+        self._dialog_menu_added = False
+        self._menu_sync_did = 0
+        self._cached_df = None
+        self._cls_uc = None
+        self._cls_mc = None
+
+    def on_plugin_load(self):
+        try:
+            self.last_chat = int(self.get_setting("last_chat", 0) or 0)
+        except Exception:
+            self.last_chat = 0
+        try:
+            self.refresh_menu(0)
+        except Exception as exc:
+            self.l("menu init err: %r" % (exc,))
+        self._setup_settings_header_hook()
+        self._auto_start()
+        try:
+            run_on_ui_thread(self.lift_now)
+        except Exception as exc:
+            self.l("lift init err: %r" % (exc,))
+        self.l("load: pinned=%d" % len(self.pinned()))
+
+    def on_plugin_unload(self):
+        self._unloaded = True
+        self._menu_label = None
+        self._dialog_menu_added = False
+        for mid in (MENU_ID, DIALOG_MENU_ID):
+            try:
+                self.remove_menu_item(mid)
+            except Exception:
+                pass
+        for ref in getattr(self, "_header_hooks", []):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._header_hooks = []
+
+        def _cleanup():
+            for fid, _t, _o in self.get_folders():
+                for did in self._load(fid):
+                    try:
+                        self._clear_pin_flag(did, fid)
+                    except Exception:
+                        pass
+            self._sort_dialogs_safe()
+            self.reload_dialogs()
+        try:
+            run_on_ui_thread(_cleanup)
+        except Exception:
+            _cleanup()
+
+    def _auto_start(self):
+        try:
+            if getattr(self, "_auto_on", False):
+                return True
+            self._auto_on = True
+            th = threading.Thread(target=self._auto_loop, name="x-pins-auto")
+            th.daemon = True
+            th.start()
+            return True
+        except Exception as exc:
+            self.l("auto start err: %r" % (exc,))
+            return False
+
+    def _auto_loop(self):
+        last_lift = 0.0
+        while not getattr(self, "_unloaded", False):
+            try:
+                time.sleep(0.25)
+            except Exception:
+                break
+            try:
+                if not self.is_on():
+                    continue
+                frag = get_last_fragment()
+                if frag is None:
+                    continue
+                cname = str(frag.getClass().getName()).lower()
+
+                if "chatactivity" in cname:
+                    did = self._chat_id_from_frag(frag)
+                    if did and did != self._menu_sync_did:
+                        self._menu_sync_did = did
+                        run_on_ui_thread(lambda d=did: self._sync_chat_menu(d))
+                    continue
+
+                if self._menu_sync_did != 0:
+                    self._menu_sync_did = 0
+                    if self._menu_label != "Закрепить локально":
+                        run_on_ui_thread(lambda: self._sync_chat_menu(0))
+
+                is_dialogs = ("dialogsactivity" in cname or "maintabsactivity" in cname or cname.endswith("dialogs"))
+                if not is_dialogs:
+                    continue
+
+                now = time.monotonic()
+                if self.get_setting("auto_lift", True) and (now - last_lift) >= self.AUTO_EVERY:
+                    last_lift = now
+                    run_on_ui_thread(self.lift_now)
+            except Exception:
+                pass
+        self._auto_on = False
+
+    def _dialogs_open(self):
+        try:
+            frag = get_last_fragment()
+        except Exception:
+            return True
+        if frag is None:
+            return False
+        try:
+            cname = str(frag.getClass().getName())
+        except Exception:
+            return False
+        low = cname.lower()
+        if "dialogsactivity" in low or "maintabsactivity" in low or low.endswith("dialogs"):
+            return True
+        if "chatactivity" in low:
+            return False
+        return "dialog" in low
+
+    def _account(self):
+        uc = getattr(self, "_cls_uc", None)
+        if uc is None:
+            for loader in (
+                lambda: find_class("org.telegram.messenger.UserConfig"),
+                lambda: jclass("org.telegram.messenger.UserConfig"),
+            ):
+                try:
+                    uc = loader()
+                    if uc is not None:
+                        self._cls_uc = uc
+                        break
+                except Exception:
+                    continue
+        if uc is not None:
+            try:
+                acc = _as_int(getattr(uc, "selectedAccount", None))
+                if acc is not None and acc >= 0:
+                    return acc
+            except Exception:
+                pass
+        return 0
+
+    def _mc(self):
+        try:
+            cls = getattr(self, "_cls_mc", None)
+            if cls is None:
+                cls = find_class("org.telegram.messenger.MessagesController")
+                if cls is None:
+                    cls = jclass("org.telegram.messenger.MessagesController")
+                self._cls_mc = cls
+            acc = self._account()
+            try:
+                return cls.getInstance(jint(acc))
+            except Exception:
+                return cls.getInstance(jint(0))
+        except Exception:
+            return None
+
+    def _activity(self):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return None
+            return frag.getParentActivity()
+        except Exception:
+            return None
+
+    def get_folders(self):
+        out = []
+        seen = set()
+        mc = self._mc()
+        if mc is not None:
+            try:
+                filters = getattr(mc, "dialogFilters", None)
+                n = int(filters.size()) if filters is not None else 0
+                for i in range(n):
+                    f = filters.get(i)
+                    if f is None:
+                        continue
+                    fid = _as_int(getattr(f, "id", None))
+                    is_def = False
+                    try:
+                        fn_def = getattr(f, "isDefault", None)
+                        is_def = bool(fn_def()) if callable(fn_def) else (fid == 0)
+                    except Exception:
+                        is_def = (fid == 0)
+                    if is_def or fid == 0:
+                        if 0 not in seen:
+                            out.append((0, "Все", None))
+                            seen.add(0)
+                        continue
+                    if fid is None or fid <= 0 or fid in seen:
+                        continue
+                    title = ""
+                    try:
+                        title = str(getattr(f, "name", "") or "").strip()
+                    except Exception:
+                        title = ""
+                    if not title:
+                        title = "Папка %d" % fid
+                    out.append((int(fid), title, f))
+                    seen.add(int(fid))
+            except Exception as exc:
+                self.l("folders err: %r" % (exc,))
+        if 0 not in seen:
+            out.insert(0, (0, "Все", None))
+        return out
+
+    def _folder_obj(self, fid):
+        fid = int(fid or 0)
+        if fid == 0:
+            return None
+        mc = self._mc()
+        if mc is None:
+            return None
+        try:
+            filters = getattr(mc, "dialogFilters", None)
+            n = int(filters.size()) if filters is not None else 0
+            for i in range(n):
+                f = filters.get(i)
+                if f is not None and _as_int(getattr(f, "id", None)) == fid:
+                    return f
+        except Exception:
+            pass
+        return None
+
+    def _folder_name(self, fid):
+        fid = int(fid or 0)
+        for f_id, title, _f_obj in self.get_folders():
+            if f_id == fid:
+                return title
+        return "Все" if fid == 0 else ("Папка %d" % fid)
+
+    def _find_dialogs_fragment(self):
+        cached = getattr(self, "_cached_df", None)
+        if cached is not None:
+            try:
+                act = cached.getParentActivity()
+                finishing = bool(self._get_obj_field(cached, ("isFinishing",)))
+                if act is not None and not finishing:
+                    return cached
+            except Exception:
+                pass
+            self._cached_df = None
+
+        candidates = []
+        try:
+            frag = get_last_fragment()
+        except Exception:
+            frag = None
+        if frag is not None:
+            try:
+                layout = frag.getParentLayout()
+                stack = layout.getFragmentStack() if layout is not None else None
+                if stack is not None:
+                    for i in range(int(stack.size())):
+                        candidates.append(stack.get(i))
+            except Exception:
+                pass
+            candidates.append(frag)
+
+        if not candidates:
+            try:
+                act = self._activity()
+                if act is not None:
+                    for mname in ("getActionBarLayout", "getMainFragmentsStack"):
+                        fn = getattr(act, mname, None)
+                        if not callable(fn):
+                            continue
+                        res = fn()
+                        stack = res.getFragmentStack() if hasattr(res, "getFragmentStack") else res
+                        if stack is None:
+                            continue
+                        for i in range(int(stack.size())):
+                            candidates.append(stack.get(i))
+            except Exception:
+                pass
+
+        seen = set()
+        System = jclass("java.lang.System")
+        for c in candidates:
+            if c is None:
+                continue
+            try:
+                h = int(System.identityHashCode(c))
+            except Exception:
+                h = id(c)
+            if h in seen:
+                continue
+            seen.add(h)
+            found = self._unwrap_dialogs_fragment(c, 0)
+            if found is not None:
+                self._cached_df = found
+                return found
+        return None
+
+    def _unwrap_dialogs_fragment(self, obj, depth=0):
+        if obj is None or depth > 2:
+            return None
+        try:
+            cname = str(obj.getClass().getName())
+        except Exception:
+            return None
+        if "DialogsActivity" in cname:
+            return obj
+        if not ("MainTabs" in cname or "ViewPager" in cname or "Dialogs" in cname):
+            return None
+        for mname in ("getDialogsActivity", "getCurrentVisibleFragment", "getCurrentFragment"):
+            try:
+                fn = getattr(obj, mname, None)
+                if callable(fn):
+                    res = self._unwrap_dialogs_fragment(fn(), depth + 1)
+                    if res is not None:
+                        return res
+            except Exception:
+                continue
+        cls = None
+        try:
+            cls = obj.getClass()
+        except Exception:
+            cls = None
+        cdepth = 0
+        while cls is not None and cdepth < 3:
+            try:
+                fields = list(cls.getDeclaredFields())
+            except Exception:
+                fields = []
+            for fld in fields:
+                try:
+                    tname = str(fld.getType().getName())
+                except Exception:
+                    tname = ""
+                if not (
+                    "DialogsActivity" in tname
+                    or "MainTabs" in tname
+                    or "ViewPager" in tname
+                    or "BaseFragment" in tname
+                    or "SparseArray" in tname
+                    or "List" in tname
+                    or tname.startswith("[Lorg.telegram.ui.")
+                ):
+                    continue
+                try:
+                    fld.setAccessible(True)
+                    val = fld.get(obj)
+                except Exception:
+                    continue
+                if val is None or val is obj:
+                    continue
+                try:
+                    vc = str(val.getClass().getName())
+                except Exception:
+                    continue
+                if "DialogsActivity" in vc:
+                    return val
+                if "SparseArray" in vc:
+                    try:
+                        for i in range(int(val.size())):
+                            res = self._unwrap_dialogs_fragment(val.valueAt(i), depth + 1)
+                            if res is not None:
+                                return res
+                    except Exception:
+                        pass
+                elif "ArrayList" in vc or "List" in vc:
+                    try:
+                        for i in range(min(int(val.size()), 12)):
+                            res = self._unwrap_dialogs_fragment(val.get(i), depth + 1)
+                            if res is not None:
+                                return res
+                    except Exception:
+                        pass
+                elif vc.startswith("[Lorg.telegram.ui."):
+                    try:
+                        for i in range(min(len(val), 12)):
+                            res = self._unwrap_dialogs_fragment(val[i], depth + 1)
+                            if res is not None:
+                                return res
+                    except Exception:
+                        pass
+                elif depth < 1 and ("MainTabs" in vc or "ViewPager" in vc):
+                    res = self._unwrap_dialogs_fragment(val, depth + 1)
+                    if res is not None:
+                        return res
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                break
+            cdepth += 1
+        return None
+
+    def _find_filter_tabs_view(self, df):
+        if df is not None:
+            tabs = self._get_obj_field(df, ("filterTabsView", "tabsView"))
+            if tabs is not None:
+                return tabs
+
+        roots = []
+        if df is not None:
+            try:
+                rv = df.getFragmentView()
+                if rv is not None:
+                    roots.append(rv)
+            except Exception:
+                pass
+        try:
+            act = self._activity()
+            if act is not None:
+                dv = act.getWindow().getDecorView()
+                if dv is not None:
+                    roots.append(dv)
+        except Exception:
+            pass
+
+        def walk(v, depth=0):
+            if v is None or depth > 14:
+                return None
+            try:
+                if "FilterTabsView" in str(v.getClass().getSimpleName()):
+                    return v
+            except Exception:
+                pass
+            try:
+                n = int(v.getChildCount())
+            except Exception:
+                return None
+            for i in range(min(n, 35)):
+                try:
+                    found = walk(v.getChildAt(i), depth + 1)
+                    if found is not None:
+                        return found
+                except Exception:
+                    continue
+            return None
+
+        for root in roots:
+            found = walk(root, 0)
+            if found is not None:
+                return found
+        return None
+
+    def _match_tab_to_folder(self, tab, folders):
+        if tab is None:
+            return None
+        try:
+            if bool(getattr(tab, "isDefault", False)):
+                return 0
+        except Exception:
+            pass
+
+        tid = _as_int(getattr(tab, "id", None))
+        sid = _as_int(getattr(tab, "stableId", None))
+        if tid == 2147483647 or sid == 2147483647:
+            return 0
+
+        if sid is not None and sid > 0:
+            for fid, _title, _f_obj in folders:
+                if fid != 0 and sid == fid:
+                    return int(fid)
+
+        ttitle = ""
+        try:
+            ttitle = str(getattr(tab, "title", "") or "").strip()
+        except Exception:
+            ttitle = ""
+
+        if ttitle:
+            title_matches = [
+                (fid, f_obj) for fid, title, f_obj in folders
+                if fid != 0 and title.strip() == ttitle
+            ]
+            if len(title_matches) == 1:
+                return int(title_matches[0][0])
+            if len(title_matches) > 1:
+                for fid, f_obj in title_matches:
+                    lid = _as_int(getattr(f_obj, "localId", None))
+                    if (sid is not None and sid == fid) or (tid is not None and lid is not None and tid == lid):
+                        return int(fid)
+                return int(title_matches[0][0])
+
+        if tid is not None:
+            for fid, _title, f_obj in folders:
+                if fid != 0 and f_obj is not None:
+                    lid = _as_int(getattr(f_obj, "localId", None))
+                    if lid is not None and tid == lid:
+                        return int(fid)
+            for fid, _title, _f_obj in folders:
+                if fid != 0 and tid == fid:
+                    return int(fid)
+        return None
+
+    def _active_folder_id(self):
+        folders = self.get_folders()
+        valid_custom = {fid for fid, _t, _o in folders if fid != 0}
+        acc = self._account()
+
+        try:
+            mc = self._mc()
+            if mc is not None:
+                sdf = self._get_obj_field(mc, ("selectedDialogFilter",))
+                f0 = sdf[0] if (sdf is not None and len(sdf) > 0) else None
+                if f0 is not None:
+                    is_def = False
+                    try:
+                        fn_def = getattr(f0, "isDefault", None)
+                        is_def = bool(fn_def()) if callable(fn_def) else False
+                    except Exception:
+                        is_def = False
+                    if not is_def:
+                        sfid = _as_int(getattr(f0, "id", None))
+                        if sfid is not None and sfid in valid_custom:
+                            self._last_active_fid = int(sfid)
+                            return int(sfid)
+        except Exception as exc:
+            self.l("active_folder sdf err: %r" % (exc,))
+
+        df = self._find_dialogs_fragment()
+
+        try:
+            tabs = self._find_filter_tabs_view(df)
+            if tabs is not None:
+                cur_tab = None
+                try:
+                    fn_ct = getattr(tabs, "getCurrentTab", None)
+                    if callable(fn_ct):
+                        cur_tab = fn_ct()
+                except Exception:
+                    cur_tab = None
+
+                if cur_tab is not None:
+                    matched = self._match_tab_to_folder(cur_tab, folders)
+                    if matched is not None:
+                        self._last_active_fid = int(matched)
+                        return int(matched)
+
+                tabs_arr = self._get_obj_field(tabs, ("tabs",))
+                tid = None
+                try:
+                    tid = _as_int(tabs.getCurrentTabId())
+                except Exception:
+                    tid = _as_int(self._get_obj_field(tabs, ("selectedTabId",)))
+
+                if tid == 2147483647:
+                    self._last_active_fid = 0
+                    return 0
+
+                if tabs_arr is not None and tid is not None:
+                    try:
+                        for i in range(int(tabs_arr.size())):
+                            t = tabs_arr.get(i)
+                            if _as_int(getattr(t, "id", None)) == tid:
+                                matched = self._match_tab_to_folder(t, folders)
+                                if matched is not None:
+                                    self._last_active_fid = int(matched)
+                                    return int(matched)
+                                break
+                    except Exception:
+                        pass
+
+                pos = _as_int(self._get_obj_field(tabs, ("currentPosition", "selectedTabPosition")))
+                if tabs_arr is not None and pos is not None and 0 <= pos < int(tabs_arr.size()):
+                    matched = self._match_tab_to_folder(tabs_arr.get(pos), folders)
+                    if matched is not None:
+                        self._last_active_fid = int(matched)
+                        return int(matched)
+                if pos is not None and 0 <= pos < len(folders):
+                    fid = int(folders[pos][0])
+                    self._last_active_fid = fid
+                    return fid
+        except Exception as exc:
+            self.l("active_folder tabs err: %r" % (exc,))
+
+        if df is not None:
+            try:
+                vps = self._get_obj_field(df, ("viewPages",))
+                vp0 = vps[0] if (vps is not None and len(vps) > 0) else None
+                if vp0 is not None:
+                    da = self._get_obj_field(vp0, ("dialogsAdapter",))
+                    if da is None:
+                        lv = self._get_obj_field(vp0, ("listView",))
+                        if lv is not None:
+                            try:
+                                da = lv.getAdapter()
+                            except Exception:
+                                da = None
+                    da_type = _as_int(self._get_obj_field(da, ("dialogsType",))) if da is not None else None
+                    da_fid = _as_int(self._get_obj_field(da, ("folderId",))) if da is not None else None
+                    if da_type is None:
+                        da_type = _as_int(self._get_obj_field(vp0, ("selectedType", "dialogsType")))
+                    if da_fid is None:
+                        da_fid = 0
+
+                    if da_type is not None:
+                        active_list = None
+                        DA = find_class("org.telegram.ui.DialogsActivity") or jclass("org.telegram.ui.DialogsActivity")
+                        for args in (
+                            (jint(acc), jint(da_type), jint(da_fid), False),
+                            (jint(acc), jint(da_type), jint(da_fid)),
+                        ):
+                            try:
+                                active_list = DA.getDialogsArray(*args)
+                                if active_list is not None:
+                                    break
+                            except Exception:
+                                continue
+                        if active_list is not None:
+                            System = jclass("java.lang.System")
+                            active_hash = int(System.identityHashCode(active_list))
+                            for fid, _title, f_obj in folders:
+                                if fid != 0 and f_obj is not None:
+                                    fd = getattr(f_obj, "dialogs", None)
+                                    if fd is not None and int(System.identityHashCode(fd)) == active_hash:
+                                        self._last_active_fid = int(fid)
+                                        return int(fid)
+                            main_lst = self._dialogs_list(0)
+                            if main_lst is not None and int(System.identityHashCode(main_lst)) == active_hash:
+                                self._last_active_fid = 0
+                                return 0
+            except Exception as exc:
+                self.l("active_folder vp err: %r" % (exc,))
+
+        return int(getattr(self, "_last_active_fid", 0) or 0)
+
+    def _active_folder_id_fast(self):
+        try:
+            mc = self._mc()
+            if mc is not None:
+                sdf = self._get_obj_field(mc, ("selectedDialogFilter",))
+                f0 = sdf[0] if (sdf is not None and len(sdf) > 0) else None
+                if f0 is not None:
+                    fn_def = getattr(f0, "isDefault", None)
+                    is_def = bool(fn_def()) if callable(fn_def) else False
+                    if is_def:
+                        self._last_active_fid = 0
+                        return 0
+                    sfid = _as_int(getattr(f0, "id", None))
+                    if sfid and sfid > 0:
+                        self._last_active_fid = int(sfid)
+                        return int(sfid)
+        except Exception:
+            pass
+        return int(getattr(self, "_last_active_fid", 0) or 0)
+
+    def _folder_contains(self, fid, did):
+        fid = int(fid or 0)
+        if fid == 0:
+            return True
+        lst = self._dialogs_list(fid)
+        vset = set(variants(int(did)))
+        if lst is not None:
+            try:
+                n = int(lst.size())
+                for i in range(n):
+                    k = elem_id(lst.get(i))
+                    if k is not None and k in vset:
+                        return True
+            except Exception:
+                pass
+        f = self._folder_obj(fid)
+        if f is not None:
+            try:
+                AI = find_class("org.telegram.messenger.AccountInstance") or jclass("org.telegram.messenger.AccountInstance")
+                ai = AI.getInstance(jint(self._account()))
+                if bool(f.includesDialog(ai, jlong(int(did)))):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _target_folder_for_chat(self, did):
+        fid = self._active_folder_id()
+        if fid == 0:
+            return 0
+        if self._folder_contains(fid, did):
+            return fid
+
+        lst = self._dialogs_list(fid)
+        try:
+            has_items = lst is not None and int(lst.size()) > 0
+        except Exception:
+            has_items = False
+        if not has_items:
+            return fid
+        return 0
+
+    def _load(self, fid=0):
+        try:
+            raw = self.get_setting(self._skey("pins", fid), "") or ""
+        except Exception:
+            return []
+        out = []
+        for part in str(raw).replace("\n", ",").split(","):
+            part = part.strip().replace(" ", "")
+            if part and part.lstrip("-").isdigit():
+                v = int(part)
+                if _is_real_dialog(v) and v not in out:
+                    out.append(v)
+        return out
+
+    def _save(self, ids, fid=0):
+        try:
+            self.set_setting(self._skey("pins", fid), ",".join(str(x) for x in ids))
+        except Exception as exc:
+            self.l("save err: %r" % (exc,))
+
+    def pinned(self, fid=0):
+        return self._load(fid)
+
+    def _server_raw(self, fid=0):
+        fid = int(fid or 0)
+        mc = self._mc()
+        if mc is None:
+            return []
+        if fid != 0:
+            out = []
+            try:
+                f = self._folder_obj(fid)
+                pd = getattr(f, "pinnedDialogs", None) if f is not None else None
+                if pd is not None:
+                    n = int(pd.size())
+                    for i in range(n):
+                        k = _as_int(pd.keyAt(i))
+                        v = _as_int(pd.valueAt(i))
+                        if k is not None and v is not None:
+                            out.append((int(k), int(v)))
+                    out.sort(key=lambda p: p[1])
+                    out = [k for k, _v in out]
+            except Exception as exc:
+                self.l("server raw folder err: %r" % (exc,))
+            return [int(x) for x in out if x and _is_real_dialog(x) and int(x) not in self._local_variants(fid)]
+
+        out = []
+        try:
+            got = mc.getDialogs(0)
+            if got is not None:
+                n = int(got.size())
+                pinned_objs = []
+                non_pinned_streak = 0
+                for i in range(n):
+                    d = got.get(i)
+                    if d is None:
+                        continue
+                    did = elem_id(d)
+                    if not did or not _is_real_dialog(did):
+                        continue
+                    if self._flag(d, "pinned"):
+                        pinned_objs.append((int(did), self._num(d, "pinnedNum")))
+                        non_pinned_streak = 0
+                    else:
+                        non_pinned_streak += 1
+                        if non_pinned_streak >= 25:
+                            break
+                pinned_objs.sort(key=lambda p: -p[1])
+                out = [did for did, _pnum in pinned_objs]
+        except Exception:
+            out = []
+        local_v = self._local_variants(0)
+        return [int(x) for x in out if x and _is_real_dialog(x) and int(x) not in local_v]
+
+    def _local_variants(self, fid=0):
+        out = set()
+        for d in self._load(fid):
+            out.update(variants(int(d)))
+        return out
+
+    @staticmethod
+    def _flag(obj, name):
+        try:
+            return bool(getattr(obj, name))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _num(obj, name):
+        try:
+            return int(getattr(obj, name))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _skey(base, fid=0):
+        fid = int(fid or 0)
+        return base if fid == 0 else "%s_%d" % (base, fid)
+
+    def _load_order(self, fid=0):
+        out = []
+        try:
+            raw = str(self.get_setting(self._skey("server_order", fid), "") or "")
+        except Exception:
+            return []
+        for part in raw.replace("\n", ",").split(","):
+            part = part.strip().replace(" ", "")
+            if part and part.lstrip("-").isdigit():
+                v = int(part)
+                if _is_real_dialog(v) and v not in out:
+                    out.append(v)
+        return out
+
+    def _save_order(self, ids, fid=0):
+        try:
+            self.set_setting(self._skey("server_order", fid), ",".join(str(int(x)) for x in ids))
+        except Exception as exc:
+            self.l("server order save err: %r" % (exc,))
+
+    def server_pinned(self, fid=0):
+        actual = self._server_raw(fid)
+        saved = self._load_order(fid)
+        if not actual:
+            return saved
+        if not saved:
+            return actual
+        if sorted(set(actual)) == sorted(set(saved)):
+            return saved
+        self._save_order(actual, fid)
+        return actual
+
+    def pin_kind(self, did, fid=0):
+        if not did:
+            return None
+        for v in variants(int(did)):
+            if v in self.server_pinned(fid):
+                return "server"
+        return "local" if self.is_pinned(did, fid) else None
+
+    def apply_server(self, target, fid=0):
+        target = [int(x) for x in target if _is_real_dialog(x)]
+        if not target:
+            self._save_order([], fid)
+            return True
+        fid = int(fid or 0)
+        if fid != 0:
+            self._save_order(target, fid)
+            return True
+        mc = self._mc()
+        if mc is not None:
+            try:
+                ArrayList = jclass("java.util.ArrayList")
+                Long = jclass("java.lang.Long")
+                j_order = ArrayList()
+                for did in target:
+                    j_order.add(Long.valueOf(jlong(did)))
+                reordered = False
+                for args in (
+                    (jint(0), j_order, jlong(0)),
+                    (jint(0), j_order, jlong(0), True),
+                ):
+                    try:
+                        res = mc.reorderPinnedDialogs(*args)
+                        if res is not False:
+                            reordered = True
+                            break
+                    except Exception:
+                        continue
+                self.l("reorder: %s" % ("ok" if reordered else "local-only"))
+            except Exception as exc:
+                self.l("reorder err: %r" % (exc,))
+        self._save_order(target)
+        return True
+
+    def _load_custom_order(self, fid=0):
+        out = []
+        try:
+            raw = str(self.get_setting(self._skey("custom_order", fid), "") or "")
+        except Exception:
+            return []
+        for part in raw.replace("\n", ",").split(","):
+            part = part.strip().replace(" ", "")
+            if part and part.lstrip("-").isdigit():
+                v = int(part)
+                if _is_real_dialog(v) and v not in out:
+                    out.append(v)
+        return out
+
+    def _save_custom_order(self, ids, fid=0):
+        clean = [int(x) for x in ids if _is_real_dialog(x)]
+        try:
+            self.set_setting(self._skey("custom_order", fid), ",".join(str(x) for x in clean))
+        except Exception as exc:
+            self.l("custom order save err: %r" % (exc,))
+
+    def desired_order(self, fid=0):
+        srv = [int(x) for x in self.server_pinned(fid) if _is_real_dialog(x)]
+        loc = [int(x) for x in self._load(fid) if _is_real_dialog(x)]
+
+        active_map = {}
+        active_default = []
+        for did in srv + loc:
+            vs = variants(did)
+            if any(v in active_map for v in vs):
+                continue
+            for v in vs:
+                active_map[v] = did
+            active_default.append(did)
+
+        if not active_default:
+            return []
+
+        saved = self._load_custom_order(fid)
+        if not saved:
+            return active_default
+
+        out = []
+        seen = set()
+        for did in saved:
+            canon = active_map.get(did)
+            if canon is not None and canon not in seen:
+                out.append(canon)
+                seen.add(canon)
+
+        new_srv = [d for d in srv if d not in seen]
+        new_loc = [d for d in loc if d not in seen]
+        return new_loc + new_srv + out
+
+    def apply_order(self, new_order, fid=0):
+        clean = []
+        seen_v = set()
+        for did in new_order:
+            if not _is_real_dialog(did):
+                continue
+            did = int(did)
+            vs = variants(did)
+            if any(v in seen_v for v in vs):
+                continue
+            clean.append(did)
+            seen_v.update(vs)
+
+        srv_cur = [int(x) for x in self.server_pinned(fid) if _is_real_dialog(x)]
+        srv_v = set()
+        for s in srv_cur:
+            srv_v.update(variants(s))
+
+        loc_cur = [int(x) for x in self._load(fid) if _is_real_dialog(x)]
+        loc_v = set()
+        for l_id in loc_cur:
+            loc_v.update(variants(l_id))
+
+        new_srv = [d for d in clean if d in srv_v]
+        new_loc = [d for d in clean if d in loc_v and d not in srv_v]
+
+        self._save_custom_order(clean, fid)
+        self._save(new_loc, fid)
+
+        if new_srv and new_srv != srv_cur and sorted(set(new_srv)) == sorted(set(srv_cur)):
+            self.apply_server(new_srv, fid)
+
+        self.lift_now(force_reload=True)
+        self._reload()
+        return True
+
+    def is_pinned(self, did, fid=0):
+        cur = self._load(fid)
+        for v in variants(int(did)):
+            if v in cur:
+                return True
+        return False
+
+    def is_on(self):
+        try:
+            return bool(self.get_setting("enabled", True))
+        except Exception:
+            return True
+
+    def _apply_pin_flags(self, fid=0, mc=None):
+        if not self.is_on():
+            return False
+        fid = int(fid or 0)
+        desired = self.desired_order(fid)
+        if not desired:
+            return False
+        if fid != 0:
+            f = self._folder_obj(fid)
+            pd = getattr(f, "pinnedDialogs", None) if f is not None else None
+            if pd is None:
+                return False
+            changed = False
+            for idx, did in enumerate(desired):
+                target_num = int(idx + 1)
+                try:
+                    pos = int(pd.indexOfKey(jlong(int(did))))
+                    cur_val = int(pd.valueAt(pos)) if pos >= 0 else None
+                    if cur_val != target_num:
+                        pd.put(jlong(int(did)), jint(target_num))
+                        changed = True
+                except Exception:
+                    pass
+            return changed
+        if mc is None:
+            mc = self._mc()
+        if mc is None:
+            return False
+        try:
+            ddict = mc.dialogs_dict
+        except Exception:
+            ddict = None
+        if ddict is None:
+            return False
+        changed = False
+        for idx, did in enumerate(desired):
+            el = None
+            for v in variants(did):
+                try:
+                    el = ddict.get(jlong(v))
+                except Exception:
+                    el = None
+                if el is not None:
+                    break
+            if el is None:
+                continue
+            target_num = int(100000 - idx)
+            try:
+                if (not bool(getattr(el, "pinned", False))) or int(getattr(el, "pinnedNum", 0)) != target_num:
+                    el.pinned = True
+                    el.pinnedNum = target_num
+                    changed = True
+            except Exception:
+                pass
+        return changed
+
+    def _clear_pin_flag(self, did, fid=0, mc=None):
+        fid = int(fid or 0)
+        if fid != 0:
+            f = self._folder_obj(fid)
+            pd = getattr(f, "pinnedDialogs", None) if f is not None else None
+            if pd is not None:
+                for v in variants(int(did)):
+                    try:
+                        pd.delete(jlong(v))
+                    except Exception:
+                        try:
+                            pd.remove(jlong(v))
+                        except Exception:
+                            pass
+            return
+        if mc is None:
+            mc = self._mc()
+        if mc is None:
+            return
+        try:
+            ddict = mc.dialogs_dict
+            if ddict is not None:
+                for v in variants(int(did)):
+                    el = ddict.get(jlong(v))
+                    if el is not None:
+                        el.pinned = False
+                        el.pinnedNum = 0
+                        break
+        except Exception:
+            pass
+
+    def _sort_dialogs_safe(self, mc=None):
+        def _do():
+            ctrl = mc if mc is not None else self._mc()
+            if ctrl is None:
+                return
+            try:
+                ctrl.sortDialogs(None)
+            except Exception:
+                pass
+        try:
+            run_on_ui_thread(_do)
+        except Exception:
+            _do()
+
+    def _lift_folder(self, fid):
+        fid = int(fid or 0)
+        desired = self.desired_order(fid)
+        if not desired:
+            return (0, False)
+
+        flags_changed = self._apply_pin_flags(fid)
+
+        lst = self._dialogs_list(fid)
+        if lst is None:
+            return (0, flags_changed)
+        try:
+            n = int(lst.size())
+        except Exception:
+            return (0, flags_changed)
+        if n <= 0:
+            return (0, flags_changed)
+
+        base_offset = 0
+        while base_offset < n:
+            try:
+                k0 = elem_id(lst.get(base_offset))
+            except Exception:
+                break
+            if k0 is not None and not _is_real_dialog(k0):
+                base_offset += 1
+            else:
+                break
+
+        vmap = {}
+        for d in desired:
+            for v in variants(d):
+                vmap[v] = d
+
+        found = {}
+        for i in range(base_offset, n):
+            try:
+                el = lst.get(i)
+                k = elem_id(el)
+            except Exception:
+                continue
+            if k is not None and k in vmap:
+                canon = vmap[k]
+                if canon not in found:
+                    found[canon] = (i, el)
+                if len(found) == len(desired):
+                    break
+
+        ordered = [d for d in desired if d in found]
+        if not ordered:
+            return (0, flags_changed)
+
+        if fid == 0:
+            for d in ordered:
+                el = found[d][1]
+                target_num = int(100000 - desired.index(d))
+                try:
+                    if (not bool(getattr(el, "pinned", False))) or int(getattr(el, "pinnedNum", 0)) != target_num:
+                        el.pinned = True
+                        el.pinnedNum = target_num
+                        flags_changed = True
+                except Exception:
+                    pass
+
+        elems = [found[d][1] for d in ordered]
+        moved = False
+        if not all(found[d][0] == base_offset + idx for idx, d in enumerate(ordered)):
+            moved = True
+            for e in elems:
+                try:
+                    while lst.remove(e):
+                        pass
+                except Exception:
+                    break
+            for i, e in enumerate(elems):
+                try:
+                    lst.add(base_offset + i, e)
+                except Exception:
+                    pass
+
+        return (len(elems) if moved else 0, flags_changed)
+
+    def lift_now(self, force_reload=False):
+        try:
+            if self._dialogs_open():
+                self._active_folder_id()
+        except Exception:
+            pass
+        total_moved = 0
+        any_changed = False
+        for fid, _title, _fobj in self.get_folders():
+            if not self._load(fid) and not self._load_custom_order(fid):
+                continue
+            moved_count, flags_changed = self._lift_folder(fid)
+            total_moved += moved_count
+            any_changed = any_changed or flags_changed
+        if total_moved > 0 or any_changed or force_reload:
+            self.reload_dialogs()
+        return total_moved
+
+    def _dialogs_list(self, fid=0):
+        fid = int(fid or 0)
+        if fid != 0:
+            f = self._folder_obj(fid)
+            if f is not None:
+                return getattr(f, "dialogs", None)
+            return None
+        mc = self._mc()
+        if mc is None:
+            return None
+        for name in ("getDialogs", "getFilteredDialogs", "getCurrentDialogs",
+                     "getDialogsFromExtension"):
+            fn = getattr(mc, name, None)
+            if not callable(fn):
+                continue
+            for arg in ((0,), ()):
+                try:
+                    got = fn(*arg)
+                except Exception:
+                    continue
+                if got is None:
+                    continue
+                try:
+                    if int(got.size()) > 0:
+                        return got
+                except Exception:
+                    if hasattr(got, "indexOf"):
+                        return got
+        return None
+
+    def toggle(self, did, fid=None):
+        if not did:
+            msg = "не понял, какой чат: открой его и нажми снова"
+            self.toast(msg)
+            return False
+        did = self._canonical_did(did)
+        self.last_chat = did
+        if fid is None:
+            fid = self._target_folder_for_chat(did)
+        fid = int(fid or 0)
+        self.l("toggle: did=%s fid=%s" % (did, fid))
+        if self.is_pinned(did, fid):
+            self._clear_pin_flag(did, fid)
+            cur = self._load(fid)
+            for v in variants(int(did)):
+                if v in cur:
+                    cur.remove(v)
+            self._save(cur, fid)
+            custom = [x for x in self._load_custom_order(fid)
+                      if x not in variants(int(did))]
+            self._save_custom_order(custom, fid)
+            self._sort_dialogs_safe()
+            self.reload_dialogs()
+            if fid != 0:
+                msg = "открепил локально (%s): %s" % (self._folder_name(fid), self._describe(did))
+            else:
+                msg = "открепил локально: %s" % self._describe(did)
+        else:
+            if self.pin_kind(did, fid) == "server":
+                self.toast("Чат уже закреплён телеграмом")
+                return False
+            order = list(self.desired_order(fid))
+            cur = self._load(fid)
+            vset = set(variants(int(did)))
+            cur = [x for x in cur if x not in vset]
+            cur.insert(0, int(did))
+            self._save(cur, fid)
+            order = [x for x in order if x not in vset]
+            order.insert(0, int(did))
+            self._save_custom_order(order, fid)
+            if fid != 0:
+                msg = "закрепил локально (%s): %s" % (self._folder_name(fid), self._describe(did))
+            else:
+                msg = "закрепил локально: %s" % self._describe(did)
+            self.lift_now(force_reload=True)
+        self.l("toggle: %s" % msg)
+        self.toast(msg)
+        self.refresh_menu(did)
+        return True
+
+    def reload_dialogs(self):
+        def _do():
+            try:
+                NC = jclass("org.telegram.messenger.NotificationCenter")
+                nc = NC.getInstance(jint(self._account()))
+                ev_reload = int(NC.dialogsNeedReload)
+                nc.postNotificationName(jint(ev_reload))
+            except Exception as exc:
+                self.l("reload_dialogs err: %r" % (exc,))
+        try:
+            run_on_ui_thread(_do)
+        except Exception:
+            _do()
+
+    def _sync_chat_menu(self, did=0, force=False):
+        if did:
+            fid = self._target_folder_for_chat(did)
+            want = "Открепить локально" if self.is_pinned(did, fid) else "Закрепить локально"
+        else:
+            want = "Закрепить локально"
+
+        if (not force) and want == self._menu_label:
+            return
+
+        try:
+            self.remove_menu_item(MENU_ID)
+        except Exception:
+            pass
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id=MENU_ID,
+                text=want,
+                on_click=self.on_menu_click,
+            ))
+            self._menu_label = want
+        except Exception as exc:
+            self.l("menu err: %r" % (exc,))
+
+    def refresh_menu(self, did=0):
+        if not getattr(self, "_dialog_menu_added", False):
+            try:
+                self.remove_menu_item(DIALOG_MENU_ID)
+            except Exception:
+                pass
+            try:
+                if hasattr(MenuItemType, "DIALOG_ACTION_MENU"):
+                    self.add_menu_item(MenuItemData(
+                        menu_type=MenuItemType.DIALOG_ACTION_MENU,
+                        item_id=DIALOG_MENU_ID,
+                        text="Закрепить / открепить локально",
+                        on_click=self.on_menu_click,
+                    ))
+                    self._dialog_menu_added = True
+            except Exception as exc:
+                self.l("dialog menu err: %r" % (exc,))
+        self._sync_chat_menu(did, force=True)
+
+    def _did_from(self, data):
+        did = 0
+        try:
+            if isinstance(data, dict):
+                for key in ("dialog_id", "dialogId", "peer_id", "peerId"):
+                    v = _as_int(data.get(key))
+                    if v:
+                        did = v
+                        break
+                if not did and data.get("dialog") is not None:
+                    did = elem_id(data.get("dialog")) or 0
+                if not did and data.get("fragment") is not None:
+                    frag = data.get("fragment")
+                    try:
+                        fn = getattr(frag, "getDialogId", None)
+                        if callable(fn):
+                            did = _as_int(fn()) or 0
+                    except Exception:
+                        pass
+                    if not did:
+                        did = self._field(frag, ("dialog_id", "dialogId", "currentDialogId"))
+                if not did and data.get("chat") is not None:
+                    c = _as_int(getattr(data.get("chat"), "id", None))
+                    if c:
+                        did = -abs(int(c))
+                if not did and data.get("user") is not None:
+                    u = _as_int(getattr(data.get("user"), "id", None))
+                    if u:
+                        did = abs(int(u))
+                if not did:
+                    c = _as_int(data.get("chat_id"))
+                    if c:
+                        did = -abs(int(c))
+                if not did:
+                    u = _as_int(data.get("user_id"))
+                    if u:
+                        did = abs(int(u))
+            elif data is not None:
+                for getter, neg in (("getDialogId", False), ("getPeerId", False), ("getChatId", True)):
+                    try:
+                        fn = getattr(data, getter, None)
+                        v = _as_int(fn() if callable(fn) else fn)
+                        if v:
+                            did = -abs(int(v)) if neg else int(v)
+                            break
+                    except Exception:
+                        continue
+                if not did:
+                    try:
+                        c = _as_int(getattr(data, "chat_id", None))
+                        if c:
+                            did = -abs(int(c))
+                        u = _as_int(getattr(data, "user_id", None))
+                        if not did and u:
+                            did = abs(int(u))
+                    except Exception:
+                        pass
+        except Exception:
+            did = 0
+        if not did:
+            did = self.current_chat_id()
+        return self._canonical_did(int(did or 0))
+
+    def on_menu_click(self, data):
+        self.toggle(self._did_from(data))
+
+    def on_open_editor(self, *_a):
+        self.open_editor()
+
+    def open_editor(self, *_a):
+        run_on_ui_thread(lambda: PinOrderEditor(self).open())
+
+    def _reload(self):
+        try:
+            from ui.settings import push_reload
+            push_reload()
+        except Exception:
+            pass
+
+    def _chat_id_from_frag(self, frag):
+        if frag is None:
+            return 0
+        did = 0
+        try:
+            fn = getattr(frag, "getDialogId", None)
+            if callable(fn):
+                did = _as_int(fn()) or 0
+        except Exception:
+            did = 0
+        if not did:
+            did = self._field(frag, ("dialog_id", "dialogId", "currentDialogId"))
+        return self._canonical_did(int(did or 0)) if did else 0
+
+    def current_chat_id(self):
+        did = 0
+        try:
+            frag = get_last_fragment()
+        except Exception:
+            frag = None
+        if frag is not None:
+            try:
+                cname = str(frag.getClass().getName())
+            except Exception:
+                cname = ""
+            if "Chat" in cname or "hat" in cname:
+                try:
+                    fn = getattr(frag, "getDialogId", None)
+                    if callable(fn):
+                        did = _as_int(fn()) or 0
+                except Exception:
+                    did = 0
+                if not did:
+                    did = self._field(frag, ("dialog_id", "dialogId", "currentDialogId"))
+        if not did:
+            did = self.last_chat
+        if not did:
+            try:
+                did = int(self.get_setting("last_chat", 0) or 0)
+            except Exception:
+                did = 0
+        return self._canonical_did(int(did or 0))
+
+    def _get_tl_dialog(self, did, mc=None):
+        if mc is None:
+            mc = self._mc()
+        if mc is None:
+            return None
+        try:
+            ddict = mc.dialogs_dict
+            if ddict is not None:
+                for v in variants(int(did)):
+                    el = ddict.get(jlong(v))
+                    if el is not None:
+                        return el
+        except Exception:
+            pass
+        return None
+
+    def _canonical_did(self, did):
+        did = int(did or 0)
+        if not did:
+            return 0
+        mc = self._mc()
+        if mc is not None:
+            try:
+                ddict = mc.dialogs_dict
+                if ddict is not None:
+                    for v in variants(did):
+                        el = ddict.get(jlong(v))
+                        if el is not None:
+                            eid = elem_id(el)
+                            if eid:
+                                return int(eid)
+            except Exception:
+                pass
+        return did
+
+    def _create_settings_header(self, context):
+        try:
+            LinearLayout = jclass("android.widget.LinearLayout")
+            TextView = jclass("android.widget.TextView")
+            Gravity = jclass("android.view.Gravity")
+            TypedValue = jclass("android.util.TypedValue")
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+            BackupImageView = find_class("org.telegram.ui.Components.BackupImageView")
+
+            ml = LinearLayout(context)
+            ml.setOrientation(LinearLayout.VERTICAL)
+            ml.setGravity(Gravity.CENTER)
+            ml.setPadding(
+                AndroidUtilities.dp(20.0), AndroidUtilities.dp(20.0),
+                AndroidUtilities.dp(20.0), AndroidUtilities.dp(16.0),
+            )
+
+            if BackupImageView is not None:
+                stk = BackupImageView(context)
+                stk.setRoundRadius(AndroidUtilities.dp(45.0))
+                self.load_sticker_with_fallback(
+                    stk, HEADER_STICKER_SET, HEADER_STICKER_INDEX, "110_110"
+                )
+                ml.addView(stk, LayoutHelper.createLinear(110, 110, Gravity.CENTER, 0, 0, 0, 12))
+
+            t = TextView(context)
+            t.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            t.setTypeface(AndroidUtilities.bold())
+            t.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22.0)
+            t.setText(__name__)
+            t.setGravity(Gravity.CENTER)
+            ml.addView(t, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 4))
+
+            sub = TextView(context)
+            sub.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            sub.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0)
+            sub.setText(f"Версия {__version__} • {__author__}")
+            sub.setGravity(Gravity.CENTER)
+            ml.addView(sub, LayoutHelper.createLinear(-1, -2, Gravity.CENTER))
+            return ml
+        except Exception as exc:
+            self.l("settings header err: %r" % (exc,))
+            return None
+
+    def _setup_settings_header_hook(self):
+        try:
+            PSA = (
+                find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+                or find_class("com.ayugram.messenger.plugins.ui.PluginSettingsActivity")
+            )
+            UItem = find_class("org.telegram.ui.Components.UItem")
+            if not PSA or not UItem:
+                return
+            methods = (
+                list(PSA.getDeclaredMethods())
+                if hasattr(PSA, "getDeclaredMethods")
+                else list(PSA.getClass().getDeclaredMethods())
+            )
+            plugin = self
+
+            class HeaderHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        items = param.args[0]
+                        if not items or int(items.size()) == 0:
+                            return
+                        act = param.thisObject
+                        p_obj = get_private_field(act, "plugin")
+                        if not p_obj or str(p_obj.getId()) != __id__:
+                            return
+                        hdr = plugin._create_settings_header(act.getContext())
+                        if hdr is not None:
+                            items.add(0, UItem.asCustom(hdr))
+                            items.add(1, UItem.asShadow())
+                    except Exception:
+                        pass
+
+            for m in methods:
+                try:
+                    if str(m.getName()) == "fillItems" and len(m.getParameterTypes()) == 2:
+                        m.setAccessible(True)
+                        ref = self.hook_method(m, HeaderHook())
+                        if ref:
+                            self._header_hooks.append(ref)
+                except Exception:
+                    pass
+        except Exception as exc:
+            self.l("header hook err: %r" % (exc,))
+
+    def _create_sheet_button(self, act, text, is_accent, on_click):
+        FrameLayout = jclass("android.widget.FrameLayout")
+        FLP = jclass("android.widget.FrameLayout$LayoutParams")
+        TextView = jclass("android.widget.TextView")
+        Gravity = jclass("android.view.Gravity")
+        TypedValue = jclass("android.util.TypedValue")
+        AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+
+        btn = FrameLayout(act)
+        col = Theme.getColor(Theme.key_featuredStickers_addButton if is_accent else Theme.key_chat_inLoader)
+        bg_col = col if is_accent else ((col & 0x20FFFFFF) | 0x14000000)
+        btn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(26), bg_col, bg_col))
+        btn.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12))
+
+        tv = TextView(act)
+        tv.setText(text)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15.0)
+        tv.setTypeface(AndroidUtilities.bold())
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText if is_accent else Theme.key_dialogTextBlack))
+        btn.addView(tv, FLP(FLP.MATCH_PARENT, FLP.WRAP_CONTENT))
+        btn.setOnClickListener(OnClickListener(on_click))
+        self._apply_press_scale(btn)
+        return btn
+
+    def _apply_press_scale(self, view):
+        try:
+            MotionEvent = jclass("android.view.MotionEvent")
+
+            def _on_touch(v, ev):
+                act = int(ev.getActionMasked())
+                if act == MotionEvent.ACTION_DOWN:
+                    v.animate().scaleX(0.94).scaleY(0.94).setDuration(100).start()
+                elif act in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                    v.animate().scaleX(1.0).scaleY(1.0).setDuration(200).start()
+                return False
+
+            proxy = _touch_proxy(_on_touch)
+            self._ui_proxies.append(proxy)
+            view.setOnTouchListener(proxy)
+        except Exception:
+            pass
+
+    def _open_url(self, url):
+        try:
+            Browser = jclass("org.telegram.messenger.browser.Browser")
+            Uri = jclass("android.net.Uri")
+            act = self._activity()
+            if act is not None:
+                Browser.openUrl(act, Uri.parse(url), True, True, True, None, None, False, False, False)
+        except Exception as exc:
+            self.l("open_url err: %r" % (exc,))
+
+    def _show_support_me_menu(self, _ctx=None):
+        act = self._activity()
+        if act is None:
+            return
+        BottomSheet = jclass("org.telegram.ui.ActionBar.BottomSheet")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+        LinearLayout = jclass("android.widget.LinearLayout")
+        TextView = jclass("android.widget.TextView")
+        Gravity = jclass("android.view.Gravity")
+        TypedValue = jclass("android.util.TypedValue")
+        GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+
+        sheet = BottomSheet(act, False)
+        sheet.setCanDismissWithSwipe(False)
+
+        root = LinearLayout(act)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(18), AndroidUtilities.dp(20), AndroidUtilities.dp(14))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        r = float(AndroidUtilities.dp(20))
+        bg.setCornerRadii([r, r, r, r, 0.0, 0.0, 0.0, 0.0])
+        root.setBackground(bg)
+
+        title = TextView(act)
+        title.setTypeface(AndroidUtilities.bold())
+        title.setGravity(Gravity.CENTER)
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20.0)
+        title.setText("⭐ Поддержать проект")
+        title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        root.addView(title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
+
+        tv = TextView(act)
+        tv.setTypeface(AndroidUtilities.bold())
+        tv.setText("Если вам нравится X-Pins, вы можете поддержать автора подарком в Telegram или написать в личные сообщения ❤️")
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15.0)
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        tv.setLineSpacing(float(AndroidUtilities.dp(3)), 1.15)
+        root.addView(tv, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 4, 0, 4, 16))
+
+        def on_gift_click(_v):
+            sheet.dismiss()
+            try:
+                GiftSheet = jclass("org.telegram.ui.Gifts.GiftSheet")
+                GiftSheet(act, jint(self._account()), jlong(int(AUTHOR_USER_ID)), None, None).show()
+                return
+            except Exception:
+                pass
+            self._open_url("https://t.me/Somewhat_empty")
+
+        gift_btn = self._create_sheet_button(act, "🎁 Отправить подарок в Telegram", True, on_gift_click)
+        close_btn = self._create_sheet_button(act, "Закрыть", False, lambda _v: sheet.dismiss())
+        root.addView(gift_btn, LayoutHelper.createLinear(-1, -2, 0, 4, 0, 8))
+        root.addView(close_btn, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0))
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _show_version_dialog(self, _ctx=None):
+        act = self._activity()
+        if act is None:
+            return
+        BottomSheet = jclass("org.telegram.ui.ActionBar.BottomSheet")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+        LinearLayout = jclass("android.widget.LinearLayout")
+        TextView = jclass("android.widget.TextView")
+        Gravity = jclass("android.view.Gravity")
+        TypedValue = jclass("android.util.TypedValue")
+        GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+
+        sheet = BottomSheet(act, False)
+        sheet.setCanDismissWithSwipe(True)
+
+        root = LinearLayout(act)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(18), AndroidUtilities.dp(20), AndroidUtilities.dp(14))
+        bg = GradientDrawable()
+        bg.setColor(Theme.getColor(Theme.key_dialogBackground))
+        r = float(AndroidUtilities.dp(20))
+        bg.setCornerRadii([r, r, r, r, 0.0, 0.0, 0.0, 0.0])
+        root.setBackground(bg)
+
+        title = TextView(act)
+        title.setTypeface(AndroidUtilities.bold())
+        title.setGravity(Gravity.CENTER)
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20.0)
+        title.setText("📌 О плагине")
+        title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        root.addView(title, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 10))
+
+        tv = TextView(act)
+        tv.setTypeface(AndroidUtilities.bold())
+        tv.setText(
+            "Позволяет локально обходить лимит закреплённых чатов Telegram "
+            "и свободно менять их порядок на устройстве.\n\n"
+            "Для закрепления:\n"
+            "Перейдите в чат\n"
+            "Нажмите на три точки в правом верхнем углу, выберите \"Плагины\"\n"
+            "Нажмите на \"Закрепить локально\"."
+        )
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15.0)
+        tv.setGravity(Gravity.CENTER)
+        tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        tv.setLineSpacing(float(AndroidUtilities.dp(3)), 1.15)
+        root.addView(tv, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 4, 0, 4, 16))
+
+        close_btn = self._create_sheet_button(act, "Закрыть", True, lambda _v: sheet.dismiss())
+        root.addView(close_btn, LayoutHelper.createLinear(-1, -2, 0, 4, 0, 0))
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def try_load_sticker(self, img, sticker_name, sticker_index=0, size="110_110"):
+        try:
+            mdc_cls = find_class("org.telegram.messenger.MediaDataController")
+            loc_cls = find_class("org.telegram.messenger.ImageLocation")
+            if not mdc_cls or not loc_cls:
+                return False
+            set_name = sticker_name.split("/")[0] if isinstance(sticker_name, str) and "/" in sticker_name else sticker_name
+            idx = int(sticker_name.split("/")[1]) if isinstance(sticker_name, str) and "/" in sticker_name else int(sticker_index)
+            mdc = mdc_cls.getInstance(jint(self._account()))
+            ss = mdc.getStickerSetByName(set_name) or mdc.getStickerSetByEmojiOrName(set_name)
+            if ss and ss.documents and int(ss.documents.size()) > idx:
+                img.setImage(loc_cls.getForDocument(ss.documents.get(jint(idx))), size, None, None, jint(0), jint(1))
+                img.setAlpha(1.0)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def load_sticker_with_fallback(self, img, sticker_name, sticker_index=0, size="110_110", delay=800):
+        if self.try_load_sticker(img, sticker_name, sticker_index, size):
+            return
+        try:
+            mdc_cls = find_class("org.telegram.messenger.MediaDataController")
+            tl_cls = find_class("org.telegram.tgnet.TLRPC$TL_inputStickerSetShortName")
+            if not mdc_cls or not tl_cls:
+                return
+            set_name = sticker_name.split("/")[0] if isinstance(sticker_name, str) and "/" in sticker_name else sticker_name
+            mdc = mdc_cls.getInstance(jint(self._account()))
+            input_set = tl_cls()
+            input_set.short_name = set_name
+            mdc.getStickerSet(input_set, None, False, None)
+            run_on_ui_thread(lambda: self.try_load_sticker(img, sticker_name, sticker_index, size), delay)
+            run_on_ui_thread(lambda: self.try_load_sticker(img, sticker_name, sticker_index, size), delay + 1200)
+        except Exception:
+            pass
+
+    def create_settings(self):
+        return [
+            Header(text="X-Pins"),
+            Text(text="Открыть редактор закрепов", icon="msg_pin", accent=True,
+                 on_click=self.on_open_editor),
+            Divider(),
+            Header(text="О плагине"),
+            Text(text="💬 Связь с автором", icon="msg_contacts", accent=True,
+                 on_click=lambda _v: self._open_url("https://t.me/Somewhat_empty")),
+            Text(text="📢 Канал", icon="msg_channel", accent=True,
+                 on_click=lambda _v: self._open_url("https://t.me/XDevelopments")),
+            Text(text="⭐ Поддержать проект", icon="menu_feature_reactions", accent=True,
+                 on_click=lambda ctx: run_on_ui_thread(lambda: self._show_support_me_menu(ctx))),
+            Text(text="📌 О плагине", icon="msg_settings", accent=True,
+                 on_click=lambda ctx: run_on_ui_thread(lambda: self._show_version_dialog(ctx))),
+        ]
+
+    def _name(self, did):
+        did = int(did)
+        try:
+            for _did, (tt, _mm) in (self._cell_texts() or {}).items():
+                if _did == did and tt.strip():
+                    return tt.strip()
+        except Exception:
+            pass
+        for v in variants(did):
+            info = (self._dialog_index() or {}).get(v)
+            if info:
+                el = info.get("el")
+                t = ""
+                for f in ("title", "dialog_name", "name"):
+                    try:
+                        t = str(getattr(el, f, "") or "")
+                    except Exception:
+                        t = ""
+                    if t.strip():
+                        break
+                if t.strip():
+                    return t.strip()
+                break
+        try:
+            mc = self._mc()
+            if mc is None:
+                return ""
+            obj = None
+            if did < 0:
+                for arg in (-did, did):
+                    try:
+                        obj = mc.getChat(jlong(int(arg)))
+                    except Exception:
+                        obj = None
+                    if obj is not None:
+                        break
+                if obj is not None:
+                    return str(getattr(obj, "title", "") or "").strip()
+                return ""
+            obj = mc.getUser(jlong(did))
+            if obj is None:
+                return ""
+            first = str(getattr(obj, "first_name", "") or "")
+            last = str(getattr(obj, "last_name", "") or "")
+            return (first + " " + last).strip()
+        except Exception:
+            return ""
+
+    def _describe(self, did):
+        if not did:
+            return "не понял - открой чат и вернись"
+        nm = self._name(did)
+        return nm if nm else str(did)
+
+    def _when(self, ts):
+        try:
+            ts = int(ts or 0)
+        except Exception:
+            return ""
+        if ts <= 0:
+            return ""
+        lt = time.localtime(ts)
+        now = time.localtime()
+        if (lt.tm_year, lt.tm_yday) == (now.tm_year, now.tm_yday):
+            return time.strftime("%H:%M", lt)
+
+        yesterday = time.localtime(time.time() - 86400)
+        if (lt.tm_year, lt.tm_yday) == (yesterday.tm_year, yesterday.tm_yday):
+            return "вчера"
+        if lt.tm_year == now.tm_year:
+            return time.strftime("%d %b", lt)
+        return time.strftime("%d.%m.%y", lt)
+
+    def _preview(self, did):
+        did = int(did)
+        bits = []
+        txt = ""
+        try:
+            for _did, (_tt, mm) in (self._cell_texts() or {}).items():
+                if _did == did and mm.strip():
+                    txt = mm.strip()
+                    break
+        except Exception:
+            txt = ""
+        info = (self._dialog_index() or {}).get(did) or {}
+        if not txt:
+            label = ""
+            try:
+                top = int(info.get("top") or 0)
+                if top and info.get("el") is not None:
+                    arr = None
+                    try:
+                        arr = self._mc().dialogMessage.get(did)
+                    except Exception:
+                        arr = None
+                    n = 0
+                    try:
+                        n = int(arr.size()) if arr is not None else 0
+                    except Exception:
+                        n = 0
+                    if n:
+                        try:
+                            m = arr.get(n - 1)
+                        except Exception:
+                            m = None
+                        if m is not None:
+                            try:
+                                mtype = int(m.getMediaType())
+                            except Exception:
+                                mtype = 0
+                            nm = ""
+                            if mtype in (7, 10):
+                                try:
+                                    nm = str(m.getMusicTitle() or m.getDocumentName() or
+                                             m.getFileNameFast() or "")
+                                except Exception:
+                                    nm = ""
+                            if not nm.strip():
+                                try:
+                                    label = self.MEDIA_LABELS.get(mtype, "")
+                                except Exception:
+                                    label = ""
+                            if nm.strip():
+                                txt = nm.strip()
+                            elif label:
+                                txt = "вложение: " + label
+            except Exception:
+                pass
+            if not txt and label:
+                txt = "вложение: " + label
+        if txt:
+            bits.append(txt[:44])
+        when = self._when(info.get("date") or 0)
+        if when:
+            bits.append(when)
+        return " · ".join(bits)[:96]
+
+    def _cell_texts(self):
+        out = {}
+        try:
+            frag = get_last_fragment()
+            a = frag.getParentActivity() if frag is not None else None
+        except Exception:
+            a = None
+        if a is None:
+            return out
+        try:
+            root = a.getWindow().getDecorView()
+        except Exception:
+            return out
+
+        def walk(v, depth=0):
+            if v is None or depth > 16 or len(out) > 60:
+                return
+            try:
+                cn = str(v.getClass().getSimpleName())
+            except Exception:
+                cn = ""
+            if "DialogCell" in cn:
+                try:
+                    did = None
+                    for m in ("getDialogId", "getPeerIdUnsafe"):
+                        try:
+                            did = int(getattr(v, m)())
+                            break
+                        except Exception:
+                            continue
+                    tt = ""
+                    mm = ""
+                    for get in ("getTextTitle", "titleTextView"):
+                        try:
+                            t = getattr(v, get)()
+                            if t is not None:
+                                tt = str(t.getText())
+                                break
+                        except Exception:
+                            continue
+                    for get in ("getTextMessage", "textTextView"):
+                        try:
+                            t = getattr(v, get)()
+                            if t is not None:
+                                mm = str(t.getText())
+                                break
+                        except Exception:
+                            continue
+                    if did and (tt or mm):
+                        out[did] = (tt, mm)
+                except Exception:
+                    pass
+            try:
+                n = int(v.getChildCount())
+            except Exception:
+                n = 0
+            for i in range(min(n, 40)):
+                try:
+                    walk(v.getChildAt(i), depth + 1)
+                except Exception:
+                    pass
+
+        try:
+            walk(root)
+        except Exception as exc:
+            self.l("cell texts err: %r" % (exc,))
+        return out
+
+    def _row_info(self, el):
+        out = {"did": None, "date": 0, "top": 0, "pinned": False, "pin": 0}
+        if el is None:
+            return out
+        for f, k in (("id", "did"), ("last_message_date", "date"),
+                     ("top_message", "top"), ("pinned", "pinned"),
+                     ("pinnedNum", "pin")):
+            try:
+                v = getattr(el, f)
+            except Exception:
+                continue
+            if v is None:
+                continue
+            try:
+                out[k] = bool(v) if k == "pinned" else int(v)
+            except Exception:
+                pass
+        return out
+
+    def _dialog_index(self, fid=0):
+        fid = int(fid or 0)
+        cache = getattr(self, "_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._idx_cache = cache
+        key = (self._account(), fid)
+        now = time.time()
+        ent = cache.get(key)
+        if ent is not None and now - ent[0] < 5:
+            return ent[1]
+        idx = {}
+        try:
+            lst = self._dialogs_list(fid)
+            if lst is not None:
+                n = int(lst.size())
+                for i in range(n):
+                    try:
+                        el = lst.get(i)
+                    except Exception:
+                        break
+                    info = self._row_info(el)
+                    if info["did"]:
+                        idx[info["did"]] = info
+                        try:
+                            idx[info["did"]]["el"] = el
+                        except Exception:
+                            pass
+        except Exception as exc:
+            self.l("dialog index err: %r" % (exc,))
+        cache[key] = (now, idx)
+        return idx
+
+    def _get_obj_field(self, obj, names):
+        if obj is None:
+            return None
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return None
+        depth = 0
+        while cls is not None and depth < 6:
+            for n in names:
+                try:
+                    f = cls.getDeclaredField(n)
+                    f.setAccessible(True)
+                    val = f.get(obj)
+                    if val is not None:
+                        return val
+                except Exception:
+                    continue
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                break
+            depth += 1
+        return None
+
+    def _field(self, obj, names):
+        cls = None
+        try:
+            cls = obj.getClass()
+        except Exception:
+            return 0
+        depth = 0
+        while cls is not None and depth < 6:
+            for n in names:
+                try:
+                    f = cls.getDeclaredField(n)
+                    f.setAccessible(True)
+                    try:
+                        v = _as_int(f.get(obj))
+                        if v:
+                            return v
+                    except Exception:
+                        pass
+                    try:
+                        v = f.getLong(obj)
+                        if v:
+                            return int(v)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            cls = cls.getSuperclass()
+            depth += 1
+        return 0
+
+    def l(self, msg):
+        try:
+            self.log_lines.append(str(msg)[:160])
+            if len(self.log_lines) > 30:
+                self.log_lines = self.log_lines[-30:]
+            try:
+                self.set_setting("diag", " | ".join(self.log_lines[-6:])[-700:])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def toast(self, text):
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_info(str(text)))
+        except Exception:
+            pass
+
+
+class PinOrderEditor:
+    ROW_DP = 72
+    LONG_PRESS_MS = 180
+    _J = {}
+    _CELL_CTOR_IDX = None
+
+    @classmethod
+    def _j(cls, name):
+        c = cls._J.get(name)
+        if c is None:
+            c = jclass(name)
+            cls._J[name] = c
+        return c
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.dialog = None
+        self.order = []
+        self.views = {}
+        self.drag_idx = -1
+        self.drag_did = None
+        self.drag_view = None
+        self.drag_start_raw_y = 0.0
+        self.drag_start_ty = 0.0
+        self.drag_start_scroll = 0
+        self.press_idx = -1
+        self.press_raw_y = 0.0
+        self.press_token = 0
+        self.row_h = 0
+        self.touch_slop = 0
+        self.scroll = None
+        self.list_box = None
+        self.handler = None
+        self.folders = []
+        self.current_fid = 0
+        self.orders_by_folder = {}
+        self.initial_orders = {}
+        self.tab_views = {}
+        self.tabs_scroll = None
+        self.max_list_h = 0
+        self._tab_colors = {}
+        self.row_cache = {}
+        self._mc_ref = None
+        self._acc = 0
+        self._dialogs_frag = None
+        self._dialog_cell_cls = None
+        self._render_token = 0
+        self._lp_runnable = None
+        self._render_runnable = None
+        self._proxies = []
+
+    def _dp(self, ctx, val):
+        return int(round(val * float(ctx.getResources().getDisplayMetrics().density)))
+
+    @staticmethod
+    def _argb(val):
+        return val - (1 << 32) if val >= (1 << 31) else val
+
+    @staticmethod
+    def _is_dark(color_int):
+        r = (color_int >> 16) & 0xFF
+        g = (color_int >> 8) & 0xFF
+        b = color_int & 0xFF
+        return (0.299 * r + 0.587 * g + 0.114 * b) < 128.0
+
+    def _theme_color(self, key_name, fallback):
+        try:
+            Theme = self._j("org.telegram.ui.ActionBar.Theme")
+            key = getattr(Theme, key_name, None)
+            if key is not None:
+                return int(Theme.getColor(key))
+        except Exception:
+            pass
+        return fallback
+
+    def _find_dialogs_activity(self):
+        return self.plugin._find_dialogs_fragment()
+
+    def _make_native_cell(self, ctx, did, tl_dialog, dialogs_frag):
+        try:
+            DialogCell = self._dialog_cell_cls or self._j("org.telegram.ui.Cells.DialogCell")
+            acc = self._acc
+            ctors = (
+                (dialogs_frag, ctx, False, False, jint(acc), None),
+                (dialogs_frag, ctx, False, False),
+                (None, ctx, False, False, jint(acc), None),
+                (None, ctx, False, False),
+            )
+            cell = None
+            if PinOrderEditor._CELL_CTOR_IDX is not None:
+                try:
+                    cell = DialogCell(*ctors[PinOrderEditor._CELL_CTOR_IDX])
+                except Exception:
+                    PinOrderEditor._CELL_CTOR_IDX = None
+            if cell is None:
+                for idx, args in enumerate(ctors):
+                    try:
+                        cell = DialogCell(*args)
+                        PinOrderEditor._CELL_CTOR_IDX = idx
+                        break
+                    except Exception:
+                        continue
+            if cell is None:
+                return None
+
+            cell.setClickable(False)
+            cell.setFocusable(False)
+            if tl_dialog is not None:
+                try:
+                    cell.setDialog(tl_dialog, 0, 0)
+                except Exception:
+                    cell.setDialog(jlong(int(did)), None, 0, False, False)
+            else:
+                cell.setDialog(jlong(int(did)), None, 0, False, False)
+            return cell
+        except Exception as exc:
+            self.plugin.l("DialogCell err: %r" % (exc,))
+            return None
+
+    def _make_fallback_row(self, ctx, did):
+        LinearLayout = self._j("android.widget.LinearLayout")
+        TextView = self._j("android.widget.TextView")
+        Gravity = self._j("android.view.Gravity")
+        TruncateAt = self._j("android.text.TextUtils$TruncateAt")
+        LP = self._j("android.widget.LinearLayout$LayoutParams")
+
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        pad_x = self._dp(ctx, 14)
+        row.setPadding(pad_x, 0, pad_x, 0)
+
+        try:
+            BackupImageView = self._j("org.telegram.ui.Components.BackupImageView")
+            AvatarDrawable = self._j("org.telegram.ui.Components.AvatarDrawable")
+            ImageLocation = self._j("org.telegram.messenger.ImageLocation")
+            mc = self.plugin._mc()
+            av = BackupImageView(ctx)
+            av.setRoundRadius(self._dp(ctx, 25))
+            av_sz = self._dp(ctx, 50)
+            av_lp = LP(av_sz, av_sz)
+            av_lp.rightMargin = self._dp(ctx, 12)
+            av.setLayoutParams(av_lp)
+
+            obj = None
+            if mc is not None:
+                obj = mc.getChat(jlong(abs(did))) if did < 0 else mc.getUser(jlong(did))
+            ad = AvatarDrawable(obj) if obj is not None else AvatarDrawable()
+            if obj is not None:
+                loc = ImageLocation.getForUserOrChat(obj, ImageLocation.TYPE_SMALL)
+                av.setImage(loc, "50_50", ad, obj)
+            else:
+                av.setImageDrawable(ad)
+            row.addView(av)
+        except Exception:
+            pass
+
+        col = LinearLayout(ctx)
+        col.setOrientation(LinearLayout.VERTICAL)
+        col.setLayoutParams(LP(0, LP.WRAP_CONTENT, 1.0))
+
+        title = TextView(ctx)
+        title.setText(self.plugin._describe(did))
+        title.setTextSize(16.0)
+        title.setSingleLine(True)
+        title.setEllipsize(TruncateAt.END)
+        title.setTextColor(self._theme_color("key_chats_name", self._argb(0xFFEDEDED)))
+        col.addView(title)
+
+        sub = self.plugin._preview(did)
+        if sub:
+            msg = TextView(ctx)
+            msg.setText(sub)
+            msg.setTextSize(14.0)
+            msg.setSingleLine(True)
+            msg.setEllipsize(TruncateAt.END)
+            msg.setTextColor(self._theme_color("key_chats_message", self._argb(0xFF8E8E93)))
+            col.addView(msg)
+
+        row.addView(col)
+        return row
+
+    def _build_row(self, ctx, did, tl_dialog, dialogs_frag):
+        FrameLayout = self._j("android.widget.FrameLayout")
+        FLP = self._j("android.widget.FrameLayout$LayoutParams")
+
+        wrap = FrameLayout(ctx)
+        wrap.setLayoutParams(FLP(FLP.MATCH_PARENT, self.row_h))
+        wrap.setClickable(False)
+        wrap.setFocusable(False)
+
+        inner = self._make_native_cell(ctx, did, tl_dialog, dialogs_frag)
+        if inner is None:
+            inner = self._make_fallback_row(ctx, did)
+        wrap.addView(inner, FLP(FLP.MATCH_PARENT, self.row_h))
+        return wrap
+
+    def _haptic(self, view, const_name):
+        try:
+            HFC = self._j("android.view.HapticFeedbackConstants")
+            code = getattr(HFC, const_name, HFC.LONG_PRESS)
+            view.performHapticFeedback(code)
+        except Exception:
+            pass
+
+    def _start_drag(self, idx, ctx):
+        if idx < 0 or idx >= len(self.order):
+            return
+        self.drag_idx = idx
+        self.drag_did = self.order[idx]
+        self.drag_view = self.views.get(self.drag_did)
+        if self.drag_view is None:
+            self.drag_idx = -1
+            return
+
+        self.drag_start_ty = float(self.drag_view.getTranslationY())
+        self.drag_start_raw_y = self.press_raw_y
+        self.drag_start_scroll = int(self.scroll.getScrollY()) if self.scroll is not None else 0
+
+        try:
+            self.scroll.requestDisallowInterceptTouchEvent(True)
+        except Exception:
+            pass
+
+        self._haptic(self.drag_view, "LONG_PRESS")
+        self.drag_view.bringToFront()
+        try:
+            self.drag_view.setElevation(float(self._dp(ctx, 10)))
+            self.drag_view.setBackgroundColor(self._theme_color("key_listSelector", self._argb(0x22FFFFFF)))
+            self.drag_view.animate().scaleX(1.03).scaleY(1.03).alpha(0.96).setDuration(140).start()
+        except Exception:
+            pass
+
+    def _move_drag(self, raw_y, ctx):
+        if self.drag_idx < 0 or self.drag_view is None:
+            return
+        cur_scroll = int(self.scroll.getScrollY()) if self.scroll is not None else 0
+        dy = (raw_y - self.drag_start_raw_y) + (cur_scroll - self.drag_start_scroll)
+        max_ty = float(max(0, (len(self.order) - 1) * self.row_h))
+        new_ty = max(0.0, min(max_ty, self.drag_start_ty + dy))
+        self.drag_view.setTranslationY(new_ty)
+
+        if self.scroll is not None:
+            try:
+                jarr = self._j("java.lang.reflect.Array").newInstance(self._j("java.lang.Integer").TYPE, 2)
+                self.scroll.getLocationOnScreen(jarr)
+                top_y = float(jarr[1])
+                bot_y = top_y + float(self.scroll.getHeight())
+                edge = float(self._dp(ctx, 44))
+                step = self._dp(ctx, 10)
+                if raw_y < top_y + edge:
+                    self.scroll.smoothScrollBy(0, -step)
+                elif raw_y > bot_y - edge:
+                    self.scroll.smoothScrollBy(0, step)
+            except Exception:
+                pass
+
+        target_idx = int(round(new_ty / float(self.row_h)))
+        target_idx = max(0, min(len(self.order) - 1, target_idx))
+        if target_idx != self.drag_idx:
+            item = self.order.pop(self.drag_idx)
+            self.order.insert(target_idx, item)
+            self.drag_idx = target_idx
+            self._haptic(self.drag_view, "CLOCK_TICK")
+            self._animate_slots(skip_did=self.drag_did)
+
+    def _animate_slots(self, skip_did=None):
+        Decel = self._j("android.view.animation.DecelerateInterpolator")
+        interp = Decel()
+        for idx, did in enumerate(self.order):
+            if did == skip_did:
+                continue
+            v = self.views.get(did)
+            if v is not None:
+                v.animate().translationY(float(idx * self.row_h)).setDuration(180).setInterpolator(interp).start()
+
+    def _end_drag(self):
+        self.press_token += 1
+        self.press_idx = -1
+        if self.drag_idx < 0 or self.drag_view is None:
+            return
+        v = self.drag_view
+        idx = self.drag_idx
+        self.drag_idx = -1
+        self.drag_did = None
+        self.drag_view = None
+        try:
+            self.scroll.requestDisallowInterceptTouchEvent(False)
+        except Exception:
+            pass
+        Decel = self._j("android.view.animation.DecelerateInterpolator")
+        try:
+            v.setBackgroundColor(0)
+            v.setElevation(0.0)
+            v.animate().translationY(float(idx * self.row_h)).scaleX(1.0).scaleY(1.0).alpha(1.0).setDuration(180).setInterpolator(Decel()).start()
+        except Exception:
+            pass
+
+    def _ensure_tab_visible(self, ctx, animate=True):
+        hsv = self.tabs_scroll
+        tv = self.tab_views.get(self.current_fid)
+        if hsv is None or tv is None:
+            return
+        try:
+            view_w = int(hsv.getWidth())
+            tab_w = int(tv.getWidth())
+            if view_w <= 0 or tab_w <= 0:
+                return
+            child = hsv.getChildAt(0)
+            content_w = int(child.getWidth()) if child is not None else 0
+            max_scroll = max(0, content_w - view_w)
+            if max_scroll <= 0:
+                return
+
+            cur_x = int(hsv.getScrollX())
+            tab_left = int(tv.getLeft())
+            tab_right = int(tv.getRight())
+            peek = self._dp(ctx, 32)
+
+            target_x = cur_x
+            if tab_left < cur_x + peek:
+                target_x = max(0, tab_left - peek)
+            elif tab_right > cur_x + view_w - peek:
+                target_x = min(max_scroll, tab_right - view_w + peek)
+
+            if target_x != cur_x:
+                if animate:
+                    hsv.smoothScrollTo(jint(target_x), jint(0))
+                else:
+                    hsv.scrollTo(jint(target_x), jint(0))
+        except Exception:
+            pass
+
+    def _update_tab_styles(self, ctx, scroll_to_active=True):
+        GradientDrawable = self._j("android.graphics.drawable.GradientDrawable")
+        sel_bg = self._tab_colors["sel_bg"]
+        sel_text = self._tab_colors["sel_text"]
+        unsel_text = self._tab_colors["unsel_text"]
+        radius = float(self._dp(ctx, 18))
+
+        for fid, tv in self.tab_views.items():
+            if fid == self.current_fid:
+                pill = GradientDrawable()
+                pill.setColor(sel_bg)
+                pill.setCornerRadius(radius)
+                tv.setBackground(pill)
+                tv.setTextColor(sel_text)
+            else:
+                tv.setBackground(None)
+                tv.setTextColor(unsel_text)
+
+        if scroll_to_active:
+            self._ensure_tab_visible(ctx, animate=True)
+
+    def _select_folder(self, fid, ctx):
+        if fid == self.current_fid:
+            return
+        self._end_drag()
+        self.orders_by_folder[self.current_fid] = list(self.order)
+        self.current_fid = fid
+        self._update_tab_styles(ctx, scroll_to_active=True)
+
+        self._render_token += 1
+        tok = self._render_token
+        editor = self
+
+        def _do_render():
+            if tok == editor._render_token:
+                if fid not in editor.orders_by_folder:
+                    ord_f = list(editor.plugin.desired_order(fid))
+                    editor.orders_by_folder[fid] = ord_f
+                    editor.initial_orders[fid] = list(ord_f)
+                editor._render_folder_list(ctx)
+
+        r = _runnable_proxy(_do_render)
+        self._render_runnable = r
+        if self.handler is not None:
+            self.handler.post(r)
+        else:
+            _do_render()
+
+    def _render_folder_list(self, ctx):
+        TextView = self._j("android.widget.TextView")
+        View = self._j("android.view.View")
+        Gravity = self._j("android.view.Gravity")
+        FLP = self._j("android.widget.FrameLayout$LayoutParams")
+
+        self.list_box.removeAllViews()
+        self.views = {}
+        self.order = list(self.orders_by_folder.get(self.current_fid, []))
+
+        if not self.order:
+            empty_h = self._dp(ctx, 96)
+            self.list_box.setMinimumHeight(empty_h)
+            self.list_box.setLayoutParams(FLP(FLP.MATCH_PARENT, empty_h))
+            tv = TextView(ctx)
+            tv.setText("В этой папке нет закреплённых чатов")
+            tv.setTextSize(14.0)
+            tv.setTextColor(self._theme_color("key_dialogTextGray3", self._argb(0xFF8E8E93)))
+            tv.setGravity(Gravity.CENTER)
+            tv.setPadding(self._dp(ctx, 18), self._dp(ctx, 32), self._dp(ctx, 18), self._dp(ctx, 32))
+            tv.setLayoutParams(FLP(FLP.MATCH_PARENT, empty_h))
+            self.list_box.addView(tv)
+            try:
+                lp = self.scroll.getLayoutParams()
+                lp.height = empty_h
+                self.scroll.setLayoutParams(lp)
+                self.scroll.requestLayout()
+            except Exception:
+                pass
+            return
+
+        total_h = len(self.order) * self.row_h
+        self.list_box.setMinimumHeight(total_h)
+        self.list_box.setLayoutParams(FLP(FLP.MATCH_PARENT, total_h))
+
+        spacer = View(ctx)
+        spacer.setLayoutParams(FLP(1, total_h))
+        self.list_box.addView(spacer)
+
+        mc = self._mc_ref or self.plugin._mc()
+        for i, did in enumerate(self.order):
+            row = self.row_cache.get(did)
+            if row is not None:
+                try:
+                    parent = row.getParent()
+                    if parent is not None:
+                        parent.removeView(row)
+                except Exception:
+                    pass
+                try:
+                    row.setScaleX(1.0)
+                    row.setScaleY(1.0)
+                    row.setAlpha(1.0)
+                    row.setElevation(0.0)
+                    row.setBackgroundColor(0)
+                except Exception:
+                    pass
+            else:
+                tl_dialog = self.plugin._get_tl_dialog(did, mc)
+                row = self._build_row(ctx, did, tl_dialog, self._dialogs_frag)
+                self.row_cache[did] = row
+
+            row.setTranslationY(float(i * self.row_h))
+            self.list_box.addView(row)
+            self.views[did] = row
+
+        try:
+            lp = self.scroll.getLayoutParams()
+            lp.height = min(total_h, self.max_list_h)
+            self.scroll.setLayoutParams(lp)
+            self.scroll.requestLayout()
+        except Exception:
+            pass
+        try:
+            self.scroll.scrollTo(0, 0)
+        except Exception:
+            pass
+
+    def open(self):
+        ctx = self.plugin._activity()
+        if ctx is None:
+            self.plugin.toast("Не удалось открыть редактор")
+            return
+
+        editor = self
+
+        self._mc_ref = self.plugin._mc()
+        self._acc = self.plugin._account()
+        self._dialogs_frag = self._find_dialogs_activity()
+        try:
+            self._dialog_cell_cls = self._j("org.telegram.ui.Cells.DialogCell")
+        except Exception:
+            self._dialog_cell_cls = None
+
+        self.folders = self.plugin.get_folders()
+        valid_fids = [fid for fid, _title, _fobj in self.folders]
+        self.orders_by_folder = {}
+        self.initial_orders = {}
+
+        active = self.plugin._active_folder_id_fast()
+        if active not in valid_fids:
+            active = 0
+
+        ord_active = list(self.plugin.desired_order(active))
+        self.orders_by_folder[active] = ord_active
+        self.initial_orders[active] = list(ord_active)
+
+        if ord_active:
+            self.current_fid = active
+        else:
+            found_fid = None
+            for fid in valid_fids:
+                if fid == active:
+                    continue
+                ord_f = list(self.plugin.desired_order(fid))
+                self.orders_by_folder[fid] = ord_f
+                self.initial_orders[fid] = list(ord_f)
+                if ord_f:
+                    found_fid = fid
+                    break
+            if found_fid is None:
+                self.plugin.toast("Нет закреплённых чатов")
+                return
+            self.current_fid = found_fid
+
+        self.order = list(self.orders_by_folder.get(self.current_fid, []))
+
+        Dialog = self._j("android.app.Dialog")
+        Window = self._j("android.view.Window")
+        LinearLayout = self._j("android.widget.LinearLayout")
+        FrameLayout = self._j("android.widget.FrameLayout")
+        ScrollView = self._j("android.widget.ScrollView")
+        TextView = self._j("android.widget.TextView")
+        View = self._j("android.view.View")
+        Gravity = self._j("android.view.Gravity")
+        MotionEvent = self._j("android.view.MotionEvent")
+        GradientDrawable = self._j("android.graphics.drawable.GradientDrawable")
+        ColorDrawable = self._j("android.graphics.drawable.ColorDrawable")
+        Handler = self._j("android.os.Handler")
+        Looper = self._j("android.os.Looper")
+        LLP = self._j("android.widget.LinearLayout$LayoutParams")
+        FLP = self._j("android.widget.FrameLayout$LayoutParams")
+
+        self.handler = Handler(Looper.getMainLooper())
+        self.row_h = self._dp(ctx, self.ROW_DP)
+        self.touch_slop = self._dp(ctx, 10)
+
+        bg_color = self._theme_color("key_dialogBackground", self._argb(0xFF18181B))
+
+        if self._is_dark(bg_color):
+            self._tab_colors = {
+                "bar_bg": self._argb(0xFF212026),
+                "bar_stroke": self._argb(0x1EFFFFFF),
+                "sel_bg": self._argb(0xFF392B49),
+                "sel_text": self._argb(0xFFD59BFF),
+                "unsel_text": self._argb(0xFFB5B5BC),
+            }
+        else:
+            self._tab_colors = {
+                "bar_bg": self._argb(0xFFF1EFF5),
+                "bar_stroke": self._argb(0x14000000),
+                "sel_bg": self._argb(0x289B59F6),
+                "sel_text": self._argb(0xFF7C3AED),
+                "unsel_text": self._argb(0xFF6B6B73),
+            }
+        title_color = self._theme_color("key_dialogTextBlack", self._argb(0xFFF2F2F7))
+        accent_color = self._theme_color("key_dialogTextBlue2", self._argb(0xFFA78BFA))
+        muted_color = self._theme_color("key_dialogTextGray3", self._argb(0xFF8E8E93))
+        div_color = self._theme_color("key_divider", self._argb(0x22FFFFFF))
+
+        dlg = Dialog(ctx)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dlg.setCancelable(True)
+        self.dialog = dlg
+
+        card = LinearLayout(ctx)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card_bg = GradientDrawable()
+        card_bg.setColor(bg_color)
+        card_bg.setCornerRadius(float(self._dp(ctx, 18)))
+        card.setBackground(card_bg)
+        card.setClipToOutline(True)
+
+        hdr = TextView(ctx)
+        hdr.setText("Порядок закрепов")
+        hdr.setTextSize(17.0)
+        hdr.setTextColor(title_color)
+        hdr.setPadding(self._dp(ctx, 18), self._dp(ctx, 16), self._dp(ctx, 18), self._dp(ctx, 2))
+        card.addView(hdr, LLP(LLP.MATCH_PARENT, LLP.WRAP_CONTENT))
+
+        hint = TextView(ctx)
+        hint.setText("Зажмите чат, чтобы перенести...")
+        hint.setTextSize(13.0)
+        hint.setTextColor(muted_color)
+        hint.setPadding(self._dp(ctx, 18), 0, self._dp(ctx, 18), self._dp(ctx, 12))
+        card.addView(hint, LLP(LLP.MATCH_PARENT, LLP.WRAP_CONTENT))
+
+        HorizontalScrollView = self._j("android.widget.HorizontalScrollView")
+        TypedValue = self._j("android.util.TypedValue")
+        AndroidUtilities = self._j("org.telegram.messenger.AndroidUtilities")
+
+        capsule = FrameLayout(ctx)
+        cap_bg = GradientDrawable()
+        cap_bg.setColor(self._tab_colors["bar_bg"])
+        cap_bg.setCornerRadius(float(self._dp(ctx, 22)))
+        cap_bg.setStroke(self._dp(ctx, 1), self._tab_colors["bar_stroke"])
+        capsule.setBackground(cap_bg)
+        capsule.setClipToOutline(True)
+        pad_cap = self._dp(ctx, 4)
+        capsule.setPadding(pad_cap, pad_cap, pad_cap, pad_cap)
+
+        hsv = HorizontalScrollView(ctx)
+        hsv.setHorizontalScrollBarEnabled(False)
+        hsv.setOverScrollMode(View.OVER_SCROLL_NEVER)
+        hsv.setPadding(0, 0, 0, 0)
+        hsv.setSmoothScrollingEnabled(True)
+        self.tabs_scroll = hsv
+
+        tabs_row = LinearLayout(ctx)
+        tabs_row.setOrientation(LinearLayout.HORIZONTAL)
+        tabs_row.setGravity(Gravity.CENTER_VERTICAL)
+
+        self.tab_views = {}
+        for fid, title, _fobj in self.folders:
+            tv = TextView(ctx)
+            tv.setText(title)
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14.0)
+            tv.setTypeface(AndroidUtilities.bold())
+            tv.setSingleLine(True)
+            tv.setGravity(Gravity.CENTER)
+            tv.setPadding(self._dp(ctx, 14), self._dp(ctx, 7), self._dp(ctx, 14), self._dp(ctx, 7))
+            tv.setClickable(True)
+            tv.setTextColor(self._tab_colors["unsel_text"])
+            tv.setFocusable(False)
+            tv.setFocusableInTouchMode(False)
+
+            tp = OnClickListener(lambda _v, target_fid=fid: editor._select_folder(target_fid, ctx))
+            self._proxies.append(tp)
+            tv.setOnClickListener(tp)
+
+            tlp = LLP(LLP.WRAP_CONTENT, LLP.WRAP_CONTENT)
+            tlp.rightMargin = self._dp(ctx, 2)
+            tabs_row.addView(tv, tlp)
+            self.tab_views[fid] = tv
+
+        hsv.addView(tabs_row, FLP(FLP.WRAP_CONTENT, FLP.WRAP_CONTENT))
+        capsule.addView(hsv, FLP(FLP.MATCH_PARENT, FLP.WRAP_CONTENT))
+        cap_lp = LLP(LLP.MATCH_PARENT, LLP.WRAP_CONTENT)
+        cap_lp.leftMargin = self._dp(ctx, 14)
+        cap_lp.rightMargin = self._dp(ctx, 14)
+        cap_lp.bottomMargin = self._dp(ctx, 10)
+        card.addView(capsule, cap_lp)
+
+        self._update_tab_styles(ctx, scroll_to_active=False)
+
+        scroll = ScrollView(ctx)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.setFillViewport(True)
+        scroll.setClipChildren(False)
+        self.scroll = scroll
+
+        list_box = FrameLayout(ctx)
+        list_box.setClipChildren(False)
+        list_box.setClipToPadding(False)
+        self.list_box = list_box
+
+        self.max_list_h = int(float(ctx.getResources().getDisplayMetrics().heightPixels) * 0.62)
+        init_h = (len(self.order) * self.row_h) if self.order else self._dp(ctx, 96)
+        list_box.setMinimumHeight(init_h)
+        list_box.setLayoutParams(FLP(FLP.MATCH_PARENT, init_h))
+
+        scroll.addView(list_box)
+        card.addView(scroll, LLP(LLP.MATCH_PARENT, min(init_h, self.max_list_h)))
+
+        def _on_list_touch(_v, ev):
+            act = int(ev.getActionMasked())
+            if act == MotionEvent.ACTION_DOWN:
+                if not editor.order:
+                    return False
+                idx = int(ev.getY() // float(editor.row_h))
+                if 0 <= idx < len(editor.order):
+                    editor.press_idx = idx
+                    editor.press_raw_y = float(ev.getRawY())
+                    editor.press_token += 1
+                    tok = editor.press_token
+                    r = _runnable_proxy(lambda t=tok, i=idx: editor._start_drag(i, ctx) if (t == editor.press_token and editor.drag_idx < 0) else None)
+                    editor._lp_runnable = r
+                    editor.handler.postDelayed(r, jlong(editor.LONG_PRESS_MS))
+                return True
+
+            if act == MotionEvent.ACTION_MOVE:
+                raw_y = float(ev.getRawY())
+                if editor.drag_idx >= 0:
+                    editor._move_drag(raw_y, ctx)
+                    return True
+                if abs(raw_y - editor.press_raw_y) > editor.touch_slop:
+                    editor.press_token += 1
+                    editor.press_idx = -1
+                return False
+
+            if act in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
+                editor._end_drag()
+                return True
+
+            return False
+
+        touch_p = _touch_proxy(_on_list_touch)
+        self._proxies.append(touch_p)
+        list_box.setOnTouchListener(touch_p)
+
+        div = View(ctx)
+        div.setBackgroundColor(div_color)
+        card.addView(div, LLP(LLP.MATCH_PARENT, self._dp(ctx, 1)))
+
+        bar = LinearLayout(ctx)
+        bar.setOrientation(LinearLayout.HORIZONTAL)
+        bar.setGravity(Gravity.END | Gravity.CENTER_VERTICAL)
+        bar.setPadding(self._dp(ctx, 12), self._dp(ctx, 8), self._dp(ctx, 12), self._dp(ctx, 8))
+
+        def _make_btn(text, color, cb):
+            b = TextView(ctx)
+            b.setText(text)
+            b.setTextSize(15.0)
+            b.setTextColor(color)
+            b.setPadding(self._dp(ctx, 16), self._dp(ctx, 10), self._dp(ctx, 16), self._dp(ctx, 10))
+            b.setClickable(True)
+            p = OnClickListener(lambda _v: cb())
+            editor._proxies.append(p)
+            b.setOnClickListener(p)
+            return b
+
+        def _on_cancel():
+            try:
+                dlg.dismiss()
+            except Exception:
+                pass
+
+        def _on_apply():
+            editor.orders_by_folder[editor.current_fid] = list(editor.order)
+            try:
+                dlg.dismiss()
+            except Exception:
+                pass
+            for fid, new_order in editor.orders_by_folder.items():
+                if new_order != editor.initial_orders.get(fid):
+                    editor.plugin.apply_order(new_order, fid=fid)
+            editor.plugin.toast("Порядок закрепов обновлён")
+
+        bar.addView(_make_btn("Отмена", muted_color, _on_cancel))
+        bar.addView(_make_btn("Применить", accent_color, _on_apply))
+        card.addView(bar, LLP(LLP.MATCH_PARENT, LLP.WRAP_CONTENT))
+
+        dlg.setContentView(card)
+        win = dlg.getWindow()
+        if win is not None:
+            win.setBackgroundDrawable(ColorDrawable(0))
+            dm = ctx.getResources().getDisplayMetrics()
+            w = int(float(dm.widthPixels) * 0.92)
+            win.setLayout(w, LLP.WRAP_CONTENT)
+        dlg.show()
+
+        self._render_token += 1
+        init_tok = self._render_token
+
+        def _init_render():
+            if init_tok == editor._render_token:
+                editor._render_folder_list(ctx)
+            editor._ensure_tab_visible(ctx, animate=False)
+
+        init_r = _runnable_proxy(_init_render)
+        self._proxies.append(init_r)
+        self.handler.post(init_r)
