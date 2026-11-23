@@ -1,0 +1,1931 @@
+import json
+import math
+import time
+from typing import Any, List
+
+from android.content import Context
+from android.graphics import Bitmap, Canvas, DashPathEffect, Paint, RectF, Typeface
+from android.view import Gravity
+from android.widget import ImageView, LinearLayout, ScrollView, SeekBar, TextView
+from java import jarray, jfloat, jint, jlong
+from org.telegram.messenger import (
+    AndroidUtilities, ApplicationLoader, MessagesController, NotificationCenter, UserConfig,
+)
+
+from base_plugin import AppEvent, BasePlugin, HookResult, MenuItemData, MenuItemType, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+from android_utils import OnClickListener, copy_to_clipboard, run_on_ui_thread
+
+__id__ = "owed_plugin"
+__name__ = "owed"
+__description__ = "**Кольцо вокруг аватарки показывает, кому ты ещё не ответил и как давно.**\n\nПрочитал, отвлёкся, забыл ответить: для Telegram такое сообщение уже «обработано». owed его отмечает: кольцо идёт от зелёного к красному и дальше к тёмному, дуга заполняется по кругу, а значок показывает время ожидания: 40м, 3ч, 2д, 2н (недели), 1мес. Ответил или поставил реакцию, и кольцо гаснет.\n\n**Что умеет**\n• Умная срочность: вопрос и «срочно» краснеют быстрее, стикеры и «лол» почти нет.\n• «Ждут ответа» в боковом меню: самые давние сверху, из списка можно открыть чат.\n• «Ответ: действия» в меню чата: ответ не нужен, отложить, важный контакт, не отслеживать.\n• Тихие часы: ночь не считается ожиданием.\n• 5 стилей кольца, предпросмотр, обмен настройками.\n\nВсё работает на телефоне: тексты сообщений не сохраняются, ничего не отправляется, фоновой работы нет."
+__author__ = "@raznosing"
+__version__ = "1.10.1"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["chats", "appearance", "tools"]
+
+# Готовые палитры: (название, (цвет в начале, посередине, в конце)).
+# Цвета мягкие, чтобы кольцо не резало глаза.
+PALETTES = [
+    ("Мягкий", ((110, 200, 150), (255, 200, 110), (240, 110, 110))),
+    ("Классика", ((67, 190, 80), (255, 204, 0), (230, 45, 45))),
+    ("Океан", ((80, 200, 200), (90, 140, 240), (150, 110, 230))),
+    ("Закат", ((255, 190, 130), (245, 120, 160), (150, 100, 220))),
+]
+
+IGNORE_TEXTS = {
+    "ок", "ok", "окей", "спс", "спасибо", "👍", "+", "понял", "принял",
+    "хорошо", "ладно", "ага", "угу", "thx", "thanks",
+}
+
+KEY_DEBTS = "debts"      # JSON: {"account:dialog_id": unix_time}
+KEY_URGENCY = "urgency"  # JSON: {"account:dialog_id": множитель срочности}
+KEY_SNOOZE = "snooze"    # JSON: {"account:dialog_id": unix_time, до которого кольцо скрыто}
+KEY_VIP = "vip"          # JSON: {"account:dialog_id": true}
+KEY_IGNORED = "ignored"  # JSON: {"account:dialog_id": true}
+KEY_CLEARED = "cleared"  # JSON: {"account:dialog_id": unix_time, когда нажали «Ответ не нужен»}
+KEY_DISMISSED = "dismissed"  # JSON: {"account:dialog_id": unix_time, когда ответил или убрал кольцо}
+
+STYLES = ["Сплошное", "Пунктир", "Деления", "Двойное", "Точки"]
+STYLE_SOLID, STYLE_DASHED, STYLE_TICKS, STYLE_DOUBLE, STYLE_DOTS = range(5)
+
+# Пункты окна «Настроить» в предпросмотре: (название, действие)
+TUNE_ACTIONS = [
+    ("Толще", "thicker"), ("Тоньше", "thinner"),
+    ("Дальше от аватарки", "farther"), ("Ближе к аватарке", "closer"),
+    ("Менее прозрачное", "more_opaque"), ("Более прозрачное", "less_opaque"),
+    ("Следующий стиль", "next_style"), ("Следующая палитра", "next_palette"),
+]
+
+URGENT_WORDS_DEFAULT = "срочно, помоги, помогите, звони, позвони, ответь, быстро, urgent, asap, help"
+CALM_WORDS_DEFAULT = "лол, ахах, хаха, ржу, кек"
+WAITING_LIMIT = 25   # сколько людей показывать в списке «Ждут ответа»
+MAX_FACTOR = 4.0   # потолок множителя срочности
+BURST_STEP = 0.25  # прибавка за каждое следующее сообщение подряд без ответа
+
+
+def lerp(a, b, t):
+    return int(a + (b - a) * t)
+
+
+def parse_hex(text, fallback):
+    """'#RRGGBB' или 'RGB' -> (r, g, b); при ошибке возвращает fallback."""
+    try:
+        t = str(text).strip().lstrip("#")
+        if len(t) == 3:
+            t = "".join(ch * 2 for ch in t)
+        if len(t) != 6:
+            return fallback
+        return int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16)
+    except ValueError:
+        return fallback
+
+
+def deepen(rgb):
+    """Тёмный оттенок цвета: им кольцо становится, когда человек ждёт совсем давно."""
+    r, g, b = rgb
+    return int(r * 0.55), int(g * 0.38), int(b * 0.62)
+
+
+def build_stops(start, mid, end, colors, long_end=None, deep=None):
+    """Точки (минуты, цвет); минуты всегда идут по возрастанию.
+
+    Дальше красного идут необязательные этапы «очень давно»: тёмно-красный (deep) и почти
+    чёрно-бордовый (long_end). Благодаря им кольцо различает 2, 3, 5 дней, неделю, две недели и месяц.
+    """
+    start = max(start, 0.0)
+    mid = max(mid, start + 1.0)
+    end = max(end, mid + 1.0)
+    stops = [(start, colors[0]), (mid, colors[1]), (end, colors[2])]
+    if long_end is not None:
+        long_end = max(long_end, end + 1.0)
+        dark = deepen(colors[2])
+        if deep is not None and end + 1.0 <= deep <= long_end - 1.0:
+            stops += [(deep, dark), (long_end, deepen(dark))]
+        else:
+            stops.append((long_end, dark))
+    return stops
+
+
+def debt_color(minutes, stops):
+    """(r, g, b) для данного числа минут: плавный переход между точками."""
+    if minutes <= stops[0][0]:
+        return stops[0][1]
+    if minutes >= stops[-1][0]:
+        return stops[-1][1]
+    for i in range(len(stops) - 1):
+        (m1, c1), (m2, c2) = stops[i], stops[i + 1]
+        if m1 <= minutes < m2:
+            if i >= 2 and m1 > 0:
+                # отрезки дальше красного идут по логарифму: на них дни и недели различимы
+                t = math.log(minutes / m1) / math.log(m2 / m1)
+            else:
+                t = (minutes - m1) / float(m2 - m1)
+            return lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)
+    return stops[-1][1]
+
+
+def to_argb_int(a, r, g, b):
+    """Подписанный 32-битный ARGB для Paint.setColor(int)."""
+    value = (a << 24) | (r << 16) | (g << 8) | b
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return value
+
+
+def dp(value):
+    try:
+        return int(AndroidUtilities.dp(float(value)))
+    except Exception:
+        return int(round(float(value) * 3))
+
+
+def ring_progress(minutes, stops):
+    """Доля пути по шкале от 0 до 1. Каждый этап шкалы занимает равную долю,
+    внутри этапа время идёт по логарифму: минуты, часы, дни и недели хорошо различимы."""
+    if minutes <= stops[0][0]:
+        return 0.0
+    if minutes >= stops[-1][0]:
+        return 1.0
+    stages = len(stops) - 1
+    for i in range(stages):
+        m1, m2 = stops[i][0], stops[i + 1][0]
+        if m1 <= minutes < m2:
+            if m1 >= 1:
+                t = math.log(minutes / m1) / math.log(m2 / m1)
+            else:
+                t = (minutes - m1) / float(m2 - m1)
+            return (i + t) / stages
+    return 1.0
+
+
+def arc_fraction(minutes, stops):
+    """Доля круга, которую занимает дуга: от 10% в начале до полного круга на последнем этапе."""
+    return ring_progress(minutes, stops) * 0.9 + 0.1
+
+
+def format_wait(minutes):
+    """Короткая подпись времени ожидания: 15м, 3ч, 2д, 2н (недели), 1мес, 1г."""
+    m = int(minutes)
+    if m < 1:
+        return "1м"
+    if m < 60:
+        return "%dм" % m
+    hours = m // 60
+    if hours < 24:
+        return "%dч" % hours
+    days = hours // 24
+    if days < 7:
+        return "%dд" % days
+    if days < 30:
+        return "%dн" % (days // 7)
+    if days < 365:
+        return "%dмес" % (days // 30)
+    return "%dг" % (days // 365)
+
+
+def text_color_for(rgb):
+    """Тёмный текст на светлом фоне значка и белый на тёмном."""
+    r, g, b = rgb
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return (34, 34, 34) if luminance > 160 else (255, 255, 255)
+
+
+def tomorrow_morning(now_ts, hour=9):
+    """Unix-время завтрашнего утра (по умолчанию 9:00) по локальному времени."""
+    t = time.localtime(now_ts)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday + 1, hour, 0, 0, 0, 0, -1))
+
+
+def next_morning(now_ts, hour=9):
+    """Ближайшие 9:00: сегодня, если ещё не наступили, иначе завтра."""
+    t = time.localtime(now_ts)
+    today = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hour, 0, 0, 0, 0, -1))
+    return today if today > now_ts else tomorrow_morning(now_ts, hour)
+
+
+# Настройки, которыми можно делиться: оформление и пороги. Без личных данных (долги, важные,
+# исключённые и «ответ не нужен» в обмен не попадают). «enabled» тоже не передаётся.
+# ключ: (тип, значение по умолчанию, [минимум, максимум или длина])
+SHARED_SETTINGS = {
+    "mutual_boost": ("bool", True), "only_sound_on": ("bool", False), "contacts_only": ("bool", True),
+    "skip_trivial": ("bool", True), "show_arc": ("bool", True), "show_badge": ("bool", True), "urgent_mark": ("bool", False),
+    "smart_urgency": ("bool", True), "reaction_counts": ("bool", True), "quiet_enabled": ("bool", False),
+    "palette": ("int", 0, 0, len(PALETTES)), "ring_style": ("int", 0, 0, len(STYLES) - 1),
+    "color_start": ("hex", "#6EC896"), "color_mid": ("hex", "#FFC86E"), "color_end": ("hex", "#F06E6E"),
+    "ring_thickness": ("num", "3", 1, 10), "ring_opacity": ("num", "92", 10, 100), "ring_gap": ("num", "2", -3, 12),
+    "urgent_words": ("text", URGENT_WORDS_DEFAULT, 600), "calm_words": ("text", CALM_WORDS_DEFAULT, 600),
+    "urgent_factor": ("num", "2", 1, 4), "calm_factor": ("num", "0.5", 0.1, 1),
+    "min_minutes": ("num", "15", 0, 100000), "mid_minutes": ("num", "240", 0, 100000),
+    "end_minutes": ("num", "1440", 0, 100000), "long_minutes": ("num", "43200", 0, 1000000), "deep_minutes": ("num", "10080", 0, 1000000), "boost_factor": ("num", "1.5", 1, 4), "vip_factor": ("num", "2", 1, 4),
+    "quiet_from": ("clock", "23:00"), "quiet_to": ("clock", "08:00"),
+}
+EXPORT_PREFIX = "OWED1:"
+MAX_IMPORT_LENGTH = 20000
+
+
+def make_seek_listener(callback):
+    """Слушатель ползунка SeekBar. Возвращает None, если динамические прокси недоступны."""
+    try:
+        from java import dynamic_proxy, jclass
+        interface = jclass("android.widget.SeekBar$OnSeekBarChangeListener")
+
+        class Listener(dynamic_proxy(interface)):
+            def onProgressChanged(self, seek_bar, progress, from_user):
+                if from_user:
+                    callback(int(progress))
+
+            def onStartTrackingTouch(self, seek_bar):
+                pass
+
+            def onStopTrackingTouch(self, seek_bar):
+                pass
+
+        return Listener()
+    except Exception:
+        return None
+
+
+# Ползунки редактора кольца: ключ, подпись, минимум, шаг, число шагов, формат значения
+RING_SLIDERS = [
+    ("ring_thickness", "Толщина", 1.0, 0.5, 18, "%g dp"),
+    ("ring_gap", "Расстояние до аватарки", -3.0, 1.0, 15, "%g dp"),
+    ("ring_opacity", "Прозрачность", 10.0, 1.0, 90, "%g%%"),
+]
+RING_DEFAULTS = {"ring_thickness": "3", "ring_gap": "2", "ring_opacity": "92", "ring_style": 0, "palette": 0}
+
+
+def slider_progress(value, minimum, step, count):
+    """Положение ползунка для значения: с округлением до шага и ограничением диапазоном."""
+    return min(max(int(round((value - minimum) / step)), 0), count)
+
+
+def slider_value(progress, minimum, step):
+    return minimum + progress * step
+
+
+def sanitize_setting(spec, value):
+    """Проверяет значение из буфера обмена. Возвращает значение в том виде, как его хранят настройки,
+    или None, если оно не подходит."""
+    kind = spec[0]
+    if kind == "bool":
+        return value if isinstance(value, bool) else None
+    if kind == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if spec[2] <= value <= spec[3] else None
+    if kind == "num":
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(str(value).replace(",", "."))
+        except ValueError:
+            return None
+        if math.isnan(number) or math.isinf(number) or not (spec[2] <= number <= spec[3]):
+            return None
+        return "%g" % number
+    if kind == "hex":
+        rgb = parse_hex(str(value), None)
+        return None if rgb is None else "#%02X%02X%02X" % rgb
+    if kind == "clock":
+        text = str(value).strip()
+        return text if parse_clock(text, None) is not None else None
+    if kind == "text":
+        text = str(value)
+        return text if len(text) <= spec[2] else None
+    return None
+
+
+def build_export(read):
+    """Строка с настройками для копирования. read(ключ, по умолчанию) отдаёт текущее значение."""
+    data = {}
+    for key, spec in SHARED_SETTINGS.items():
+        default = spec[1]
+        clean = sanitize_setting(spec, read(key, default))
+        data[key] = default if clean is None else clean
+    return EXPORT_PREFIX + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_import(text):
+    """Разбирает строку из буфера. Возвращает (настройки, пропущено, ошибка)."""
+    text = (text or "").strip()
+    if not text.startswith(EXPORT_PREFIX):
+        return {}, 0, "В буфере обмена нет настроек owed"
+    if len(text) > MAX_IMPORT_LENGTH:
+        return {}, 0, "Слишком длинный текст в буфере"
+    try:
+        raw = json.loads(text[len(EXPORT_PREFIX):])
+    except ValueError:
+        return {}, 0, "Настройки повреждены: не получилось прочитать"
+    if not isinstance(raw, dict):
+        return {}, 0, "Настройки повреждены: неверный формат"
+    accepted, skipped = {}, 0
+    for key, value in raw.items():
+        spec = SHARED_SETTINGS.get(key)
+        clean = None if spec is None else sanitize_setting(spec, value)
+        if clean is None:
+            skipped += 1
+        else:
+            accepted[key] = clean
+    if not accepted:
+        return {}, skipped, "В буфере нет подходящих настроек"
+    return accepted, skipped, None
+
+
+def parse_clock(text, default):
+    """'23:30', '23.30' или '23' -> минуты от полуночи. Некорректный ввод -> default."""
+    try:
+        parts = str(text).strip().replace(".", ":").split(":")
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    except (ValueError, IndexError):
+        return default
+    if not (0 <= hours <= 24 and 0 <= minutes < 60):
+        return default
+    return (hours % 24) * 60 + minutes
+
+
+def quiet_overlap_minutes(start_ts, end_ts, from_min, to_min):
+    """Сколько минут между start_ts и end_ts приходится на тихие часы (каждый день с from_min до to_min)."""
+    if end_ts <= start_ts or from_min == to_min:
+        return 0.0
+    first = time.localtime(start_ts)
+    length = ((to_min - from_min) % 1440) * 60   # окно может переходить через полночь
+    total = 0.0
+    for day in range(0, 400):
+        midnight = time.mktime((first.tm_year, first.tm_mon, first.tm_mday - 1 + day, 0, 0, 0, 0, 0, -1))
+        window_start = midnight + from_min * 60
+        if window_start >= end_ts:
+            break
+        overlap = min(window_start + length, end_ts) - max(window_start, start_ts)
+        if overlap > 0:
+            total += overlap
+    return total / 60.0
+
+
+def step_value(value, delta, low, high):
+    """Сдвигает значение на delta и держит его в границах."""
+    return min(max(round(value + delta, 2), low), high)
+
+
+def next_index(index, count):
+    """Следующий по кругу индекс: 0, 1, ..., count-1, снова 0."""
+    return (int(index) + 1) % count
+
+
+def dkey(account, dialog_id):
+    return "%d:%d" % (account, dialog_id)
+
+
+def parse_words(text) -> List[str]:
+    """'срочно, помоги; asap' -> ['срочно', 'помоги', 'asap']."""
+    parts = str(text).replace(";", ",").replace("\n", ",").split(",")
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def message_factor(text, kind, urgent_words, calm_words, urgent_factor, calm_factor) -> float:
+    """Множитель срочности для одного входящего сообщения.
+
+    1.0 = обычное. Вопрос и слова срочности ускоряют кольцо, стикеры, эмодзи и «лол» замедляют.
+    """
+    if kind == "sticker":
+        return calm_factor
+    t = (text or "").strip().lower()
+    if t:
+        if not any(ch.isalnum() for ch in t):   # только эмодзи и знаки
+            return calm_factor
+        if len(t) <= 12 and any(t.startswith(w) for w in calm_words):
+            return calm_factor
+    score = 0
+    if "?" in t:
+        score += 1
+    if any(w in t for w in urgent_words):
+        score += 1
+    if score == 0:
+        return 1.0
+    factor = urgent_factor if score == 1 else urgent_factor * 1.5
+    return min(factor, MAX_FACTOR)
+
+
+def accumulate_factor(previous: float, new_factor: float) -> float:
+    """Следующее сообщение подряд без ответа: берём большее значение и добавляем шаг."""
+    return round(min(MAX_FACTOR, max(previous, new_factor) + BURST_STEP), 2)
+
+
+class DialogCellDrawHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.draw_ring(param.thisObject, param.args[0])
+        except Exception:
+            self.plugin.logger.exception("draw_ring failed")
+
+
+class OwedPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.debts = self._load(KEY_DEBTS)
+        self.urgency = self._load(KEY_URGENCY)
+        self.snooze = self._load(KEY_SNOOZE)
+        self.vip = self._load(KEY_VIP)
+        self.ignored = self._load(KEY_IGNORED)
+        self.dismissed = self._load(KEY_DISMISSED)
+        self.cleared = self._load(KEY_CLEARED)
+        self._no_date = 0       # чатов с непрочитанным, у которых не нашлась дата сообщения
+        self._repaired = 0      # исправленных неверных времён
+        self._draft = None   # черновик окна «Предпросмотр и настройка», только на время рисования
+        self._dash_cache = {}
+        self._paint = None
+        self._text_paint = None
+        self._fill_paint = None
+        self._oval = None
+        self._badge_rect = None
+        self._foreground = True     # приложение на экране?
+        self._sound_cache = {}      # key -> (время проверки, звук включён)
+        self._draw_calls = 0        # для диагностики
+        self._rings_drawn = 0
+        self._skips = {}            # причина -> сколько раз кольцо не нарисовано
+        self._seen = []             # какие чаты видела отрисовка (до 8)
+        self._last_error = "нет"
+        self._cfg = None            # (время, настройки) — кэш на 2 секунды
+        self._last_reason = "ничего ещё не происходило"
+        self._hook_info = "перехват не запускался"
+
+        # входящие сообщения (update) и твои исходящие
+        self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_messages_sendReaction")   # реакция тоже считается ответом
+        self.add_on_send_message_hook()
+
+        # перехват отрисовки ячейки списка чатов
+        self._install_draw_hook()
+
+        # пункт «Ответ: действия» в меню чата (если не получится, кольцо всё равно работает)
+        self._register_menu()
+
+        # один раз после загрузки подхватить уже непрочитанные чаты
+        run_on_ui_thread(self._startup, 3000)
+
+    def _install_draw_hook(self):
+        cell_cls = find_class("org.telegram.ui.Cells.DialogCell")
+        if not cell_cls:
+            self._hook_info = "класс DialogCell не найден"
+            self.logger.error(self._hook_info)
+            return
+
+        errors = []
+        # пробуем по очереди: onDraw, затем dispatchDraw, затем draw
+        for name in ("onDraw", "dispatchDraw", "draw"):
+            try:
+                unhooks = self.hook_all_methods(cell_cls, name, DialogCellDrawHook(self))
+                count = len(unhooks) if unhooks else 0
+            except Exception as e:
+                errors.append("%s: %s" % (name, e))
+                self.logger.exception("hook_all_methods(%s) failed" % name)
+                continue
+            if count:
+                self._hook_info = "перехват: %s (%d)" % (name, count)
+                self.logger.info(self._hook_info)
+                return
+            errors.append("%s: метода нет" % name)
+
+        # ничего не сработало: покажем, какие draw-методы вообще есть
+        names = []
+        try:
+            for m in cell_cls.getDeclaredMethods():
+                n = str(m.getName())
+                if "draw" in n.lower() and n not in names:
+                    names.append(n)
+        except Exception as e:
+            names.append("не прочитать: %s" % e)
+        self._hook_info = "перехват не удался (%s). draw-методы: %s" % (
+            "; ".join(errors), ", ".join(names[:10]) or "нет")
+        self.logger.error(self._hook_info)
+
+    def on_app_event(self, event_type: AppEvent):
+        if event_type in (AppEvent.PAUSE, AppEvent.STOP):
+            # в фоне долги продолжают считаться, но список не перерисовываем
+            self._foreground = False
+        elif event_type in (AppEvent.RESUME, AppEvent.START):
+            self._foreground = True
+            try:
+                account = UserConfig.selectedAccount
+                self._seed_from_dialogs(account)   # подхватить то, что пришло в фоне
+                self._refresh(account)             # сразу обновить цвета колец
+            except Exception:
+                self.logger.exception("on resume failed")
+
+    # ---------- настройки ----------
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Кольцо"),
+            Switch(key="enabled", text="Включить кольцо", default=True),
+            Switch(key="mutual_boost",
+                   text="Взаимные контакты краснеют быстрее", default=True),
+            Switch(key="only_sound_on",
+                   text="Только если звук у контакта включён",
+                   subtext="Кольцо скрыто у контактов с отключёнными уведомлениями",
+                   default=False),
+            Switch(key="contacts_only",
+                   text="Только для сохранённых контактов",
+                   subtext="Выключи, чтобы кольцо работало для любых личных чатов",
+                   default=True),
+            Switch(key="skip_trivial",
+                   text="Не считать «ок», «спасибо» и т.п.", default=True),
+            Divider(),
+            Header(text="Цвет кольца"),
+            Selector(key="palette", text="Палитра", default=0,
+                     items=[name for name, _ in PALETTES] + ["Свой"]),
+            Input(key="color_start", text="Свой: начальный цвет",
+                  subtext="HEX, например #6EC896. Работает при палитре «Свой»",
+                  default="#6EC896"),
+            Input(key="color_mid", text="Свой: средний цвет",
+                  default="#FFC86E"),
+            Input(key="color_end", text="Свой: конечный цвет",
+                  default="#F06E6E"),
+            Divider(),
+            Header(text="Стиль и размер кольца"),
+            Text(text="Предпросмотр и настройка",
+                 subtext="Ползунки толщины, расстояния и прозрачности с мгновенным результатом, плюс стиль и палитра",
+                 on_click=self._show_preview),
+            Selector(key="ring_style", text="Стиль", default=0, items=STYLES),
+            Input(key="ring_thickness", text="Толщина (dp)",
+                  subtext="От 1 до 10. По умолчанию 3",
+                  default="3"),
+            Input(key="ring_opacity", text="Прозрачность кольца (%)",
+                  subtext="От 10 до 100. 100 = непрозрачное. По умолчанию 92",
+                  default="92"),
+            Input(key="ring_gap", text="Расстояние до аватарки (dp)",
+                  subtext="От -3 до 12. 0 = вплотную, отрицательное = заходит на аватарку. По умолчанию 2",
+                  default="2"),
+            Divider(),
+            Header(text="Детали кольца"),
+            Switch(key="show_arc", text="Дуга времени",
+                   subtext="Кольцо заполняется по кругу по мере ожидания",
+                   default=True),
+            Switch(key="show_badge", text="Значок со временем",
+                   subtext="Например «3ч», «2д», «1н»",
+                   default=True),
+            Switch(key="urgent_mark", text="Восклицательный знак у срочных",
+                   subtext="Например «3ч!»: последнее сообщение было срочным. Выключено по умолчанию",
+                   default=False),
+            Divider(),
+            Header(text="Умная срочность"),
+            Switch(key="smart_urgency", text="Умная срочность",
+                   subtext="Вопросы и «срочно» краснеют быстрее, стикеры и «лол» медленнее",
+                   default=True),
+            Input(key="urgent_words", text="Слова срочности",
+                  subtext="Через запятую. Совпадение в тексте ускоряет кольцо",
+                  default=URGENT_WORDS_DEFAULT),
+            Input(key="calm_words", text="Спокойные слова",
+                  subtext="Короткие сообщения, которые начинаются с них, замедляют кольцо",
+                  default=CALM_WORDS_DEFAULT),
+            Input(key="urgent_factor", text="Ускорение для срочных (1–3)",
+                  subtext="2 = кольцо краснеет вдвое быстрее. По умолчанию 2",
+                  default="2"),
+            Input(key="calm_factor", text="Замедление для спокойных (0.2–1)",
+                  subtext="0.5 = вдвое медленнее. По умолчанию 0.5",
+                  default="0.5"),
+            Divider(),
+            Header(text="Время (в минутах)"),
+            Input(key="min_minutes", text="Показывать кольцо после",
+                  subtext="60 = час, 1440 = сутки. 0 = сразу",
+                  default="15"),
+            Input(key="mid_minutes", text="Средний цвет через",
+                  subtext="Столько минут от первого сообщения",
+                  default="240"),
+            Input(key="end_minutes", text="Конечный цвет через",
+                  default="1440"),
+            Input(key="deep_minutes", text="Тёмно-красное кольцо через",
+                  subtext="Между красным и этим порогом дни различаются сильнее. 10080 = неделя. 0 = без этапа",
+                  default="10080"),
+            Input(key="long_minutes", text="Самый долгий порог",
+                  subtext="Кольцо почти чёрно-бордовое, дуга замкнута. 43200 = месяц. 0 = без этого этапа",
+                  default="43200"),
+            Input(key="boost_factor",
+                  text="Ускорение для взаимных (1.5 = в 1.5 раза)",
+                  default="1.5"),
+            Divider(),
+            Header(text="Действия над кольцом"),
+            Text(text="Ждут ответа",
+                 subtext="Список людей, которым ты не ответил. Тап по человеку: «Ответ не нужен», «Отложить» и другое",
+                 on_click=self._show_waiting),
+            Input(key="vip_factor", text="Важные контакты: ускорение",
+                  subtext="2 = краснеют вдвое быстрее. Важным контакт делается в меню чата: «Ответ: действия»",
+                  default="2"),
+            Switch(key="reaction_counts", text="Реакция тоже считается ответом",
+                   subtext="Поставил реакцию на сообщение, и кольцо гаснет",
+                   default=True),
+            Text(text="Сбросить важные, исключённые, отложенные и «ответ не нужен»",
+                 on_click=self._reset_actions),
+            Divider(),
+            Header(text="Люди"),
+            Text(text="Ответ не нужен: %d" % len(self.cleared),
+                 subtext="Кого ты закрыл. Тап по человеку возвращает кольцо",
+                 on_click=lambda v: self._show_people("cleared")),
+            Text(text="Не отслеживаются: %d" % len(self.ignored),
+                 on_click=lambda v: self._show_people("ignored")),
+            Text(text="Важные контакты: %d" % len(self.vip),
+                 on_click=lambda v: self._show_people("vip")),
+            Text(text="Отложены: %d" % self._snoozed_count(),
+                 on_click=lambda v: self._show_people("snooze")),
+            Divider(),
+            Header(text="Тихие часы"),
+            Switch(key="quiet_enabled", text="Ночь не считается ожиданием",
+                   subtext="Время в тихие часы вычитается из ожидания: кольцо не краснеет, пока ты спишь",
+                   default=False),
+            Input(key="quiet_from", text="Тихие часы с", subtext="Например 23:00", default="23:00"),
+            Input(key="quiet_to", text="Тихие часы до", subtext="Например 08:00", default="08:00"),
+            Divider(),
+            Header(text="Обмен настройками"),
+            Text(text="Скопировать настройки",
+                 subtext="Оформление и пороги. Твои долги и списки людей не копируются",
+                 on_click=self._export_settings),
+            Text(text="Вставить настройки из буфера обмена", on_click=self._import_settings),
+            Divider(),
+            Header(text="Диагностика"),
+            Text(text="Показать состояние плагина", on_click=self._show_diagnostics),
+            Divider(text="Автор: @raznosing"),
+        ]
+
+    # ---------- настройки: чтение ----------
+
+    def _read(self, key, default):
+        """Значение настройки; во время рисования предпросмотра сначала смотрит в черновик."""
+        if self._draft is not None and key in self._draft:
+            return self._draft[key]
+        return self.get_setting(key, default)
+
+    def _num(self, key, default):
+        """Число из настройки. Мусор, NaN и бесконечность заменяются значением по умолчанию."""
+        try:
+            value = float(str(self._read(key, default)).replace(",", "."))
+        except ValueError:
+            return float(default)
+        return value if math.isfinite(value) else float(default)
+
+    def _palette_colors(self):
+        try:
+            idx = int(self._read("palette", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        if 0 <= idx < len(PALETTES):
+            return PALETTES[idx][1]
+        base = PALETTES[0][1]
+        return (
+            parse_hex(self.get_setting("color_start", "#6EC896"), base[0]),
+            parse_hex(self.get_setting("color_mid", "#FFC86E"), base[1]),
+            parse_hex(self.get_setting("color_end", "#F06E6E"), base[2]),
+        )
+
+    def _config(self, force=False):
+        """Пороги и цвета. Кэш на 2 секунды: отрисовка вызывается очень часто."""
+        now = time.time()
+        if not force and self._draft is None and self._cfg and now - self._cfg[0] < 2:
+            return self._cfg[1]
+        try:
+            style = int(self._read("ring_style", 0))
+        except (TypeError, ValueError):
+            style = 0
+        if not 0 <= style < len(STYLES):
+            style = 0
+        start = self._num("min_minutes", 15)
+        mid = self._num("mid_minutes", 240)
+        end = self._num("end_minutes", 1440)
+        long_end = self._num("long_minutes", 43200)   # 0 или меньше конечной точки: шкала заканчивается на ней
+        deep = self._num("deep_minutes", 10080)       # 0: без этапа «тёмно-красный»
+        opacity = min(max(self._num("ring_opacity", 92), 10.0), 100.0)
+        ring_alpha = int(round(opacity / 100.0 * 255))
+        cfg = {
+            "ring_alpha": ring_alpha,
+            "halo_alpha": int(round(ring_alpha * 0.25)),  # свечение слабее кольца
+            "stroke": min(max(self._num("ring_thickness", 3), 1.0), 10.0),
+            "gap": min(max(self._num("ring_gap", 2), -3.0), 12.0),
+            "threshold": start,
+            "stops": build_stops(start, mid, end, self._palette_colors(), long_end, deep),
+            "style": style,
+            "show_arc": bool(self.get_setting("show_arc", True)),
+            "show_badge": bool(self.get_setting("show_badge", True)),
+            "urgent_mark": bool(self.get_setting("urgent_mark", False)),
+            # настройки, которые нужны при каждой отрисовке ячейки списка
+            "enabled": bool(self.get_setting("enabled", True)),
+            "contacts_only": bool(self.get_setting("contacts_only", True)),
+            "only_sound_on": bool(self.get_setting("only_sound_on", False)),
+            "smart": bool(self.get_setting("smart_urgency", True)),
+            "mutual_boost": bool(self.get_setting("mutual_boost", True)),
+            "boost_factor": min(max(self._num("boost_factor", 1.5), 1.0), 4.0),
+            "vip_factor": min(max(self._num("vip_factor", 2), 1.0), 4.0),
+            "quiet": ((parse_clock(self.get_setting("quiet_from", "23:00"), 23 * 60),
+                       parse_clock(self.get_setting("quiet_to", "08:00"), 8 * 60))
+                      if bool(self.get_setting("quiet_enabled", False)) else None),
+        }
+        if self._draft is None:   # конфигурацию с черновиком в кэш не кладём
+            self._cfg = (now, cfg)
+        return cfg
+
+    def _show_diagnostics(self, view):
+        """Копирует полный отчёт в буфер обмена: его можно вставить в чат."""
+        lines = [
+            "owed %s" % __version__,
+            self._hook_info,
+            "отрисовок: %d, колец: %d" % (self._draw_calls, self._rings_drawn),
+            "долги: %s" % ("; ".join(
+                "%s с %s (%s)" % (k, time.strftime("%d.%m %H:%M", time.localtime(v)), format_wait((time.time() - v) / 60.0))
+                for k, v in sorted(self.debts.items())) or "нет"),
+            "чатов без даты сообщения: %d, исправлено неверных времён: %d" % (self._no_date, self._repaired),
+            "видела ячейки: %s" % (", ".join(self._seen) or "нет"),
+            "пропуски: %s" % json.dumps(self._skips, ensure_ascii=False),
+            "последняя ошибка: %s" % self._last_error,
+            "только контакты: %s, только со звуком: %s, палитра: %s, минуты: %s / %s / %s / %s / %s" % (
+                self.get_setting("contacts_only", True),
+                self.get_setting("only_sound_on", False),
+                self.get_setting("palette", 0),
+                self.get_setting("min_minutes", "15"),
+                self.get_setting("mid_minutes", "240"),
+                self.get_setting("end_minutes", "1440"),
+                self.get_setting("deep_minutes", "10080"),
+                self.get_setting("long_minutes", "43200")),
+            "размер: толщина %s, отступ %s, прозрачность %s%%" % (
+                self.get_setting("ring_thickness", "3"),
+                self.get_setting("ring_gap", "2"),
+                self.get_setting("ring_opacity", "92")),
+            "умная срочность: %s, множители: %s" % (
+                self.get_setting("smart_urgency", True),
+                ", ".join("%s=%s" % (k, v) for k, v in self.urgency.items()) or "нет"),
+            "стиль: %s, важных: %d, исключённых: %d, отложенных: %d" % (
+                STYLES[min(max(int(self.get_setting("ring_style", 0) or 0), 0), len(STYLES) - 1)],
+                len(self.vip), len(self.ignored), len(self.snooze)),
+            "«ответ не нужен» запомнено: %d (вручную %d), реакция считается ответом: %s, тихие часы: %s (%s–%s)" % (
+                len(self.dismissed), len(self.cleared), self.get_setting("reaction_counts", True),
+                self.get_setting("quiet_enabled", False),
+                self.get_setting("quiet_from", "23:00"), self.get_setting("quiet_to", "08:00")),
+            self._last_reason,
+        ]
+        copy_to_clipboard("\n".join(lines))
+
+    # ---------- хранилище ----------
+
+    def _load(self, key):
+        try:
+            return json.loads(self.get_setting(key, "{}"))
+        except Exception:
+            return {}
+
+    def _save(self, key, data, reload=False):
+        self.set_setting(key, json.dumps(data), reload_settings=reload)
+
+    # ---------- проверки ----------
+
+    def _user(self, account, dialog_id):
+        if dialog_id <= 0:  # группы, каналы и секретные чаты пропускаем
+            return None
+        return MessagesController.getInstance(account).getUser(dialog_id)
+
+    def _ineligible_reason(self, account, dialog_id):
+        """None, если чат подходит; иначе причина текстом."""
+        if dialog_id <= 0:
+            return "не личный чат"
+        if dkey(account, dialog_id) in self.ignored:
+            return "чат исключён"
+        user = self._user(account, dialog_id)
+        if user is None:
+            return "пользователь не найден"
+        if user.bot:
+            return "это бот"
+        if user.self:
+            return "это «Избранное»"
+        if self.get_setting("contacts_only", True) and not user.contact:
+            return "собеседника нет в контактах"
+        return None
+
+    def _sound_on(self, account, dialog_id):
+        """True, если уведомления от этого чата не отключены. Кэш на 5 секунд."""
+        key = dkey(account, dialog_id)
+        now = time.time()
+        cached = self._sound_cache.get(key)
+        if cached and now - cached[0] < 5:
+            return cached[1]
+        mc = MessagesController.getInstance(account)
+        try:
+            muted = mc.isDialogMuted(dialog_id, 0)
+        except TypeError:  # старая сигнатура без topicId
+            muted = mc.isDialogMuted(dialog_id)
+        result = not muted
+        self._sound_cache[key] = (now, result)
+        return result
+
+    def _is_trivial(self, text, kind="text"):
+        if not self.get_setting("skip_trivial", True):
+            return False
+        if kind == "sticker":
+            return True            # стикер сам по себе ответа не требует
+        if kind in ("voice", "media"):
+            return False           # голосовое или фото: человек ждёт реакции, даже без текста
+        t = (text or "").strip().lower()
+        return t == "" or t in IGNORE_TEXTS
+
+    def _classify(self, msg):
+        """Тип входящего: 'text', 'voice', 'sticker' или 'media' (фото, видео, файл).
+
+        Имена классов Telegram сравниваются без учёта регистра: TL_messageMediaDocument,
+        TL_documentAttributeSticker и т.д.
+        """
+        try:
+            media = getattr(msg, "media", None)
+            if media is None:
+                return "text"
+            name = str(media.getClass().getSimpleName()).lower()
+            if name.startswith("tl_messagemediaempty") or name.startswith("tl_messagemediawebpage"):
+                return "text"
+            if name.startswith("tl_messagemediadocument"):
+                document = getattr(media, "document", None)
+                attributes = getattr(document, "attributes", None) if document is not None else None
+                if attributes is not None:
+                    for i in range(int(attributes.size())):
+                        attribute = attributes.get(i)
+                        attribute_name = str(attribute.getClass().getSimpleName()).lower()
+                        if "documentattributesticker" in attribute_name:
+                            return "sticker"
+                        if "documentattributeanimated" in attribute_name:
+                            return "sticker"   # GIF считаем спокойным, как стикер
+                        if "documentattributeaudio" in attribute_name and bool(getattr(attribute, "voice", False)):
+                            return "voice"
+            return "media"
+        except Exception:
+            return "text"
+
+    def _factor_for(self, text, kind):
+        if not self.get_setting("smart_urgency", True):
+            return 1.0
+        return message_factor(
+            text, kind,
+            parse_words(self.get_setting("urgent_words", URGENT_WORDS_DEFAULT)),
+            parse_words(self.get_setting("calm_words", CALM_WORDS_DEFAULT)),
+            min(max(self._num("urgent_factor", 2), 1.0), 3.0),
+            min(max(self._num("calm_factor", 0.5), 0.2), 1.0),
+        )
+
+    # ---------- хуки событий ----------
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        """Входящее сообщение: запускаем таймер долга."""
+        try:
+            if update_name != "TL_updateNewMessage":
+                return HookResult()
+            msg = update.message
+            if msg.out:
+                return HookResult()
+
+            dialog_id = int(msg.dialog_id)
+            reason = self._ineligible_reason(account, dialog_id)
+            if reason:
+                self._last_reason = "последнее входящее пропущено: " + reason
+                return HookResult()
+            kind = self._classify(msg)
+            text = msg.message
+            if self._is_trivial(text, kind):
+                self._last_reason = "последнее входящее пропущено: короткий ответ или стикер"
+                return HookResult()
+
+            key = dkey(account, dialog_id)
+            if self.dismissed.pop(key, None) is not None:
+                self._save(KEY_DISMISSED, self.dismissed)   # написал снова: отсчёт начинается заново
+            if self.cleared.pop(key, None) is not None:
+                self._save(KEY_CLEARED, self.cleared)
+            factor = self._factor_for(text, kind)
+            if key not in self.debts:
+                # таймер идёт от ПЕРВОГО неотвеченного сообщения
+                self.debts[key] = int(msg.date)
+                self.urgency[key] = round(factor, 2)
+                if self.snooze.pop(key, None) is not None:
+                    self._save(KEY_SNOOZE, self.snooze)
+            else:
+                # ещё одно сообщение подряд без ответа: срочность растёт
+                previous = float(self.urgency.get(key, 1.0))
+                self.urgency[key] = accumulate_factor(previous, factor)
+            self._save(KEY_DEBTS, self.debts)
+            self._save(KEY_URGENCY, self.urgency)
+            self._refresh(account)
+            self._last_reason = "последнее входящее учтено (%s, множитель %s)" % (kind, self.urgency[key])
+        except Exception:
+            self.logger.exception("on_update_hook failed")
+            self._last_reason = "ошибка в on_update_hook (см. logcat)"
+        return HookResult()
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        """Ты ответил: долг обнуляется."""
+        try:
+            self._clear_debt(account, int(getattr(params, "peer", 0)))
+        except Exception:
+            self.logger.exception("on_send_message_hook failed")
+        return HookResult()
+
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        """Реакция на сообщение тоже считается ответом: кольцо гаснет."""
+        try:
+            if request_name == "TL_messages_sendReaction" and self.get_setting("reaction_counts", True):
+                reactions = getattr(request, "reaction", None)
+                if reactions is not None and int(reactions.size()) > 0:   # реакцию поставили, а не сняли
+                    user_id = int(getattr(request.peer, "user_id", 0) or 0)
+                    if user_id > 0 and self._clear_debt(account, user_id):
+                        self._last_reason = "реакция засчитана как ответ"
+        except Exception:
+            self.logger.exception("pre_request_hook failed")
+        return HookResult()
+
+    def _clear_debt(self, account, dialog_id):
+        """Снимает долг и запоминает момент: чат с непрочитанными больше не оживает при следующем запуске.
+        Возвращает True, если долг был."""
+        key = dkey(account, dialog_id)
+        if key not in self.debts:
+            return False
+        self.debts.pop(key, None)
+        self.urgency.pop(key, None)
+        self.snooze.pop(key, None)
+        self.dismissed[key] = int(time.time())
+        for storage_key, data in ((KEY_DEBTS, self.debts), (KEY_URGENCY, self.urgency),
+                                  (KEY_SNOOZE, self.snooze), (KEY_DISMISSED, self.dismissed)):
+            self._save(storage_key, data)
+        self._refresh(account)
+        return True
+
+    # ---------- фоновые задачи ----------
+
+    def _last_message_date(self, mc, d, dialog_id):
+        """Дата последнего сообщения чата в секундах. Пробует несколько источников, 0 если не нашла."""
+        try:
+            date = int(d.last_message_date)
+            if date > 0:
+                return date
+        except Exception:
+            pass
+        sources = (
+            lambda: mc.dialogMessage.get(dialog_id),
+            lambda: mc.dialogMessagesByIds.get(int(d.top_message)),
+        )
+        for source in sources:
+            try:
+                obj = source()
+                if obj is None:
+                    continue
+                if hasattr(obj, "size"):          # вместо одного сообщения пришёл список
+                    if int(obj.size()) == 0:
+                        continue
+                    obj = obj.get(0)
+                date = int(obj.messageOwner.date)
+                if date > 0:
+                    return date
+            except Exception:
+                continue
+        return 0
+
+    def _seed_from_dialogs(self, account):
+        """Подхватывает чаты, где уже есть непрочитанные от контактов
+        (сообщения, пришедшие до установки плагина или пока приложение было закрыто).
+
+        Время ожидания берётся из даты настоящего сообщения. Если даты нет, чат пропускается:
+        «сейчас» вместо неё давало разным людям одинаковое время ожидания.
+        """
+        mc = MessagesController.getInstance(account)
+        dialogs = mc.allDialogs
+        added = repaired = 0
+        for i in range(dialogs.size()):
+            d = dialogs.get(i)
+            dialog_id = int(d.id)
+            if d.unread_count <= 0:
+                continue
+            if self._ineligible_reason(account, dialog_id):
+                continue
+            key = dkey(account, dialog_id)
+            real_date = self._last_message_date(mc, d, dialog_id)
+
+            if key in self.debts:
+                # отсчёт не может начинаться позже последнего сообщения: такое время записано по ошибке
+                if real_date and self.debts[key] > real_date + 60:
+                    self.debts[key] = real_date
+                    repaired += 1
+                continue
+
+            mark = self.dismissed.get(key)
+            if mark is not None and real_date and real_date <= mark + 5:
+                continue   # ты ответил или убрал кольцо, новых сообщений с тех пор нет
+            if not real_date:
+                self._no_date += 1
+                continue   # даты нет: попробуем при следующем запуске, а не выдумаем время
+            self.debts[key] = real_date
+            added += 1
+        if added or repaired:
+            self._repaired += repaired
+            self._save(KEY_DEBTS, self.debts)
+            self._refresh(account)
+        return added
+
+    def _prune_old_debts(self):
+        """Удаляет записи старше 180 дней, чтобы хранилище не росло вечно."""
+        cutoff = time.time() - 180 * 24 * 3600
+        old = [k for k, started in self.debts.items() if started < cutoff]
+        for k in old:
+            del self.debts[k]
+        stale = [k for k in self.urgency if k not in self.debts]
+        for k in stale:
+            del self.urgency[k]
+        if old or stale:
+            self._save(KEY_DEBTS, self.debts)
+            self._save(KEY_URGENCY, self.urgency)
+        old_cleared = [k for k, t in self.cleared.items() if t < cutoff]
+        for k in old_cleared:
+            del self.cleared[k]
+        if old_cleared:
+            self._save(KEY_CLEARED, self.cleared)
+        old_marks = [k for k, t in self.dismissed.items() if t < cutoff]
+        for k in old_marks:
+            del self.dismissed[k]
+        if old_marks:
+            self._save(KEY_DISMISSED, self.dismissed)
+        expired = [k for k, until in self.snooze.items() if until < time.time()]
+        for k in expired:
+            del self.snooze[k]
+        if expired:
+            self._save(KEY_SNOOZE, self.snooze)
+
+    def _startup(self):
+        """Один раз при загрузке. Никаких таймеров и фоновой работы."""
+        try:
+            self._prune_old_debts()
+            account = UserConfig.selectedAccount
+            self._seed_from_dialogs(account)
+            self._refresh(account)
+        except Exception:
+            self.logger.exception("startup failed")
+
+    def _refresh(self, account):
+        if not self._foreground:
+            return  # перерисовывать список, пока приложение свёрнуто, незачем
+
+        def run():
+            try:
+                NotificationCenter.getInstance(account).postNotificationName(
+                    NotificationCenter.dialogsNeedReload)
+            except Exception:
+                self.logger.exception("refresh failed")
+        run_on_ui_thread(run)
+
+    # ---------- отрисовка ----------
+
+    def _minutes(self, account, dialog_id, user=None):
+        """Эффективное время ожидания в минутах: с учётом тихих часов, срочности и важности."""
+        key = dkey(account, dialog_id)
+        started = self.debts.get(key)
+        if started is None:
+            return None
+        cfg = self._config()
+        now = time.time()
+        minutes = (now - started) / 60.0
+        if cfg["quiet"] is not None:
+            minutes = max(0.0, minutes - quiet_overlap_minutes(started, now, cfg["quiet"][0], cfg["quiet"][1]))
+        if cfg["smart"]:
+            minutes *= float(self.urgency.get(key, 1.0))
+        if key in self.vip:
+            minutes *= cfg["vip_factor"]
+        if cfg["mutual_boost"]:
+            if user is None:
+                user = self._user(account, dialog_id)
+            if user is not None and user.mutual_contact:
+                minutes *= cfg["boost_factor"]
+        return minutes
+
+    def _elapsed_minutes(self, account, dialog_id):
+        """Реальное время ожидания в минутах, без множителей срочности."""
+        started = self.debts.get(dkey(account, dialog_id))
+        return None if started is None else (time.time() - started) / 60.0
+
+    def _skip(self, reason):
+        self._skips[reason] = self._skips.get(reason, 0) + 1
+
+    def draw_ring(self, cell, canvas):
+        self._draw_calls += 1
+        try:
+            self._draw_ring_impl(cell, canvas)
+        except Exception as e:
+            self._last_error = "%s: %s" % (type(e).__name__, e)
+            self._skip("исключение")
+            raise
+
+    def _draw_ring_impl(self, cell, canvas):
+        cfg = self._config()
+        if not cfg["enabled"]:
+            return self._skip("плагин выключен")
+        if not self.debts:
+            return self._skip("нет долга")   # долгов нет совсем: поля ячейки даже не читаем
+
+        dialog_id = get_private_field(cell, "currentDialogId")
+        account = get_private_field(cell, "currentAccount")
+        if account is None:
+            account = UserConfig.selectedAccount
+        if dialog_id is None:
+            return self._skip("нет полей DialogCell")
+        dialog_id, account = int(dialog_id), int(account)
+
+        key = dkey(account, dialog_id)
+        if dialog_id > 0 and key not in self._seen and len(self._seen) < 8:
+            self._seen.append(key)
+        if dialog_id <= 0:
+            return self._skip("не личный чат")
+        if key not in self.debts:
+            return self._skip("нет долга")
+        user = self._user(account, dialog_id)
+        if user is None or (cfg["contacts_only"] and not user.contact):
+            return self._skip("не в контактах")
+        if key in self.ignored:
+            return self._skip("чат исключён")
+        until = self.snooze.get(key)
+        if until and until > time.time():
+            return self._skip("отложено")
+
+        if cfg["only_sound_on"]:
+            try:
+                if not self._sound_on(account, dialog_id):
+                    return self._skip("звук выключен")
+            except Exception:
+                self.logger.exception("sound check failed")
+
+        minutes = self._minutes(account, dialog_id, user)
+        if minutes is None:
+            return self._skip("нет времени")
+        if minutes < cfg["threshold"]:
+            return self._skip("рано (минут %.1f < %.1f)" % (minutes, cfg["threshold"]))
+
+        img = get_private_field(cell, "avatarImage")
+        if img is None:
+            return self._skip("нет полей DialogCell")
+        elapsed = self._elapsed_minutes(account, dialog_id)
+        urgent = cfg["smart"] and float(self.urgency.get(key, 1.0)) >= 2.0
+        left, top = img.getImageX(), img.getImageY()
+        box = (left, top, left + img.getImageWidth(), top + img.getImageHeight())
+        self._render_ring(canvas, box, minutes, elapsed, urgent, cfg)
+        self._rings_drawn += 1
+
+    # ---------- рисование кольца (общее для списка чатов и предпросмотра) ----------
+
+    def _ensure_paints(self):
+        if self._paint is not None:
+            return
+        stroke = Paint(Paint.ANTI_ALIAS_FLAG)
+        stroke.setStyle(Paint.Style.STROKE)
+        self._paint = stroke
+        fill = Paint(Paint.ANTI_ALIAS_FLAG)
+        fill.setStyle(Paint.Style.FILL)
+        self._fill_paint = fill
+        label = Paint(Paint.ANTI_ALIAS_FLAG)
+        label.setStyle(Paint.Style.FILL)
+        label.setTextAlign(Paint.Align.CENTER)
+        label.setTypeface(Typeface.DEFAULT_BOLD)
+        self._text_paint = label
+        self._oval = RectF()
+        self._badge_rect = RectF()
+
+    def _dash_effect(self, radius, stroke):
+        """Пунктир: 28 штрихов по кругу. Кэшируется по размеру кольца."""
+        cache_key = (int(round(radius)), int(round(stroke)))
+        effect = self._dash_cache.get(cache_key)
+        if effect is None:
+            segment = 2.0 * math.pi * radius / 28.0
+            on = max(0.5, segment * 0.55 - stroke)   # скруглённые концы добавляют толщину штриха
+            off = max(0.5, segment - on)
+            effect = DashPathEffect(jarray(jfloat)([on, off]), 0.0)
+            if len(self._dash_cache) > 32:
+                self._dash_cache.clear()
+            self._dash_cache[cache_key] = effect
+        return effect
+
+    def _render_ring(self, canvas, box, minutes, elapsed, urgent, cfg):
+        """Рисует кольцо выбранного стиля вокруг аватарки в рамке box = (слева, сверху, справа, снизу)."""
+        self._ensure_paints()
+        left, top, right, bottom = box
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        stroke = float(max(dp(cfg["stroke"]), 1))
+        radius = (right - left) / 2.0 + float(dp(cfg["gap"])) + stroke / 2.0
+        r, g, b = debt_color(minutes, cfg["stops"])
+        ring_alpha, halo_alpha = cfg["ring_alpha"], cfg["halo_alpha"]
+        fraction = 1.0
+        if cfg["show_arc"]:
+            fraction = arc_fraction(minutes, cfg["stops"])
+        style = cfg["style"]
+
+        paint = self._paint
+        paint.setPathEffect(None)
+        paint.setStrokeCap(Paint.Cap.BUTT if style == STYLE_TICKS else Paint.Cap.ROUND)
+        oval = self._oval
+        oval.set(cx - radius, cy - radius, cx + radius, cy + radius)
+
+        if style == STYLE_TICKS:
+            filled = max(1, int(round(fraction * 12)))
+            paint.setStrokeWidth(stroke)
+            for i in range(12):
+                alpha = ring_alpha if i < filled else max(28, int(ring_alpha * 0.25))
+                paint.setColor(jint(to_argb_int(alpha, r, g, b)))
+                canvas.drawArc(oval, -90.0 + i * 30.0 + 4.0, 22.0, False, paint)
+        elif style == STYLE_DOTS:
+            filled = max(1, int(round(fraction * 12)))
+            dot_radius = max(1.5, stroke * 0.6)
+            fill = self._fill_paint
+            for i in range(12):
+                angle = math.radians(-90.0 + i * 30.0)
+                fill.setColor(jint(to_argb_int(
+                    ring_alpha if i < filled else max(28, int(ring_alpha * 0.25)), r, g, b)))
+                canvas.drawCircle(cx + radius * math.cos(angle), cy + radius * math.sin(angle),
+                                  dot_radius, fill)
+        elif style == STYLE_DASHED:
+            paint.setPathEffect(self._dash_effect(radius, stroke))
+            paint.setStrokeWidth(stroke)
+            paint.setColor(jint(to_argb_int(max(halo_alpha, 30), r, g, b)))   # «дорожка»
+            canvas.drawArc(oval, -90.0, 360.0, False, paint)
+            paint.setColor(jint(to_argb_int(ring_alpha, r, g, b)))
+            canvas.drawArc(oval, -90.0, 360.0 * fraction, False, paint)
+            paint.setPathEffect(None)
+        else:   # сплошное и двойное
+            if style == STYLE_SOLID:
+                paint.setStrokeWidth(stroke * 2.4)   # мягкое свечение под кольцом
+                paint.setColor(jint(to_argb_int(halo_alpha, r, g, b)))
+                canvas.drawCircle(cx, cy, radius, paint)
+            paint.setStrokeWidth(stroke)
+            paint.setColor(jint(to_argb_int(ring_alpha, r, g, b)))
+            if fraction < 0.999:
+                canvas.drawArc(oval, -90.0, 360.0 * fraction, False, paint)
+            else:
+                canvas.drawCircle(cx, cy, radius, paint)
+            if style == STYLE_DOUBLE:
+                thin = max(1.0, stroke / 3.0)
+                outer = radius + stroke / 2.0 + float(dp(2)) + thin / 2.0
+                paint.setStrokeWidth(thin)
+                paint.setColor(jint(to_argb_int(int(ring_alpha * 0.55), r, g, b)))
+                canvas.drawCircle(cx, cy, outer, paint)
+
+        if cfg["show_badge"] and elapsed is not None:
+            text = format_wait(elapsed) + ("!" if urgent and cfg["urgent_mark"] else "")
+            self._draw_badge(canvas, right, bottom, (r, g, b), ring_alpha, text)
+
+    def _draw_badge(self, canvas, right, bottom, rgb, alpha, text):
+        """Значок со временем ожидания в правом нижнем углу аватарки."""
+        label = self._text_paint
+        label.setTextSize(float(dp(10)))
+        metrics = label.getFontMetrics()
+        ascent, descent = float(metrics.ascent), float(metrics.descent)
+        pad_x, pad_y = float(dp(3)), float(dp(1))
+        height = (descent - ascent) + pad_y * 2
+        width = max(height, float(label.measureText(text)) + pad_x * 2)
+        bx, by = right - width * 0.30, bottom - height * 0.30
+
+        self._badge_rect.set(bx - width / 2.0, by - height / 2.0, bx + width / 2.0, by + height / 2.0)
+        self._fill_paint.setColor(jint(to_argb_int(max(alpha, 230), *rgb)))
+        canvas.drawRoundRect(self._badge_rect, height / 2.0, height / 2.0, self._fill_paint)
+        label.setColor(jint(to_argb_int(255, *text_color_for(rgb))))
+        canvas.drawText(text, bx, by - (ascent + descent) / 2.0, label)
+
+    # ---------- предпросмотр кольца ----------
+
+    PREVIEW_COLUMNS = 3
+    PREVIEW_SAMPLES = [
+        # (прошло минут, множитель срочности, буква, цвет аватарки, срочное ли сообщение)
+        (20, 1.0, "А", (88, 152, 230), False),
+        (360, 1.0, "М", (230, 126, 110), True),    # «!» видно, только если включён знак у срочных
+        (3 * 1440, 1.0, "П", (110, 190, 130), False),
+        (7 * 1440, 1.0, "К", (170, 130, 220), False),
+        (14 * 1440, 1.0, "О", (232, 160, 90), False),
+        (30 * 1440, 1.0, "Л", (80, 190, 190), False),
+    ]
+
+    def _render_preview_bitmap(self, draft=None):
+        """Шесть аватарок с кольцом, от минут до месяца. Рисует тем же кодом, что и список чатов.
+        draft: временные значения из редактора, на настоящие настройки они не влияют."""
+        self._ensure_paints()
+        self._draft = draft
+        try:
+            cfg = self._config(force=True)
+        finally:
+            self._draft = None
+        diameter, margin = float(dp(44)), float(dp(22))
+        cell = diameter + margin * 2
+        columns = self.PREVIEW_COLUMNS
+        rows = (len(self.PREVIEW_SAMPLES) + columns - 1) // columns
+        bitmap = Bitmap.createBitmap(int(cell * columns), int(cell * rows), Bitmap.Config.ARGB_8888)
+        canvas = Canvas(bitmap)
+        for i, (elapsed, factor, letter, color, marked) in enumerate(self.PREVIEW_SAMPLES):
+            left = (i % columns) * cell + margin
+            top = (i // columns) * cell + margin
+            box = (left, top, left + diameter, top + diameter)
+            self._fill_paint.setColor(jint(to_argb_int(255, *color)))
+            canvas.drawCircle(left + diameter / 2.0, top + diameter / 2.0, diameter / 2.0, self._fill_paint)
+            label = self._text_paint
+            label.setTextSize(float(dp(20)))
+            label.setColor(jint(to_argb_int(255, 255, 255, 255)))
+            metrics = label.getFontMetrics()
+            canvas.drawText(letter, left + diameter / 2.0,
+                            top + diameter / 2.0 - (float(metrics.ascent) + float(metrics.descent)) / 2.0, label)
+            self._render_ring(canvas, box, elapsed * factor, float(elapsed), marked, cfg)
+        return bitmap
+
+    def _show_preview(self, view=None):
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть окно предпросмотра")
+                return
+            try:
+                self._open_editor(activity)
+            except Exception as e:   # запасной вариант: окно с кнопками
+                self._last_error = "editor: %s: %s" % (type(e).__name__, e)
+                self.logger.exception("editor failed, fallback to buttons")
+                self._open_preview(activity)
+        except Exception as e:
+            self._last_error = "preview: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("show_preview failed")
+
+    def _open_preview(self, activity):
+        bitmap = self._render_preview_bitmap()
+        layout = LinearLayout(activity)
+        layout.setOrientation(LinearLayout.VERTICAL)
+        layout.setGravity(Gravity.CENTER)
+        padding = dp(8)
+        layout.setPadding(padding, padding, padding, padding)
+        image = ImageView(activity)
+        image.setImageBitmap(bitmap)
+        image.setAdjustViewBounds(True)
+        layout.addView(image, LinearLayout.LayoutParams(-1, -2))
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Предпросмотр кольца")
+        builder.set_message("Сверху: 20 минут, 6 часов, 3 дня. Снизу: неделя, 2 недели, месяц")
+        builder.set_view(layout)
+        builder.set_positive_button("Готово", lambda bld, which: bld.dismiss())
+        builder.set_neutral_button("Настроить…", lambda bld, which: self._open_tune(bld, activity))
+        builder.show()
+
+    def _saved_ring_values(self):
+        """Текущие сохранённые значения того, что меняется в редакторе."""
+        values = {}
+        for key, _, minimum, step, count, _ in RING_SLIDERS:
+            default = float(RING_DEFAULTS[key])
+            value = slider_value(slider_progress(self._num(key, default), minimum, step, count), minimum, step)
+            values[key] = "%g" % value
+        values["ring_style"] = self._style_index()
+        try:
+            palette = int(self.get_setting("palette", 0))
+        except (TypeError, ValueError):
+            palette = 0
+        values["palette"] = palette if 0 <= palette <= len(PALETTES) else 0
+        return values
+
+    def _dialog_colors(self):
+        """Цвета текста и акцента в окнах Telegram. Запасные читаются и на светлой, и на тёмной теме."""
+        text, accent = to_argb_int(255, 138, 138, 138), to_argb_int(255, 58, 142, 230)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            text = int(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            accent = int(Theme.getColor(Theme.key_dialogTextBlue))
+        except Exception:
+            pass
+        return text, accent
+
+    def _open_editor(self, activity, draft=None):
+        """Окно с ползунками: двигаешь, и кольцо меняется сразу. «Готово» сохраняет, «Отмена» ничего не меняет."""
+        draft = dict(draft) if draft else self._saved_ring_values()
+        text_color, accent_color = self._dialog_colors()
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        padding = dp(12)
+        root.setPadding(padding, dp(4), padding, dp(4))
+
+        image = ImageView(activity)
+        image.setAdjustViewBounds(True)
+        root.addView(image, LinearLayout.LayoutParams(-1, -2))
+
+        def make_label(color):
+            label = TextView(activity)
+            label.setTextColor(jint(color))
+            label.setTextSize(14.0)
+            label.setPadding(0, dp(10), 0, 0)
+            root.addView(label, LinearLayout.LayoutParams(-1, -2))
+            return label
+
+        palette_names = [name for name, _ in PALETTES] + ["Свой"]
+        labels = {}
+
+        def refresh():
+            image.setImageBitmap(self._render_preview_bitmap(dict(draft)))
+            for key, title, minimum, step, count, fmt in RING_SLIDERS:
+                labels[key].setText("%s: %s" % (title, fmt % float(draft[key])))
+            labels["ring_style"].setText("Стиль: %s  ›" % STYLES[draft["ring_style"]])
+            labels["palette"].setText("Палитра: %s  ›" % palette_names[draft["palette"]])
+
+        for key, title, minimum, step, count, fmt in RING_SLIDERS:
+            labels[key] = make_label(text_color)
+            bar = SeekBar(activity)
+            bar.setMax(count)
+            bar.setProgress(slider_progress(float(draft[key]), minimum, step, count))
+
+            def on_change(progress, key=key, minimum=minimum, step=step):
+                draft[key] = "%g" % slider_value(progress, minimum, step)
+                refresh()
+
+            listener = make_seek_listener(on_change)
+            if listener is None:
+                raise RuntimeError("ползунки недоступны в этой версии")
+            bar.setOnSeekBarChangeListener(listener)
+            root.addView(bar, LinearLayout.LayoutParams(-1, -2))
+
+        for key, size in (("ring_style", len(STYLES)), ("palette", len(PALETTES) + 1)):
+            labels[key] = make_label(accent_color)
+            labels[key].setPadding(0, dp(14), 0, dp(6))
+
+            def on_cycle(view, key=key, size=size):
+                draft[key] = next_index(draft[key], size)
+                refresh()
+
+            labels[key].setOnClickListener(OnClickListener(on_cycle))
+
+        refresh()
+        scroll = ScrollView(activity)
+        scroll.addView(root)
+
+        def on_done(bld, which):
+            bld.dismiss()
+            items = list(draft.items())
+            for index, (key, value) in enumerate(items):
+                self.set_setting(key, value, reload_settings=(index == len(items) - 1))
+            self._cfg = None
+            BulletinHelper.show_info("Кольцо сохранено")
+
+        def on_defaults(bld, which):
+            bld.dismiss()
+            run_on_ui_thread(lambda: self._open_editor(activity, dict(RING_DEFAULTS)), 150)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Кольцо")
+        builder.set_message("Двигай ползунки: кольцо меняется сразу. «Готово» сохранит, «Отмена» оставит как было")
+        builder.set_view(scroll)
+        builder.set_positive_button("Готово", on_done)
+        builder.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+        builder.set_neutral_button("По умолчанию", on_defaults)
+        builder.show()
+
+    def _open_tune(self, previous, activity):
+        previous.dismiss()
+        labels = [title for title, _ in TUNE_ACTIONS] + ["Сбросить размер и стиль"]
+
+        def on_pick(bld, which):
+            bld.dismiss()
+            action = TUNE_ACTIONS[which][1] if which < len(TUNE_ACTIONS) else "reset"
+            self._tune(action)
+            run_on_ui_thread(lambda: self._open_preview(activity), 150)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Настроить кольцо")
+        builder.set_items(labels, on_pick)
+        builder.set_negative_button("Назад", lambda bld, which: (
+            bld.dismiss(), run_on_ui_thread(lambda: self._open_preview(activity), 150)))
+        builder.show()
+
+    def _tune(self, action):
+        """Меняет одну настройку кольца на шаг и сохраняет её."""
+        def put(key, value):
+            self.set_setting(key, value, reload_settings=True)
+
+        if action == "thicker":
+            put("ring_thickness", "%g" % step_value(self._num("ring_thickness", 3), 0.5, 1.0, 10.0))
+        elif action == "thinner":
+            put("ring_thickness", "%g" % step_value(self._num("ring_thickness", 3), -0.5, 1.0, 10.0))
+        elif action == "farther":
+            put("ring_gap", "%g" % step_value(self._num("ring_gap", 2), 1.0, -3.0, 12.0))
+        elif action == "closer":
+            put("ring_gap", "%g" % step_value(self._num("ring_gap", 2), -1.0, -3.0, 12.0))
+        elif action == "more_opaque":
+            put("ring_opacity", "%g" % step_value(self._num("ring_opacity", 92), 10.0, 10.0, 100.0))
+        elif action == "less_opaque":
+            put("ring_opacity", "%g" % step_value(self._num("ring_opacity", 92), -10.0, 10.0, 100.0))
+        elif action == "next_style":
+            put("ring_style", next_index(self._style_index(), len(STYLES)))
+        elif action == "next_palette":
+            try:
+                current = int(self.get_setting("palette", 0))
+            except (TypeError, ValueError):
+                current = 0
+            put("palette", next_index(current, len(PALETTES) + 1))
+        elif action == "reset":
+            for key, value in (("ring_thickness", "3"), ("ring_gap", "2"),
+                               ("ring_opacity", "92"), ("ring_style", 0)):
+                put(key, value)
+        self._cfg = None
+
+    def _style_index(self):
+        try:
+            value = int(self.get_setting("ring_style", 0))
+        except (TypeError, ValueError):
+            value = 0
+        return value if 0 <= value < len(STYLES) else 0
+
+    # ---------- действия над кольцом (меню чата) ----------
+
+    def _register_menu(self):
+        for menu_type, text, handler in (
+            (MenuItemType.CHAT_ACTION_MENU, "Ответ: действия", self._on_menu_click),
+            (MenuItemType.PROFILE_ACTION_MENU, "Ответ: действия", self._on_menu_click),
+            (MenuItemType.DRAWER_MENU, "Ждут ответа", self._show_waiting),
+            (MenuItemType.MAIN_MENU, "Ждут ответа", self._show_waiting),
+        ):
+            try:   # каждый пункт отдельно: если один не встанет, остальные работают
+                self.add_menu_item(MenuItemData(menu_type=menu_type, text=text, on_click=handler))
+            except Exception:
+                self.logger.exception("menu registration failed: %s" % text)
+
+    def _on_menu_click(self, context):
+        try:
+            raw_id = context.get("dialog_id") or context.get("userId")
+            dialog_id = int(raw_id) if raw_id else 0
+            account = context.get("account")
+            account = int(account) if account is not None else int(UserConfig.selectedAccount)
+            fragment = context.get("fragment") or get_last_fragment()
+            if dialog_id <= 0:
+                BulletinHelper.show_info("Действия работают только в личных чатах", fragment)
+                return
+            user = context.get("user")
+            name = str(user.first_name) if user is not None and user.first_name else ""
+            self._open_actions(fragment, account, dialog_id, name)
+        except Exception as e:
+            self._last_error = "menu: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("menu click failed")
+
+    def _open_actions(self, fragment, account, dialog_id, name, after=None, show_open=False):
+        """Окно действий для одного человека. after вызывается после выбранного действия."""
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_error("Не удалось открыть окно действий")
+            return
+
+        key = dkey(account, dialog_id)
+        now = time.time()
+        has_debt = key in self.debts
+        snoozed = self.snooze.get(key, 0) > now
+        actions = []
+        if show_open:
+            actions.append(("Открыть чат", "open"))
+        if has_debt and not snoozed:
+            actions += [("Ответ не нужен", "clear"),
+                        ("Отложить на 3 часа", "snooze3"),
+                        ("Отложить до утра", "snooze_morning")]
+        if snoozed:
+            actions.append(("Вернуть кольцо сейчас", "unsnooze"))
+        actions.append(("Убрать из важных" if key in self.vip else "Сделать важным контактом", "vip"))
+        actions.append(("Снова отслеживать чат" if key in self.ignored else "Не отслеживать этот чат", "ignore"))
+
+        status = []
+        elapsed = self._elapsed_minutes(account, dialog_id)
+        status.append("Ждёт ответа: %s" % format_wait(elapsed) if elapsed is not None
+                      else "Сейчас ответа не ждёт")
+        if key in self.vip:
+            status.append("важный контакт")
+        if snoozed:
+            status.append("отложено до %s" % time.strftime("%H:%M", time.localtime(self.snooze[key])))
+        if key in self.ignored:
+            status.append("не отслеживается")
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Ответ: %s" % name if name else "Ответ")
+        builder.set_message("; ".join(status))
+        builder.set_items(
+            [label for label, _ in actions],
+            lambda bld, which: self._apply_action(bld, actions[which][1], account, dialog_id, fragment, after),
+        )
+        builder.set_negative_button("Закрыть", lambda bld, which: (
+            bld.dismiss(), after() if after else None))
+        builder.show()
+
+    # ---------- список «Ждут ответа» ----------
+
+    def _display_name(self, account, dialog_id):
+        try:
+            user = MessagesController.getInstance(account).getUser(dialog_id)
+            parts = [str(user.first_name or ""), str(user.last_name or "")]
+            name = " ".join(p for p in parts if p).strip()
+            return name or str(dialog_id)
+        except Exception:
+            return str(dialog_id)
+
+    def _waiting_entries(self):
+        """Люди, которым пора ответить: самые давние сверху. Учитывает исключения и отсрочки."""
+        now = time.time()
+        entries = []
+        threshold = self._config(force=True)["threshold"]
+        smart = bool(self.get_setting("smart_urgency", True))
+        for key in list(self.debts):
+            try:
+                account_text, dialog_text = key.split(":")
+                account, dialog_id = int(account_text), int(dialog_text)
+            except ValueError:
+                continue
+            if key in self.ignored or self.snooze.get(key, 0) > now:
+                continue
+            if self._ineligible_reason(account, dialog_id):
+                continue
+            minutes = self._minutes(account, dialog_id)
+            elapsed = self._elapsed_minutes(account, dialog_id)
+            if minutes is None or elapsed is None or minutes < threshold:
+                continue
+            urgent = smart and float(self.urgency.get(key, 1.0)) >= 2.0
+            entries.append((minutes, account, dialog_id, elapsed, urgent))
+        entries.sort(key=lambda e: e[0], reverse=True)
+        return entries
+
+    def _show_waiting(self, context=None):
+        """Окно со списком тех, кто ждёт ответа. Тап по человеку открывает действия."""
+        try:
+            fragment = (context.get("fragment") if isinstance(context, dict) else None) or get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть список")
+                return
+            entries = self._waiting_entries()
+            if not entries:
+                BulletinHelper.show_info("Сейчас никто не ждёт ответа", fragment)
+                return
+
+            shown = entries[:WAITING_LIMIT]
+            mark = bool(self.get_setting("urgent_mark", False))
+            labels = ["%s · %s%s" % (self._display_name(account, dialog_id), format_wait(elapsed),
+                                     "!" if urgent and mark else "")
+                      for _, account, dialog_id, elapsed, urgent in shown]
+
+            def on_pick(bld, which):
+                bld.dismiss()
+                _, account, dialog_id, _, _ = shown[which]
+                name = self._display_name(account, dialog_id)
+                run_on_ui_thread(lambda: self._open_actions(
+                    fragment, account, dialog_id, name,
+                    after=lambda: run_on_ui_thread(self._show_waiting, 150),
+                    show_open=True), 150)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Ждут ответа: %d" % len(entries))
+            if len(entries) > len(shown):
+                builder.set_message("Показаны первые %d, самые давние" % len(shown))
+            builder.set_items(labels, on_pick)
+            builder.set_negative_button("Закрыть", lambda bld, which: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            self._last_error = "waiting: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("show_waiting failed")
+
+    def _apply_action(self, builder, action, account, dialog_id, fragment, after=None):
+        builder.dismiss()
+        key = dkey(account, dialog_id)
+        try:
+            if action == "open":
+                self._open_chat(fragment, account, dialog_id)
+                return
+            if action == "clear":
+                self._clear_debt(account, dialog_id)
+                self.cleared[key] = int(time.time())
+                message = "Готово, кольцо убрано"
+            elif action == "snooze3":
+                self.snooze[key] = time.time() + 3 * 3600
+                message = "Кольцо скрыто на 3 часа"
+            elif action == "snooze_morning":
+                self.snooze[key] = next_morning(time.time())
+                message = "Кольцо скрыто до утра"
+            elif action == "unsnooze":
+                self.snooze.pop(key, None)
+                message = "Кольцо снова видно"
+            elif action == "vip":
+                if key in self.vip:
+                    del self.vip[key]
+                    message = "Контакт больше не важный"
+                else:
+                    self.vip[key] = True
+                    message = "Важный контакт: кольцо краснеет быстрее"
+            elif action == "ignore":
+                if key in self.ignored:
+                    del self.ignored[key]
+                    message = "Чат снова отслеживается"
+                else:
+                    self.ignored[key] = True
+                    self.debts.pop(key, None)
+                    self.urgency.pop(key, None)
+                    self.snooze.pop(key, None)
+                    message = "Чат больше не отслеживается"
+            else:
+                return
+            for storage_key, data in ((KEY_DEBTS, self.debts), (KEY_URGENCY, self.urgency),
+                                      (KEY_SNOOZE, self.snooze), (KEY_VIP, self.vip),
+                                      (KEY_IGNORED, self.ignored), (KEY_DISMISSED, self.dismissed),
+                                      (KEY_CLEARED, self.cleared)):
+                self._save(storage_key, data)
+            self._refresh(account)
+            BulletinHelper.show_info(message, fragment)
+            if after:
+                after()
+        except Exception as e:
+            self._last_error = "action %s: %s: %s" % (action, type(e).__name__, e)
+            self.logger.exception("apply action failed")
+
+    def _open_chat(self, fragment, account, dialog_id):
+        """Открывает личный чат. Работает для аккаунта, который сейчас выбран."""
+        try:
+            if account != int(UserConfig.selectedAccount):
+                BulletinHelper.show_info("Этот чат из другого аккаунта: переключись на него", fragment)
+                return
+            from android.os import Bundle
+            from org.telegram.ui import ChatActivity
+            args = Bundle()
+            args.putLong("user_id", jlong(dialog_id))
+            fragment.presentFragment(ChatActivity(args))
+        except Exception as e:
+            self._last_error = "open chat: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("open chat failed")
+            BulletinHelper.show_error("Не удалось открыть чат", fragment)
+
+    # ---------- списки людей: «Ответ не нужен», «Не отслеживаются», «Важные», «Отложены» ----------
+
+    PEOPLE_KINDS = {
+        "cleared": ("Ответ не нужен", KEY_CLEARED, "Нажми на человека, чтобы снова считать ожидание"),
+        "ignored": ("Не отслеживаются", KEY_IGNORED, "Нажми на человека, чтобы снова отслеживать чат"),
+        "vip": ("Важные контакты", KEY_VIP, "Нажми на человека, чтобы убрать из важных"),
+        "snooze": ("Отложены", KEY_SNOOZE, "Нажми на человека, чтобы вернуть кольцо сейчас"),
+    }
+
+    def _people_store(self, kind):
+        return {"cleared": self.cleared, "ignored": self.ignored, "vip": self.vip, "snooze": self.snooze}[kind]
+
+    def _snoozed_count(self):
+        now = time.time()
+        return sum(1 for until in self.snooze.values() if until > now)
+
+    def _people_entries(self, kind):
+        now = time.time()
+        entries = []
+        for key, value in self._people_store(kind).items():
+            if kind == "snooze" and value <= now:
+                continue   # отсрочка уже закончилась
+            try:
+                account_text, dialog_text = key.split(":")
+                entries.append((key, int(account_text), int(dialog_text), value))
+            except ValueError:
+                continue
+        if kind == "cleared":
+            entries.sort(key=lambda e: e[3], reverse=True)    # недавние сверху
+        elif kind == "snooze":
+            entries.sort(key=lambda e: e[3])                   # раньше вернутся, выше
+        else:
+            entries.sort(key=lambda e: self._display_name(e[1], e[2]).lower())
+        return entries
+
+    def _people_label(self, kind, name, value):
+        if kind == "cleared":
+            return "%s · закрыто %s назад" % (name, format_wait((time.time() - value) / 60.0))
+        if kind == "snooze":
+            return "%s · до %s" % (name, time.strftime("%H:%M", time.localtime(value)))
+        return name
+
+    def _show_people(self, kind, context=None):
+        """Окно со списком людей из выбранной группы. Тап по человеку возвращает его."""
+        try:
+            title, _, hint = self.PEOPLE_KINDS[kind]
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть список")
+                return
+            entries = self._people_entries(kind)
+            if not entries:
+                BulletinHelper.show_info("%s: пока никого" % title, fragment)
+                return
+            shown = entries[:40]
+            labels = [self._people_label(kind, self._display_name(account, dialog_id), value)
+                      for _, account, dialog_id, value in shown]
+
+            def on_pick(bld, which):
+                bld.dismiss()
+                key, account, dialog_id, _ = shown[which]
+                message = self._restore_person(kind, key, account, dialog_id)
+                BulletinHelper.show_info(message, fragment)
+                if self._people_entries(kind):   # список ещё не пуст: открываем снова
+                    run_on_ui_thread(lambda: self._show_people(kind), 150)
+
+            def on_all(bld, which):
+                bld.dismiss()
+                for key, account, dialog_id, _ in entries:
+                    self._restore_person(kind, key, account, dialog_id, reload=False)
+                self._save(self.PEOPLE_KINDS[kind][1], self._people_store(kind), reload=True)
+                BulletinHelper.show_info("Готово: список очищен", fragment)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("%s: %d" % (title, len(entries)))
+            builder.set_message(hint)
+            builder.set_items(labels, on_pick)
+            builder.set_neutral_button("Вернуть всех", on_all)
+            builder.set_negative_button("Закрыть", lambda bld, which: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            self._last_error = "people: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("show_people failed")
+
+    def _restore_person(self, kind, key, account, dialog_id, reload=True):
+        """Возвращает человека из списка. Возвращает текст для плашки."""
+        store = self._people_store(kind)
+        store.pop(key, None)
+        if kind == "cleared":
+            self.dismissed.pop(key, None)
+            self._save(KEY_DISMISSED, self.dismissed)
+        self._save(self.PEOPLE_KINDS[kind][1], store, reload=reload)
+        self._cfg = None
+        revived = False
+        if kind in ("cleared", "ignored"):
+            try:
+                self._seed_from_dialogs(account)    # если в чате остались непрочитанные, кольцо вернётся
+            except Exception:
+                self.logger.exception("seed after restore failed")
+            revived = key in self.debts
+        self._refresh(account)
+        if kind == "cleared" or kind == "ignored":
+            return ("Кольцо вернулось" if revived
+                    else "Готово: кольцо появится, когда человек напишет")
+        if kind == "vip":
+            return "Больше не важный контакт"
+        return "Кольцо снова видно"
+
+    # ---------- обмен настройками через буфер обмена ----------
+
+    def _export_settings(self, view=None):
+        try:
+            copy_to_clipboard(build_export(self.get_setting))
+            BulletinHelper.show_info("Настройки скопированы. Вставь их на другом телефоне или отправь другу")
+        except Exception as e:
+            self._last_error = "export: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("export failed")
+            BulletinHelper.show_error("Не удалось скопировать настройки")
+
+    def _read_clipboard(self):
+        context = ApplicationLoader.applicationContext
+        manager = context.getSystemService(Context.CLIPBOARD_SERVICE)
+        clip = manager.getPrimaryClip()
+        if clip is None or int(clip.getItemCount()) == 0:
+            return ""
+        return str(clip.getItemAt(0).coerceToText(context))
+
+    def _import_settings(self, view=None):
+        try:
+            accepted, skipped, error = parse_import(self._read_clipboard())
+            fragment = get_last_fragment()
+            if error:
+                BulletinHelper.show_error(error, fragment)
+                return
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть окно подтверждения")
+                return
+            changed = sum(1 for key, value in accepted.items()
+                          if self.get_setting(key, SHARED_SETTINGS[key][1]) != value)
+            message = "Из буфера прочитано настроек: %d, из них изменится: %d." % (len(accepted), changed)
+            if skipped:
+                message += " Пропущено неподходящих: %d." % skipped
+            message += " Твои долги и списки людей не затрагиваются."
+
+            def apply(bld, which):
+                bld.dismiss()
+                items = list(accepted.items())
+                for index, (key, value) in enumerate(items):
+                    self.set_setting(key, value, reload_settings=(index == len(items) - 1))
+                self._cfg = None
+                BulletinHelper.show_info("Применено настроек: %d" % len(items), fragment)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Вставить настройки?")
+            builder.set_message(message)
+            builder.set_positive_button("Применить", apply)
+            builder.set_negative_button("Отмена", lambda bld, which: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            self._last_error = "import: %s: %s" % (type(e).__name__, e)
+            self.logger.exception("import failed")
+            BulletinHelper.show_error("Не удалось прочитать буфер обмена")
+
+    def _reset_actions(self, view=None):
+        self.vip, self.ignored, self.snooze, self.dismissed, self.cleared = {}, {}, {}, {}, {}
+        self._save(KEY_CLEARED, self.cleared)
+        self._save(KEY_DISMISSED, self.dismissed)
+        self._save(KEY_VIP, self.vip)
+        self._save(KEY_IGNORED, self.ignored)
+        self._save(KEY_SNOOZE, self.snooze)
+        BulletinHelper.show_info("Важные, исключённые, отложенные и «ответ не нужен» сброшены")
