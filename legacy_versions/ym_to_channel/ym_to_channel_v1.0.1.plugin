@@ -1,0 +1,630 @@
+__id__ = "ym_to_channel"
+__name__ = "Y.m download"
+__description__ = "Выгружает треки из Яндекс Музыки в ваш Telegram-канал.\n\n• «Мне нравится» и выбранные плейлисты\n• mp3 с названием, исполнителем, альбомом и обложкой\n• Повторный запуск докачивает только новые треки\n• Файлы удаляются с телефона после отправки\n\nНужен OAuth-токен Яндекс Музыки, как его получить — в настройках плагина. Канал выбирается через ⋮ внутри канала → «Яндекс Музыка: выгружать сюда»."
+__author__ = "@floppamother, Claude opus5.5"
+__version__ = "1.0.1"
+__icon__ = "FloppatmotherSet/1"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.6.1"
+__category__ = ["media", "integrations", "tools"]
+import hashlib
+import json
+import os
+import re
+import struct
+import threading
+import time
+import traceback
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from android_utils import log as _sdk_log, run_on_ui_thread
+from client_utils import get_last_fragment
+from ui.settings import Header, Divider, Switch, Selector, Input, Text
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from file_utils import get_plugins_dir, ensure_dir_exists
+from java.lang import Long
+from org.telegram.messenger import ChatObject, MessagesController, UserConfig
+API = "https://api.music.yandex.net"
+YM_HEADERS = {
+    "X-Yandex-Music-Client": "YandexMusicAndroid/24023621",
+    "User-Agent": "Yandex-Music-API",
+    "Accept-Language": "ru",
+}
+SIGN_SALT = "XGRlBW9FXlekgbPrRHuSiA"
+EXT_CHROME = "https://chrome.google.com/webstore/detail/yandex-music-token/lcbjeookjibfhjjopieifgjnhlegmkib"
+EXT_FIREFOX = "https://addons.mozilla.org/firefox/addon/yandex-music-token/"
+TOKEN_HELP = (
+    "Большинство способов получить токен перестали работать. Самый стабильный — расширение "
+    "для браузера Yandex Music Token (Chrome или Firefox на компьютере).\n\n"
+    "1. Установите расширение по ссылке ниже.\n"
+    "2. Нажмите на его значок и войдите в аккаунт Яндекса, где ваша музыка.\n"
+    "3. После входа расширение покажет токен — скопируйте его.\n"
+    "4. Вставьте токен в поле «OAuth-токен» и нажмите «Проверить токен».\n\n"
+    "Токен даёт полный доступ к вашему аккаунту Яндекс Музыки. Никому его не пересылайте.\n\n"
+    "Автор плагина никак не связан с создателем расширения и не отвечает за данные, "
+    "которые вы ему передаёте."
+)
+QUALITIES = [320, 192, 128]
+PAUSES = [3, 6, 10, 20]
+MAX_PENDING = 20
+UPLOAD_GRACE = 60.0
+UPLOAD_LIMIT = 600.0
+_LOG_RING = []
+_SECRET_RE = re.compile(r"(OAuth\s+|token=|access_token=)[^&\s'\")]+", re.I)
+def scrub(text):
+    return _SECRET_RE.sub(lambda m: m.group(1) + "***", str(text))
+def ylog(msg):
+    text = scrub(msg)
+    _LOG_RING.append(time.strftime("%H:%M:%S") + " " + text)
+    del _LOG_RING[:-60]
+    try:
+        _sdk_log("[YM2TG] " + text)
+    except Exception:
+        pass
+def ylog_exc(where):
+    ylog(where + ": " + traceback.format_exc().strip().splitlines()[-1])
+def ui(fn, delay=0):
+    def _wrapped():
+        try:
+            fn()
+        except Exception:
+            ylog_exc("ui")
+    if delay:
+        run_on_ui_thread(_wrapped, delay)
+    else:
+        run_on_ui_thread(_wrapped)
+def _toast(kind, text):
+    text = scrub(text)
+    def _show():
+        try:
+            getattr(BulletinHelper, kind)(text)
+        except Exception:
+            pass
+    ui(_show)
+def toast_info(text):
+    _toast("show_info", text)
+def toast_ok(text):
+    _toast("show_success", text)
+def toast_err(text):
+    _toast("show_error", text)
+def ctx_get(ctx, key):
+    if ctx is None:
+        return None
+    try:
+        return ctx.get(key)
+    except Exception:
+        pass
+    try:
+        return ctx[key]
+    except Exception:
+        return None
+def safe_name(s):
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", s or "").strip()
+    return s[:120] or "track"
+class JsonFile:
+    def __init__(self, path, default):
+        self.path = path
+        self.data = default
+        self.lock = threading.RLock()
+    def load(self):
+        with self.lock:
+            try:
+                if os.path.exists(self.path):
+                    with open(self.path, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if isinstance(d, dict):
+                        self.data.update(d)
+            except Exception:
+                ylog_exc("load state")
+        return self
+    def save(self):
+        with self.lock:
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, separators=(",", ":"))
+                os.replace(tmp, self.path)
+            except Exception:
+                ylog_exc("save state")
+class YmError(Exception):
+    pass
+class YandexMusic:
+    def __init__(self, token):
+        import requests
+        self.s = requests.Session()
+        self.s.headers.update(YM_HEADERS)
+        self.s.headers["Authorization"] = "OAuth " + token
+        self.uid = None
+        self.login = None
+    def _call(self, method, path, **kw):
+        kw.setdefault("timeout", (8, 30))
+        r = self.s.request(method, API + path, **kw)
+        if r.status_code in (401, 403):
+            raise YmError("токен не подходит или истёк (HTTP %d)" % r.status_code)
+        if r.status_code >= 400:
+            raise YmError("Яндекс ответил HTTP %d" % r.status_code)
+        j = r.json()
+        if isinstance(j, dict) and j.get("error"):
+            raise YmError(str(j.get("error")))
+        return j.get("result") if isinstance(j, dict) else j
+    def account(self):
+        res = self._call("GET", "/account/status") or {}
+        acc = res.get("account") or {}
+        self.uid = acc.get("uid")
+        self.login = acc.get("login") or acc.get("displayName") or str(self.uid)
+        if not self.uid:
+            raise YmError("не удалось узнать аккаунт")
+        plus = bool((res.get("plus") or {}).get("hasPlus"))
+        return self.login, plus
+    def liked_ids(self):
+        res = self._call("GET", "/users/%s/likes/tracks" % self.uid) or {}
+        items = ((res.get("library") or {}).get("tracks")) or []
+        return [str(t.get("id")).split(":")[0] for t in items if t.get("id")]
+    def playlists(self):
+        res = self._call("GET", "/users/%s/playlists/list" % self.uid) or []
+        return [{"kind": int(p.get("kind")), "title": p.get("title") or "Без названия",
+                 "count": int(p.get("trackCount") or 0)} for p in res if p.get("kind") is not None]
+    def playlist_ids(self, kind):
+        res = self._call("GET", "/users/%s/playlists/%s" % (self.uid, kind)) or {}
+        out = []
+        for t in res.get("tracks") or []:
+            tid = t.get("id") or (t.get("track") or {}).get("id")
+            if tid:
+                out.append(str(tid).split(":")[0])
+        return out
+    def tracks(self, ids):
+        out = {}
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            res = self._call("POST", "/tracks", data={"track-ids": ",".join(chunk), "with-positions": "false"}) or []
+            for t in res:
+                out[str(t.get("id"))] = t
+        return out
+    def download_url(self, tid, quality):
+        infos = self._call("GET", "/tracks/%s/download-info" % tid) or []
+        mp3 = [i for i in infos if i.get("codec") == "mp3" and i.get("downloadInfoUrl")]
+        if not mp3:
+            raise YmError("нет mp3 для скачивания")
+        rate = lambda i: int(i.get("bitrateInKbps") or 0)
+        fit = [i for i in mp3 if rate(i) <= quality]
+        best = max(fit, key=rate) if fit else min(mp3, key=rate)
+        r = self.s.get(best["downloadInfoUrl"], timeout=(8, 30))
+        if r.status_code >= 400:
+            raise YmError("download-info HTTP %d" % r.status_code)
+        xml = r.text
+        def tag(name):
+            m = re.search(r"<%s>([^<]*)</%s>" % (name, name), xml)
+            if not m:
+                raise YmError("download-info без поля " + name)
+            return m.group(1)
+        host, path, ts, s = tag("host"), tag("path"), tag("ts"), tag("s")
+        sign = hashlib.md5((SIGN_SALT + path[1:] + s).encode("utf-8")).hexdigest()
+        return "https://%s/get-mp3/%s/%s%s" % (host, sign, ts, path), int(best.get("bitrateInKbps") or 0)
+    def fetch(self, url, dest):
+        tmp = dest + ".part"
+        with self.s.get(url, stream=True, timeout=(8, 60)) as r:
+            if r.status_code >= 400:
+                raise YmError("файл HTTP %d" % r.status_code)
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+        os.replace(tmp, dest)
+    def cover(self, track):
+        uri = track.get("coverUri") or ((track.get("albums") or [{}])[0].get("coverUri"))
+        if not uri:
+            return None
+        try:
+            r = self.s.get("https://" + uri.replace("%%", "400x400"), timeout=(8, 20))
+            if r.status_code < 400 and r.content:
+                return r.content
+        except Exception:
+            pass
+        return None
+def _id3_text(fid, text):
+    body = b"\x01" + "﻿".encode("utf-16-le") + (text or "").encode("utf-16-le") + b"\x00\x00"
+    return fid.encode("ascii") + struct.pack(">I", len(body)) + b"\x00\x00" + body
+def _id3_cover(data):
+    body = b"\x00" + b"image/jpeg\x00" + b"\x03" + b"\x00" + data
+    return b"APIC" + struct.pack(">I", len(body)) + b"\x00\x00" + body
+def _syncsafe(n):
+    return bytes([(n >> 21) & 0x7F, (n >> 14) & 0x7F, (n >> 7) & 0x7F, n & 0x7F])
+def write_tags(path, title, artist, album, cover):
+    with open(path, "rb") as f:
+        audio = f.read()
+    if audio[:3] == b"ID3" and len(audio) >= 10:
+        size = (audio[6] << 21) | (audio[7] << 14) | (audio[8] << 7) | audio[9]
+        footer = 10 if audio[5] & 0x10 else 0
+        audio = audio[10 + size + footer:]
+    frames = _id3_text("TIT2", title) + _id3_text("TPE1", artist)
+    if album:
+        frames += _id3_text("TALB", album)
+    if cover:
+        frames += _id3_cover(cover)
+    header = b"ID3\x03\x00\x00" + _syncsafe(len(frames))
+    with open(path + ".tag", "wb") as f:
+        f.write(header + frames + audio)
+    os.replace(path + ".tag", path)
+class Ym2TgPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.dir = os.path.join(get_plugins_dir(), "ym_to_channel_data")
+        self.files = os.path.join(self.dir, "files")
+        for d in (self.dir, self.files):
+            try:
+                ensure_dir_exists(d)
+            except Exception:
+                os.makedirs(d, exist_ok=True)
+        self.state = JsonFile(os.path.join(self.dir, "state.json"),
+                              {"sent": {}, "failed": {}, "channel": None, "playlists": [], "pending": []}).load()
+        self.stop_ev = threading.Event()
+        self.worker = None
+        self.status = "не запускалась"
+        self.progress = None
+        self._settings_ts = 0.0
+        self._known_playlists = []
+        self._cleanup(force_old=True)
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Яндекс Музыка: выгружать сюда",
+                subtext="Сделать канал целью выгрузки",
+                on_click=lambda ctx: ui(lambda: self.set_channel_from_ctx(ctx)),
+                icon="msg_channel",
+                item_id="ym_to_channel_target",
+                priority=9,
+            ))
+        except Exception:
+            ylog_exc("chat menu")
+        ylog("загружен, отправлено ранее: %d" % len(self.state.data["sent"]))
+    def on_plugin_unload(self):
+        self.stop_ev.set()
+        self.state.save()
+    def _index(self, key, default, size):
+        try:
+            v = self.get_setting(key, default)
+            v = default if v is None else int(v)
+        except Exception:
+            v = default
+        return v if 0 <= v < size else default
+    def _token(self):
+        return str(self.get_setting("ym_token", "") or "").strip()
+    def _activity(self):
+        frag = get_last_fragment()
+        return frag.getParentActivity() if frag is not None else None
+    def _refresh_settings(self, throttle=False):
+        now = time.time()
+        if throttle and now - self._settings_ts < 3.0:
+            return
+        self._settings_ts = now
+        def _do():
+            self.set_setting("_rev", int(self.get_setting("_rev", 0) or 0) + 1, reload_settings=True)
+        ui(_do)
+    def set_channel_from_ctx(self, ctx):
+        chat = ctx_get(ctx, "chat")
+        did = ctx_get(ctx, "dialog_id")
+        acc = ctx_get(ctx, "account")
+        try:
+            acc = int(acc) if acc is not None else UserConfig.selectedAccount
+        except Exception:
+            acc = UserConfig.selectedAccount
+        if chat is None and did:
+            try:
+                chat = MessagesController.getInstance(acc).getChat(Long.valueOf(-int(did)))
+            except Exception:
+                chat = None
+        if chat is None or not ChatObject.isChannel(chat):
+            toast_err("Выгружать можно только в канал")
+            return
+        try:
+            if not ChatObject.canPost(chat):
+                toast_err("В этом канале у вас нет права публиковать")
+                return
+        except Exception:
+            pass
+        self.state.data["channel"] = {"id": int(chat.id), "acc": int(acc), "title": str(chat.title or "")}
+        self.state.save()
+        toast_ok("Треки будут выгружаться в «%s»" % chat.title)
+        self._refresh_settings()
+    def _copy(self, text, label):
+        try:
+            from android_utils import copy_to_clipboard
+            copy_to_clipboard(text)
+            toast_ok("Ссылка на расширение для %s скопирована" % label)
+        except Exception:
+            ylog_exc("copy")
+            toast_err("Не удалось скопировать ссылку")
+    def token_help(self, *args):
+        act = self._activity()
+        if act is None:
+            return
+        b = AlertDialogBuilder(act)
+        b.set_title("Как получить OAuth-токен")
+        b.set_message(TOKEN_HELP)
+        def chrome(bld, w):
+            bld.dismiss()
+            self._copy(EXT_CHROME, "Chrome")
+        def firefox(bld, w):
+            bld.dismiss()
+            self._copy(EXT_FIREFOX, "Firefox")
+        b.set_neutral_button("Закрыть", lambda bld, w: bld.dismiss())
+        b.set_negative_button("Firefox", firefox)
+        b.set_positive_button("Chrome", chrome)
+        b.show()
+    def check_token(self, *args):
+        token = self._token()
+        if not token:
+            toast_err("Сначала вставьте OAuth-токен")
+            return
+        def bg():
+            try:
+                ym = YandexMusic(token)
+                login, plus = ym.account()
+                if plus:
+                    toast_ok("Яндекс Музыка: %s, Плюс есть" % login)
+                else:
+                    toast_info("Яндекс Музыка: %s. Без Плюса скачается не всё" % login)
+            except Exception as e:
+                ylog_exc("check token")
+                toast_err("Вход не удался: %s" % e)
+        threading.Thread(target=bg, name="YM2TG-check", daemon=True).start()
+    def ui_playlists(self, *args):
+        token = self._token()
+        if not token:
+            toast_err("Сначала вставьте OAuth-токен")
+            return
+        def bg():
+            try:
+                ym = YandexMusic(token)
+                ym.account()
+                self._known_playlists = ym.playlists()
+            except Exception as e:
+                ylog_exc("playlists")
+                toast_err("Не удалось получить плейлисты: %s" % e)
+                return
+            if not self._known_playlists:
+                toast_info("Своих плейлистов нет")
+                return
+            ui(self._playlists_dialog)
+        threading.Thread(target=bg, name="YM2TG-lists", daemon=True).start()
+    def _playlists_dialog(self):
+        act = self._activity()
+        if act is None:
+            return
+        chosen = set(int(k) for k in self.state.data.get("playlists", []))
+        items = ["%s %s (%d)" % ("☑" if p["kind"] in chosen else "☐", p["title"], p["count"]) for p in self._known_playlists]
+        b = AlertDialogBuilder(act)
+        b.set_title("Плейлисты для выгрузки")
+        def on_item(bld, which):
+            bld.dismiss()
+            if 0 <= which < len(self._known_playlists):
+                kind = self._known_playlists[which]["kind"]
+                sel = set(int(k) for k in self.state.data.get("playlists", []))
+                sel.symmetric_difference_update({kind})
+                self.state.data["playlists"] = sorted(sel)
+                self.state.save()
+                self._refresh_settings()
+                ui(self._playlists_dialog, 150)
+        b.set_items(items, on_item)
+        b.set_positive_button("Готово", lambda bld, w: bld.dismiss())
+        b.show()
+    def toggle_run(self, *args):
+        if self.worker is not None and self.worker.is_alive():
+            self.stop_ev.set()
+            self.status = "останавливается…"
+            toast_info("Останавливаю после текущего трека")
+            self._refresh_settings()
+            return
+        if not self._token():
+            toast_err("Сначала вставьте OAuth-токен")
+            return
+        if not self.state.data.get("channel"):
+            toast_err("Выберите канал: ⋮ внутри канала → «Яндекс Музыка: выгружать сюда»")
+            return
+        if not self.get_setting("ym_likes", True) and not self.state.data.get("playlists"):
+            toast_err("Нечего выгружать: включите «Мне нравится» или выберите плейлисты")
+            return
+        self.stop_ev = threading.Event()
+        self.worker = threading.Thread(target=self._run, name="YM2TG-run", daemon=True)
+        self.worker.start()
+        toast_info("Выгрузка запущена")
+    def _collect(self, ym):
+        ids = []
+        if self.get_setting("ym_likes", True):
+            ids += list(reversed(ym.liked_ids()))
+        for kind in self.state.data.get("playlists", []):
+            try:
+                ids += ym.playlist_ids(kind)
+            except Exception as e:
+                ylog("плейлист %s: %s" % (kind, e))
+        seen = set()
+        out = []
+        for tid in ids:
+            if tid not in seen:
+                seen.add(tid)
+                out.append(tid)
+        return out
+    def _run(self):
+        sent = self.state.data["sent"]
+        failed = self.state.data["failed"]
+        ch = self.state.data["channel"]
+        ok = fail = 0
+        try:
+            self.status = "получаю список треков…"
+            self._refresh_settings()
+            ym = YandexMusic(self._token())
+            ym.account()
+            todo = [t for t in self._collect(ym) if t not in sent]
+            total = len(todo)
+            ylog("к выгрузке: %d" % total)
+            if not total:
+                self.status = "новых треков нет"
+                toast_ok("Новых треков нет — всё уже в канале")
+                return
+            quality = QUALITIES[self._index("ym_quality", 0, len(QUALITIES))]
+            pause = PAUSES[self._index("ym_pause", 1, len(PAUSES))]
+            for i in range(0, total, 100):
+                if self.stop_ev.is_set():
+                    break
+                chunk = todo[i:i + 100]
+                info = ym.tracks(chunk)
+                for tid in chunk:
+                    if self.stop_ev.is_set():
+                        break
+                    self._wait_pending()
+                    self.progress = (ok + fail, total)
+                    self.status = "выгружено %d из %d, ошибок %d" % (ok, total, fail)
+                    self._refresh_settings(throttle=True)
+                    tr = info.get(tid)
+                    try:
+                        if tr is None or tr.get("available") is False:
+                            raise YmError("трек недоступен")
+                        self._one(ym, tr, ch, quality)
+                        sent[tid] = int(time.time())
+                        failed.pop(tid, None)
+                        ok += 1
+                    except Exception as e:
+                        failed[tid] = str(e)[:120]
+                        fail += 1
+                        ylog("трек %s: %s" % (tid, e))
+                    if (ok + fail) % 10 == 0:
+                        self.state.save()
+                    self.stop_ev.wait(pause)
+            self.status = ("остановлено: " if self.stop_ev.is_set() else "готово: ") + "отправлено %d из %d, ошибок %d" % (ok, total, fail)
+            (toast_info if self.stop_ev.is_set() or fail else toast_ok)("Y.m download: " + self.status)
+        except Exception as e:
+            ylog_exc("run")
+            self.status = "ошибка: %s" % e
+            toast_err("Выгрузка прервана: %s" % e)
+        finally:
+            self.progress = None
+            self.state.save()
+            self._refresh_settings()
+    def _one(self, ym, tr, ch, quality):
+        from client_utils import send_document
+        tid = str(tr.get("id"))
+        artists = ", ".join(a.get("name", "") for a in tr.get("artists") or [] if a.get("name")) or "Unknown"
+        title = tr.get("title") or "Без названия"
+        if tr.get("version"):
+            title = "%s (%s)" % (title, tr["version"])
+        album = ((tr.get("albums") or [{}])[0]).get("title") or ""
+        url, _ = ym.download_url(tid, quality)
+        path = os.path.join(self.files, "%s - %s [%s].mp3" % (safe_name(artists)[:60], safe_name(title)[:60], tid))
+        ym.fetch(url, path)
+        write_tags(path, title, artists, album, ym.cover(tr))
+        send_document(-int(ch["id"]), path)
+        with self.state.lock:
+            self.state.data["pending"].append([path, time.time()])
+    def _uploading_paths(self):
+        try:
+            from hook_utils import get_private_field
+            from org.telegram.messenger import FileLoader
+            acc = int((self.state.data.get("channel") or {}).get("acc", UserConfig.selectedAccount))
+            m = get_private_field(FileLoader.getInstance(acc), "uploadOperationPaths")
+            if m is None:
+                return None
+            return {str(k) for k in m.keySet().toArray()}
+        except Exception:
+            return None
+    def _cleanup(self, force_old=False):
+        now = time.time()
+        busy = self._uploading_paths()
+        keep = []
+        with self.state.lock:
+            for path, ts in self.state.data.get("pending", []):
+                age = now - float(ts)
+                done = age > UPLOAD_LIMIT or (busy is not None and age > UPLOAD_GRACE and path not in busy)
+                if force_old and age > UPLOAD_LIMIT:
+                    done = True
+                if done:
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+                else:
+                    keep.append([path, ts])
+            self.state.data["pending"] = keep
+        if force_old:
+            for name in os.listdir(self.files):
+                p = os.path.join(self.files, name)
+                if all(p != k[0] for k in keep):
+                    try:
+                        if now - os.path.getmtime(p) > UPLOAD_LIMIT:
+                            os.remove(p)
+                    except Exception:
+                        pass
+    def _wait_pending(self):
+        while not self.stop_ev.is_set():
+            self._cleanup()
+            if len(self.state.data.get("pending", [])) < MAX_PENDING:
+                return
+            self.status = "жду, пока Telegram догрузит отправленное…"
+            self._refresh_settings(throttle=True)
+            self.stop_ev.wait(5)
+    def reset_sent(self, *args):
+        act = self._activity()
+        if act is None:
+            return
+        b = AlertDialogBuilder(act)
+        b.set_title("Сбросить список отправленных?")
+        b.set_message("Плагин забудет, какие треки уже в канале, и при следующем запуске отправит всё заново.")
+        def yes(bld, w):
+            bld.dismiss()
+            self.state.data["sent"] = {}
+            self.state.data["failed"] = {}
+            self.state.save()
+            toast_info("Список отправленных очищен")
+            self._refresh_settings()
+        b.set_positive_button("Сбросить", yes)
+        b.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+        b.show()
+    def show_log(self, *args):
+        act = self._activity()
+        if act is None:
+            return
+        failed = self.state.data.get("failed", {})
+        text = "\n".join(["Версия " + __version__, "Отправлено всего: %d" % len(self.state.data["sent"]),
+                          "С ошибкой: %d" % len(failed), "", "Последние события:"] + _LOG_RING[-25:])
+        b = AlertDialogBuilder(act)
+        b.set_title("Журнал выгрузки")
+        b.set_message(text)
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.show()
+    def create_settings(self):
+        st = getattr(self, "state", None)
+        data = st.data if st is not None else {"sent": {}, "playlists": [], "channel": None}
+        ch = data.get("channel")
+        running = getattr(self, "worker", None) is not None and self.worker.is_alive()
+        return [
+            Header(text="Яндекс Музыка"),
+            Input(key="ym_token", text="OAuth-токен", default="",
+                  subtext="Токен Яндекс Музыки. Используется только для запросов к Яндексу"),
+            Text(text="Проверить токен", icon="msg_info", on_click=lambda v: self.check_token()),
+            Text(text="Как получить токен", icon="msg_help", accent=True,
+                 subtext="Пошагово, со ссылкой на расширение для браузера",
+                 on_click=lambda v: ui(self.token_help)),
+            Divider(text="Большинство способов получить токен перестали работать. "
+                         "Самый стабильный — расширение для браузера Yandex Music Token."),
+            Divider(text="Автор плагина никак не связан с создателем расширения "
+                         "и не отвечает за данные пользователя."),
+            Header(text="Что выгружать"),
+            Switch(key="ym_likes", text="Мне нравится", default=True, subtext="Все лайкнутые треки, от старых к новым"),
+            Text(text="Плейлисты", icon="msg_media",
+                 subtext="Выбрано: %d" % len(data.get("playlists", [])) if data.get("playlists") else "Не выбраны",
+                 on_click=lambda v: self.ui_playlists()),
+            Selector(key="ym_quality", text="Качество", default=0, items=["%d kbps" % q for q in QUALITIES]),
+            Divider(),
+            Header(text="Канал"),
+            Text(text=(ch or {}).get("title") or "Канал не выбран", icon="msg_channel",
+                 subtext="Меняется через ⋮ внутри канала → «Яндекс Музыка: выгружать сюда»"),
+            Divider(),
+            Header(text="Выгрузка"),
+            Text(text="Остановить" if running else "Начать выгрузку", icon="msg_download", accent=True,
+                 subtext=getattr(self, "status", ""), on_click=lambda v: self.toggle_run()),
+            Selector(key="ym_pause", text="Пауза между треками", default=1, items=["%d с" % p for p in PAUSES]),
+            Text(text="Журнал", icon="msg_stats", subtext="Отправлено всего: %d" % len(data.get("sent", {})),
+                 on_click=lambda v: ui(self.show_log)),
+            Text(text="Сбросить список отправленных", icon="msg_delete", on_click=lambda v: ui(self.reset_sent)),
+            Divider(text="Уже отправленные треки пропускаются, так что повторный запуск докачивает только новое. "
+                         "Файлы удаляются с телефона после того, как Telegram их загрузит."),
+        ]
