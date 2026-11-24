@@ -1,0 +1,727 @@
+# SPDX-License-Identifier: MIT
+# Built against the official Telegram Android sources (ChatActivity / ChatPullingDownDrawable).
+__id__ = "pull_next_chat"
+__name__ = "Pull to Next Chat"
+__description__ = "Жест «потяни вверх — следующий чат» для каналов, групп, личных чатов и ботов / Pull-up gesture to the next unread chat"
+__author__ = "@dtfserega Claude"
+__version__ = "1.0.0"
+__app_version__ = ">=13.1.1"
+__category__ = ["chats", "tools"]
+__sdk_version__ = ">=1.4.6.3"
+__icon__ = "exteraPlugins/1"
+
+import threading
+import time
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+
+try:
+    from ui.bulletin import BulletinHelper
+except ImportError:
+    BulletinHelper = None
+
+from ui.settings import Header, Switch, Selector, Divider, Text
+from java import jclass
+
+KINDS = ("channel", "group", "private", "bot")
+
+# (swipe hint, release hint, "nothing unread" text) per target kind; "mixed" is used for several kinds.
+PHRASES = {
+    "group": (
+        ("Потяните вверх, чтобы перейти в следующую группу", "Pull up to go to the next group"),
+        ("Отпустите, чтобы перейти в следующую группу", "Release to go to the next group"),
+        ("У вас нет непрочитанных групп", "You have no unread groups"),
+    ),
+    "private": (
+        ("Потяните вверх, чтобы перейти в следующий личный чат", "Pull up to go to the next private chat"),
+        ("Отпустите, чтобы перейти в следующий личный чат", "Release to go to the next private chat"),
+        ("У вас нет непрочитанных личных чатов", "You have no unread private chats"),
+    ),
+    "bot": (
+        ("Потяните вверх, чтобы перейти к следующему боту", "Pull up to go to the next bot"),
+        ("Отпустите, чтобы перейти к следующему боту", "Release to go to the next bot"),
+        ("У вас нет непрочитанных ботов", "You have no unread bots"),
+    ),
+    "channel": (
+        ("Потяните вверх, чтобы перейти в следующий канал", "Pull up to go to the next channel"),
+        ("Отпустите, чтобы перейти в следующий канал", "Release to go to the next channel"),
+        ("У вас нет непрочитанных каналов", "You have no unread channels"),
+    ),
+    "mixed": (
+        ("Потяните вверх, чтобы перейти в следующий чат", "Pull up to go to the next chat"),
+        ("Отпустите, чтобы перейти в следующий чат", "Release to go to the next chat"),
+        ("У вас нет непрочитанных чатов", "You have no unread chats"),
+    ),
+}
+
+_lang_cache = (0.0, "en")
+
+
+def _lang():
+    global _lang_cache
+    now = time.monotonic()
+    if now - _lang_cache[0] > 5:
+        try:
+            code = str(jclass("java.util.Locale").getDefault().getLanguage())
+        except Exception:
+            code = "en"
+        _lang_cache = (now, "ru" if code == "ru" else "en")
+    return _lang_cache[1]
+
+
+def tr(ru, en):
+    return ru if _lang() == "ru" else en
+
+
+def phrase(kind, index):
+    pair = PHRASES.get(kind, PHRASES["mixed"])[index]
+    return pair[0] if _lang() == "ru" else pair[1]
+
+
+# --------------------------------------------------------------------------- pure selection logic
+
+def target_kinds(source_kind, mode, selected):
+    """Chat kinds the gesture may jump to."""
+    if mode == 0:
+        return {source_kind} if source_kind in KINDS else set(selected)
+    chosen = {kind for kind in KINDS if kind in selected}
+    return chosen or ({source_kind} if source_kind in KINDS else set())
+
+
+def pick_dialog(passes, qualifies, weight, strategy):
+    """First (or most / least unread) qualifying dialog; passes is an iterable of (info, dialogs)."""
+    for info, dialogs in passes:
+        if dialogs is None:
+            continue
+        best = None
+        for dialog in dialogs:
+            if not qualifies(dialog):
+                continue
+            if strategy == 0:
+                return dialog, info
+            value = weight(dialog)
+            if best is None or (strategy == 1 and value > best[0]) or (strategy == 2 and value < best[0]):
+                best = (value, dialog)
+        if best is not None:
+            return best[1], info
+    return None, None
+
+
+def label_kind(targets):
+    return next(iter(targets)) if len(targets) == 1 else "mixed"
+
+
+# --------------------------------------------------------------------------- helpers
+
+def find_class(name):
+    context = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+    return jclass("java.lang.Class").forName(name, False, context.getClassLoader())
+
+
+class Hook(MethodHook):
+    def __init__(self, plugin, kind):
+        self.plugin, self.kind = plugin, kind
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if not plugin._active:
+            return
+        try:
+            if self.kind == "next":
+                plugin._before_next_dialog(param)
+            elif self.kind == "update":
+                plugin._updating_until = time.monotonic() + 1.5
+                plugin._last_pick = None
+            elif self.kind == "animate":
+                plugin._before_animate(param)
+        except Exception as error:
+            plugin._log("before " + self.kind + ": " + type(error).__name__ + ": " + str(error))
+
+    def after_hooked_method(self, param):
+        plugin = self.plugin
+        if not plugin._active:
+            return
+        try:
+            if self.kind == "scroll":
+                plugin._after_scroll(param)
+            elif self.kind == "create":
+                plugin._after_create(param)
+            elif self.kind == "update":
+                plugin._updating_until = 0.0
+                plugin._after_update(param)
+            elif self.kind == "width":
+                plugin._after_set_width(param)
+        except Exception as error:
+            plugin._log("after " + self.kind + ": " + type(error).__name__ + ": " + str(error))
+
+
+class PullNextChatPlugin(BasePlugin):
+    # ------------------------------------------------------------------ lifecycle
+
+    def on_plugin_load(self):
+        self._active = False
+        self._hooks = []
+        self._errors = []
+        self._fields = {}
+        self._managers = {}
+        self._scroll_hooked = set()
+        self._updating_until = 0.0
+        self._last_pick = None            # (dialog_id, kind, source_kind, targets)
+        self._muted_args = 2
+        self._status = {}
+        self._lock = threading.RLock()
+        try:
+            self._System = jclass("java.lang.System")
+            self._Long = jclass("java.lang.Long")
+            self._Boolean = jclass("java.lang.Boolean")
+            self._Integer = jclass("java.lang.Integer")
+            self._Utils = jclass("org.telegram.messenger.AndroidUtilities")
+            self._chat_activity = find_class("org.telegram.ui.ChatActivity")
+            context = find_class("android.content.Context")
+            self._install(self._chat_activity.getDeclaredMethod("createView", context), "create", "createView")
+            self._install(self._chat_activity.getDeclaredMethod("animateToNextChat"), "animate", "animateToNextChat")
+            drawable = find_class("org.telegram.ui.ChatPullingDownDrawable")
+            self._drawable_class = drawable
+            self._install(drawable.getDeclaredMethod("updateDialog"), "update", "updateDialog")
+            self._install(drawable.getDeclaredMethod("setWidth", self._Integer.TYPE), "width", "setWidth")
+            installed = False
+            long_type, int_type, bool_type = self._Long.TYPE, self._Integer.TYPE, self._Boolean.TYPE
+            for types in ((long_type, int_type, int_type, bool_type, find_class("[I")), (long_type, int_type, int_type)):
+                try:
+                    self._install(drawable.getDeclaredMethod("getNextUnreadDialog", *types), "next", "getNextUnreadDialog")
+                    installed = True
+                    break
+                except Exception as error:
+                    self._log("getNextUnreadDialog" + str(len(types)) + ": " + type(error).__name__)
+            if not installed:
+                raise RuntimeError("getNextUnreadDialog not found")
+            self._active = True
+            self._scan_open_fragments()
+        except Exception as error:
+            self._log("load failed: " + type(error).__name__ + ": " + str(error))
+            self._remove_hooks()
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._remove_hooks()
+        self._managers.clear()
+
+    def _install(self, method, kind, label):
+        method.setAccessible(True)
+        handle = self.hook_method(method, Hook(self, kind))
+        if handle is None:
+            raise RuntimeError("hook failed: " + label)
+        self._hooks.append(handle)
+        self._status[label] = True
+
+    def _remove_hooks(self):
+        for handle in self._hooks:
+            try:
+                self.unhook_method(handle)
+            except Exception:
+                pass
+        self._hooks = []
+        self._scroll_hooked.clear()
+
+    def _log(self, text):
+        self._errors = (self._errors + [time.strftime("%H:%M:%S") + " " + text[:300]])[-15:]
+        try:
+            self.log("PullNextChat: " + text)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ settings
+
+    def _cfg(self):
+        get = self.get_setting
+        return {
+            "enabled": bool(get("enabled", True)),
+            "src": {"channel": bool(get("src_channel", True)), "group": bool(get("src_group", True)),
+                    "private": bool(get("src_private", False)), "bot": bool(get("src_bot", False))},
+            "mode": int(get("target_mode", 0)),
+            "selected": {kind for kind in KINDS if bool(get("tgt_" + kind, kind == "channel"))},
+            "strategy": max(0, min(2, int(get("strategy", 0)))),
+            "skip_muted": int(get("muted", 0)) == 1,
+            "skip_pinned": bool(get("pinned_skip", False)),
+            "other_folders": bool(get("other_folders", True)),
+            "mark_unread": bool(get("mark_unread", False)),
+        }
+
+    def _native_equivalent(self, cfg, targets):
+        return (targets == {"channel"} and cfg["strategy"] == 0 and not cfg["skip_muted"] and not cfg["skip_pinned"]
+                and cfg["other_folders"] and not cfg["mark_unread"])
+
+    def create_settings(self):
+        return [
+            Header(text=tr("Жест", "Gesture")),
+            Switch(key="enabled", text=tr("Включить жест", "Enable gesture"), default=True,
+                   subtext=tr("Потяните вверх у конца чата, чтобы перейти в следующий непрочитанный чат.",
+                              "Pull up at the end of a chat to jump to the next unread chat.")),
+            Header(text=tr("Где работает жест", "Where the gesture works")),
+            Switch(key="src_channel", text=tr("Каналы", "Channels"), default=True, subtext=tr("Как в Telegram.", "Like stock Telegram.")),
+            Switch(key="src_group", text=tr("Группы", "Groups"), default=True),
+            Switch(key="src_private", text=tr("Личные чаты", "Private chats"), default=False),
+            Switch(key="src_bot", text=tr("Боты", "Bots"), default=False),
+            Divider(text=tr("Форумы и темы работают как в Telegram.", "Forums and topics work like stock Telegram.")),
+            Header(text=tr("Куда переходить", "Where it jumps")),
+            Selector(key="target_mode", text=tr("Цель перехода", "Jump target"), default=0,
+                     items=[tr("Тот же тип, что у текущего чата", "Same type as the current chat"),
+                            tr("Выбранные типы ниже", "Types selected below")]),
+            Switch(key="tgt_channel", text=tr("Переходить в каналы", "Jump to channels"), default=True),
+            Switch(key="tgt_group", text=tr("Переходить в группы", "Jump to groups"), default=False),
+            Switch(key="tgt_private", text=tr("Переходить в личные чаты", "Jump to private chats"), default=False),
+            Switch(key="tgt_bot", text=tr("Переходить в боты", "Jump to bots"), default=False),
+            Selector(key="strategy", text=tr("Какой чат выбрать", "Which chat to pick"), default=0,
+                     items=[tr("Первый непрочитанный в списке", "First unread in the list"),
+                            tr("Где больше всего непрочитанных", "Most unread messages"),
+                            tr("Где меньше всего непрочитанных", "Fewest unread messages")]),
+            Header(text=tr("Фильтры", "Filters")),
+            Selector(key="muted", text=tr("Чаты без звука", "Muted chats"), default=0,
+                     items=[tr("Включать", "Include"), tr("Пропускать", "Skip")]),
+            Switch(key="pinned_skip", text=tr("Пропускать закреплённые чаты", "Skip pinned chats"), default=False),
+            Switch(key="other_folders", text=tr("Искать в других папках и архиве", "Search other folders and archive"), default=True,
+                   subtext=tr("Если в текущей папке непрочитанных нет.", "When the current folder has nothing unread.")),
+            Switch(key="mark_unread", text=tr("Учитывать отметку «непрочитано»", "Count manual «unread» marks"), default=False,
+                   subtext=tr("Чаты, помеченные вручную без счётчика.", "Chats marked unread without a counter.")),
+            Divider(text=tr("При настройках по умолчанию каналы работают в точности как в Telegram.",
+                            "With the default options channels behave exactly like stock Telegram.")),
+            Header(text=tr("Диагностика", "Diagnostics")),
+            Text(text=tr("Проверить состояние", "Check status"), subtext=tr("Показать подключённые хуки и последние ошибки", "Show hooks and recent errors"),
+                 on_click=self._show_status),
+        ]
+
+    def _show_status(self, *_):
+        hooks = ", ".join(("✓ " if ok else "✗ ") + name for name, ok in self._status.items()) or "—"
+        text = hooks + ("\n" + self._errors[-1] if self._errors else "")
+        shown = False
+        if BulletinHelper is not None:
+            for name in ("show_info", "show_success"):
+                function = getattr(BulletinHelper, name, None)
+                if function is not None:
+                    try:
+                        function(text)
+                        shown = True
+                        break
+                    except Exception:
+                        pass
+        if not shown:
+            self._log("status: " + text)
+
+    # ------------------------------------------------------------------ reflection
+
+    def _field(self, owner_class, name):
+        key = (str(owner_class.getName()), name)
+        field = self._fields.get(key)
+        if field is None:
+            cls = owner_class
+            while cls is not None:
+                try:
+                    field = cls.getDeclaredField(name)
+                    break
+                except Exception:
+                    cls = cls.getSuperclass()
+            if field is None:
+                raise AttributeError(name)
+            field.setAccessible(True)
+            self._fields[key] = field
+        return field
+
+    def _get(self, obj, name):
+        return self._field(obj.getClass(), name).get(obj)
+
+    def _hash(self, obj):
+        return int(self._System.identityHashCode(obj))
+
+    # ------------------------------------------------------------------ fragments and scrolling
+
+    def _scan_open_fragments(self):
+        try:
+            from client_utils import get_last_fragment
+            fragment = get_last_fragment()
+            if fragment is not None and self._chat_activity.isInstance(fragment):
+                self._register(fragment)
+        except Exception as error:
+            self._log("scan: " + type(error).__name__)
+
+    def _after_create(self, param):
+        self._register(param.thisObject)
+
+    def _register(self, fragment):
+        manager = self._get(fragment, "chatLayoutManager")
+        if manager is None:
+            return
+        self._managers[self._hash(manager)] = self._weak(fragment)
+        if len(self._managers) > 24:
+            for key in [k for k, ref in self._managers.items() if ref.get() is None]:
+                self._managers.pop(key, None)
+        self._hook_scroll(manager.getClass())
+
+    def _weak(self, obj):
+        return jclass("java.lang.ref.WeakReference")(obj)
+
+    def _hook_scroll(self, cls):
+        name = str(cls.getName())
+        if name in self._scroll_hooked:
+            return
+        for method in cls.getDeclaredMethods():
+            if str(method.getName()) == "scrollVerticallyBy" and len(method.getParameterTypes()) == 3:
+                self._install(method, "scroll", "scrollVerticallyBy")
+                self._scroll_hooked.add(name)
+                return
+        self._status["scrollVerticallyBy"] = False
+        self._log("scrollVerticallyBy is not declared by " + name)
+
+    def _fragment_for(self, manager):
+        ref = self._managers.get(self._hash(manager))
+        return ref.get() if ref is not None else None
+
+    def _fragment_kind(self, fragment):
+        try:
+            if bool(fragment.isTopic):
+                return "forum"
+        except Exception:
+            pass
+        user, chat = self._get(fragment, "currentUser"), self._get(fragment, "currentChat")
+        if user is not None:
+            if int(user.id) == 777000 or bool(self._is_self(user)):
+                return None
+            return "bot" if bool(user.bot) else "private"
+        if chat is not None:
+            return "channel" if bool(jclass("org.telegram.messenger.ChatObject").isChannelAndNotMegaGroup(chat)) else "group"
+        return None
+
+    def _is_self(self, user):
+        try:
+            return bool(jclass("org.telegram.messenger.UserObject").isUserSelf(user))
+        except Exception:
+            return False
+
+    def _after_scroll(self, param):
+        args = param.args
+        dy = int(args[0])
+        result = param.getResult()
+        if dy <= 0 or result is None or int(result) != 0:
+            return
+        cfg = self._cfg()
+        if not cfg["enabled"]:
+            return
+        fragment = self._fragment_for(param.thisObject)
+        if fragment is None:
+            return
+        kind = self._fragment_kind(fragment)
+        if kind is None or kind == "forum":
+            return
+        cls = fragment.getClass()
+        offset_field = self._field(cls, "pullingDownOffset")
+        enabled = cfg["src"][kind]
+        if kind == "channel":
+            if not enabled and float(offset_field.getFloat(fragment)) != 0.0:
+                self._cancel_pull(fragment, offset_field)
+            return
+        if not enabled or not self._can_pull(fragment):
+            return
+        self._pull(fragment, offset_field, dy)
+
+    def _can_pull(self, fragment):
+        cls = fragment.getClass()
+        if int(self._field(cls, "chatMode").getInt(fragment)) != 0:
+            return False
+        if int(self._field(cls, "threadMessageId").getLong(fragment)) != 0:
+            return False
+        view = self._get(fragment, "chatListView")
+        if view is None or int(view.getScrollState()) != 1:
+            return False
+        if bool(fragment.hasSelectedMessages()) or bool(fragment.isReport()):
+            return False
+        for name in ("isFastScrollAnimationRunning", "isMultiselect"):
+            try:
+                if bool(getattr(view, name)()):
+                    return False
+            except Exception:
+                pass
+        try:
+            if bool(fragment.isInPreviewMode()):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _pull(self, fragment, offset_field, dy):
+        """Same elastic pull that Telegram applies to channels, for the other chat types."""
+        cls = fragment.getClass()
+        view = self._get(fragment, "chatListView")
+        offset = float(offset_field.getFloat(fragment))
+        drawable = self._get(fragment, "pullingDownDrawable")
+        if offset == 0.0 and drawable is not None:
+            drawable.updateDialog()
+        animator = self._get(fragment, "pullingDownBackAnimator")
+        if animator is not None:
+            animator.removeAllListeners()
+            animator.cancel()
+        first, second = float(self._Utils.dp(110.0)), float(self._Utils.dp(160.0))
+        if offset < first:
+            progress = offset / first
+            k = 0.65 * (1.0 - progress) + 0.45 * progress
+        elif offset < second:
+            progress = (offset - first) / (second - first)
+            k = 0.45 * (1.0 - progress) + 0.05 * progress
+        else:
+            k = 0.05
+        offset += dy * k
+        offset_field.setFloat(fragment, offset)
+        view.invalidate()
+        view.setOverScrollMode(2)
+        self._pulling_container(fragment, offset > 0 and int(view.getScrollState()) == 1)
+
+    def _cancel_pull(self, fragment, offset_field):
+        offset_field.setFloat(fragment, 0.0)
+        view = self._get(fragment, "chatListView")
+        view.setOverScrollMode(0)
+        view.invalidate()
+        self._pulling_container(fragment, False)
+
+    def _pulling_container(self, fragment, visible):
+        try:
+            animator = self._get(fragment, "animatorPullingDownContainerVisibility")
+            animator.setValue(bool(visible), True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ choosing the next chat
+
+    def _account(self):
+        return int(jclass("org.telegram.messenger.UserConfig").selectedAccount)
+
+    def _controller(self):
+        return jclass("org.telegram.messenger.MessagesController").getInstance(self._account())
+
+    def _kind_of_dialog(self, mc, did):
+        if bool(jclass("org.telegram.messenger.DialogObject").isEncryptedDialog(did)):
+            return None
+        if did < 0:
+            chat = mc.getChat(self._Long.valueOf(-did))
+            if chat is None or bool(getattr(chat, "forum", False)):
+                return None
+            return "channel" if bool(jclass("org.telegram.messenger.ChatObject").isChannelAndNotMegaGroup(chat)) else "group"
+        if did == 777000:
+            return None
+        user = mc.getUser(self._Long.valueOf(did))
+        if user is None or self._is_self(user):
+            return None
+        try:
+            if bool(jclass("org.telegram.messenger.UserObject").isDeleted(user)):
+                return None
+        except Exception:
+            pass
+        return "bot" if bool(user.bot) else "private"
+
+    def _is_muted(self, mc, did):
+        for count in (self._muted_args, 3 - self._muted_args):
+            try:
+                value = bool(mc.isDialogMuted(did, 0)) if count == 2 else bool(mc.isDialogMuted(did))
+                self._muted_args = count
+                return value
+            except Exception:
+                continue
+        return False
+
+    def _passes(self, mc, folder, filter_id, other_folders):
+        def lookup(folder_id, fid):
+            if fid != 0:
+                entry = mc.dialogFiltersById.get(fid)
+                return JavaList(entry.dialogs) if entry is not None else None
+            lst = mc.getDialogs(folder_id)
+            return JavaList(lst) if lst is not None else None
+        yield (folder, filter_id, False), lookup(folder, filter_id)
+        if not other_folders:
+            return
+        if filter_id != 0:
+            filters = mc.dialogFilters
+            for i in range(int(filters.size())):
+                fid = int(filters.get(i).id)
+                if fid != filter_id:
+                    yield (folder, fid, True), lookup(folder, fid)
+        by_folder = mc.dialogsByFolder
+        for i in range(int(by_folder.size())):
+            key = int(by_folder.keyAt(i))
+            if key != folder:
+                yield (key, 0, True), lookup(key, 0)
+
+    def _select(self, current_id, folder, filter_id, source_kind, cfg, targets):
+        mc = self._controller()
+
+        def unread(dialog):
+            if int(dialog.unread_count) > 0:
+                return True
+            return cfg["mark_unread"] and bool(dialog.unread_mark)
+
+        def qualifies(dialog):
+            did = int(dialog.id)
+            if did == current_id or not unread(dialog):
+                return False
+            if cfg["skip_pinned"] and bool(dialog.pinned):
+                return False
+            kind = self._kind_of_dialog(mc, did)
+            if kind is None or kind not in targets:
+                return False
+            if cfg["skip_muted"] and self._is_muted(mc, did):
+                return False
+            try:
+                if bool(mc.isPromoDialog(did, False)):
+                    return False
+            except Exception:
+                pass
+            if did < 0:
+                chat = mc.getChat(self._Long.valueOf(-did))
+                if chat is not None and mc.getRestrictionReason(chat.restriction_reason) is not None:
+                    return False
+            return True
+
+        dialog, info = pick_dialog(self._passes(mc, folder, filter_id, cfg["other_folders"]), qualifies,
+                                   lambda d: int(d.unread_count), cfg["strategy"])
+        kind = self._kind_of_dialog(mc, int(dialog.id)) if dialog is not None else None
+        return dialog, info, kind
+
+    def _kind_of_id(self, did):
+        try:
+            return self._kind_of_dialog(self._controller(), int(did))
+        except Exception:
+            return None
+
+    def _before_next_dialog(self, param):
+        if time.monotonic() > self._updating_until:
+            return
+        cfg = self._cfg()
+        if not cfg["enabled"]:
+            return
+        args = param.args
+        current = int(args[0])
+        folder, filter_id = int(args[1]), int(args[2])
+        params = args[4] if len(args) > 4 else None
+        source = self._kind_of_id(current)
+        if source is None:
+            return
+        targets = target_kinds(source, cfg["mode"], cfg["selected"])
+        self._last_pick = (0, None, source, targets)
+        if not targets or self._native_equivalent(cfg, targets):
+            self._last_pick = None
+            return
+        dialog, info, kind = self._select(current, folder, filter_id, source, cfg, targets)
+        if dialog is not None and params is not None:
+            params[0] = 1 if info[2] else 0
+            params[1] = info[0]
+            params[2] = info[1]
+        self._last_pick = (int(dialog.id) if dialog is not None else 0, kind, source, targets)
+        param.setResult(dialog)
+
+    # ------------------------------------------------------------------ drawable tweaks
+
+    def _after_update(self, param):
+        pick = self._last_pick
+        if pick is None:
+            return
+        drawable = param.thisObject
+        cls = drawable.getClass()
+        self._pick_drawable = self._hash(drawable)
+        self._field(cls, "lastWidth").setInt(drawable, 0)      # rebuild labels for the new target
+        did = int(drawable.nextDialogId) if pick[0] else 0
+        if did > 0:
+            self._show_user_target(drawable, cls, did)
+
+    def _show_user_target(self, drawable, cls, user_id):
+        mc = self._controller()
+        user = mc.getUser(self._Long.valueOf(user_id))
+        if user is None:
+            return
+        account = self._account()
+        fake = jclass("org.telegram.tgnet.TLRPC$TL_chat")()
+        fake.id = user_id
+        fake.title = str(jclass("org.telegram.messenger.UserObject").getUserName(user))
+        self._field(cls, "nextChat").set(drawable, fake)
+        try:
+            avatar = jclass("org.telegram.ui.Components.AvatarDrawable")()
+            avatar.setInfo(account, user)
+            receiver = self._get(drawable, "imageReceiver")
+            location = jclass("org.telegram.messenger.ImageLocation").getForUser(user, jclass("org.telegram.messenger.ImageLocation").TYPE_SMALL)
+            receiver.setImage(location, "50_50", avatar, None, jclass("org.telegram.messenger.UserConfig").getInstance(0).getCurrentUser(), 0)
+        except Exception as error:
+            self._log("avatar: " + type(error).__name__)
+
+    def _after_set_width(self, param):
+        pick = self._last_pick
+        drawable = param.thisObject
+        if pick is None or self._hash(drawable) != getattr(self, "_pick_drawable", None):
+            return
+        cls = drawable.getClass()
+        kind = pick[1]
+        empty = bool(self._field(cls, "emptyStub").getBoolean(drawable))
+        layout_class = jclass("android.text.StaticLayout")
+        alignment = jclass("android.text.Layout$Alignment")
+        width = int(self._field(cls, "lastWidth").getInt(drawable))
+        limit = width - int(self._Utils.dp(60.0))
+        if limit <= 0:
+            return
+        if empty:
+            if pick[3] == {"channel"}:
+                return
+            text, paint_name, layout_name, width_name, align = phrase(label_kind(pick[3]), 2), "textPaint", "chatNameLayout", "chatNameWidth", alignment.ALIGN_NORMAL
+            self._set_layout(drawable, cls, layout_class, text, paint_name, layout_name, width_name, align, limit)
+            return
+        if kind is None or kind == "channel" or int(drawable.nextDialogId) != pick[0]:
+            return
+        center = alignment.ALIGN_CENTER
+        self._set_layout(drawable, cls, layout_class, phrase(kind, 0), "textPaint2", "layout1", "layout1Width", center, limit)
+        self._set_layout(drawable, cls, layout_class, phrase(kind, 1), "textPaint2", "layout2", "layout2Width", center, limit)
+
+    def _set_layout(self, drawable, cls, layout_class, text, paint_name, layout_name, width_name, align, limit):
+        paint = self._get(drawable, paint_name)
+        measured = min(int(paint.measureText(text)), limit)
+        layout = layout_class(text, paint, measured, align, 1.0, 0.0, False)
+        self._field(cls, layout_name).set(drawable, layout)
+        self._field(cls, width_name).setInt(drawable, measured)
+
+    # ------------------------------------------------------------------ opening a private chat or bot
+
+    def _before_animate(self, param):
+        fragment = param.thisObject
+        drawable = self._get(fragment, "pullingDownDrawable")
+        if drawable is None or bool(self._field(drawable.getClass(), "emptyStub").getBoolean(drawable)):
+            return
+        user_id = int(drawable.nextDialogId)
+        if user_id <= 0:
+            return                                              # chats and channels: Telegram does it
+        param.setResult(None)
+        folder, filter_id = int(drawable.dialogFolderId), int(drawable.dialogFilterId)
+        try:
+            method = fragment.getClass().getDeclaredMethod("addToPulledDialogsMyself")
+            method.setAccessible(True)
+            method.invoke(fragment)
+        except Exception:
+            pass
+        bundle = jclass("android.os.Bundle")()
+        bundle.putLong("user_id", user_id)
+        bundle.putInt("dialog_folder_id", folder)
+        bundle.putInt("dialog_filter_id", filter_id)
+        bundle.putBoolean("pulled", True)
+        activity = jclass("org.telegram.ui.ChatActivity")(bundle)
+        try:
+            method = self._chat_activity.getDeclaredMethod("setPullingDownTransition", self._Boolean.TYPE)
+            method.setAccessible(True)
+            method.invoke(activity, self._Boolean.TRUE)
+            self._field(self._chat_activity, "replacingChatActivity").setBoolean(fragment, True)
+        except Exception as error:
+            self._log("transition: " + type(error).__name__)
+        fragment.presentFragment(activity, True)
+
+
+class JavaList:
+    """Cheap iteration over a java.util.List."""
+
+    def __init__(self, items):
+        self.items = items
+
+    def __iter__(self):
+        items = self.items
+        for index in range(int(items.size())):
+            yield items.get(index)

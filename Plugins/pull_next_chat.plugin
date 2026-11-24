@@ -3,30 +3,74 @@
 __id__ = "pull_next_chat"
 __name__ = "Pull to Next Chat"
 __description__ = "Жест «потяни вверх — следующий чат» для каналов, групп, личных чатов и ботов / Pull-up gesture to the next unread chat"
-__author__ = "@dtfserega Claude"
-__version__ = "1.0.0"
+__author__ = "@dtfserega, Claude, Gemini"
+__version__ = "1.1"
 __app_version__ = ">=13.1.1"
 __category__ = ["chats", "tools"]
 __sdk_version__ = ">=1.4.6.3"
-__icon__ = "exteraPlugins/1"
+# Sticker pack: t.me/addstickers/Ff_t1 (first sticker, doc_id 5201899745638921737)
+__icon__ = "Ff_t1/0"
 
+import math
 import threading
 import time
 
-from base_plugin import BasePlugin, MethodHook
 from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from java import jclass, jfloat, jint
+from ui.settings import Divider, Header, Selector, Switch, Text
 
 try:
     from ui.bulletin import BulletinHelper
 except ImportError:
     BulletinHelper = None
 
-from ui.settings import Header, Switch, Selector, Divider, Text
-from java import jclass
+try:
+    from ui.alert import AlertDialogBuilder
+except ImportError:
+    AlertDialogBuilder = None
 
 KINDS = ("channel", "group", "private", "bot")
 
-# (swipe hint, release hint, "nothing unread" text) per target kind; "mixed" is used for several kinds.
+SCOPE_CURRENT_ONLY = 0
+SCOPE_FOLDERS_NO_ARCHIVE = 1
+SCOPE_FOLDERS_AND_ARCHIVE = 2
+
+# 6-step pure sensitivity multipliers (default index 2 = 1.0x stock Telegram)
+SENSITIVITY_VALUES = (0.5, 0.75, 1.0, 1.5, 2.0, 2.5)
+DEFAULT_SENSITIVITY_IDX = 2
+
+ACCIDENTAL_DEADZONE_DP = 32.0
+MAX_PULL_OFFSET_DP = 220.0
+PULL_GESTURE_GAP_SEC = 0.25
+UPDATE_SUPPRESS_TTL_SEC = 0.35
+
+CHAIN_TTL_SEC = 120.0
+MAX_CHAIN_SIZE = 32
+CFG_TTL_SEC = 0.5        # settings are re-read at most twice a second (hot scroll path)
+DP_TTL_SEC = 2.0         # re-check AndroidUtilities.density at most every 2s
+LOG_REPEAT_SEC = 3.0     # identical log lines are suppressed for this long
+MAX_KEPT_CHATS = 6       # keep_back_stack: max ChatActivity instances kept below the top one
+POST_JUMP_DELAY_MS = 450 # wait for transition animation before trimming stack / resetting offset
+POST_JUMP_RETRY_MS = 250 # single retry delay if ActionBarLayout is still animating
+MAX_REFLECT_CACHE = 128
+
+_MISSING = object()
+_UNSET = object()
+
+# Entry indices for per-LayoutManager state in self._managers:
+# [0] mgr_ref, [1] frag_ref, [2] kind, [3] deadzone_px, [4] last_pull_ts,
+# [5] last_ch_off, [6] in_pull, [7] container_visible, [8] can_pull_static
+_E_MGR = 0
+_E_FRAG = 1
+_E_KIND = 2
+_E_DZ = 3
+_E_TS = 4
+_E_CH_OFF = 5
+_E_IN_PULL = 6
+_E_VIS = 7
+_E_STATIC_OK = 8
+
 PHRASES = {
     "group": (
         ("Потяните вверх, чтобы перейти в следующую группу", "Pull up to go to the next group"),
@@ -55,18 +99,39 @@ PHRASES = {
     ),
 }
 
-_lang_cache = (0.0, "en")
+_lang_cache = (-10.0, "en")
 
 
 def _lang():
     global _lang_cache
     now = time.monotonic()
-    if now - _lang_cache[0] > 5:
+    if now - _lang_cache[0] > 5.0:
+        lang = ""
         try:
-            code = str(jclass("java.util.Locale").getDefault().getLanguage())
+            lc = jclass("org.telegram.messenger.LocaleController").getInstance()
+            info = lc.getCurrentLocaleInfo()
+            if info is not None:
+                short_name = str(getattr(info, "shortName", "") or "").strip().lower()
+                plural_code = str(getattr(info, "pluralLangCode", "") or "").strip().lower()
+                if short_name.startswith("ru") or plural_code.startswith("ru"):
+                    lang = "ru"
+                elif short_name or plural_code:
+                    lang = "en"
+            if not lang:
+                locale = lc.getCurrentLocale()
+                if locale is not None:
+                    code = str(locale.getLanguage() or "").strip().lower()
+                    if code:
+                        lang = "ru" if code.startswith("ru") else "en"
         except Exception:
-            code = "en"
-        _lang_cache = (now, "ru" if code == "ru" else "en")
+            lang = ""
+        if not lang:
+            try:
+                code = str(jclass("java.util.Locale").getDefault().getLanguage() or "").strip().lower()
+                lang = "ru" if code.startswith("ru") else "en"
+            except Exception:
+                lang = "en"
+        _lang_cache = (now, lang)
     return _lang_cache[1]
 
 
@@ -79,6 +144,19 @@ def phrase(kind, index):
     return pair[0] if _lang() == "ru" else pair[1]
 
 
+def _run_ui_delayed(fn, delay_ms):
+    try:
+        run_on_ui_thread(fn, delay=delay_ms)
+    except TypeError:
+        run_on_ui_thread(fn)
+
+
+def _format_mult(mult):
+    if mult == int(mult):
+        return f"×{int(mult)}"
+    return f"×{mult:g}"
+
+
 # --------------------------------------------------------------------------- pure selection logic
 
 def target_kinds(source_kind, mode, selected):
@@ -89,22 +167,54 @@ def target_kinds(source_kind, mode, selected):
     return chosen or ({source_kind} if source_kind in KINDS else set())
 
 
-def pick_dialog(passes, qualifies, weight, strategy):
-    """First (or most / least unread) qualifying dialog; passes is an iterable of (info, dialogs)."""
+def pick_dialog(passes, qualifies, weight, strategy, has_mention=None, visited_ids=None):
+    """First (or most / least unread) qualifying dialog with optional mention priority and anti-loop."""
+    fallback_visited = None
+
     for info, dialogs in passes:
         if dialogs is None:
             continue
-        best = None
+        best_fresh = None
+        best_mention = None
         for dialog in dialogs:
-            if not qualifies(dialog):
+            if dialog is None or not qualifies(dialog):
                 continue
-            if strategy == 0:
+            did = int(dialog.id)
+            is_visited = visited_ids is not None and did in visited_ids
+            val = weight(dialog)
+
+            if is_visited:
+                if fallback_visited is None:
+                    fallback_visited = (val, dialog, info)
+                elif strategy == 1 and val > fallback_visited[0]:
+                    fallback_visited = (val, dialog, info)
+                elif strategy == 2 and val < fallback_visited[0]:
+                    fallback_visited = (val, dialog, info)
+                continue
+
+            if has_mention is not None and has_mention(dialog):
+                if strategy == 0:
+                    return dialog, info
+                if best_mention is None or (strategy == 1 and val > best_mention[0]) or (strategy == 2 and val < best_mention[0]):
+                    best_mention = (val, dialog)
+                continue
+
+            if strategy == 0 and has_mention is None:
                 return dialog, info
-            value = weight(dialog)
-            if best is None or (strategy == 1 and value > best[0]) or (strategy == 2 and value < best[0]):
-                best = (value, dialog)
-        if best is not None:
-            return best[1], info
+            if best_fresh is None:
+                best_fresh = (val, dialog)
+            elif strategy == 1 and val > best_fresh[0]:
+                best_fresh = (val, dialog)
+            elif strategy == 2 and val < best_fresh[0]:
+                best_fresh = (val, dialog)
+
+        if best_mention is not None:
+            return best_mention[1], info
+        if best_fresh is not None:
+            return best_fresh[1], info
+
+    if fallback_visited is not None:
+        return fallback_visited[1], fallback_visited[2]
     return None, None
 
 
@@ -131,10 +241,11 @@ class Hook(MethodHook):
             if self.kind == "next":
                 plugin._before_next_dialog(param)
             elif self.kind == "update":
-                plugin._updating_until = time.monotonic() + 1.5
-                plugin._last_pick = None
+                plugin._begin_update(param)
             elif self.kind == "animate":
                 plugin._before_animate(param)
+            elif self.kind == "destroy":
+                plugin._before_destroy(param.thisObject)
         except Exception as error:
             plugin._log("before " + self.kind + ": " + type(error).__name__ + ": " + str(error))
 
@@ -148,15 +259,32 @@ class Hook(MethodHook):
             elif self.kind == "create":
                 plugin._after_create(param)
             elif self.kind == "update":
-                plugin._updating_until = 0.0
+                plugin._end_update(param.thisObject)
                 plugin._after_update(param)
             elif self.kind == "width":
                 plugin._after_set_width(param)
+            elif self.kind == "animate":
+                plugin._after_animate(param)
         except Exception as error:
             plugin._log("after " + self.kind + ": " + type(error).__name__ + ": " + str(error))
+            if self.kind == "update":
+                plugin._end_update(param.thisObject)
 
 
 class PullNextChatPlugin(BasePlugin):
+    _JAVA_REF_ATTRS = (
+        "_chat_activity", "_chat_activity_ctor", "_drawable_class",
+        "_System", "_Long", "_Boolean", "_Integer", "_WeakRef",
+        "_Utils", "_ChatObject", "_UserObject", "_DialogObject",
+        "_MessagesController", "_UserConfig", "_StaticLayout", "_LayoutAlignment",
+        "_TextUtils", "_TruncateAt", "_ArrayList", "_Bundle",
+        "_TLChat", "_AvatarDrawable", "_ImageLocation",
+        "_f_pull_offset", "_f_chat_mode", "_f_thread_id", "_f_list_view",
+        "_f_drawable", "_f_back_anim", "_f_vis_anim", "_f_replacing",
+        "_f_pulled_dialogs", "_f_cur_user", "_f_cur_chat", "_f_cur_enc_chat",
+        "_f_dialog_id",
+    )
+
     # ------------------------------------------------------------------ lifecycle
 
     def on_plugin_load(self):
@@ -164,155 +292,542 @@ class PullNextChatPlugin(BasePlugin):
         self._hooks = []
         self._errors = []
         self._fields = {}
-        self._managers = {}
+        self._methods = {}
+        self._managers = {}           # hash(mgr) -> [entry_list, ...]
+        self._picks = {}              # hash(drawable) -> [(WeakRef(drawable), pick_dict), ...]
+        self._suppressed = {}         # hash(drawable) -> [(WeakRef(drawable), expire_ts), ...]
         self._scroll_hooked = set()
+        self._scroll_failed = set()
         self._updating_until = 0.0
-        self._last_pick = None            # (dialog_id, kind, source_kind, targets)
+        self._updating_drawable_ref = None
+        self._last_pick_fallback = None
+        self._pending_native_jump = None
         self._muted_args = 2
         self._status = {}
         self._lock = threading.RLock()
+        self._jump_chain = {}         # account -> {dialog_id: timestamp}
+        self._jump_count = 0
+        self._cfg_cache = (0.0, None)
+        self._last_log_text = ""
+        self._last_log_ts = 0.0
+        self._dp_cache = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # (ts, density, dp110, dp160, dp60, dp32, dp220)
+        for attr in self._JAVA_REF_ATTRS:
+            setattr(self, attr, None)
+
+        self._migrate_settings()
+
         try:
             self._System = jclass("java.lang.System")
             self._Long = jclass("java.lang.Long")
             self._Boolean = jclass("java.lang.Boolean")
             self._Integer = jclass("java.lang.Integer")
+            self._WeakRef = jclass("java.lang.ref.WeakReference")
             self._Utils = jclass("org.telegram.messenger.AndroidUtilities")
+            self._ChatObject = jclass("org.telegram.messenger.ChatObject")
+            self._UserObject = jclass("org.telegram.messenger.UserObject")
+            self._DialogObject = jclass("org.telegram.messenger.DialogObject")
+            self._MessagesController = jclass("org.telegram.messenger.MessagesController")
+            self._UserConfig = jclass("org.telegram.messenger.UserConfig")
+            self._StaticLayout = jclass("android.text.StaticLayout")
+            self._LayoutAlignment = jclass("android.text.Layout$Alignment")
+            self._TextUtils = jclass("android.text.TextUtils")
+            self._TruncateAt = jclass("android.text.TextUtils$TruncateAt")
+            self._ArrayList = jclass("java.util.ArrayList")
+            self._Bundle = jclass("android.os.Bundle")
+            self._TLChat = jclass("org.telegram.tgnet.TLRPC$TL_chat")
+            self._AvatarDrawable = jclass("org.telegram.ui.Components.AvatarDrawable")
+            self._ImageLocation = jclass("org.telegram.messenger.ImageLocation")
+            self._chat_activity_ctor = jclass("org.telegram.ui.ChatActivity")
+
             self._chat_activity = find_class("org.telegram.ui.ChatActivity")
+            self._cache_hot_chat_fields()
+
             context = find_class("android.content.Context")
             self._install(self._chat_activity.getDeclaredMethod("createView", context), "create", "createView")
             self._install(self._chat_activity.getDeclaredMethod("animateToNextChat"), "animate", "animateToNextChat")
+            try:
+                self._install(self._chat_activity.getDeclaredMethod("onFragmentDestroy"), "destroy", "onFragmentDestroy")
+            except Exception:
+                pass
+
             drawable = find_class("org.telegram.ui.ChatPullingDownDrawable")
             self._drawable_class = drawable
             self._install(drawable.getDeclaredMethod("updateDialog"), "update", "updateDialog")
             self._install(drawable.getDeclaredMethod("setWidth", self._Integer.TYPE), "width", "setWidth")
+
             installed = False
+            sig_errors = []
             long_type, int_type, bool_type = self._Long.TYPE, self._Integer.TYPE, self._Boolean.TYPE
-            for types in ((long_type, int_type, int_type, bool_type, find_class("[I")), (long_type, int_type, int_type)):
+            for sig in ((long_type, int_type, int_type, bool_type, find_class("[I")), (long_type, int_type, int_type)):
                 try:
-                    self._install(drawable.getDeclaredMethod("getNextUnreadDialog", *types), "next", "getNextUnreadDialog")
+                    self._install(drawable.getDeclaredMethod("getNextUnreadDialog", *sig), "next", "getNextUnreadDialog")
                     installed = True
                     break
                 except Exception as error:
-                    self._log("getNextUnreadDialog" + str(len(types)) + ": " + type(error).__name__)
+                    sig_errors.append("getNextUnreadDialog" + str(len(sig)) + ": " + type(error).__name__)
             if not installed:
+                for msg in sig_errors:
+                    self._log(msg)
                 raise RuntimeError("getNextUnreadDialog not found")
+
             self._active = True
-            self._scan_open_fragments()
+            run_on_ui_thread(self._scan_open_fragments)
         except Exception as error:
             self._log("load failed: " + type(error).__name__ + ": " + str(error))
             self._remove_hooks()
+            self._release_java_refs()
+
+    def _cache_hot_chat_fields(self):
+        """Resolve frequently accessed ChatActivity fields once to eliminate per-frame lock/reflection overhead."""
+        cls = self._chat_activity
+        if cls is None:
+            return
+        mapping = (
+            ("_f_pull_offset", "pullingDownOffset"),
+            ("_f_chat_mode", "chatMode"),
+            ("_f_thread_id", "threadMessageId"),
+            ("_f_list_view", "chatListView"),
+            ("_f_drawable", "pullingDownDrawable"),
+            ("_f_back_anim", "pullingDownBackAnimator"),
+            ("_f_vis_anim", "animatorPullingDownContainerVisibility"),
+            ("_f_replacing", "replacingChatActivity"),
+            ("_f_pulled_dialogs", "pulledDialogs"),
+            ("_f_cur_user", "currentUser"),
+            ("_f_cur_chat", "currentChat"),
+            ("_f_cur_enc_chat", "currentEncryptedChat"),
+            ("_f_dialog_id", "dialog_id"),
+        )
+        for attr, fname in mapping:
+            setattr(self, attr, self._field_opt(cls, fname))
 
     def on_plugin_unload(self):
         self._active = False
         self._remove_hooks()
-        self._managers.clear()
+        with self._lock:
+            self._managers.clear()
+            self._picks.clear()
+            self._suppressed.clear()
+            self._fields.clear()
+            self._methods.clear()
+            self._jump_chain.clear()
+            self._errors.clear()
+            self._status.clear()
+            self._updating_until = 0.0
+            self._updating_drawable_ref = None
+            self._last_pick_fallback = None
+            self._pending_native_jump = None
+            self._cfg_cache = (0.0, None)
+            self._dp_cache = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        # Defer nulling Java class refs onto the UI thread so any in-flight UI hook finishes cleanly first.
+        try:
+            run_on_ui_thread(self._release_java_refs)
+        except Exception:
+            self._release_java_refs()
+
+    def _release_java_refs(self):
+        with self._lock:
+            if self._active:
+                return
+            for attr in self._JAVA_REF_ATTRS:
+                setattr(self, attr, None)
 
     def _install(self, method, kind, label):
         method.setAccessible(True)
         handle = self.hook_method(method, Hook(self, kind))
         if handle is None:
             raise RuntimeError("hook failed: " + label)
-        self._hooks.append(handle)
-        self._status[label] = True
+        with self._lock:
+            self._hooks.append(handle)
+            self._status[label] = True
 
     def _remove_hooks(self):
-        for handle in self._hooks:
+        with self._lock:
+            hooks = list(self._hooks)
+            self._hooks = []
+            self._scroll_hooked.clear()
+            self._scroll_failed.clear()
+        for handle in reversed(hooks):
             try:
                 self.unhook_method(handle)
             except Exception:
                 pass
-        self._hooks = []
-        self._scroll_hooked.clear()
 
     def _log(self, text):
-        self._errors = (self._errors + [time.strftime("%H:%M:%S") + " " + text[:300]])[-15:]
+        text = str(text)[:300]
+        now = time.monotonic()
+        with self._lock:
+            if text == self._last_log_text and now - self._last_log_ts < LOG_REPEAT_SEC:
+                return
+            self._last_log_text, self._last_log_ts = text, now
+            self._errors = (self._errors + [time.strftime("%H:%M:%S") + " " + text])[-15:]
         try:
             self.log("PullNextChat: " + text)
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ settings
+    # ------------------------------------------------------------------ throttled dynamic DPI metrics
+
+    def _dp_metrics(self, force_check=False):
+        """Returns (dp110, dp160, dp60, dp32, dp220); checks AndroidUtilities.density at most every DP_TTL_SEC."""
+        now = time.monotonic()
+        ts, cached_d, dp110, dp160, dp60, dp32, dp220 = self._dp_cache
+        if not force_check and dp110 > 0.0 and (now - ts) < DP_TTL_SEC:
+            return dp110, dp160, dp60, dp32, dp220
+
+        density = 0.0
+        try:
+            d = getattr(self._Utils, "density", None)
+            if isinstance(d, (int, float)) and d > 0.0:
+                density = float(d)
+        except Exception:
+            density = 0.0
+
+        if density > 0.0:
+            if density == cached_d and dp110 > 0.0:
+                self._dp_cache = (now, cached_d, dp110, dp160, dp60, dp32, dp220)
+                return dp110, dp160, dp60, dp32, dp220
+            dp110 = 110.0 * density
+            dp160 = 160.0 * density
+            dp60 = 60.0 * density
+            dp32 = ACCIDENTAL_DEADZONE_DP * density
+            dp220 = MAX_PULL_OFFSET_DP * density
+            self._dp_cache = (now, density, dp110, dp160, dp60, dp32, dp220)
+            return dp110, dp160, dp60, dp32, dp220
+
+        if dp110 > 0.0:
+            self._dp_cache = (now, 0.0, dp110, dp160, dp60, dp32, dp220)
+            return dp110, dp160, dp60, dp32, dp220
+
+        dp110 = float(self._Utils.dp(110.0))
+        dp160 = float(self._Utils.dp(160.0))
+        dp60 = float(self._Utils.dp(60.0))
+        dp32 = float(self._Utils.dp(ACCIDENTAL_DEADZONE_DP))
+        dp220 = float(self._Utils.dp(MAX_PULL_OFFSET_DP))
+        self._dp_cache = (now, 0.0, dp110, dp160, dp60, dp32, dp220)
+        return dp110, dp160, dp60, dp32, dp220
+
+    # ------------------------------------------------------------------ settings & safe migrations
+
+    def _get_int(self, key, default, lo, hi):
+        try:
+            val = self.get_setting(key, default)
+            return max(lo, min(hi, int(val)))
+        except Exception:
+            return default
+
+    def _get_bool(self, key, default):
+        try:
+            return bool(self.get_setting(key, default))
+        except Exception:
+            return default
+
+    def _on_setting_changed(self, *_):
+        self._cfg_cache = (0.0, None)
+
+    def _migrate_settings(self):
+        """Type-safe one-time migrations (never passes None or mismatched types to get_setting):
+        1) v1.0 `other_folders` (bool) -> `folder_scope` (int 0..2).
+        2) old 3-step `pull_sensitivity` (0=1.0x, 1=2.5x, 2=0.48x+DZ) ->
+           new 6-step `pull_sensitivity_v2` (0=0.5, 1=0.75, 2=1.0, 3=1.5, 4=2.0, 5=2.5) + `anti_accidental`."""
+        try:
+            if self._get_int("folder_scope", -1, -1, 2) < 0:
+                legacy_other = self._get_bool("other_folders", True)
+                self.set_setting(
+                    "folder_scope",
+                    SCOPE_FOLDERS_AND_ARCHIVE if legacy_other else SCOPE_CURRENT_ONLY,
+                )
+        except Exception as error:
+            self._log("migrate scope: " + type(error).__name__)
+
+        try:
+            if self._get_int("pull_sensitivity_v2", -1, -1, len(SENSITIVITY_VALUES) - 1) < 0:
+                old_s = self._get_int("pull_sensitivity", 0, 0, 2)
+                if old_s == 1:
+                    self.set_setting("pull_sensitivity_v2", 5)  # 2.5x
+                elif old_s == 2:
+                    self.set_setting("pull_sensitivity_v2", 0)  # 0.5x
+                    self.set_setting("anti_accidental", True)
+                else:
+                    self.set_setting("pull_sensitivity_v2", DEFAULT_SENSITIVITY_IDX)  # 1.0x
+        except Exception as error:
+            self._log("migrate sens: " + type(error).__name__)
 
     def _cfg(self):
-        get = self.get_setting
+        now = time.monotonic()
+        cached_at, cached = self._cfg_cache
+        if cached is not None and now - cached_at < CFG_TTL_SEC:
+            return cached
+        cfg = self._read_cfg()
+        self._cfg_cache = (now, cfg)
+        return cfg
+
+    def _read_cfg(self):
+        max_sens = len(SENSITIVITY_VALUES) - 1
+        sens_idx = self._get_int("pull_sensitivity_v2", DEFAULT_SENSITIVITY_IDX, 0, max_sens)
+        folder_scope = self._get_int("folder_scope", SCOPE_FOLDERS_AND_ARCHIVE, 0, 2)
+
         return {
-            "enabled": bool(get("enabled", True)),
-            "src": {"channel": bool(get("src_channel", True)), "group": bool(get("src_group", True)),
-                    "private": bool(get("src_private", False)), "bot": bool(get("src_bot", False))},
-            "mode": int(get("target_mode", 0)),
-            "selected": {kind for kind in KINDS if bool(get("tgt_" + kind, kind == "channel"))},
-            "strategy": max(0, min(2, int(get("strategy", 0)))),
-            "skip_muted": int(get("muted", 0)) == 1,
-            "skip_pinned": bool(get("pinned_skip", False)),
-            "other_folders": bool(get("other_folders", True)),
-            "mark_unread": bool(get("mark_unread", False)),
+            "enabled": self._get_bool("enabled", True),
+            "src": {
+                "channel": self._get_bool("src_channel", True),
+                "group": self._get_bool("src_group", True),
+                "private": self._get_bool("src_private", False),
+                "bot": self._get_bool("src_bot", False),
+            },
+            "mode": self._get_int("target_mode", 0, 0, 1),
+            "selected": {kind for kind in KINDS if self._get_bool("tgt_" + kind, kind == "channel")},
+            "strategy": self._get_int("strategy", 0, 0, 2),
+            "prioritize_mentions": self._get_bool("prioritize_mentions", False),
+            "skip_muted": self._get_int("muted", 0, 0, 1) == 1,
+            "skip_pinned": self._get_bool("pinned_skip", False),
+            "folder_scope": folder_scope,
+            "mark_unread": self._get_bool("mark_unread", False),
+            "anti_ping_pong": self._get_bool("anti_ping_pong", False),
+            "sensitivity_idx": sens_idx,
+            "sensitivity_mult": SENSITIVITY_VALUES[sens_idx],
+            "anti_accidental": self._get_bool("anti_accidental", False),
+            "keep_back_stack": self._get_bool("keep_back_stack", False),
         }
 
     def _native_equivalent(self, cfg, targets):
-        return (targets == {"channel"} and cfg["strategy"] == 0 and not cfg["skip_muted"] and not cfg["skip_pinned"]
-                and cfg["other_folders"] and not cfg["mark_unread"])
+        return (
+            targets == {"channel"}
+            and cfg["strategy"] == 0
+            and not cfg["prioritize_mentions"]
+            and not cfg["skip_muted"]
+            and not cfg["skip_pinned"]
+            and cfg["folder_scope"] == SCOPE_FOLDERS_AND_ARCHIVE
+            and not cfg["mark_unread"]
+            and not cfg["anti_ping_pong"]
+        )
 
     def create_settings(self):
+        self._cfg_cache = (0.0, None)
+        on_chg = self._on_setting_changed
         return [
             Header(text=tr("Жест", "Gesture")),
-            Switch(key="enabled", text=tr("Включить жест", "Enable gesture"), default=True,
-                   subtext=tr("Потяните вверх у конца чата, чтобы перейти в следующий непрочитанный чат.",
-                              "Pull up at the end of a chat to jump to the next unread chat.")),
+            Switch(
+                key="enabled",
+                text=tr("Включить жест", "Enable gesture"),
+                default=True,
+                subtext=tr(
+                    "Потяните вверх у конца чата, чтобы перейти в следующий непрочитанный чат.",
+                    "Pull up at the end of a chat to jump to the next unread chat.",
+                ),
+                on_change=on_chg,
+            ),
+            Selector(
+                key="pull_sensitivity_v2",
+                text=tr("Чувствительность жеста", "Pull sensitivity"),
+                default=DEFAULT_SENSITIVITY_IDX,
+                items=[
+                    tr("×0.5 (очень длинный свайп)", "×0.5 (very long pull)"),
+                    tr("×0.75 (длиннее обычного)", "×0.75 (longer pull)"),
+                    tr("×1 (стандартная, как в Telegram)", "×1 (standard, like Telegram)"),
+                    tr("×1.5 (быстрее обычного)", "×1.5 (faster pull)"),
+                    tr("×2 (короткий свайп)", "×2 (short pull)"),
+                    tr("×2.5 (очень короткий свайп)", "×2.5 (very short pull)"),
+                ],
+                on_change=on_chg,
+            ),
+            Switch(
+                key="anti_accidental",
+                text=tr("Защита от случайных свайпов", "Accidental swipe protection"),
+                default=False,
+                subtext=tr(
+                    "Игнорирует первые 32 dp тяги, чтобы короткие случайные свайпы не вызывали жест.",
+                    "Ignores the first 32 dp of pull so short accidental swipes don't trigger the gesture.",
+                ),
+                on_change=on_chg,
+            ),
+            Switch(
+                key="keep_back_stack",
+                text=tr("Возвращаться к прошлому чату по «Назад»", "Keep previous chat on Back"),
+                default=False,
+                subtext=tr(
+                    "Кнопка «Назад» вернёт вас в предыдущий чат, а не в список чатов.",
+                    "Pressing Back returns to the previous chat instead of the chat list.",
+                ),
+                on_change=on_chg,
+            ),
             Header(text=tr("Где работает жест", "Where the gesture works")),
-            Switch(key="src_channel", text=tr("Каналы", "Channels"), default=True, subtext=tr("Как в Telegram.", "Like stock Telegram.")),
-            Switch(key="src_group", text=tr("Группы", "Groups"), default=True),
-            Switch(key="src_private", text=tr("Личные чаты", "Private chats"), default=False),
-            Switch(key="src_bot", text=tr("Боты", "Bots"), default=False),
-            Divider(text=tr("Форумы и темы работают как в Telegram.", "Forums and topics work like stock Telegram.")),
+            Switch(key="src_channel", text=tr("Каналы", "Channels"), default=True, subtext=tr("Как в Telegram.", "Like stock Telegram."), on_change=on_chg),
+            Switch(key="src_group", text=tr("Группы", "Groups"), default=True, on_change=on_chg),
+            Switch(key="src_private", text=tr("Личные чаты", "Private chats"), default=False, on_change=on_chg),
+            Switch(key="src_bot", text=tr("Боты", "Bots"), default=False, on_change=on_chg),
+            Divider(text=tr("Форумы, темы и секретные чаты работают как в Telegram.", "Forums, topics and secret chats work like stock Telegram.")),
             Header(text=tr("Куда переходить", "Where it jumps")),
-            Selector(key="target_mode", text=tr("Цель перехода", "Jump target"), default=0,
-                     items=[tr("Тот же тип, что у текущего чата", "Same type as the current chat"),
-                            tr("Выбранные типы ниже", "Types selected below")]),
-            Switch(key="tgt_channel", text=tr("Переходить в каналы", "Jump to channels"), default=True),
-            Switch(key="tgt_group", text=tr("Переходить в группы", "Jump to groups"), default=False),
-            Switch(key="tgt_private", text=tr("Переходить в личные чаты", "Jump to private chats"), default=False),
-            Switch(key="tgt_bot", text=tr("Переходить в боты", "Jump to bots"), default=False),
-            Selector(key="strategy", text=tr("Какой чат выбрать", "Which chat to pick"), default=0,
-                     items=[tr("Первый непрочитанный в списке", "First unread in the list"),
-                            tr("Где больше всего непрочитанных", "Most unread messages"),
-                            tr("Где меньше всего непрочитанных", "Fewest unread messages")]),
-            Header(text=tr("Фильтры", "Filters")),
-            Selector(key="muted", text=tr("Чаты без звука", "Muted chats"), default=0,
-                     items=[tr("Включать", "Include"), tr("Пропускать", "Skip")]),
-            Switch(key="pinned_skip", text=tr("Пропускать закреплённые чаты", "Skip pinned chats"), default=False),
-            Switch(key="other_folders", text=tr("Искать в других папках и архиве", "Search other folders and archive"), default=True,
-                   subtext=tr("Если в текущей папке непрочитанных нет.", "When the current folder has nothing unread.")),
-            Switch(key="mark_unread", text=tr("Учитывать отметку «непрочитано»", "Count manual «unread» marks"), default=False,
-                   subtext=tr("Чаты, помеченные вручную без счётчика.", "Chats marked unread without a counter.")),
-            Divider(text=tr("При настройках по умолчанию каналы работают в точности как в Telegram.",
-                            "With the default options channels behave exactly like stock Telegram.")),
+            Selector(
+                key="target_mode",
+                text=tr("Цель перехода", "Jump target"),
+                default=0,
+                items=[
+                    tr("Тот же тип, что у текущего чата", "Same type as the current chat"),
+                    tr("Выбранные типы ниже", "Types selected below"),
+                ],
+                on_change=on_chg,
+            ),
+            Switch(key="tgt_channel", text=tr("Переходить в каналы", "Jump to channels"), default=True, on_change=on_chg),
+            Switch(key="tgt_group", text=tr("Переходить в группы", "Jump to groups"), default=False, on_change=on_chg),
+            Switch(key="tgt_private", text=tr("Переходить в личные чаты", "Jump to private chats"), default=False, on_change=on_chg),
+            Switch(key="tgt_bot", text=tr("Переходить в боты", "Jump to bots"), default=False, on_change=on_chg),
+            Selector(
+                key="strategy",
+                text=tr("Какой чат выбрать", "Which chat to pick"),
+                default=0,
+                items=[
+                    tr("Первый непрочитанный в списке", "First unread in the list"),
+                    tr("Где больше всего непрочитанных", "Most unread messages"),
+                    tr("Где меньше всего непрочитанных", "Fewest unread messages"),
+                ],
+                on_change=on_chg,
+            ),
+            Switch(
+                key="prioritize_mentions",
+                text=tr("Сначала чаты с упоминаниями (@)", "Prioritize unread mentions (@)"),
+                default=False,
+                subtext=tr(
+                    "Сначала открывать чаты, где вас упомянули или ответили на сообщение.",
+                    "Jump first to chats where you were mentioned or replied to.",
+                ),
+                on_change=on_chg,
+            ),
+            Header(text=tr("Фильтры и папки", "Filters & Folders")),
+            Selector(
+                key="folder_scope",
+                text=tr("Область поиска", "Search scope"),
+                default=SCOPE_FOLDERS_AND_ARCHIVE,
+                items=[
+                    tr("Только текущая папка", "Current folder only"),
+                    tr("Другие папки (без архива)", "Other folders (skip archive)"),
+                    tr("Другие папки и архив", "Other folders and archive"),
+                ],
+                on_change=on_chg,
+            ),
+            Selector(
+                key="muted",
+                text=tr("Чаты без звука", "Muted chats"),
+                default=0,
+                items=[tr("Включать", "Include"), tr("Пропускать", "Skip")],
+                on_change=on_chg,
+            ),
+            Switch(key="pinned_skip", text=tr("Пропускать закреплённые чаты", "Skip pinned chats"), default=False, on_change=on_chg),
+            Switch(
+                key="mark_unread",
+                text=tr("Учитывать отметку «непрочитано»", "Count manual «unread» marks"),
+                default=False,
+                subtext=tr("Чаты, помеченные вручную без счётчика.", "Chats marked unread without a counter."),
+                on_change=on_chg,
+            ),
+            Switch(
+                key="anti_ping_pong",
+                text=tr("Не возвращаться в недавние чаты (анти-цикл)", "Avoid ping-pong loops"),
+                default=False,
+                subtext=tr(
+                    "Запоминает цепочку переходов, чтобы не прыгать туда-сюда между двумя чатами.",
+                    "Remembers recent jumps so you cycle through all unread chats instead of bouncing back and forth.",
+                ),
+                on_change=on_chg,
+            ),
+            Divider(text=tr(
+                "При настройках по умолчанию каналы работают в точности как в Telegram.",
+                "With the default options channels behave exactly like stock Telegram.",
+            )),
             Header(text=tr("Диагностика", "Diagnostics")),
-            Text(text=tr("Проверить состояние", "Check status"), subtext=tr("Показать подключённые хуки и последние ошибки", "Show hooks and recent errors"),
-                 on_click=self._show_status),
+            Text(
+                text=tr("Сбросить цепочку переходов", "Reset jump history"),
+                subtext=tr("Очистить временный список недавно посещённых чатов", "Clear recently visited chats list"),
+                on_click=self._reset_chain,
+            ),
+            Text(
+                text=tr("Проверить состояние", "Check status"),
+                subtext=tr("Показать подключённые хуки, память и ошибки", "Show hooks, memory tracking and recent errors"),
+                on_click=self._show_status,
+            ),
         ]
 
+    def _reset_chain(self, *_):
+        self._cfg_cache = (0.0, None)
+        with self._lock:
+            self._jump_chain.clear()
+        if BulletinHelper is not None:
+            try:
+                BulletinHelper.show_success(tr("История переходов очищена", "Jump history cleared"))
+            except Exception:
+                pass
+
     def _show_status(self, *_):
-        hooks = ", ".join(("✓ " if ok else "✗ ") + name for name, ok in self._status.items()) or "—"
-        text = hooks + ("\n" + self._errors[-1] if self._errors else "")
-        shown = False
+        self._cfg_cache = (0.0, None)
+        cfg = self._cfg()
+        self._prune_refs()
+        sens_str = _format_mult(cfg["sensitivity_mult"])
+        if cfg["anti_accidental"]:
+            sens_str += tr(" + защита 32dp", " + 32dp guard")
+        with self._lock:
+            hooks = ", ".join(("✓ " if ok else "✗ ") + name for name, ok in self._status.items()) or "—"
+            live_frags = sum(len(b) for b in self._managers.values())
+            live_picks = sum(len(b) for b in self._picks.values())
+            jumps = self._jump_count
+            chain_sz = sum(len(v) for v in self._jump_chain.values())
+            errs = list(self._errors[-4:])
+
+        lines = [
+            f"Pull to Next Chat v{__version__} ({__author__})",
+            tr(f"Хуки: {hooks}", f"Hooks: {hooks}"),
+            tr(f"Чувствительность: {sens_str}", f"Sensitivity: {sens_str}"),
+            tr(
+                f"Активных чатов в памяти: {live_frags} | Кэш drawable: {live_picks}",
+                f"Tracked active chats: {live_frags} | Drawable cache: {live_picks}",
+            ),
+            tr(
+                f"Переходов за сессию: {jumps} | В анти-цикле: {chain_sz}",
+                f"Jumps this session: {jumps} | Anti-loop entries: {chain_sz}",
+            ),
+            tr(
+                "Ошибки: " + ("нет" if not errs else "\n" + "\n".join(errs)),
+                "Errors: " + ("none" if not errs else "\n" + "\n".join(errs)),
+            ),
+        ]
+        msg = "\n\n".join(lines)
+
+        try:
+            if AlertDialogBuilder is not None:
+                from client_utils import get_last_fragment
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag is not None else None
+                if act is not None:
+                    AlertDialogBuilder(act).set_title("Pull to Next Chat v" + __version__).set_message(msg).set_positive_button("OK", lambda b, _: b.dismiss()).show()
+                    return
+        except Exception:
+            pass
+
         if BulletinHelper is not None:
             for name in ("show_info", "show_success"):
-                function = getattr(BulletinHelper, name, None)
-                if function is not None:
+                fn = getattr(BulletinHelper, name, None)
+                if fn is not None:
                     try:
-                        function(text)
-                        shown = True
-                        break
+                        fn(hooks + ("\n" + errs[-1] if errs else ""))
+                        return
                     except Exception:
                         pass
-        if not shown:
-            self._log("status: " + text)
+        self._log("status: " + hooks)
 
-    # ------------------------------------------------------------------ reflection
+    # ------------------------------------------------------------------ reflection & collision-safe weak caches
 
-    def _field(self, owner_class, name):
+    @staticmethod
+    def _evict_quarter(cache_dict):
+        if len(cache_dict) >= MAX_REFLECT_CACHE:
+            drop_n = max(1, MAX_REFLECT_CACHE // 4)
+            for k in list(cache_dict.keys())[:drop_n]:
+                cache_dict.pop(k, None)
+
+    def _field_opt(self, owner_class, name):
+        """Bounded cached reflection lookup (caches misses via _MISSING; evicts oldest quarter on cap)."""
         key = (str(owner_class.getName()), name)
-        field = self._fields.get(key)
+        with self._lock:
+            field = self._fields.get(key)
+        if field is _MISSING:
+            return None
         if field is None:
             cls = owner_class
             while cls is not None:
@@ -321,119 +836,629 @@ class PullNextChatPlugin(BasePlugin):
                     break
                 except Exception:
                     cls = cls.getSuperclass()
-            if field is None:
-                raise AttributeError(name)
-            field.setAccessible(True)
-            self._fields[key] = field
+            with self._lock:
+                self._evict_quarter(self._fields)
+                if field is None:
+                    self._fields[key] = _MISSING
+                    return None
+                field.setAccessible(True)
+                self._fields[key] = field
         return field
+
+    def _field(self, owner_class, name):
+        field = self._field_opt(owner_class, name)
+        if field is None:
+            raise AttributeError(name)
+        return field
+
+    def _method(self, owner_class, name, *arg_types):
+        key = (str(owner_class.getName()), name, tuple(str(t.getName()) for t in arg_types))
+        with self._lock:
+            method = self._methods.get(key)
+        if method is None:
+            cls = owner_class
+            while cls is not None:
+                try:
+                    method = cls.getDeclaredMethod(name, *arg_types)
+                    break
+                except Exception:
+                    cls = cls.getSuperclass()
+            if method is None:
+                raise AttributeError(name)
+            method.setAccessible(True)
+            with self._lock:
+                self._evict_quarter(self._methods)
+                self._methods[key] = method
+        return method
 
     def _get(self, obj, name):
         return self._field(obj.getClass(), name).get(obj)
 
+    def _get_opt(self, obj, name):
+        field = self._field_opt(obj.getClass(), name)
+        return field.get(obj) if field is not None else None
+
+    def _chat_field(self, fragment, cached_field, name):
+        if cached_field is not None:
+            return cached_field
+        return self._field(fragment.getClass(), name)
+
+    def _chat_field_opt(self, fragment, cached_field, name):
+        if cached_field is not None:
+            return cached_field
+        return self._field_opt(fragment.getClass(), name)
+
     def _hash(self, obj):
         return int(self._System.identityHashCode(obj))
+
+    @staticmethod
+    def _same(a, b):
+        """Real identity check (safe against 32-bit identityHashCode collisions)."""
+        if a is None or b is None:
+            return False
+        try:
+            return bool(a.equals(b))
+        except Exception:
+            return a is b
+
+    def _weak(self, obj):
+        return self._WeakRef(obj)
+
+    def _prune_refs(self):
+        now = time.monotonic()
+        with self._lock:
+            for k in list(self._managers.keys()):
+                alive = [e for e in self._managers[k] if e[_E_MGR].get() is not None and e[_E_FRAG].get() is not None]
+                if alive:
+                    self._managers[k] = alive
+                else:
+                    self._managers.pop(k, None)
+            for k in list(self._picks.keys()):
+                alive = [e for e in self._picks[k] if e[0].get() is not None]
+                if alive:
+                    self._picks[k] = alive
+                else:
+                    self._picks.pop(k, None)
+            for k in list(self._suppressed.keys()):
+                alive = [e for e in self._suppressed[k] if e[0].get() is not None and e[1] > now]
+                if alive:
+                    self._suppressed[k] = alive
+                else:
+                    self._suppressed.pop(k, None)
+
+    def _mark_drawable_suppressed(self, drawable, ttl=UPDATE_SUPPRESS_TTL_SEC):
+        if drawable is None:
+            return
+        dh = self._hash(drawable)
+        exp = time.monotonic() + ttl
+        with self._lock:
+            bucket = self._suppressed.get(dh, [])
+            kept = []
+            for dr, ts in bucket:
+                obj = dr.get()
+                if obj is not None and not self._same(obj, drawable):
+                    kept.append((dr, ts))
+            kept.append((self._weak(drawable), exp))
+            self._suppressed[dh] = kept
+
+    def _clear_drawable_suppressed(self, drawable):
+        if drawable is None:
+            return
+        dh = self._hash(drawable)
+        with self._lock:
+            bucket = self._suppressed.get(dh)
+            if not bucket:
+                return
+            kept = []
+            for dr, ts in bucket:
+                obj = dr.get()
+                if obj is not None and not self._same(obj, drawable):
+                    kept.append((dr, ts))
+            if kept:
+                self._suppressed[dh] = kept
+            else:
+                self._suppressed.pop(dh, None)
+
+    def _is_drawable_suppressed(self, drawable, refresh=True):
+        if drawable is None:
+            return False
+        dh = self._hash(drawable)
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._suppressed.get(dh)
+            if not bucket:
+                return False
+            matched = False
+            kept = []
+            for dr, exp in bucket:
+                obj = dr.get()
+                if obj is None or exp <= now:
+                    continue
+                if self._same(obj, drawable):
+                    matched = True
+                    kept.append((dr, (now + UPDATE_SUPPRESS_TTL_SEC) if refresh else exp))
+                else:
+                    kept.append((dr, exp))
+            if kept:
+                self._suppressed[dh] = kept
+            else:
+                self._suppressed.pop(dh, None)
+            return matched
+
+    def _set_pick(self, drawable, pick_data):
+        if drawable is None:
+            with self._lock:
+                self._last_pick_fallback = pick_data
+            return
+        dh = self._hash(drawable)
+        with self._lock:
+            bucket = self._picks.get(dh, [])
+            kept = []
+            for dr, data in bucket:
+                obj = dr.get()
+                if obj is not None and not self._same(obj, drawable):
+                    kept.append((dr, data))
+            if pick_data is not None:
+                kept.append((self._weak(drawable), pick_data))
+            if kept:
+                self._picks[dh] = kept
+            else:
+                self._picks.pop(dh, None)
+            if len(self._picks) > 12:
+                for k in list(self._picks.keys()):
+                    alive = [e for e in self._picks[k] if e[0].get() is not None]
+                    if alive:
+                        self._picks[k] = alive
+                    else:
+                        self._picks.pop(k, None)
+
+    def _get_pick(self, drawable):
+        if drawable is None:
+            return None
+        dh = self._hash(drawable)
+        with self._lock:
+            bucket = self._picks.get(dh)
+            if not bucket:
+                return None
+            if len(bucket) == 1:
+                dr, data = bucket[0]
+                ref_obj = dr.get()
+                return data if (ref_obj is not None and self._same(ref_obj, drawable)) else None
+            snapshot = list(bucket)
+        for dr, data in snapshot:
+            ref_obj = dr.get()
+            if ref_obj is not None and self._same(ref_obj, drawable):
+                return data
+        return None
+
+    def _begin_update(self, param):
+        if not self._cfg()["enabled"]:
+            return
+        drawable = param.thisObject
+        if drawable is not None and self._is_drawable_suppressed(drawable, refresh=True):
+            # Prevent 60-120Hz updateDialog() storm while suppressed (channel deadzone or src_channel=False)
+            param.setResult(None)
+            return
+        with self._lock:
+            self._updating_until = time.monotonic() + 1.5
+            self._updating_drawable_ref = self._weak(drawable) if drawable is not None else None
+            self._last_pick_fallback = None
+        if drawable is not None:
+            self._set_pick(drawable, None)
+
+    def _end_update(self, drawable):
+        with self._lock:
+            self._updating_until = 0.0
+            self._updating_drawable_ref = None
+
+    # ------------------------------------------------------------------ anti-ping-pong jump chain
+
+    def _record_jump(self, account, did, anti_ping_pong):
+        now = time.monotonic()
+        with self._lock:
+            self._jump_count += 1
+            if not anti_ping_pong or did == 0:
+                return
+            bucket = self._jump_chain.setdefault(account, {})
+            bucket[int(did)] = now
+            expired = [k for k, ts in bucket.items() if now - ts > CHAIN_TTL_SEC]
+            for k in expired:
+                bucket.pop(k, None)
+            if len(bucket) > MAX_CHAIN_SIZE:
+                oldest = sorted(bucket.items(), key=lambda kv: kv[1])[: len(bucket) - MAX_CHAIN_SIZE]
+                for k, _ in oldest:
+                    bucket.pop(k, None)
+
+    def _visited_set(self, account):
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._jump_chain.get(account)
+            if not bucket:
+                return set()
+            expired = [k for k, ts in bucket.items() if now - ts > CHAIN_TTL_SEC]
+            for k in expired:
+                bucket.pop(k, None)
+            return set(bucket.keys())
+
+    # ------------------------------------------------------------------ account resolution
+
+    def _account_of(self, obj=None):
+        """Read exact currentAccount from ChatActivity or ChatPullingDownDrawable (multi-account safe)."""
+        if obj is not None:
+            try:
+                if hasattr(obj, "getCurrentAccount"):
+                    return int(obj.getCurrentAccount())
+            except Exception:
+                pass
+            try:
+                f = self._field_opt(obj.getClass(), "currentAccount")
+                if f is not None:
+                    return int(f.getInt(obj))
+            except Exception:
+                pass
+        return int(self._UserConfig.selectedAccount)
+
+    def _controller(self, account=None):
+        acc = self._account_of() if account is None else int(account)
+        return self._MessagesController.getInstance(acc)
 
     # ------------------------------------------------------------------ fragments and scrolling
 
     def _scan_open_fragments(self):
+        if not self._active:
+            return
         try:
             from client_utils import get_last_fragment
-            fragment = get_last_fragment()
-            if fragment is not None and self._chat_activity.isInstance(fragment):
-                self._register(fragment)
+            last = get_last_fragment()
+            if last is None:
+                return
+            candidates = []
+
+            def add_unique(frag):
+                if frag is None:
+                    return
+                for existing in candidates:
+                    if self._same(existing, frag):
+                        return
+                candidates.append(frag)
+
+            try:
+                layout = last.getParentLayout()
+                stack = layout.getFragmentStack() if layout is not None else None
+                if stack is not None:
+                    for frag in JavaList(stack):
+                        add_unique(frag)
+            except Exception:
+                pass
+            add_unique(last)
+            for fragment in candidates:
+                if self._chat_activity is not None and self._chat_activity.isInstance(fragment):
+                    self._register(fragment)
         except Exception as error:
             self._log("scan: " + type(error).__name__)
 
     def _after_create(self, param):
         self._register(param.thisObject)
 
+    def _before_destroy(self, fragment):
+        if fragment is None:
+            return
+        try:
+            df = self._chat_field_opt(fragment, self._f_drawable, "pullingDownDrawable")
+            drawable = df.get(fragment) if df is not None else None
+            if drawable is not None:
+                self._set_pick(drawable, None)
+                self._clear_drawable_suppressed(drawable)
+        except Exception:
+            pass
+        with self._lock:
+            for k in list(self._managers.keys()):
+                kept = []
+                for entry in self._managers[k]:
+                    m_obj, f_obj = entry[_E_MGR].get(), entry[_E_FRAG].get()
+                    if m_obj is not None and f_obj is not None and not self._same(f_obj, fragment):
+                        kept.append(entry)
+                if kept:
+                    self._managers[k] = kept
+                else:
+                    self._managers.pop(k, None)
+
+    def _compute_static_pull_ok(self, fragment):
+        try:
+            mf = self._chat_field(fragment, self._f_chat_mode, "chatMode")
+            if int(mf.getInt(fragment)) != 0:
+                return False
+            tf = self._chat_field(fragment, self._f_thread_id, "threadMessageId")
+            if int(tf.getLong(fragment)) != 0:
+                return False
+            return True
+        except Exception:
+            return False
+
     def _register(self, fragment):
-        manager = self._get(fragment, "chatLayoutManager")
+        manager = self._get_opt(fragment, "chatLayoutManager")
         if manager is None:
             return
-        self._managers[self._hash(manager)] = self._weak(fragment)
-        if len(self._managers) > 24:
-            for key in [k for k, ref in self._managers.items() if ref.get() is None]:
-                self._managers.pop(key, None)
-        self._hook_scroll(manager.getClass())
+        self._prune_refs()
+        mh = self._hash(manager)
+        cached_kind = self._fragment_kind_cached_init(fragment)
+        static_ok = self._compute_static_pull_ok(fragment) if cached_kind is not _UNSET else _UNSET
+        with self._lock:
+            # Remove any stale entry for EITHER the same manager OR the same fragment (e.g. recreated View!)
+            for k in list(self._managers.keys()):
+                kept = []
+                for entry in self._managers[k]:
+                    m_obj, f_obj = entry[_E_MGR].get(), entry[_E_FRAG].get()
+                    if m_obj is None or f_obj is None:
+                        continue
+                    if self._same(m_obj, manager) or self._same(f_obj, fragment):
+                        continue
+                    kept.append(entry)
+                if kept:
+                    self._managers[k] = kept
+                else:
+                    self._managers.pop(k, None)
 
-    def _weak(self, obj):
-        return jclass("java.lang.ref.WeakReference")(obj)
+            new_entry = [self._weak(manager), self._weak(fragment), cached_kind, 0.0, 0.0, 0.0, False, False, static_ok]
+            self._managers.setdefault(mh, []).append(new_entry)
+        self._hook_scroll(manager.getClass())
 
     def _hook_scroll(self, cls):
         name = str(cls.getName())
-        if name in self._scroll_hooked:
-            return
+        with self._lock:
+            if name in self._scroll_hooked or name in self._scroll_failed:
+                return
         for method in cls.getDeclaredMethods():
             if str(method.getName()) == "scrollVerticallyBy" and len(method.getParameterTypes()) == 3:
-                self._install(method, "scroll", "scrollVerticallyBy")
-                self._scroll_hooked.add(name)
+                try:
+                    self._install(method, "scroll", "scrollVerticallyBy")
+                except Exception as error:
+                    with self._lock:
+                        self._scroll_failed.add(name)
+                        self._status["scrollVerticallyBy"] = False
+                    self._log("scroll hook failed: " + type(error).__name__ + ": " + str(error))
+                    return
+                with self._lock:
+                    self._scroll_hooked.add(name)
                 return
-        self._status["scrollVerticallyBy"] = False
+        with self._lock:
+            self._scroll_failed.add(name)
+            self._status["scrollVerticallyBy"] = False
         self._log("scrollVerticallyBy is not declared by " + name)
 
-    def _fragment_for(self, manager):
-        ref = self._managers.get(self._hash(manager))
-        return ref.get() if ref is not None else None
+    def _entry_for(self, manager):
+        """Returns (fragment, kind, entry_list) with zero list-copy allocation on the common 1-item bucket."""
+        key = self._hash(manager)
+        with self._lock:
+            bucket = self._managers.get(key)
+            if not bucket:
+                return None, None, None
+            if len(bucket) == 1:
+                entry = bucket[0]
+                mgr_obj = entry[_E_MGR].get()
+                if mgr_obj is None or not self._same(mgr_obj, manager):
+                    return None, None, None
+                frag = entry[_E_FRAG].get()
+                if frag is None:
+                    self._managers.pop(key, None)
+                    return None, None, None
+            else:
+                entry = None
+                frag = None
+                for e in bucket:
+                    mgr_obj = e[_E_MGR].get()
+                    if mgr_obj is not None and self._same(mgr_obj, manager):
+                        entry = e
+                        frag = e[_E_FRAG].get()
+                        break
+                if entry is None:
+                    return None, None, None
+                if frag is None:
+                    self._prune_refs()
+                    return None, None, None
 
-    def _fragment_kind(self, fragment):
+        kind = entry[_E_KIND]
+        if kind is _UNSET:
+            kind = self._fragment_kind_cached_init(frag)
+            entry[_E_KIND] = kind
+            if kind is not _UNSET and entry[_E_STATIC_OK] is _UNSET:
+                entry[_E_STATIC_OK] = self._compute_static_pull_ok(frag)
+        return frag, (None if kind is _UNSET else kind), entry
+
+    def _fragment_for(self, manager):
+        frag, _, _ = self._entry_for(manager)
+        return frag
+
+    def _fragment_kind_cached_init(self, fragment):
+        """Returns chat kind, None (permanently unsupported like Saved/Secret/777000), or _UNSET if not yet bound."""
         try:
             if bool(fragment.isTopic):
                 return "forum"
         except Exception:
             pass
-        user, chat = self._get(fragment, "currentUser"), self._get(fragment, "currentChat")
+        ef = self._chat_field_opt(fragment, self._f_cur_enc_chat, "currentEncryptedChat")
+        if ef is not None and ef.get(fragment) is not None:
+            return None
+        uf = self._chat_field_opt(fragment, self._f_cur_user, "currentUser")
+        cf = self._chat_field_opt(fragment, self._f_cur_chat, "currentChat")
+        user = uf.get(fragment) if uf is not None else None
+        chat = cf.get(fragment) if cf is not None else None
         if user is not None:
-            if int(user.id) == 777000 or bool(self._is_self(user)):
+            if int(user.id) == 777000 or self._is_self(user):
                 return None
             return "bot" if bool(user.bot) else "private"
         if chat is not None:
-            return "channel" if bool(jclass("org.telegram.messenger.ChatObject").isChannelAndNotMegaGroup(chat)) else "group"
-        return None
+            if bool(getattr(chat, "forum", False)):
+                return "forum"
+            return "channel" if bool(self._ChatObject.isChannelAndNotMegaGroup(chat)) else "group"
+        return _UNSET
+
+    def _fragment_kind(self, fragment):
+        kind = self._fragment_kind_cached_init(fragment)
+        return None if kind is _UNSET else kind
 
     def _is_self(self, user):
         try:
-            return bool(jclass("org.telegram.messenger.UserObject").isUserSelf(user))
+            return bool(self._UserObject.isUserSelf(user))
         except Exception:
             return False
+
+    def _pull_k(self, offset, dp110, dp160):
+        if offset < dp110:
+            progress = offset / dp110
+            return 0.65 * (1.0 - progress) + 0.45 * progress
+        if offset < dp160:
+            progress = (offset - dp110) / (dp160 - dp110)
+            return 0.45 * (1.0 - progress) + 0.05 * progress
+        return 0.05
 
     def _after_scroll(self, param):
         args = param.args
         dy = int(args[0])
         result = param.getResult()
-        if dy <= 0 or result is None or int(result) != 0:
+        if result is None:
+            return
+
+        # Fast-path reverse drag tracking: keeps channel in_pull & offset in sync if user drags slightly back down!
+        if dy <= 0:
+            if dy < 0 and int(result) == 0:
+                fragment, kind, entry = self._entry_for(param.thisObject)
+                if fragment is not None and entry is not None and entry[_E_IN_PULL]:
+                    offset_field = self._chat_field(fragment, self._f_pull_offset, "pullingDownOffset")
+                    cur_off = float(offset_field.getFloat(fragment))
+                    entry[_E_CH_OFF] = cur_off
+                    entry[_E_TS] = time.monotonic()
+                    if cur_off <= 0.0:
+                        entry[_E_IN_PULL] = False
+                        entry[_E_VIS] = False
+                        entry[_E_DZ] = 0.0
+            return
+
+        if int(result) != 0:
             return
         cfg = self._cfg()
         if not cfg["enabled"]:
             return
-        fragment = self._fragment_for(param.thisObject)
-        if fragment is None:
+        fragment, kind, entry = self._entry_for(param.thisObject)
+        if fragment is None or kind is None or kind == "forum":
             return
-        kind = self._fragment_kind(fragment)
-        if kind is None or kind == "forum":
-            return
-        cls = fragment.getClass()
-        offset_field = self._field(cls, "pullingDownOffset")
+        offset_field = self._chat_field(fragment, self._f_pull_offset, "pullingDownOffset")
         enabled = cfg["src"][kind]
         if kind == "channel":
-            if not enabled and float(offset_field.getFloat(fragment)) != 0.0:
-                self._cancel_pull(fragment, offset_field)
+            if not enabled:
+                if float(offset_field.getFloat(fragment)) != 0.0:
+                    df = self._chat_field_opt(fragment, self._f_drawable, "pullingDownDrawable")
+                    dr = df.get(fragment) if df is not None else None
+                    if dr is not None:
+                        self._mark_drawable_suppressed(dr)
+                    self._cancel_pull(fragment, offset_field, entry)
+                return
+            self._adjust_channel_pull(fragment, offset_field, dy, cfg["sensitivity_mult"], cfg["anti_accidental"], entry)
             return
-        if not enabled or not self._can_pull(fragment):
+        if not enabled or not self._can_pull(fragment, entry):
             return
-        self._pull(fragment, offset_field, dy)
+        self._pull(fragment, offset_field, dy, cfg["sensitivity_mult"], cfg["anti_accidental"], entry)
 
-    def _can_pull(self, fragment):
-        cls = fragment.getClass()
-        if int(self._field(cls, "chatMode").getInt(fragment)) != 0:
-            return False
-        if int(self._field(cls, "threadMessageId").getLong(fragment)) != 0:
-            return False
-        view = self._get(fragment, "chatListView")
+    def _adjust_channel_pull(self, fragment, offset_field, dy, sens, anti_accidental, entry):
+        """Apply calibrated 6-step sensitivity & optional 32dp accidental-swipe guard to native channel pulls."""
+        if sens == 1.0 and not anti_accidental:
+            return
+        cur_off = float(offset_field.getFloat(fragment))
+        if cur_off <= 0.0:
+            entry[_E_IN_PULL] = False
+            entry[_E_CH_OFF] = 0.0
+            return
+
+        dp110, dp160, _, dp32, dp220 = self._dp_metrics()
+        now = time.monotonic()
+        stale_gesture = (now - entry[_E_TS]) > PULL_GESTURE_GAP_SEC
+        if stale_gesture:
+            entry[_E_IN_PULL] = False
+            entry[_E_CH_OFF] = 0.0
+            entry[_E_DZ] = 0.0
+
+        prev_off = entry[_E_CH_OFF] if (entry[_E_IN_PULL] and cur_off > entry[_E_CH_OFF]) else 0.0
+
+        # Optional 32dp deadzone: only before a gesture enters active pull (NEVER snaps mid-gesture!)
+        if anti_accidental and not entry[_E_IN_PULL]:
+            entry[_E_DZ] += float(dy)
+            entry[_E_TS] = now
+            df = self._chat_field_opt(fragment, self._f_drawable, "pullingDownDrawable")
+            dr = df.get(fragment) if df is not None else None
+            if entry[_E_DZ] < dp32:
+                # Suppress repeated updateDialog() calls while offset stays at 0.0 inside deadzone!
+                if dr is not None:
+                    self._mark_drawable_suppressed(dr)
+                entry[_E_CH_OFF] = 0.0
+                self._cancel_pull(fragment, offset_field, entry)
+                return
+            if dr is not None:
+                self._clear_drawable_suppressed(dr)
+            eff_dy = min(float(dy), entry[_E_DZ] - dp32)
+            entry[_E_IN_PULL] = True
+            new_off = min(dp220, max(0.0, eff_dy * 0.65 * sens))
+            entry[_E_CH_OFF] = new_off
+            if new_off <= 0.0:
+                entry[_E_IN_PULL] = False
+                self._cancel_pull(fragment, offset_field, entry)
+                return
+            offset_field.setFloat(fragment, jfloat(new_off))
+            vf = self._chat_field_opt(fragment, self._f_list_view, "chatListView")
+            view = vf.get(fragment) if vf is not None else None
+            if view is not None:
+                view.invalidate()
+                self._pulling_container(fragment, int(view.getScrollState()) == 1, entry)
+            return
+
+        entry[_E_IN_PULL] = True
+        entry[_E_TS] = now
+        if sens == 1.0:
+            entry[_E_CH_OFF] = cur_off
+            return
+
+        est_old = max(0.0, cur_off - dy * self._pull_k(cur_off, dp110, dp160))
+        delta_est = min(cur_off, dy * self._pull_k(est_old, dp110, dp160))
+        if prev_off > 0.0 and cur_off > prev_off:
+            delta_native = min(delta_est, cur_off - prev_off)
+        else:
+            delta_native = delta_est
+
+        new_off = min(dp220, cur_off + delta_native * (sens - 1.0))
+        if new_off <= 0.0:
+            entry[_E_IN_PULL] = False
+            entry[_E_CH_OFF] = 0.0
+            self._cancel_pull(fragment, offset_field, entry)
+            return
+
+        entry[_E_CH_OFF] = new_off
+        offset_field.setFloat(fragment, jfloat(new_off))
+        vf = self._chat_field_opt(fragment, self._f_list_view, "chatListView")
+        view = vf.get(fragment) if vf is not None else None
+        if view is not None:
+            view.invalidate()
+            self._pulling_container(fragment, int(view.getScrollState()) == 1, entry)
+
+    def _can_pull(self, fragment, entry=None):
+        if entry is not None:
+            static_ok = entry[_E_STATIC_OK]
+            if static_ok is _UNSET:
+                static_ok = self._compute_static_pull_ok(fragment)
+                entry[_E_STATIC_OK] = static_ok
+            if not static_ok:
+                return False
+        else:
+            if not self._compute_static_pull_ok(fragment):
+                return False
+
+        vf = self._chat_field(fragment, self._f_list_view, "chatListView")
+        view = vf.get(fragment)
         if view is None or int(view.getScrollState()) != 1:
             return False
-        if bool(fragment.hasSelectedMessages()) or bool(fragment.isReport()):
-            return False
+        try:
+            if bool(fragment.hasSelectedMessages()) or bool(fragment.isReport()):
+                return False
+        except Exception:
+            pass
         for name in ("isFastScrollAnimationRunning", "isMultiselect"):
             try:
                 if bool(getattr(view, name)()):
@@ -447,70 +1472,95 @@ class PullNextChatPlugin(BasePlugin):
             pass
         return True
 
-    def _pull(self, fragment, offset_field, dy):
-        """Same elastic pull that Telegram applies to channels, for the other chat types."""
-        cls = fragment.getClass()
-        view = self._get(fragment, "chatListView")
+    def _pull(self, fragment, offset_field, dy, sens=1.0, anti_accidental=False, entry=None):
+        """Elastic pull matching Telegram's channel pull-up with 6-step sensitivity & optional 32dp guard."""
+        vf = self._chat_field(fragment, self._f_list_view, "chatListView")
+        view = vf.get(fragment)
+        if view is None:
+            return
+        dp110, dp160, _, dp32, dp220 = self._dp_metrics()
         offset = float(offset_field.getFloat(fragment))
-        drawable = self._get(fragment, "pullingDownDrawable")
+        eff_dy = float(dy)
+        now = time.monotonic()
+
+        if entry is not None:
+            if offset == 0.0:
+                entry[_E_IN_PULL] = False
+                entry[_E_VIS] = False
+            if anti_accidental and offset == 0.0:
+                if entry[_E_DZ] >= dp32 or (now - entry[_E_TS]) > PULL_GESTURE_GAP_SEC:
+                    entry[_E_DZ] = 0.0
+                entry[_E_DZ] += eff_dy
+                entry[_E_TS] = now
+                if entry[_E_DZ] < dp32:
+                    return
+                eff_dy = min(eff_dy, entry[_E_DZ] - dp32)
+                if eff_dy <= 0.0:
+                    return
+            else:
+                entry[_E_TS] = now
+                if offset == 0.0:
+                    entry[_E_DZ] = 0.0
+            entry[_E_IN_PULL] = True
+
+        df = self._chat_field_opt(fragment, self._f_drawable, "pullingDownDrawable")
+        drawable = df.get(fragment) if df is not None else None
         if offset == 0.0 and drawable is not None:
+            self._clear_drawable_suppressed(drawable)
             drawable.updateDialog()
-        animator = self._get(fragment, "pullingDownBackAnimator")
+        af = self._chat_field_opt(fragment, self._f_back_anim, "pullingDownBackAnimator")
+        animator = af.get(fragment) if af is not None else None
         if animator is not None:
             animator.removeAllListeners()
             animator.cancel()
-        first, second = float(self._Utils.dp(110.0)), float(self._Utils.dp(160.0))
-        if offset < first:
-            progress = offset / first
-            k = 0.65 * (1.0 - progress) + 0.45 * progress
-        elif offset < second:
-            progress = (offset - first) / (second - first)
-            k = 0.45 * (1.0 - progress) + 0.05 * progress
-        else:
-            k = 0.05
-        offset += dy * k
-        offset_field.setFloat(fragment, offset)
+
+        k = self._pull_k(offset, dp110, dp160) * sens
+        offset = min(dp220, offset + eff_dy * k)
+        offset_field.setFloat(fragment, jfloat(offset))
         view.invalidate()
         view.setOverScrollMode(2)
-        self._pulling_container(fragment, offset > 0 and int(view.getScrollState()) == 1)
+        self._pulling_container(fragment, offset > 0 and int(view.getScrollState()) == 1, entry)
 
-    def _cancel_pull(self, fragment, offset_field):
-        offset_field.setFloat(fragment, 0.0)
-        view = self._get(fragment, "chatListView")
-        view.setOverScrollMode(0)
-        view.invalidate()
-        self._pulling_container(fragment, False)
+    def _cancel_pull(self, fragment, offset_field, entry=None):
+        offset_field.setFloat(fragment, jfloat(0.0))
+        vf = self._chat_field_opt(fragment, self._f_list_view, "chatListView")
+        view = vf.get(fragment) if vf is not None else None
+        if view is not None:
+            view.setOverScrollMode(0)
+            view.invalidate()
+        self._pulling_container(fragment, False, entry)
 
-    def _pulling_container(self, fragment, visible):
+    def _pulling_container(self, fragment, visible, entry=None):
+        want = bool(visible)
+        if entry is not None:
+            if entry[_E_VIS] is want:
+                return
+            entry[_E_VIS] = want
         try:
-            animator = self._get(fragment, "animatorPullingDownContainerVisibility")
-            animator.setValue(bool(visible), True)
+            af = self._chat_field_opt(fragment, self._f_vis_anim, "animatorPullingDownContainerVisibility")
+            animator = af.get(fragment) if af is not None else None
+            if animator is not None:
+                animator.setValue(want, True)
         except Exception:
             pass
 
     # ------------------------------------------------------------------ choosing the next chat
 
-    def _account(self):
-        return int(jclass("org.telegram.messenger.UserConfig").selectedAccount)
-
-    def _controller(self):
-        return jclass("org.telegram.messenger.MessagesController").getInstance(self._account())
-
     def _kind_of_dialog(self, mc, did):
-        if bool(jclass("org.telegram.messenger.DialogObject").isEncryptedDialog(did)):
+        if bool(self._DialogObject.isEncryptedDialog(did)):
             return None
         if did < 0:
             chat = mc.getChat(self._Long.valueOf(-did))
             if chat is None or bool(getattr(chat, "forum", False)):
                 return None
-            return "channel" if bool(jclass("org.telegram.messenger.ChatObject").isChannelAndNotMegaGroup(chat)) else "group"
+            return "channel" if bool(self._ChatObject.isChannelAndNotMegaGroup(chat)) else "group"
         if did == 777000:
             return None
         user = mc.getUser(self._Long.valueOf(did))
         if user is None or self._is_self(user):
             return None
         try:
-            if bool(jclass("org.telegram.messenger.UserObject").isDeleted(user)):
+            if bool(self._UserObject.isDeleted(user)):
                 return None
         except Exception:
             pass
@@ -526,33 +1576,65 @@ class PullNextChatPlugin(BasePlugin):
                 continue
         return False
 
-    def _passes(self, mc, folder, filter_id, other_folders):
+    def _passes(self, mc, folder, filter_id, folder_scope):
         def lookup(folder_id, fid):
-            if fid != 0:
-                entry = mc.dialogFiltersById.get(fid)
-                return JavaList(entry.dialogs) if entry is not None else None
-            lst = mc.getDialogs(folder_id)
-            return JavaList(lst) if lst is not None else None
+            try:
+                if fid != 0:
+                    by_id = getattr(mc, "dialogFiltersById", None)
+                    entry = by_id.get(fid) if by_id is not None else None
+                    return JavaList(entry.dialogs) if (entry is not None and entry.dialogs is not None) else None
+                lst = mc.getDialogs(folder_id)
+                return JavaList(lst) if lst is not None else None
+            except Exception:
+                return None
+
+        # Pass 1: Current folder/filter
         yield (folder, filter_id, False), lookup(folder, filter_id)
-        if not other_folders:
+        if folder_scope == SCOPE_CURRENT_ONLY:
             return
+
+        # Pass 2: Other custom folders ONLY when currently inside a custom folder (filter_id != 0)
         if filter_id != 0:
-            filters = mc.dialogFilters
-            for i in range(int(filters.size())):
-                fid = int(filters.get(i).id)
-                if fid != filter_id:
-                    yield (folder, fid, True), lookup(folder, fid)
-        by_folder = mc.dialogsByFolder
-        for i in range(int(by_folder.size())):
-            key = int(by_folder.keyAt(i))
-            if key != folder:
+            filters = getattr(mc, "dialogFilters", None)
+            if filters is not None:
+                for fobj in JavaList(filters):
+                    if fobj is None:
+                        continue
+                    try:
+                        fid = int(fobj.id)
+                    except Exception:
+                        continue
+                    if fid != 0 and fid != filter_id:
+                        yield (folder, fid, True), lookup(folder, fid)
+
+        # Pass 3: Other folders (main list if we were in a filter; archive only if enabled)
+        include_archive = (folder_scope == SCOPE_FOLDERS_AND_ARCHIVE)
+        seen_folders = {folder} if filter_id == 0 else set()
+        by_folder = getattr(mc, "dialogsByFolder", None)
+        if by_folder is not None:
+            idx = 0
+            while True:
+                try:
+                    if idx >= int(by_folder.size()):
+                        break
+                    key = int(by_folder.keyAt(idx))
+                except Exception:
+                    break
+                idx += 1
+                if key in seen_folders:
+                    continue
+                if key == 1 and not include_archive:
+                    continue
+                seen_folders.add(key)
                 yield (key, 0, True), lookup(key, 0)
 
-    def _select(self, current_id, folder, filter_id, source_kind, cfg, targets):
-        mc = self._controller()
+    def _select(self, account, current_id, folder, filter_id, source_kind, cfg, targets):
+        mc = self._controller(account)
 
         def unread(dialog):
             if int(dialog.unread_count) > 0:
+                return True
+            if cfg["prioritize_mentions"] and int(getattr(dialog, "unread_mentions_count", 0) or 0) > 0:
                 return True
             return cfg["mark_unread"] and bool(dialog.unread_mark)
 
@@ -574,24 +1656,46 @@ class PullNextChatPlugin(BasePlugin):
                 pass
             if did < 0:
                 chat = mc.getChat(self._Long.valueOf(-did))
-                if chat is not None and mc.getRestrictionReason(chat.restriction_reason) is not None:
-                    return False
+                if chat is not None:
+                    rr = getattr(chat, "restriction_reason", None)
+                    if rr is not None and mc.getRestrictionReason(rr) is not None:
+                        return False
             return True
 
-        dialog, info = pick_dialog(self._passes(mc, folder, filter_id, cfg["other_folders"]), qualifies,
-                                   lambda d: int(d.unread_count), cfg["strategy"])
+        def weight(dialog):
+            cnt = int(dialog.unread_count)
+            return cnt if cnt > 0 else 1
+
+        mention_fn = (
+            (lambda d: int(getattr(d, "unread_mentions_count", 0) or 0) > 0)
+            if cfg["prioritize_mentions"]
+            else None
+        )
+        visited = self._visited_set(account) if cfg["anti_ping_pong"] else None
+
+        dialog, info = pick_dialog(
+            self._passes(mc, folder, filter_id, cfg["folder_scope"]),
+            qualifies,
+            weight,
+            cfg["strategy"],
+            has_mention=mention_fn,
+            visited_ids=visited,
+        )
         kind = self._kind_of_dialog(mc, int(dialog.id)) if dialog is not None else None
         return dialog, info, kind
 
-    def _kind_of_id(self, did):
+    def _kind_of_id(self, account, did):
         try:
-            return self._kind_of_dialog(self._controller(), int(did))
+            return self._kind_of_dialog(self._controller(account), int(did))
         except Exception:
             return None
 
     def _before_next_dialog(self, param):
-        if time.monotonic() > self._updating_until:
-            return
+        with self._lock:
+            if time.monotonic() > self._updating_until:
+                return
+            dref = self._updating_drawable_ref
+        drawable = dref.get() if dref is not None else None
         cfg = self._cfg()
         if not cfg["enabled"]:
             return
@@ -599,76 +1703,139 @@ class PullNextChatPlugin(BasePlugin):
         current = int(args[0])
         folder, filter_id = int(args[1]), int(args[2])
         params = args[4] if len(args) > 4 else None
-        source = self._kind_of_id(current)
+        account = self._account_of(drawable)
+        source = self._kind_of_id(account, current)
         if source is None:
+            self._set_pick(drawable, None)
+            return
+        if not cfg["src"].get(source, False):
+            self._set_pick(drawable, None)
+            if source == "channel":
+                self._mark_drawable_suppressed(drawable)
+                param.setResult(None)
             return
         targets = target_kinds(source, cfg["mode"], cfg["selected"])
-        self._last_pick = (0, None, source, targets)
         if not targets or self._native_equivalent(cfg, targets):
-            self._last_pick = None
+            self._set_pick(drawable, None)
             return
-        dialog, info, kind = self._select(current, folder, filter_id, source, cfg, targets)
+
+        dialog, info, kind = self._select(account, current, folder, filter_id, source, cfg, targets)
         if dialog is not None and params is not None:
-            params[0] = 1 if info[2] else 0
-            params[1] = info[0]
-            params[2] = info[1]
-        self._last_pick = (int(dialog.id) if dialog is not None else 0, kind, source, targets)
+            try:
+                if len(params) >= 3:
+                    params[0] = 1 if info[2] else 0
+                    params[1] = info[0]
+                    params[2] = info[1]
+            except Exception:
+                pass
+        pick_data = {
+            "did": int(dialog.id) if dialog is not None else 0,
+            "kind": kind,
+            "source": source,
+            "targets": targets,
+            "account": account,
+            "folder": info[0] if info is not None else folder,
+            "filter": info[1] if info is not None else filter_id,
+        }
+        self._set_pick(drawable, pick_data)
         param.setResult(dialog)
 
     # ------------------------------------------------------------------ drawable tweaks
 
     def _after_update(self, param):
-        pick = self._last_pick
-        if pick is None:
+        if not self._cfg()["enabled"]:
             return
         drawable = param.thisObject
+        pick = self._get_pick(drawable)
+        if pick is None:
+            with self._lock:
+                pick = self._last_pick_fallback
+                self._last_pick_fallback = None
+            if pick is not None:
+                self._set_pick(drawable, pick)
+        if pick is None:
+            return
         cls = drawable.getClass()
-        self._pick_drawable = self._hash(drawable)
-        self._field(cls, "lastWidth").setInt(drawable, 0)      # rebuild labels for the new target
-        did = int(drawable.nextDialogId) if pick[0] else 0
+        self._field(cls, "lastWidth").setInt(drawable, 0)
+        did = pick["did"]
         if did > 0:
-            self._show_user_target(drawable, cls, did)
+            self._show_user_target(drawable, cls, pick, did)
 
-    def _show_user_target(self, drawable, cls, user_id):
-        mc = self._controller()
+    def _show_user_target(self, drawable, cls, pick, user_id):
+        account = pick["account"]
+        mc = self._controller(account)
         user = mc.getUser(self._Long.valueOf(user_id))
         if user is None:
+            try:
+                self._field(cls, "nextDialogId").setLong(drawable, 0)
+                self._field(cls, "emptyStub").setBoolean(drawable, True)
+            except Exception:
+                pass
             return
-        account = self._account()
-        fake = jclass("org.telegram.tgnet.TLRPC$TL_chat")()
-        fake.id = user_id
-        fake.title = str(jclass("org.telegram.messenger.UserObject").getUserName(user))
-        self._field(cls, "nextChat").set(drawable, fake)
+
         try:
-            avatar = jclass("org.telegram.ui.Components.AvatarDrawable")()
+            self._field(cls, "nextDialogId").setLong(drawable, user_id)
+            self._field(cls, "dialogFolderId").setInt(drawable, int(pick["folder"]))
+            self._field(cls, "dialogFilterId").setInt(drawable, int(pick["filter"]))
+            self._field(cls, "emptyStub").setBoolean(drawable, False)
+        except Exception:
+            pass
+
+        tl_chat_cls = self._TLChat or jclass("org.telegram.tgnet.TLRPC$TL_chat")
+        fake = tl_chat_cls()
+        fake.id = user_id
+        fake.title = str(self._UserObject.getUserName(user))
+        self._field(cls, "nextChat").set(drawable, fake)
+
+        try:
+            av_cls = self._AvatarDrawable or jclass("org.telegram.ui.Components.AvatarDrawable")
+            avatar = av_cls()
             avatar.setInfo(account, user)
             receiver = self._get(drawable, "imageReceiver")
-            location = jclass("org.telegram.messenger.ImageLocation").getForUser(user, jclass("org.telegram.messenger.ImageLocation").TYPE_SMALL)
-            receiver.setImage(location, "50_50", avatar, None, jclass("org.telegram.messenger.UserConfig").getInstance(0).getCurrentUser(), 0)
+            if receiver is not None:
+                try:
+                    receiver.setForUserOrChat(user, avatar)
+                except Exception:
+                    ImageLocation = self._ImageLocation or jclass("org.telegram.messenger.ImageLocation")
+                    location = ImageLocation.getForUser(user, ImageLocation.TYPE_SMALL)
+                    try:
+                        # Unambiguous 5-arg overload
+                        receiver.setImage(location, "50_50", avatar, user, 0)
+                    except Exception:
+                        # Use empty string "" instead of None to avoid ambiguous Java overload resolution
+                        current_user = self._UserConfig.getInstance(account).getCurrentUser()
+                        receiver.setImage(location, "50_50", avatar, "", current_user, 0)
         except Exception as error:
             self._log("avatar: " + type(error).__name__)
 
     def _after_set_width(self, param):
-        pick = self._last_pick
+        if not self._cfg()["enabled"]:
+            return
         drawable = param.thisObject
-        if pick is None or self._hash(drawable) != getattr(self, "_pick_drawable", None):
+        pick = self._get_pick(drawable)
+        if pick is None:
             return
         cls = drawable.getClass()
-        kind = pick[1]
+        kind = pick["kind"]
         empty = bool(self._field(cls, "emptyStub").getBoolean(drawable))
-        layout_class = jclass("android.text.StaticLayout")
-        alignment = jclass("android.text.Layout$Alignment")
+        layout_class = self._StaticLayout or jclass("android.text.StaticLayout")
+        alignment = self._LayoutAlignment or jclass("android.text.Layout$Alignment")
         width = int(self._field(cls, "lastWidth").getInt(drawable))
-        limit = width - int(self._Utils.dp(60.0))
+        _, _, dp60, _, _ = self._dp_metrics()
+        limit = width - int(dp60)
         if limit <= 0:
             return
         if empty:
-            if pick[3] == {"channel"}:
+            if pick["targets"] == {"channel"}:
                 return
-            text, paint_name, layout_name, width_name, align = phrase(label_kind(pick[3]), 2), "textPaint", "chatNameLayout", "chatNameWidth", alignment.ALIGN_NORMAL
-            self._set_layout(drawable, cls, layout_class, text, paint_name, layout_name, width_name, align, limit)
+            self._set_layout(
+                drawable, cls, layout_class,
+                phrase(label_kind(pick["targets"]), 2),
+                "textPaint", "chatNameLayout", "chatNameWidth",
+                alignment.ALIGN_NORMAL, limit,
+            )
             return
-        if kind is None or kind == "channel" or int(drawable.nextDialogId) != pick[0]:
+        if kind is None or kind == "channel" or int(drawable.nextDialogId) != pick["did"]:
             return
         center = alignment.ALIGN_CENTER
         self._set_layout(drawable, cls, layout_class, phrase(kind, 0), "textPaint2", "layout1", "layout1Width", center, limit)
@@ -676,52 +1843,303 @@ class PullNextChatPlugin(BasePlugin):
 
     def _set_layout(self, drawable, cls, layout_class, text, paint_name, layout_name, width_name, align, limit):
         paint = self._get(drawable, paint_name)
-        measured = min(int(paint.measureText(text)), limit)
-        layout = layout_class(text, paint, measured, align, 1.0, 0.0, False)
+        if paint is None:
+            return
+        display = text
+        try:
+            TextUtils = self._TextUtils or jclass("android.text.TextUtils")
+            TruncateAt = self._TruncateAt or jclass("android.text.TextUtils$TruncateAt")
+            display = str(TextUtils.ellipsize(text, paint, jfloat(limit), TruncateAt.END))
+        except Exception:
+            display = text
+        measured = max(1, min(int(math.ceil(float(paint.measureText(display)))), int(limit)))
+        layout = layout_class(display, paint, jint(measured), align, jfloat(1.0), jfloat(0.0), False)
         self._field(cls, layout_name).set(drawable, layout)
         self._field(cls, width_name).setInt(drawable, measured)
 
-    # ------------------------------------------------------------------ opening a private chat or bot
+    # ------------------------------------------------------------------ opening the next chat
 
-    def _before_animate(self, param):
-        fragment = param.thisObject
-        drawable = self._get(fragment, "pullingDownDrawable")
-        if drawable is None or bool(self._field(drawable.getClass(), "emptyStub").getBoolean(drawable)):
-            return
-        user_id = int(drawable.nextDialogId)
-        if user_id <= 0:
-            return                                              # chats and channels: Telegram does it
-        param.setResult(None)
-        folder, filter_id = int(drawable.dialogFolderId), int(drawable.dialogFilterId)
+    def _current_dialog_id(self, fragment):
         try:
-            method = fragment.getClass().getDeclaredMethod("addToPulledDialogsMyself")
-            method.setAccessible(True)
-            method.invoke(fragment)
+            return int(fragment.getDialogId())
         except Exception:
             pass
-        bundle = jclass("android.os.Bundle")()
-        bundle.putLong("user_id", user_id)
+        try:
+            f = self._chat_field_opt(fragment, self._f_dialog_id, "dialog_id")
+            if f is not None:
+                return int(f.getLong(fragment))
+        except Exception:
+            pass
+        return 0
+
+    def _pulled_dialogs_size(self, fragment):
+        """Returns >=0 if list exists, -1 if field exists and is None, -2 on lookup failure."""
+        try:
+            f = self._chat_field_opt(fragment, self._f_pulled_dialogs, "pulledDialogs")
+            if f is None:
+                return -2
+            lst = f.get(fragment)
+            return int(lst.size()) if lst is not None else -1
+        except Exception:
+            return -2
+
+    def _rollback_pulled_dialogs(self, fragment, prev_size):
+        if prev_size < -1:
+            return
+        try:
+            f = self._chat_field_opt(fragment, self._f_pulled_dialogs, "pulledDialogs")
+            if f is None:
+                return
+            if prev_size == -1:
+                try:
+                    f.set(fragment, None)
+                    return
+                except Exception:
+                    lst = f.get(fragment)
+                    if lst is not None:
+                        lst.clear()
+                    return
+            lst = f.get(fragment)
+            if lst is not None:
+                while int(lst.size()) > prev_size:
+                    lst.remove(int(lst.size()) - 1)
+        except Exception:
+            pass
+
+    def _copy_pulled_dialogs(self, src_frag, dst_frag):
+        try:
+            f = self._chat_field_opt(src_frag, self._f_pulled_dialogs, "pulledDialogs")
+            if f is not None:
+                lst = f.get(src_frag)
+                if lst is not None:
+                    ArrayList = self._ArrayList or jclass("java.util.ArrayList")
+                    f.set(dst_frag, ArrayList(lst))
+        except Exception:
+            pass
+
+    def _is_top_fragment(self, fragment):
+        try:
+            layout = fragment.getParentLayout()
+            stack = layout.getFragmentStack() if layout is not None else None
+            if stack is None:
+                return False
+            sz = int(stack.size())
+            if sz <= 0:
+                return False
+            top = stack.get(sz - 1)
+            return top is not None and self._same(top, fragment)
+        except Exception:
+            return False
+
+    def _before_animate(self, param):
+        self._pending_native_jump = None
+        cfg = self._cfg()
+        if not cfg["enabled"]:
+            return
+        fragment = param.thisObject
+        src_kind = self._fragment_kind(fragment)
+        if src_kind is None or src_kind == "forum" or not cfg["src"].get(src_kind, False):
+            return
+        df = self._chat_field_opt(fragment, self._f_drawable, "pullingDownDrawable")
+        drawable = df.get(fragment) if df is not None else None
+        if drawable is None or bool(self._field(drawable.getClass(), "emptyStub").getBoolean(drawable)):
+            return
+        next_did = int(drawable.nextDialogId)
+        if next_did == 0:
+            return
+
+        account = self._account_of(fragment)
+        cur_did = self._current_dialog_id(fragment)
+
+        # Channels & groups with standard back behavior: defer jump recording to _after_animate so
+        # aborted native transitions are never counted!
+        native = next_did < 0 and not cfg["keep_back_stack"]
+        if native:
+            self._pending_native_jump = (self._weak(fragment), account, cur_did, cfg["anti_ping_pong"])
+            return
+
+        try:
+            if fragment.getParentLayout() is None:
+                return
+        except Exception:
+            pass
+
+        # From here on the stock animation is replaced: record jump ONLY if presentFragment succeeds!
+        param.setResult(None)
+        prev_pulled_size = self._pulled_dialogs_size(fragment)
+        opened = False
+        try:
+            opened = self._open_next(fragment, drawable, next_did, cfg, prev_pulled_size)
+        except Exception as error:
+            self._log("jump failed: " + type(error).__name__ + ": " + str(error))
+            self._abort_jump(fragment, prev_pulled_size)
+        if opened:
+            self._record_jump(account, cur_did, cfg["anti_ping_pong"])
+
+    def _after_animate(self, param):
+        pending = self._pending_native_jump
+        self._pending_native_jump = None
+        if pending is None:
+            return
+        fref, account, cur_did, anti_ping_pong = pending
+        fragment = fref.get()
+        if fragment is None or not self._same(fragment, param.thisObject):
+            return
+        # Confirm native transition actually happened (replacingChatActivity=True or no longer top of stack)
+        succeeded = False
+        try:
+            rf = self._chat_field_opt(fragment, self._f_replacing, "replacingChatActivity")
+            if rf is not None and bool(rf.getBoolean(fragment)):
+                succeeded = True
+        except Exception:
+            pass
+        if not succeeded and not self._is_top_fragment(fragment):
+            succeeded = True
+        if succeeded:
+            self._record_jump(account, cur_did, anti_ping_pong)
+
+    def _open_next(self, fragment, drawable, next_did, cfg, prev_pulled_size):
+        folder, filter_id = int(drawable.dialogFolderId), int(drawable.dialogFilterId)
+
+        Bundle = self._Bundle or jclass("android.os.Bundle")
+        bundle = Bundle()
+        if next_did > 0:
+            bundle.putLong("user_id", next_did)
+        else:
+            bundle.putLong("chat_id", -next_did)
         bundle.putInt("dialog_folder_id", folder)
         bundle.putInt("dialog_filter_id", filter_id)
         bundle.putBoolean("pulled", True)
-        activity = jclass("org.telegram.ui.ChatActivity")(bundle)
+
+        chat_ctor = self._chat_activity_ctor or jclass("org.telegram.ui.ChatActivity")
+        activity = chat_ctor(bundle)
         try:
-            method = self._chat_activity.getDeclaredMethod("setPullingDownTransition", self._Boolean.TYPE)
-            method.setAccessible(True)
-            method.invoke(activity, self._Boolean.TRUE)
-            self._field(self._chat_activity, "replacingChatActivity").setBoolean(fragment, True)
+            method = self._method(fragment.getClass(), "addToPulledDialogsMyself")
+            method.invoke(fragment)
+        except Exception:
+            pass
+        self._copy_pulled_dialogs(fragment, activity)
+
+        remove_last = not cfg["keep_back_stack"]
+        try:
+            set_trans = self._method(self._chat_activity, "setPullingDownTransition", self._Boolean.TYPE)
+            set_trans.invoke(activity, self._Boolean.TRUE)
         except Exception as error:
             self._log("transition: " + type(error).__name__)
-        fragment.presentFragment(activity, True)
+
+        if remove_last:
+            try:
+                rf = self._chat_field(fragment, self._f_replacing, "replacingChatActivity")
+                rf.setBoolean(fragment, True)
+            except Exception as error:
+                self._log("replacing: " + type(error).__name__)
+
+        opened = fragment.presentFragment(activity, remove_last)
+        if not opened:
+            self._abort_jump(fragment, prev_pulled_size)
+            return False
+
+        if not remove_last:
+            src_ref = self._weak(fragment)
+            dst_ref = self._weak(activity)
+            _run_ui_delayed(lambda: self._post_kept_jump(src_ref.get(), dst_ref.get(), True), POST_JUMP_DELAY_MS)
+        return True
+
+    def _abort_jump(self, fragment, prev_pulled_size=-2):
+        """Undo what the custom jump did to the source chat so it is not left half-pulled / marked as replaced."""
+        self._rollback_pulled_dialogs(fragment, prev_pulled_size)
+        try:
+            rf = self._chat_field_opt(fragment, self._f_replacing, "replacingChatActivity")
+            if rf is not None:
+                rf.setBoolean(fragment, False)
+        except Exception:
+            pass
+        try:
+            off_f = self._chat_field_opt(fragment, self._f_pull_offset, "pullingDownOffset")
+            if off_f is not None:
+                self._cancel_pull(fragment, off_f)
+        except Exception:
+            pass
+
+    def _post_kept_jump(self, src_fragment, dst_fragment, allow_retry=True):
+        """Runs after the transition animation finishes when keep_back_stack=True:
+        - If layout is still mid-transition, retries once after POST_JUMP_RETRY_MS.
+        - Never resets pull offset on src_fragment if the user already pressed Back and returned to it.
+        - Trims excess ChatActivity instances via the new top fragment."""
+        if not self._active:
+            return
+        anchor = dst_fragment if dst_fragment is not None else src_fragment
+        if allow_retry and anchor is not None:
+            try:
+                layout = anchor.getParentLayout()
+                if layout is not None and hasattr(layout, "isInTransition") and bool(layout.isInTransition()):
+                    s_ref = self._weak(src_fragment) if src_fragment is not None else None
+                    d_ref = self._weak(dst_fragment) if dst_fragment is not None else None
+                    _run_ui_delayed(
+                        lambda: self._post_kept_jump(s_ref.get() if s_ref else None, d_ref.get() if d_ref else None, False),
+                        POST_JUMP_RETRY_MS,
+                    )
+                    return
+            except Exception:
+                pass
+
+        if src_fragment is not None and not self._is_top_fragment(src_fragment):
+            try:
+                off_f = self._chat_field_opt(src_fragment, self._f_pull_offset, "pullingDownOffset")
+                if off_f is not None and float(off_f.getFloat(src_fragment)) != 0.0:
+                    self._cancel_pull(src_fragment, off_f)
+            except Exception:
+                pass
+        if anchor is not None:
+            self._trim_back_stack(anchor)
+
+    def _trim_back_stack(self, fragment):
+        if not self._active or fragment is None or self._chat_activity is None:
+            return
+        try:
+            layout = fragment.getParentLayout()
+            stack = layout.getFragmentStack() if layout is not None else None
+            if stack is None:
+                return
+            count = int(stack.size())
+            chats = []
+            for i in range(count - 1):  # everything except the top fragment
+                try:
+                    frag = stack.get(i)
+                except Exception:
+                    break
+                if frag is not None and self._chat_activity.isInstance(frag):
+                    chats.append(frag)
+            surplus = len(chats) - MAX_KEPT_CHATS
+            for frag in chats[:max(0, surplus)]:
+                try:
+                    frag.removeSelfFromStack()
+                except Exception:
+                    try:
+                        layout.removeFragmentFromStack(frag)
+                    except Exception as inner_err:
+                        self._log("trim item: " + type(inner_err).__name__)
+        except Exception as error:
+            self._log("trim: " + type(error).__name__ + ": " + str(error))
 
 
 class JavaList:
-    """Cheap iteration over a java.util.List."""
+    """Snapshot-tolerant iteration over a java.util.List (safe against concurrent shrink)."""
 
     def __init__(self, items):
         self.items = items
 
     def __iter__(self):
         items = self.items
-        for index in range(int(items.size())):
-            yield items.get(index)
+        if items is None:
+            return
+        index = 0
+        while True:
+            try:
+                if index >= int(items.size()):
+                    break
+                item = items.get(index)
+            except Exception:
+                break
+            yield item
+            index += 1
