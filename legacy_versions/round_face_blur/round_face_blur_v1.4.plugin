@@ -1,0 +1,1522 @@
+import os
+import time
+import traceback
+import threading
+import uuid
+from collections import deque
+
+from java import jclass, jarray, jint, jlong, jfloat
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from android_utils import run_on_ui_thread, copy_to_clipboard
+from client_utils import get_last_fragment, get_messages_controller, get_selected_account
+from file_utils import get_cache_dir, get_files_dir, ensure_dir_exists
+from android.widget import LinearLayout, TextView
+from org.telegram.ui.ActionBar import Theme
+from ui.bulletin import BulletinHelper
+from ui.settings import Custom, Divider, Header, Switch, Selector, Text, Input
+
+__id__ = "round_face_blur"
+__name__ = "Round Face Blur"
+__description__ = "Скрывает лица пиксельной мозаикой в видеокружках перед отправкой."
+__author__ = "@Dkaq1"
+__version__ = "1.4"
+__icon__ = "hfglhjkfgopkhjfgikoph/0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.5.0"
+__category__ = ["media", "privacy"]
+
+
+class PrepareVideoHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    @staticmethod
+    def copy_invocation_args(method, values):
+        parameter_types = method.getParameterTypes()
+        if len(parameter_types) != len(values):
+            raise ValueError("Число аргументов не совпадает с Java-сигнатурой")
+        wrappers = {
+            "byte": "Byte",
+            "short": "Short",
+            "int": "Integer",
+            "long": "Long",
+            "float": "Float",
+            "double": "Double",
+            "boolean": "Boolean",
+            "char": "Character",
+        }
+        copied = []
+        for parameter_type, value in zip(parameter_types, values):
+            if parameter_type.isPrimitive():
+                name = str(parameter_type.getName())
+                wrapper = jclass("java.lang." + wrappers[name])
+                if value is None:
+                    raise ValueError("Пустой аргумент Java-примитива: " + name)
+                if name == "boolean":
+                    value = wrapper(bool(value))
+                elif name == "char":
+                    value = wrapper(value)
+                else:
+                    number = float(value) if name in ("float", "double") else int(value)
+                    value = wrapper(str(number))
+            copied.append(value)
+        return jarray(jclass("java.lang.Object"))(copied)
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin
+        if getattr(plugin.dispatch_context, "sending", False) or not plugin.get_setting("enabled", True):
+            return
+        path = None
+        job_id = None
+        try:
+            edited_info = next((arg for arg in param.args if arg is not None and hasattr(arg, "roundVideo")), None)
+            if edited_info is None or not bool(edited_info.roundVideo):
+                return
+            path_idx = next(
+                (i for i, arg in enumerate(param.args) if isinstance(arg, str) and os.path.isfile(arg)),
+                -1,
+            )
+            path = str(param.args[path_idx]) if path_idx >= 0 else str(edited_info.originalPath or "")
+            if not path or not os.path.isfile(path):
+                return
+            if plugin.is_already_processed(path):
+                return
+            if os.path.getsize(path) < 16384 and int(getattr(edited_info, "estimatedDuration", 0) or 0) <= 0:
+                return
+            if plugin.is_whitelisted(param):
+                plugin.debug_log("Белый список: кружок отправляется без обработки")
+                return
+            job_id = uuid.uuid4().hex
+            with plugin.state_lock:
+                if len(plugin.active_paths) >= 3:
+                    param.setResult(None)
+                    plugin.show_info("Очередь размытия заполнена. Дождитесь обработки и повторите отправку.")
+                    return
+                plugin.active_paths.add(job_id)
+
+            method = param.method
+            receiver = param.thisObject
+            args = self.copy_invocation_args(method, list(param.args))
+            output = plugin.make_output_path()
+
+            def worker():
+                changes = {}
+                send = False
+                started = time.monotonic()
+                try:
+                    with plugin.render_lock:
+                        dims = plugin.process_round_video(path, output)
+                    if dims is None or not os.path.isfile(output) or os.path.getsize(output) <= 0:
+                        raise RuntimeError("Не получен готовый MP4")
+                    width, height = dims
+                    updates = {
+                        "originalPath": output,
+                        "rotationValue": 0,
+                        "originalWidth": width,
+                        "originalHeight": height,
+                        "resultWidth": width,
+                        "resultHeight": height,
+                        "estimatedSize": os.path.getsize(output),
+                        "framerate": 25,
+                        "file": None,
+                        "encryptedFile": None,
+                        "key": None,
+                        "iv": None,
+                    }
+                    for name, value in updates.items():
+                        if hasattr(edited_info, name):
+                            changes[name] = getattr(edited_info, name)
+                            setattr(edited_info, name, value)
+                    if path_idx >= 0:
+                        args[path_idx] = output
+                    plugin.mark_processed(output)
+                    send = True
+                    plugin.debug_log(f"Готово за {time.monotonic() - started:.1f} с: {output}")
+                except Exception as error:
+                    for name, value in changes.items():
+                        setattr(edited_info, name, value)
+                    if path_idx >= 0:
+                        args[path_idx] = path
+                    plugin.debug_log(f"Ошибка обработки: {error}\n{traceback.format_exc()}")
+                    if os.path.isfile(output):
+                        try:
+                            os.remove(output)
+                        except OSError:
+                            pass
+                    send = plugin.get_setting("send_original_on_error", False)
+                    plugin.show_info(
+                        "Размытие не удалось. Отправляется оригинал."
+                        if send
+                        else "Кружок не отправлен: ошибка размытия. Оригинал сохранён."
+                    )
+                finally:
+                    if send:
+                        def dispatch():
+                            plugin.dispatch_context.sending = True
+                            try:
+                                method.invoke(receiver, args)
+                                plugin.debug_log("Кружок передан в штатную отправку Telegram")
+                            except Exception as error:
+                                plugin.debug_log(f"Ошибка передачи в Telegram: {error}\n{traceback.format_exc()}")
+                                plugin.show_info("Не удалось передать кружок в Telegram. Проверьте лог.")
+                            finally:
+                                plugin.dispatch_context.sending = False
+                                with plugin.state_lock:
+                                    plugin.active_paths.discard(job_id)
+
+                        try:
+                            run_on_ui_thread(dispatch)
+                        except Exception as error:
+                            plugin.debug_log(f"Ошибка очереди отправки: {error}")
+                            with plugin.state_lock:
+                                plugin.active_paths.discard(job_id)
+                            plugin.show_info("Кружок не отправлен: недоступна очередь Telegram.")
+                    else:
+                        with plugin.state_lock:
+                            plugin.active_paths.discard(job_id)
+
+            param.setResult(None)
+            threading.Thread(target=worker, name="RoundFaceBlur", daemon=True).start()
+        except Exception as error:
+            if path and job_id is not None:
+                with plugin.state_lock:
+                    plugin.active_paths.discard(job_id)
+            plugin.debug_log(f"Ошибка перехвата: {error}\n{traceback.format_exc()}")
+            if not plugin.get_setting("send_original_on_error", False):
+                param.setResult(None)
+                plugin.show_info("Кружок не отправлен: не удалось запустить размытие.")
+            else:
+                plugin.show_info("Не удалось запустить размытие. Отправляется оригинал.")
+
+
+class EglSurfaceRenderer:
+    VERTEX_SHADER = (
+        "attribute vec4 aPos;\n"
+        "attribute vec2 aTex;\n"
+        "varying vec2 vTex;\n"
+        "void main() {\n"
+        "    gl_Position = aPos;\n"
+        "    vTex = aTex;\n"
+        "}\n"
+    )
+    FRAGMENT_SHADER = (
+        "precision mediump float;\n"
+        "varying vec2 vTex;\n"
+        "uniform sampler2D uTex;\n"
+        "void main() {\n"
+        "    gl_FragColor = texture2D(uTex, vTex);\n"
+        "}\n"
+    )
+
+    def __init__(self, surface, width, height):
+        self.EGL14 = jclass("android.opengl.EGL14")
+        self.EGLExt = jclass("android.opengl.EGLExt")
+        self.GLES20 = jclass("android.opengl.GLES20")
+        self.GLUtils = jclass("android.opengl.GLUtils")
+        EGLConfig = jclass("android.opengl.EGLConfig")
+        ByteBuffer = jclass("java.nio.ByteBuffer")
+        ByteOrder = jclass("java.nio.ByteOrder")
+        self.width = width
+        self.height = height
+        self.texture_allocated = False
+        self.program = 0
+        self.pos_vbo = 0
+        self.tex_vbo = 0
+        self.tex_id = 0
+        self.display = self.EGL14.EGL_NO_DISPLAY
+        self.context = self.EGL14.EGL_NO_CONTEXT
+        self.egl_surface = self.EGL14.EGL_NO_SURFACE
+        try:
+            self.display = self.EGL14.eglGetDisplay(self.EGL14.EGL_DEFAULT_DISPLAY)
+            if self.display == self.EGL14.EGL_NO_DISPLAY:
+                raise RuntimeError("eglGetDisplay failed")
+            version = jarray(jint)(2)
+            if not self.EGL14.eglInitialize(self.display, version, 0, version, 1):
+                raise RuntimeError("eglInitialize failed")
+            attrib_list = jarray(jint)([
+                self.EGL14.EGL_RED_SIZE, 8,
+                self.EGL14.EGL_GREEN_SIZE, 8,
+                self.EGL14.EGL_BLUE_SIZE, 8,
+                self.EGL14.EGL_ALPHA_SIZE, 8,
+                self.EGL14.EGL_RENDERABLE_TYPE, self.EGL14.EGL_OPENGL_ES2_BIT,
+                0x3142, 1,
+                self.EGL14.EGL_NONE,
+            ])
+            configs = jarray(EGLConfig)(1)
+            num_configs = jarray(jint)(1)
+            if not self.EGL14.eglChooseConfig(self.display, attrib_list, 0, configs, 0, 1, num_configs, 0):
+                raise RuntimeError("eglChooseConfig failed")
+            if num_configs[0] <= 0 or configs[0] is None:
+                raise RuntimeError("No matching EGLConfig found")
+            ctx_attribs = jarray(jint)([self.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, self.EGL14.EGL_NONE])
+            self.context = self.EGL14.eglCreateContext(
+                self.display, configs[0], self.EGL14.EGL_NO_CONTEXT, ctx_attribs, 0
+            )
+            if self.context == self.EGL14.EGL_NO_CONTEXT:
+                raise RuntimeError("eglCreateContext failed")
+            surf_attribs = jarray(jint)([self.EGL14.EGL_NONE])
+            self.egl_surface = self.EGL14.eglCreateWindowSurface(
+                self.display, configs[0], surface, surf_attribs, 0
+            )
+            if self.egl_surface == self.EGL14.EGL_NO_SURFACE:
+                raise RuntimeError("eglCreateWindowSurface failed")
+            if not self.EGL14.eglMakeCurrent(self.display, self.egl_surface, self.egl_surface, self.context):
+                raise RuntimeError("eglMakeCurrent failed")
+            self.program = self._create_program(self.VERTEX_SHADER, self.FRAGMENT_SHADER)
+            self.GLES20.glUseProgram(self.program)
+            pos_data = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]
+            tex_data = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+            bb_pos = ByteBuffer.allocateDirect(len(pos_data) * 4).order(ByteOrder.nativeOrder())
+            pos_buf = bb_pos.asFloatBuffer()
+            pos_buf.put(jarray(jfloat)(pos_data))
+            pos_buf.position(0)
+            bb_tex = ByteBuffer.allocateDirect(len(tex_data) * 4).order(ByteOrder.nativeOrder())
+            tex_buf = bb_tex.asFloatBuffer()
+            tex_buf.put(jarray(jfloat)(tex_data))
+            tex_buf.position(0)
+            vbos = jarray(jint)(2)
+            self.GLES20.glGenBuffers(2, vbos, 0)
+            self.pos_vbo = vbos[0]
+            self.tex_vbo = vbos[1]
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.pos_vbo)
+            self.GLES20.glBufferData(
+                self.GLES20.GL_ARRAY_BUFFER, len(pos_data) * 4, pos_buf, self.GLES20.GL_STATIC_DRAW
+            )
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.tex_vbo)
+            self.GLES20.glBufferData(
+                self.GLES20.GL_ARRAY_BUFFER, len(tex_data) * 4, tex_buf, self.GLES20.GL_STATIC_DRAW
+            )
+            self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, 0)
+            self.pos_loc = self.GLES20.glGetAttribLocation(self.program, "aPos")
+            self.tex_loc = self.GLES20.glGetAttribLocation(self.program, "aTex")
+            self.sampler_loc = self.GLES20.glGetUniformLocation(self.program, "uTex")
+            textures = jarray(jint)(1)
+            self.GLES20.glGenTextures(1, textures, 0)
+            self.tex_id = textures[0]
+            self.GLES20.glActiveTexture(self.GLES20.GL_TEXTURE0)
+            self.GLES20.glBindTexture(self.GLES20.GL_TEXTURE_2D, self.tex_id)
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MIN_FILTER, self.GLES20.GL_LINEAR
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_MAG_FILTER, self.GLES20.GL_LINEAR
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_S, self.GLES20.GL_CLAMP_TO_EDGE
+            )
+            self.GLES20.glTexParameteri(
+                self.GLES20.GL_TEXTURE_2D, self.GLES20.GL_TEXTURE_WRAP_T, self.GLES20.GL_CLAMP_TO_EDGE
+            )
+        except Exception:
+            self.release()
+            raise
+
+    def _compile_shader(self, shader_type, source):
+        shader = self.GLES20.glCreateShader(shader_type)
+        self.GLES20.glShaderSource(shader, source)
+        self.GLES20.glCompileShader(shader)
+        compiled = jarray(jint)(1)
+        self.GLES20.glGetShaderiv(shader, self.GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if compiled[0] == 0:
+            err = str(self.GLES20.glGetShaderInfoLog(shader))
+            self.GLES20.glDeleteShader(shader)
+            raise RuntimeError(f"Shader compile error: {err}")
+        return shader
+
+    def _create_program(self, vs_src, fs_src):
+        vs = self._compile_shader(self.GLES20.GL_VERTEX_SHADER, vs_src)
+        fs = self._compile_shader(self.GLES20.GL_FRAGMENT_SHADER, fs_src)
+        prog = self.GLES20.glCreateProgram()
+        self.GLES20.glAttachShader(prog, vs)
+        self.GLES20.glAttachShader(prog, fs)
+        self.GLES20.glLinkProgram(prog)
+        linked = jarray(jint)(1)
+        self.GLES20.glGetProgramiv(prog, self.GLES20.GL_LINK_STATUS, linked, 0)
+        self.GLES20.glDeleteShader(vs)
+        self.GLES20.glDeleteShader(fs)
+        if linked[0] == 0:
+            err = str(self.GLES20.glGetProgramInfoLog(prog))
+            self.GLES20.glDeleteProgram(prog)
+            raise RuntimeError(f"Program link error: {err}")
+        return prog
+
+    def draw_bitmap(self, bitmap, pts_us):
+        self.GLES20.glViewport(0, 0, self.width, self.height)
+        self.GLES20.glUseProgram(self.program)
+        self.GLES20.glActiveTexture(self.GLES20.GL_TEXTURE0)
+        self.GLES20.glBindTexture(self.GLES20.GL_TEXTURE_2D, self.tex_id)
+        if not self.texture_allocated:
+            self.GLUtils.texImage2D(self.GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+            self.texture_allocated = True
+        else:
+            self.GLUtils.texSubImage2D(self.GLES20.GL_TEXTURE_2D, 0, 0, 0, bitmap)
+        self.GLES20.glUniform1i(self.sampler_loc, 0)
+        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.pos_vbo)
+        self.GLES20.glEnableVertexAttribArray(self.pos_loc)
+        self.GLES20.glVertexAttribPointer(self.pos_loc, 2, self.GLES20.GL_FLOAT, False, 0, 0)
+        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, self.tex_vbo)
+        self.GLES20.glEnableVertexAttribArray(self.tex_loc)
+        self.GLES20.glVertexAttribPointer(self.tex_loc, 2, self.GLES20.GL_FLOAT, False, 0, 0)
+        self.GLES20.glDrawArrays(self.GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        self.GLES20.glDisableVertexAttribArray(self.pos_loc)
+        self.GLES20.glDisableVertexAttribArray(self.tex_loc)
+        self.GLES20.glBindBuffer(self.GLES20.GL_ARRAY_BUFFER, 0)
+        if not self.EGLExt.eglPresentationTimeANDROID(self.display, self.egl_surface, pts_us * 1000):
+            raise RuntimeError("eglPresentationTimeANDROID failed")
+        if not self.EGL14.eglSwapBuffers(self.display, self.egl_surface):
+            raise RuntimeError("eglSwapBuffers failed")
+
+    def release(self):
+        try:
+            if self.display != self.EGL14.EGL_NO_DISPLAY:
+                if self.context != self.EGL14.EGL_NO_CONTEXT and self.egl_surface != self.EGL14.EGL_NO_SURFACE:
+                    self.EGL14.eglMakeCurrent(self.display, self.egl_surface, self.egl_surface, self.context)
+                    if self.tex_id:
+                        self.GLES20.glDeleteTextures(1, jarray(jint)([self.tex_id]), 0)
+                    if self.pos_vbo or self.tex_vbo:
+                        self.GLES20.glDeleteBuffers(2, jarray(jint)([self.pos_vbo, self.tex_vbo]), 0)
+                    if self.program:
+                        self.GLES20.glDeleteProgram(self.program)
+                self.EGL14.eglMakeCurrent(
+                    self.display,
+                    self.EGL14.EGL_NO_SURFACE,
+                    self.EGL14.EGL_NO_SURFACE,
+                    self.EGL14.EGL_NO_CONTEXT,
+                )
+                if self.egl_surface != self.EGL14.EGL_NO_SURFACE:
+                    self.EGL14.eglDestroySurface(self.display, self.egl_surface)
+                if self.context != self.EGL14.EGL_NO_CONTEXT:
+                    self.EGL14.eglDestroyContext(self.display, self.context)
+                self.EGL14.eglTerminate(self.display)
+        except Exception:
+            pass
+
+
+class RoundFaceBlurPlugin(BasePlugin):
+    WL_KINDS = (
+        ("pm", "ЛС"),
+        ("group", "Группы"),
+        ("supergroup", "Супергруппы"),
+        ("channel", "Каналы"),
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.hook_handles = []
+        self.mlkit_detector = None
+        self.mlkit_checked = False
+        self.mlkit_warmed_up = False
+        self.mlkit_failures = 0
+        self.InputImageCls = None
+        self.TasksCls = None
+        self.TimeUnitCls = None
+        self.gms_detector = None
+        self.gms_checked = False
+        self.FrameBuilder = None
+        self.log_file_path = None
+        self.memory_logs = deque(maxlen=200)
+        self.log_lock = threading.Lock()
+        self.active_paths = set()
+        self.processed_outputs = deque(maxlen=32)
+        self.state_lock = threading.Lock()
+        self.render_lock = threading.Lock()
+        self.dispatch_context = threading.local()
+
+    def on_plugin_load(self):
+        self._init_log_path()
+        self._hook_send_video()
+        threading.Thread(target=self._cleanup_stale_temp_files, name="RoundBlurCleanup", daemon=True).start()
+        self.debug_log(f"Плагин загружен (v{__version__})")
+
+    def on_plugin_unload(self):
+        for detector_attr in ("mlkit_detector", "gms_detector"):
+            detector = getattr(self, detector_attr, None)
+            if detector is not None:
+                try:
+                    detector.close() if hasattr(detector, "close") else detector.release()
+                except Exception:
+                    pass
+                setattr(self, detector_attr, None)
+        for handle in list(self.hook_handles):
+            try:
+                self.unhook_method(handle)
+            except Exception:
+                pass
+        self.hook_handles.clear()
+
+    def _init_log_path(self):
+        for getter in (get_files_dir, get_cache_dir):
+            try:
+                base_dir = getter()
+                if base_dir:
+                    ensure_dir_exists(base_dir)
+                    self.log_file_path = os.path.join(base_dir, "round_face_blur_debug.txt")
+                    return
+            except Exception:
+                continue
+
+    def make_output_path(self):
+        cache_dir = get_cache_dir()
+        ensure_dir_exists(cache_dir)
+        return os.path.join(cache_dir, f"round_blurred_{uuid.uuid4().hex}.mp4")
+
+    def mark_processed(self, path):
+        with self.state_lock:
+            self.processed_outputs.append(path)
+
+    def is_already_processed(self, path):
+        name = os.path.basename(path)
+        if name.startswith("round_blurred_"):
+            return True
+        with self.state_lock:
+            return path in self.processed_outputs
+
+    def _cleanup_stale_temp_files(self):
+        cutoff = time.time() - 1800.0
+        try:
+            cache_dir = get_cache_dir()
+            if not cache_dir or not os.path.isdir(cache_dir):
+                return
+            for entry in os.scandir(cache_dir):
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if (name.startswith("round_blurred_") or "_blurred_" in name) and name.endswith(".mp4"):
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            os.remove(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def debug_log(self, msg):
+        line = f"[RoundFaceBlur] {msg}"
+        if hasattr(self, "logger") and self.logger is not None:
+            self.logger.info("%s", msg)
+        with self.log_lock:
+            self.memory_logs.append(line)
+            if self.log_file_path and self.get_setting("debug_file_log", False):
+                try:
+                    with open(self.log_file_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
+
+    def _copy_log_to_clipboard(self, *args):
+        with self.log_lock:
+            content = "\n".join(self.memory_logs)
+        if not content.strip() and self.log_file_path and os.path.exists(self.log_file_path):
+            try:
+                with open(self.log_file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                pass
+        if not content.strip():
+            self.show_info("Лог пока пуст")
+            return
+        copy_to_clipboard(content[-4000:])
+
+    def _clear_log(self, *args):
+        with self.log_lock:
+            self.memory_logs.clear()
+            if self.log_file_path and os.path.exists(self.log_file_path):
+                try:
+                    with open(self.log_file_path, "w", encoding="utf-8") as f:
+                        f.write("")
+                except Exception:
+                    pass
+        self.show_info("Лог очищен")
+
+    def show_info(self, text):
+        BulletinHelper.show_info(str(text))
+
+    def _wl_entries(self):
+        raw = str(self.get_setting("wl_list", "") or "")
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
+    @staticmethod
+    def _wl_normalize(text):
+        t = str(text or "").strip()
+        if not t:
+            return None
+        tl = t.lower()
+        for pref in ("https://t.me/", "http://t.me/", "t.me/", "https://telegram.me/", "telegram.me/"):
+            if tl.startswith(pref):
+                t = t[len(pref):]
+                tl = t.lower()
+                break
+        if tl.startswith("tg://resolve?domain="):
+            t = t[len("tg://resolve?domain="):].split("&")[0]
+            tl = t.lower()
+        if tl.startswith("c/"):
+            parts = t.split("/")
+            if len(parts) >= 2 and parts[1].isdigit():
+                return "-100" + parts[1]
+            return None
+        if tl.startswith("+") or tl.startswith("joinchat/"):
+            return None
+        t = t.split("?")[0].split("/")[0].strip()
+        if not t:
+            return None
+        if t.startswith("@"):
+            t = t[1:]
+        if t.lstrip("-").isdigit():
+            n = int(t)
+            return str(n) if n != 0 else None
+        if 3 <= len(t) <= 32 and t[0].isalpha() and all(c.isalnum() or c == "_" for c in t):
+            return "@" + t.lower()
+        return None
+
+    @staticmethod
+    def _extract_usernames(obj):
+        names = set()
+        if obj is None:
+            return names
+        primary = getattr(obj, "username", None)
+        if primary:
+            names.add(str(primary).lower())
+        extra = getattr(obj, "usernames", None)
+        if extra is not None:
+            try:
+                for i in range(extra.size()):
+                    item = extra.get(i)
+                    if item is not None and bool(getattr(item, "active", True)):
+                        uname = getattr(item, "username", None)
+                        if uname:
+                            names.add(str(uname).lower())
+            except Exception:
+                pass
+        return names
+
+    @staticmethod
+    def _wl_match(entries, kinds_on, did, peer, kind, usernames):
+        if kind and kind in kinds_on:
+            return True
+        for e in entries:
+            if e.startswith("@"):
+                if e[1:] in usernames:
+                    return True
+            else:
+                try:
+                    n = int(e)
+                except ValueError:
+                    continue
+                if n == did or abs(n) == peer:
+                    return True
+                if n <= -1000000000000 and (-n - 1000000000000) == peer:
+                    return True
+        return False
+
+    def _wl_dialog_info(self, param):
+        ChatObject = jclass("org.telegram.messenger.ChatObject")
+        ptypes = param.method.getParameterTypes()
+        did = None
+        for i, pt in enumerate(ptypes):
+            if str(pt.getName()) == "long" and i < len(param.args) and param.args[i] is not None:
+                did = int(param.args[i])
+                break
+        if did is None or did == 0:
+            return None
+
+        account = get_selected_account()
+        if param.thisObject is not None and hasattr(param.thisObject, "getCurrentAccount"):
+            try:
+                account = int(param.thisObject.getCurrentAccount())
+            except Exception:
+                pass
+
+        mc = get_messages_controller(account)
+        if did > 0:
+            user = mc.getUser(did)
+            if user is None:
+                return did, did, None, set()
+            return did, did, "pm", self._extract_usernames(user)
+
+        peer = -did
+        chat = mc.getChat(peer)
+        if chat is None:
+            return did, peer, None, set()
+
+        usernames = self._extract_usernames(chat)
+        if ChatObject.isChannel(chat):
+            kind = "supergroup" if bool(getattr(chat, "megagroup", False)) else "channel"
+        else:
+            kind = "group"
+        return did, peer, kind, usernames
+
+    def is_whitelisted(self, param):
+        try:
+            kinds_on = {k for k, _ in self.WL_KINDS if self.get_setting("wl_" + k, False)}
+            entries = self._wl_entries()
+            if not kinds_on and not entries:
+                return False
+            info = self._wl_dialog_info(param)
+            if info is None:
+                return False
+            did, peer, kind, usernames = info
+            matched = self._wl_match(entries, kinds_on, did, peer, kind, usernames)
+            if matched:
+                self.debug_log(f"Белый список: совпадение did={did}, тип={kind or 'неизвестен'}")
+            return matched
+        except Exception as err:
+            self.debug_log(f"Белый список: ошибка проверки ({err}), кружок будет обработан")
+            return False
+
+    def _wl_summary(self):
+        parts = [label for k, label in self.WL_KINDS if self.get_setting("wl_" + k, False)]
+        n = len(self._wl_entries())
+        if n:
+            parts.append(f"чатов: {n}")
+        return "Без обработки: " + ", ".join(parts) if parts else "Выключен — обрабатываются все чаты"
+
+    def _wl_add_from_input(self, *args):
+        raw = str(self.get_setting("wl_input", "") or "")
+        entry = self._wl_normalize(raw)
+        if entry is None:
+            self.show_info(
+                "Не удалось распознать запись. Укажите ID, @username или ссылку t.me. "
+                "Пригласительные ссылки не поддерживаются."
+            )
+            return
+        entries = self._wl_entries()
+        if entry in entries:
+            self.show_info("Уже в списке: " + entry)
+        else:
+            entries.append(entry)
+            self.show_info("Добавлено в белый список: " + entry)
+        self.set_setting("wl_list", ",".join(entries))
+        self.set_setting("wl_input", "", reload_settings=True)
+
+    def _wl_remove(self, entry, *args):
+        entries = [e for e in self._wl_entries() if e != entry]
+        self.set_setting("wl_list", ",".join(entries), reload_settings=True)
+        self.show_info("Удалено из белого списка: " + entry)
+
+    def _wl_clear(self, *args):
+        self.set_setting("wl_list", "", reload_settings=True)
+        self.show_info("Белый список очищен")
+
+    def _whitelist_page(self):
+        entries = self._wl_entries()
+        items = [
+            Header(text="Категории без обработки"),
+            Switch(
+                key="wl_pm",
+                text="Личные сообщения (ЛС)",
+                default=False,
+                subtext="Включая ботов и Избранное",
+                icon="msg_secret",
+            ),
+            Switch(
+                key="wl_group",
+                text="Группы (обычные чаты)",
+                default=False,
+                icon="msg_groups",
+            ),
+            Switch(
+                key="wl_supergroup",
+                text="Супергруппы",
+                default=False,
+                icon="msg_groups",
+            ),
+            Switch(
+                key="wl_channel",
+                text="Каналы",
+                default=False,
+                icon="msg_channel",
+            ),
+            Header(text="Отдельные чаты"),
+            Input(
+                key="wl_input",
+                text="ID, @username или ссылка",
+                default="",
+                subtext="Например: -1001234567890, @durov, t.me/c/1234567890/1",
+                icon="msg_link",
+            ),
+            Text(
+                text="Добавить в белый список",
+                accent=True,
+                icon="msg_add",
+                on_click=self._wl_add_from_input,
+            ),
+        ]
+        if entries:
+            items.append(Header(text=f"В списке ({len(entries)}) — нажмите, чтобы удалить"))
+            for e in entries:
+                items.append(
+                    Text(
+                        text=e,
+                        subtext="Нажмите, чтобы удалить",
+                        icon="msg_delete",
+                        on_click=lambda *a, entry=e: self._wl_remove(entry),
+                    )
+                )
+            items.append(
+                Text(
+                    text="Очистить список",
+                    red=True,
+                    icon="msg_delete",
+                    on_click=self._wl_clear,
+                )
+            )
+        else:
+            items.append(
+                Text(
+                    text="Список пуст",
+                    subtext="Добавьте чаты выше или включите категории",
+                )
+            )
+        return items
+
+    def _readable_guide_block(self):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return Text(
+                text="Инструкция по кружкам и приватности",
+                subtext="Запишите кружок — лица закроются мозаикой локально на устройстве перед отправкой.",
+                icon="msg_info",
+            )
+        density = float(activity.getResources().getDisplayMetrics().density)
+        pad = int(16 * density)
+        gap = int(7 * density)
+        block = LinearLayout(activity)
+        block.setOrientation(LinearLayout.VERTICAL)
+        block.setPadding(pad, int(12 * density), pad, int(12 * density))
+
+        def add_paragraph(title, body):
+            title_view = TextView(activity)
+            title_view.setText(title)
+            title_view.setTextSize(16)
+            title_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            title_view.setSingleLine(False)
+            title_view.setMaxLines(20)
+            title_view.setLineSpacing(int(2 * density), 1.0)
+            block.addView(title_view, LinearLayout.LayoutParams(-1, -2))
+            body_view = TextView(activity)
+            body_view.setText(body)
+            body_view.setTextSize(14)
+            body_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            body_view.setSingleLine(False)
+            body_view.setMaxLines(20)
+            body_view.setLineSpacing(int(2 * density), 1.0)
+            body_view.setPadding(0, int(2 * density), 0, gap)
+            block.addView(body_view, LinearLayout.LayoutParams(-1, -2))
+
+        add_paragraph(
+            "Медиа",
+            "Кружок пересобирается на устройстве с частотой 25 кадров в секунду: лица закрываются "
+            "овальной мозаикой, звук и длительность сохраняются. Пропуск кадров поиска ускоряет обработку "
+            "без снижения плавности видео.",
+        )
+        add_paragraph(
+            "Приватность",
+            "Видео обрабатывается локально и никуда не передаётся. "
+            "Чаты из белого списка получают кружок без размытия — лицо останется открытым.",
+        )
+        return Custom(view=block)
+
+    def create_settings(self):
+        return [
+            Header(text="Настройки анонимизации"),
+            Switch(
+                key="enabled",
+                text="Блюрить лица в кружках",
+                default=True,
+                subtext="Обработка выполняется перед отправкой",
+                icon="msg_secret",
+            ),
+            Selector(
+                key="blur_strength",
+                text="Размер пикселей мозаики",
+                default=1,
+                items=["Очень мелкие", "Мелкие", "Крупные", "Очень крупные"],
+            ),
+            Selector(
+                key="frame_step",
+                text="Поиск лиц на каждом N-м кадре",
+                default=1,
+                items=["Каждый кадр (точнее)", "Каждый 2-й кадр", "Каждый 3-й кадр (быстрее)"],
+            ),
+            Selector(
+                key="face_hold_duration",
+                text="Удерживать маску при потере лица",
+                default=2,
+                items=["0,25 секунды", "0,5 секунды", "1 секунда", "1,5 секунды"],
+            ),
+            Switch(
+                key="use_gms_vision",
+                text="Использовать Google VFD / ML Kit",
+                default=True,
+                subtext="Аппаратный детектор лиц с откатом на Android SDK",
+                icon="msg_settings",
+            ),
+            Text(
+                text="Белый список",
+                subtext=self._wl_summary(),
+                icon="msg_arrow_forward",
+                create_sub_fragment=self._whitelist_page,
+            ),
+            Switch(
+                key="send_original_on_error",
+                text="Отправлять оригинал при ошибке размытия",
+                default=False,
+                subtext="Осторожно: лицо останется открытым. По умолчанию отправка отменяется.",
+                icon="msg_warning",
+            ),
+            Header(text="Диагностика"),
+            Switch(
+                key="debug_file_log",
+                text="Сохранять лог отладки в файл",
+                default=False,
+                subtext="Запись в приватную папку приложения",
+                icon="msg_log",
+            ),
+            Text(
+                text="Скопировать лог отладки",
+                icon="msg_copy",
+                on_click=self._copy_log_to_clipboard,
+            ),
+            Text(
+                text="Очистить лог",
+                icon="msg_delete",
+                on_click=self._clear_log,
+            ),
+            Divider(text="Подробности"),
+            self._readable_guide_block(),
+        ]
+
+    def _ensure_mlkit_vision(self):
+        if self.mlkit_checked:
+            return self.mlkit_detector is not None
+        self.mlkit_checked = True
+        try:
+            FaceDetectorOptions = jclass("com.google.mlkit.vision.face.FaceDetectorOptions")
+            OptionsBuilder = jclass("com.google.mlkit.vision.face.FaceDetectorOptions$Builder")
+            FaceDetection = jclass("com.google.mlkit.vision.face.FaceDetection")
+            self.InputImageCls = jclass("com.google.mlkit.vision.common.InputImage")
+            self.TasksCls = jclass("com.google.android.gms.tasks.Tasks")
+            self.TimeUnitCls = jclass("java.util.concurrent.TimeUnit")
+            builder = OptionsBuilder()
+            builder.setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            builder.setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE)
+            builder.setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+            builder.setMinFaceSize(jfloat(0.1))
+            builder.enableTracking()
+            detector = FaceDetection.getClient(builder.build())
+            if detector is not None:
+                self.mlkit_detector = detector
+                self.mlkit_failures = 0
+                self.debug_log("Детектор: ML Kit Face Detection инициализирован")
+                return True
+        except Exception as e:
+            self.debug_log(f"ML Kit недоступен: {e}")
+        return False
+
+    def _ensure_gms_vision(self):
+        if self.gms_checked:
+            return self.gms_detector is not None
+        self.gms_checked = True
+        try:
+            ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return False
+            Builder = jclass("com.google.android.gms.vision.face.FaceDetector$Builder")
+            self.FrameBuilder = jclass("com.google.android.gms.vision.Frame$Builder")
+            builder = Builder(ctx)
+            for name, value in (
+                ("setTrackingEnabled", True),
+                ("setLandmarkType", 0),
+                ("setClassificationType", 0),
+                ("setMode", 1),
+                ("setProminentFaceOnly", False),
+            ):
+                try:
+                    setter = getattr(builder, name)
+                except AttributeError:
+                    continue
+                setter(value)
+            detector = builder.build()
+            if detector is not None and bool(detector.isOperational()):
+                self.gms_detector = detector
+                self.debug_log("Детектор: Google Play Services Vision инициализирован")
+                return True
+            if detector is not None:
+                detector.release()
+            self.debug_log("GMS Vision не активен, откат на Android SDK")
+            return False
+        except Exception as e:
+            self.debug_log(f"GMS Vision недоступен, откат на Android SDK: {e}")
+            return False
+
+    def _hook_send_video(self):
+        helper_cls = find_class("org.telegram.messenger.SendMessagesHelper")
+        if helper_cls is None:
+            self.debug_log("Не удалось найти SendMessagesHelper")
+            return
+        unhooks = self.hook_all_methods(helper_cls, "prepareSendingVideo", PrepareVideoHook(self))
+        if unhooks:
+            self.hook_handles.extend(unhooks)
+        self.debug_log(f"Установлено хуков на prepareSendingVideo: {len(self.hook_handles)}")
+
+    def detect_faces(self, sw_bitmap, android_state=None):
+        Rect = jclass("android.graphics.Rect")
+        Bitmap = jclass("android.graphics.Bitmap")
+        rects = []
+        orig_w = sw_bitmap.getWidth()
+        orig_h = sw_bitmap.getHeight()
+        if orig_w <= 16 or orig_h <= 16:
+            return rects
+        target_w = min(320, orig_w)
+        target_w = target_w - (target_w % 2)
+        scale = orig_w / float(target_w)
+        target_h = max(2, int(orig_h / scale))
+        scaled = None
+        temp_rgb565 = None
+        try:
+            scaled = (
+                Bitmap.createScaledBitmap(sw_bitmap, target_w, target_h, True)
+                if target_w != orig_w or target_h != orig_h
+                else sw_bitmap
+            )
+            if self.get_setting("use_gms_vision", True):
+                if self._ensure_mlkit_vision():
+                    try:
+                        image = self.InputImageCls.fromBitmap(scaled, 0)
+                        task = self.mlkit_detector.process(image)
+                        await_task = getattr(self.TasksCls, "await")
+                        timeout_ms = 1000 if self.mlkit_warmed_up else 3000
+                        faces_list = await_task(task, jlong(timeout_ms), self.TimeUnitCls.MILLISECONDS)
+                        self.mlkit_warmed_up = True
+                        self.mlkit_failures = 0
+                        count = int(faces_list.size()) if faces_list is not None else 0
+                        for i in range(count):
+                            box = faces_list.get(i).getBoundingBox()
+                            rects.append(
+                                Rect(
+                                    int(box.left * scale),
+                                    int(box.top * scale),
+                                    int(box.right * scale),
+                                    int(box.bottom * scale),
+                                )
+                            )
+                        return rects
+                    except Exception as ml_err:
+                        self.mlkit_failures += 1
+                        self.debug_log(f"Ошибка ML Kit ({self.mlkit_failures}/3): {ml_err}")
+                        if self.mlkit_failures >= 3:
+                            try:
+                                self.mlkit_detector.close()
+                            except Exception:
+                                pass
+                            self.mlkit_detector = None
+
+                if self._ensure_gms_vision():
+                    try:
+                        frame = self.FrameBuilder().setBitmap(scaled).build()
+                        sparse_faces = self.gms_detector.detect(frame)
+                        for i in range(sparse_faces.size()):
+                            face = sparse_faces.valueAt(i)
+                            pos = face.getPosition()
+                            fw = face.getWidth()
+                            fh = face.getHeight()
+                            rects.append(
+                                Rect(
+                                    int(pos.x * scale),
+                                    int(pos.y * scale),
+                                    int((pos.x + fw) * scale),
+                                    int((pos.y + fh) * scale),
+                                )
+                            )
+                        return rects
+                    except Exception as gms_err:
+                        self.debug_log(f"Ошибка GMS Vision при детекции, откат на Android SDK: {gms_err}")
+                        try:
+                            self.gms_detector.release()
+                        except Exception:
+                            pass
+                        self.gms_detector = None
+
+            Config = jclass("android.graphics.Bitmap$Config")
+            Canvas = jclass("android.graphics.Canvas")
+            Paint = jclass("android.graphics.Paint")
+            AndroidFaceDetector = jclass("android.media.FaceDetector")
+            FaceCls = jclass("android.media.FaceDetector$Face")
+            PointF = jclass("android.graphics.PointF")
+            max_faces = 5
+            first_android_call = not getattr(self, "android_detector_logged", False)
+            if first_android_call:
+                self.debug_log("Детектор Android SDK: подготовка RGB_565 и поиск лиц")
+
+            if android_state is not None:
+                if android_state.get("size") != (target_w, target_h):
+                    old_bmp = android_state.get("rgb565")
+                    if old_bmp is not None:
+                        try:
+                            old_bmp.recycle()
+                        except Exception:
+                            pass
+                    rgb565 = Bitmap.createBitmap(target_w, target_h, Config.RGB_565)
+                    android_state["size"] = (target_w, target_h)
+                    android_state["rgb565"] = rgb565
+                    android_state["canvas"] = Canvas(rgb565)
+                    android_state["paint"] = Paint(Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG)
+                    android_state["detector"] = AndroidFaceDetector(target_w, target_h, max_faces)
+                    android_state["faces"] = jarray(FaceCls)(max_faces)
+                    android_state["mid"] = PointF()
+                rgb565 = android_state["rgb565"]
+                c565 = android_state["canvas"]
+                p565 = android_state["paint"]
+                detector = android_state["detector"]
+                faces = android_state["faces"]
+                mid = android_state["mid"]
+            else:
+                temp_rgb565 = Bitmap.createBitmap(target_w, target_h, Config.RGB_565)
+                rgb565 = temp_rgb565
+                c565 = Canvas(rgb565)
+                p565 = Paint(Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG)
+                detector = AndroidFaceDetector(target_w, target_h, max_faces)
+                faces = jarray(FaceCls)(max_faces)
+                mid = PointF()
+
+            c565.drawBitmap(scaled, 0.0, 0.0, p565)
+            found = detector.findFaces(rgb565, faces)
+            if first_android_call:
+                self.debug_log(f"Детектор Android SDK работает, найдено лиц: {found}")
+                self.android_detector_logged = True
+            for i in range(found):
+                faces[i].getMidPoint(mid)
+                eye_dist = faces[i].eyesDistance()
+                cx = mid.x * scale
+                cy = mid.y * scale
+                ed = eye_dist * scale
+                left = int(cx - ed * 1.7)
+                top = int(cy - ed * 2.0)
+                right = int(cx + ed * 1.7)
+                bottom = int(cy + ed * 2.5)
+                rects.append(Rect(left, top, right, bottom))
+            return rects
+        finally:
+            if scaled is not None and scaled != sw_bitmap:
+                scaled.recycle()
+            if temp_rgb565 is not None:
+                temp_rgb565.recycle()
+
+    @staticmethod
+    def update_face_mask(cached_rects, hold_until_us, detected, pts_us, hold_us):
+        if detected:
+            return detected, pts_us + hold_us
+        if detected is not None and pts_us >= hold_until_us:
+            return [], 0
+        return cached_rects, hold_until_us
+
+    @staticmethod
+    def mosaic_dimensions(width, height, strength):
+        columns = [28, 14, 10, 7][max(0, min(int(strength), 3))]
+        cell_size = max(2.0, width / float(columns))
+        small_w = max(1, min(width, int(round(width / cell_size))))
+        small_h = max(1, int(round(height / cell_size)))
+        return small_w, small_h
+
+    def apply_oval_mosaic(self, canvas, target_bitmap, rect, strength, paint):
+        Bitmap = jclass("android.graphics.Bitmap")
+        Path = jclass("android.graphics.Path")
+        Direction = jclass("android.graphics.Path$Direction")
+        RectF = jclass("android.graphics.RectF")
+        img_w = target_bitmap.getWidth()
+        img_h = target_bitmap.getHeight()
+        pad_x = int(rect.width() * 0.1)
+        pad_y = int(rect.height() * 0.1)
+        left = max(0, rect.left - pad_x)
+        top = max(0, rect.top - pad_y)
+        right = min(img_w, rect.right + pad_x)
+        bottom = min(img_h, rect.bottom + pad_y)
+        box_w = right - left
+        box_h = bottom - top
+        if box_w <= 4 or box_h <= 4:
+            return
+        face_crop = None
+        tiny = None
+        blocky = None
+        try:
+            face_crop = Bitmap.createBitmap(target_bitmap, left, top, box_w, box_h)
+            small_w, small_h = self.mosaic_dimensions(box_w, box_h, strength)
+            tiny = Bitmap.createScaledBitmap(face_crop, small_w, small_h, True)
+            blocky = Bitmap.createScaledBitmap(tiny, box_w, box_h, False)
+            oval_path = Path()
+            oval_path.addOval(RectF(float(left), float(top), float(right), float(bottom)), Direction.CW)
+            save_count = canvas.save()
+            try:
+                canvas.clipPath(oval_path)
+                canvas.drawBitmap(blocky, float(left), float(top), paint)
+            finally:
+                canvas.restoreToCount(save_count)
+        finally:
+            if blocky is not None and blocky != tiny and blocky != face_crop:
+                blocky.recycle()
+            if tiny is not None and tiny != face_crop:
+                tiny.recycle()
+            if face_crop is not None:
+                face_crop.recycle()
+
+    def blur_faces_on_canvas(
+        self,
+        work_canvas,
+        work_bitmap,
+        cached_rects,
+        hold_until_us,
+        run_detection,
+        pts_us,
+        hold_us,
+        strength,
+        mosaic_paint,
+        android_state=None,
+    ):
+        detected = self.detect_faces(work_bitmap, android_state) if run_detection else None
+        cached_rects, hold_until_us = self.update_face_mask(
+            cached_rects, hold_until_us, detected, pts_us, hold_us
+        )
+        for rect in cached_rects:
+            self.apply_oval_mosaic(work_canvas, work_bitmap, rect, strength, mosaic_paint)
+        return cached_rects, hold_until_us
+
+    def process_round_video(self, input_path, output_path):
+        MediaMetadataRetriever = jclass("android.media.MediaMetadataRetriever")
+        MediaExtractor = jclass("android.media.MediaExtractor")
+        MediaCodec = jclass("android.media.MediaCodec")
+        MediaFormat = jclass("android.media.MediaFormat")
+        MediaMuxer = jclass("android.media.MediaMuxer")
+        OutputFormat = jclass("android.media.MediaMuxer$OutputFormat")
+        BufferInfo = jclass("android.media.MediaCodec$BufferInfo")
+        CodecCapabilities = jclass("android.media.MediaCodecInfo$CodecCapabilities")
+        ByteBuffer = jclass("java.nio.ByteBuffer")
+        Bitmap = jclass("android.graphics.Bitmap")
+        Config = jclass("android.graphics.Bitmap$Config")
+        Canvas = jclass("android.graphics.Canvas")
+        Paint = jclass("android.graphics.Paint")
+        Rect = jclass("android.graphics.Rect")
+        BuildVersion = jclass("android.os.Build$VERSION")
+
+        retriever = MediaMetadataRetriever()
+        encoder = None
+        input_surface = None
+        egl_renderer = None
+        muxer = None
+        extractor = None
+        muxer_started = False
+        work_bitmap = None
+        batch_cache = {}
+        android_state = {}
+        deadline = time.monotonic() + 180.0
+
+        def check_deadline():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Обработка кружка превысила 180 секунд")
+
+        def clear_batch_cache():
+            for bmp in batch_cache.values():
+                try:
+                    if bmp is not None:
+                        bmp.recycle()
+                except Exception:
+                    pass
+            batch_cache.clear()
+
+        try:
+            self.debug_log("1/6 Открытие исходного видео")
+            duration_ms = 0
+            for _ in range(20):
+                try:
+                    retriever.setDataSource(input_path)
+                    duration_ms = int(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION) or 0)
+                except Exception:
+                    duration_ms = 0
+                if duration_ms > 0:
+                    break
+                if os.path.getsize(input_path) < 16384:
+                    break
+                time.sleep(0.05)
+            if duration_ms <= 0:
+                self.debug_log("Нулевая длительность видео")
+                return None
+            self.show_info("Размытие лиц в кружке...")
+            probe_frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST)
+            if probe_frame is None:
+                probe_frame = retriever.getFrameAtTime(-1)
+            if probe_frame is None:
+                self.debug_log("Не удалось извлечь пробный кадр")
+                return None
+            src_w = probe_frame.getWidth()
+            src_h = probe_frame.getHeight()
+            probe_frame.recycle()
+            square_size = min(src_w, src_h)
+            square_size = square_size - (square_size % 2)
+            if square_size <= 0:
+                return None
+            crop_left = (src_w - square_size) // 2
+            crop_top = (src_h - square_size) // 2
+            src_rect = Rect(crop_left, crop_top, crop_left + square_size, crop_top + square_size)
+            dst_rect = Rect(0, 0, square_size, square_size)
+            width = square_size
+            height = square_size
+            total_src_frames = 0
+            use_batch_frames = False
+            if int(BuildVersion.SDK_INT) >= 28:
+                try:
+                    total_src_frames = int(
+                        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT) or 0
+                    )
+                    if total_src_frames > 1:
+                        use_batch_frames = True
+                except Exception:
+                    use_batch_frames = False
+            batch_size = 4 if (src_w * src_h) >= 500_000 else 8
+            self.debug_log(
+                f"2/6 Настройка энкодера {width}x{height} (из {src_w}x{src_h}), {duration_ms} мс, "
+                f"пакетное чтение: {use_batch_frames} (пакет: {batch_size})"
+            )
+            fps = 25
+            frame_interval_us = 1_000_000 // fps
+            total_duration_us = max(0, duration_ms * 1000 - (frame_interval_us // 2))
+            mime = "video/avc"
+            format_out = MediaFormat.createVideoFormat(mime, width, height)
+            format_out.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface)
+            format_out.setInteger(MediaFormat.KEY_BIT_RATE, 1_800_000)
+            format_out.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            format_out.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            encoder = MediaCodec.createEncoderByType(mime)
+            encoder.configure(format_out, None, None, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            input_surface = encoder.createInputSurface()
+            encoder.start()
+            self.debug_log("3/6 Инициализация EGLSurfaceRenderer")
+            egl_renderer = EglSurfaceRenderer(input_surface, width, height)
+            muxer = MediaMuxer(output_path, OutputFormat.MUXER_OUTPUT_MPEG_4)
+            video_track_idx = -1
+            audio_track_idx = -1
+            extractor = MediaExtractor()
+            extractor.setDataSource(input_path)
+            src_audio_track = -1
+            for i in range(extractor.getTrackCount()):
+                track_format = extractor.getTrackFormat(i)
+                track_mime = str(track_format.getString(MediaFormat.KEY_MIME))
+                if track_mime == "audio/mp4a-latm":
+                    try:
+                        sample_rate = track_format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        channel_count = track_format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        clean_audio_fmt = MediaFormat.createAudioFormat(track_mime, sample_rate, channel_count)
+                        if track_format.containsKey("csd-0"):
+                            csd0 = track_format.getByteBuffer("csd-0")
+                            if csd0 is not None:
+                                clean_audio_fmt.setByteBuffer("csd-0", csd0)
+                        audio_track_idx = muxer.addTrack(clean_audio_fmt)
+                        src_audio_track = i
+                        self.debug_log(f"Аудиодорожка добавлена: {sample_rate} Гц, каналов: {channel_count}")
+                    except Exception as aud_err:
+                        self.debug_log(f"Пропуск аудиодорожки: {aud_err}")
+                        src_audio_track = -1
+                    break
+
+            work_bitmap = Bitmap.createBitmap(width, height, Config.ARGB_8888)
+            work_canvas = Canvas(work_bitmap)
+            copy_paint = Paint(Paint.FILTER_BITMAP_FLAG)
+            mosaic_paint = Paint(0)
+            mosaic_paint.setFilterBitmap(False)
+            mosaic_paint.setAntiAlias(False)
+
+            buf_info = BufferInfo()
+            pts_us = 0
+            frame_idx = 0
+            cached_rects = []
+            hold_until_us = 0
+            hold_idx = max(0, min(int(self.get_setting("face_hold_duration", 2)), 3))
+            hold_us = [250_000, 500_000, 1_000_000, 1_500_000][hold_idx]
+            strength = max(0, min(int(self.get_setting("blur_strength", 1)), 3))
+            frame_step = [1, 2, 3][max(0, min(int(self.get_setting("frame_step", 1)), 2))]
+            total_faces_found = 0
+
+            def fetch_source_frame(current_pts_us):
+                nonlocal use_batch_frames
+                if use_batch_frames:
+                    target_src_idx = min(
+                        total_src_frames - 1,
+                        int(round((current_pts_us / float(duration_ms * 1000)) * (total_src_frames - 1))),
+                    )
+                    stale_keys = [k for k in batch_cache if k < target_src_idx]
+                    for k in stale_keys:
+                        bmp = batch_cache.pop(k, None)
+                        if bmp is not None:
+                            bmp.recycle()
+                    if target_src_idx not in batch_cache:
+                        clear_batch_cache()
+                        count = min(batch_size, total_src_frames - target_src_idx)
+                        try:
+                            frames = retriever.getFramesAtIndex(jint(target_src_idx), jint(count))
+                            if frames is None or frames.size() == 0:
+                                raise RuntimeError("Пустой пакет кадров")
+                            for offset in range(frames.size()):
+                                batch_cache[target_src_idx + offset] = frames.get(offset)
+                        except Exception as batch_err:
+                            self.debug_log(f"Переключение на getFrameAtTime: {batch_err}")
+                            clear_batch_cache()
+                            use_batch_frames = False
+                    if use_batch_frames and target_src_idx in batch_cache:
+                        return batch_cache.pop(target_src_idx)
+                frame = retriever.getFrameAtTime(current_pts_us, MediaMetadataRetriever.OPTION_CLOSEST)
+                if frame is None and current_pts_us == 0:
+                    frame = retriever.getFrameAtTime(-1)
+                return frame
+
+            def drain_encoder(end_of_stream):
+                nonlocal video_track_idx, muxer_started
+                if end_of_stream:
+                    encoder.signalEndOfInputStream()
+                idle_deadline = time.monotonic() + 10.0
+                while True:
+                    check_deadline()
+                    if time.monotonic() >= idle_deadline:
+                        raise TimeoutError("Кодировщик не завершил видеопоток за 10 секунд")
+                    status = encoder.dequeueOutputBuffer(buf_info, 10000)
+                    if status == MediaCodec.INFO_TRY_AGAIN_LATER:
+                        if not end_of_stream:
+                            break
+                    elif status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                        if not muxer_started:
+                            new_format = encoder.getOutputFormat()
+                            video_track_idx = muxer.addTrack(new_format)
+                            muxer.start()
+                            muxer_started = True
+                    elif status >= 0:
+                        idle_deadline = time.monotonic() + 10.0
+                        encoded_data = encoder.getOutputBuffer(status)
+                        if (buf_info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0:
+                            buf_info.size = 0
+                        if buf_info.size != 0 and muxer_started and encoded_data is not None:
+                            encoded_data.position(buf_info.offset)
+                            encoded_data.limit(buf_info.offset + buf_info.size)
+                            muxer.writeSampleData(video_track_idx, encoded_data, buf_info)
+                        encoder.releaseOutputBuffer(status, False)
+                        if (buf_info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0:
+                            break
+
+            self.debug_log(f"4/6 Обработка кадров: 25 FPS, поиск лиц каждый {frame_step}-й кадр")
+            while pts_us <= total_duration_us:
+                check_deadline()
+                drain_encoder(False)
+                raw_frame = fetch_source_frame(pts_us)
+                if raw_frame is None:
+                    raise RuntimeError(f"Не удалось декодировать кадр {frame_idx}")
+                try:
+                    work_canvas.drawBitmap(raw_frame, src_rect, dst_rect, copy_paint)
+                finally:
+                    raw_frame.recycle()
+                run_detection = (frame_idx % frame_step == 0)
+                cached_rects, hold_until_us = self.blur_faces_on_canvas(
+                    work_canvas,
+                    work_bitmap,
+                    cached_rects,
+                    hold_until_us,
+                    run_detection,
+                    pts_us,
+                    hold_us,
+                    strength,
+                    mosaic_paint,
+                    android_state,
+                )
+                if run_detection and cached_rects:
+                    total_faces_found += len(cached_rects)
+                egl_renderer.draw_bitmap(work_bitmap, pts_us)
+                drain_encoder(False)
+                pts_us += frame_interval_us
+                frame_idx += 1
+                if frame_idx == 1 or frame_idx % 25 == 0:
+                    self.debug_log(f"4/6 Кадров готово: {frame_idx}, позиция {pts_us // 1000}/{duration_ms} мс")
+
+            self.debug_log(
+                f"5/6 Завершение видеопотока (кадров: {frame_idx}, срабатываний детектора: {total_faces_found})"
+            )
+            drain_encoder(True)
+            if src_audio_track >= 0 and muxer_started:
+                extractor.selectTrack(src_audio_track)
+                audio_buf = ByteBuffer.allocate(256 * 1024)
+                audio_info = BufferInfo()
+                last_audio_pts = -1
+                while True:
+                    check_deadline()
+                    audio_buf.clear()
+                    sample_size = extractor.readSampleData(audio_buf, 0)
+                    if sample_size < 0:
+                        break
+                    sample_time = extractor.getSampleTime()
+                    if sample_time < 0 or sample_time < last_audio_pts:
+                        extractor.advance()
+                        continue
+                    last_audio_pts = sample_time
+                    sample_flags = extractor.getSampleFlags()
+                    audio_info.offset = 0
+                    audio_info.size = sample_size
+                    audio_info.presentationTimeUs = sample_time
+                    audio_info.flags = (
+                        MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        if (sample_flags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        else 0
+                    )
+                    muxer.writeSampleData(audio_track_idx, audio_buf, audio_info)
+                    extractor.advance()
+            if not muxer_started or video_track_idx < 0:
+                raise RuntimeError("Кодировщик не создал видеодорожку")
+            muxer.stop()
+            muxer_started = False
+            self.debug_log("6/6 Сборка MP4 завершена")
+            return (width, height)
+        finally:
+            clear_batch_cache()
+            old_rgb565 = android_state.pop("rgb565", None)
+            if old_rgb565 is not None:
+                try:
+                    old_rgb565.recycle()
+                except Exception:
+                    pass
+            android_state.clear()
+            if work_bitmap is not None:
+                try:
+                    work_bitmap.recycle()
+                except Exception:
+                    pass
+            try:
+                retriever.release()
+            except Exception:
+                pass
+            if extractor is not None:
+                try:
+                    extractor.release()
+                except Exception:
+                    pass
+            if egl_renderer is not None:
+                egl_renderer.release()
+            if encoder is not None:
+                try:
+                    encoder.stop()
+                except Exception:
+                    pass
+                try:
+                    encoder.release()
+                except Exception:
+                    pass
+            if input_surface is not None:
+                try:
+                    input_surface.release()
+                except Exception:
+                    pass
+            if muxer is not None:
+                try:
+                    if muxer_started:
+                        muxer.stop()
+                except Exception:
+                    pass
+                try:
+                    muxer.release()
+                except Exception:
+                    pass
