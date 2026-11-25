@@ -1,0 +1,416 @@
+import time
+import threading
+
+from java import jclass, dynamic_proxy
+from base_plugin import BasePlugin, MethodHook, HookResult
+from hook_utils import find_class
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+
+__id__ = "remove_from_all_folders"
+__name__ = "Delete From All Folders"
+__description__ = (
+    "Adds a \"Delete from all folders\" checkbox to the chat deletion dialog. "
+    "When it is checked, the deleted chats are also removed from all your folders.\n\n"
+    "Добавляет в диалог удаления чата галочку «Удалить из всех папок». "
+    "Если она отмечена, удаляемые чаты также убираются из всех ваших папок."
+)
+__author__ = "@k41h311"
+__version__ = "1.0.0"
+__icon__ = "k41h31117/56"
+__app_version__ = ">=12.10.6"
+__category__ = ["chats", "tools"]
+
+ArrayList = jclass("java.util.ArrayList")
+
+RU = jclass("java.util.Locale").getDefault().getLanguage() == "ru"
+
+CHECK_TEXT = "Удалить из всех папок" if RU else "Delete from all folders"
+MSG_DONE = "Удалено из папок: %d" if RU else "Removed from folders: %d"
+MSG_NONE = "Чат не добавлен в папки вручную" if RU else "Chat is not added to any folder manually"
+MSG_FAIL = "Не удалось обновить папки" if RU else "Failed to update folders"
+
+WATCHED_REQUESTS = [
+    "TL_channels_leaveChannel",
+    "TL_channels_deleteChannel",
+    "TL_messages_deleteChatUser",
+    "TL_messages_deleteHistory",
+]
+
+SHOW_WINDOW = 5
+CONFIRM_WINDOW = 180
+
+LOGGER = [None]
+
+STATE = {
+    "armed": False,
+    "ts": 0.0,
+    "ids": set(),
+    "account": 0,
+    "cell": None,
+    "checked": False,
+    "done": False,
+    "keep": [],
+}
+
+
+def reset_state():
+    STATE.update(
+        armed=False,
+        ts=0.0,
+        ids=set(),
+        account=0,
+        cell=None,
+        checked=False,
+        done=False,
+        keep=[],
+    )
+
+
+def debug(text, *args):
+    if LOGGER[0] is not None:
+        LOGGER[0].debug(text, *args)
+
+
+def error(text, *args):
+    if LOGGER[0] is not None:
+        LOGGER[0].exception(text, *args)
+
+
+def notify(text):
+    def show():
+        try:
+            BulletinHelper.show_info(text)
+        except Exception:
+            error("Failed to show bulletin")
+
+    run_on_ui_thread(show)
+
+
+class ClickProxy(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, view):
+        try:
+            self.fn(view)
+        except Exception:
+            error("Click handler failed")
+
+
+class DelegateProxy(dynamic_proxy(jclass("org.telegram.tgnet.RequestDelegate"))):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self, response, err):
+        try:
+            self.fn(response, err)
+        except Exception:
+            error("Request delegate failed")
+
+
+def to_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return int(value.longValue())
+
+
+def find_field(cls, name):
+    while cls is not None:
+        try:
+            field = cls.getDeclaredField(name)
+            field.setAccessible(True)
+            return field
+        except Exception:
+            cls = cls.getSuperclass()
+    return None
+
+
+def get_field(obj, name):
+    field = find_field(obj.getClass(), name)
+    return field.get(obj) if field is not None else None
+
+
+def is_instance_of(obj, java_name):
+    cls = obj.getClass()
+    while cls is not None:
+        if str(cls.getName()) == java_name:
+            return True
+        cls = cls.getSuperclass()
+    return False
+
+
+def get_delete_const():
+    try:
+        cls = find_class("org.telegram.ui.DialogsActivity")
+        field = cls.getDeclaredField("delete")
+        field.setAccessible(True)
+        return to_int(field.get(None))
+    except Exception:
+        return 102
+
+
+def peer_to_dialog_id(peer, account):
+    name = str(peer.getClass().getSimpleName())
+    if "Channel" in name:
+        return -to_int(peer.channel_id)
+    if "Chat" in name:
+        return -to_int(peer.chat_id)
+    if "Self" in name:
+        user_config = jclass("org.telegram.messenger.UserConfig")
+        return to_int(user_config.getInstance(account).getClientUserId())
+    if "User" in name:
+        return to_int(peer.user_id)
+    return None
+
+
+def strip_peers(peers, ids, account):
+    result = ArrayList()
+    removed = 0
+    for i in range(peers.size()):
+        peer = peers.get(i)
+        if peer_to_dialog_id(peer, account) in ids:
+            removed += 1
+        else:
+            result.add(peer)
+    return result, removed
+
+
+def remove_from_all_folders(account, dialog_ids):
+    ids = set(dialog_ids)
+    tlrpc = "org.telegram.tgnet.TLRPC$"
+    connections = jclass("org.telegram.tgnet.ConnectionsManager").getInstance(account)
+    messages_controller = jclass("org.telegram.messenger.MessagesController")
+    request = jclass(tlrpc + "TL_messages_getDialogFilters")()
+
+    def on_filters(response, err):
+        if response is None:
+            debug("getDialogFilters failed: %s", err)
+            notify(MSG_FAIL)
+            return
+
+        filters = None
+        try:
+            filters = response.filters
+        except Exception:
+            pass
+        if filters is None:
+            try:
+                filters = response.objects
+            except Exception:
+                debug("Unknown getDialogFilters response: %s", response.getClass().getName())
+                notify(MSG_FAIL)
+                return
+
+        jobs = []
+        for i in range(filters.size()):
+            folder = filters.get(i)
+            try:
+                include = folder.include_peers
+            except Exception:
+                continue
+
+            new_include, removed_include = strip_peers(include, ids, account)
+            removed_pinned = 0
+            new_pinned = None
+            try:
+                new_pinned, removed_pinned = strip_peers(folder.pinned_peers, ids, account)
+            except Exception:
+                pass
+
+            if removed_include + removed_pinned == 0:
+                continue
+
+            folder.include_peers = new_include
+            if new_pinned is not None:
+                folder.pinned_peers = new_pinned
+            jobs.append(folder)
+
+        if not jobs:
+            notify(MSG_NONE)
+            return
+
+        state = {"left": len(jobs), "errors": 0}
+
+        def finished():
+            try:
+                messages_controller.getInstance(account).loadRemoteFilters(True)
+            except Exception:
+                error("loadRemoteFilters failed")
+            if state["errors"]:
+                notify(MSG_FAIL)
+            else:
+                notify(MSG_DONE % len(jobs))
+
+        for folder in jobs:
+            update = jclass(tlrpc + "TL_messages_updateDialogFilter")()
+            update.flags = 1
+            update.id = folder.id
+            update.filter = folder
+
+            def callback(resp, err):
+                if err is not None:
+                    state["errors"] += 1
+                    debug("updateDialogFilter failed: %s", err.text)
+                state["left"] -= 1
+                if state["left"] == 0:
+                    finished()
+
+            connections.sendRequest(update, DelegateProxy(callback))
+
+    connections.sendRequest(request, DelegateProxy(on_filters))
+
+
+def request_dialog_id(name, request, account):
+    try:
+        if name in ("TL_channels_leaveChannel", "TL_channels_deleteChannel"):
+            return -to_int(request.channel.channel_id)
+        if name == "TL_messages_deleteChatUser":
+            return -to_int(request.chat_id)
+        if name == "TL_messages_deleteHistory":
+            return peer_to_dialog_id(request.peer, account)
+    except Exception:
+        error("Failed to resolve dialog id for %s", name)
+    return None
+
+
+def inject_checkbox(dialog):
+    context = dialog.getContext()
+    layout_helper = jclass("org.telegram.ui.Components.LayoutHelper")
+    android_utilities = jclass("org.telegram.messenger.AndroidUtilities")
+    check_box_cell = jclass("org.telegram.ui.Cells.CheckBoxCell")
+    frame_layout = jclass("android.widget.FrameLayout")
+
+    try:
+        cell = check_box_cell(context, 1)
+    except Exception:
+        cell = check_box_cell(context, 1, None)
+
+    cell.setText(CHECK_TEXT, "", False, False)
+    try:
+        cell.setPadding(android_utilities.dp(8), 0, android_utilities.dp(16), 0)
+    except Exception:
+        pass
+
+    def toggle(view):
+        value = not cell.isChecked()
+        cell.setChecked(value, True)
+        STATE["checked"] = value
+        STATE["ts"] = time.time()
+
+    listener = ClickProxy(toggle)
+    cell.setOnClickListener(listener)
+    STATE["keep"].append(listener)
+
+    custom = get_field(dialog, "customView")
+
+    if custom is None:
+        frame = frame_layout(context)
+        frame.addView(cell, layout_helper.createFrame(-1, 48, 51, 0, 0, 0, 0))
+        try:
+            dialog.setView(frame)
+        except Exception:
+            dialog.setView(frame, -2)
+    elif is_instance_of(custom, "android.widget.FrameLayout"):
+        density = float(android_utilities.density)
+        bottom = 0
+        for i in range(custom.getChildCount()):
+            child = custom.getChildAt(i)
+            params = child.getLayoutParams()
+            try:
+                height = params.height if params.height > 0 else android_utilities.dp(48)
+                bottom = max(bottom, params.topMargin + height)
+            except Exception:
+                bottom = max(bottom, android_utilities.dp(48))
+        top = int(round(bottom / density)) if bottom else 0
+        custom.addView(cell, layout_helper.createFrame(-1, 48, 51, 0, top, 0, 0))
+    elif is_instance_of(custom, "android.widget.LinearLayout"):
+        custom.addView(cell, layout_helper.createLinear(-1, 48))
+    else:
+        debug("Unsupported customView: %s", custom.getClass().getName())
+        return
+
+    STATE["cell"] = cell
+    STATE["checked"] = False
+    STATE["ts"] = time.time()
+
+
+class PerformActionHook(MethodHook):
+    def __init__(self, delete_const):
+        super().__init__()
+        self.delete_const = delete_const
+
+    def before_hooked_method(self, param):
+        try:
+            if to_int(param.args[1]) != self.delete_const:
+                return
+            items = param.args[0]
+            ids = set(to_int(items.get(i)) for i in range(items.size()))
+            account = to_int(param.thisObject.getCurrentAccount())
+            reset_state()
+            STATE.update(ids=ids, account=account, armed=True, ts=time.time())
+        except Exception:
+            error("performSelectedDialogsAction hook failed")
+
+
+class DialogShowHook(MethodHook):
+    def before_hooked_method(self, param):
+        if not STATE["armed"] or STATE["cell"] is not None:
+            return
+        if time.time() - STATE["ts"] > SHOW_WINDOW:
+            STATE["armed"] = False
+            return
+        STATE["armed"] = False
+        try:
+            inject_checkbox(param.thisObject)
+        except Exception:
+            error("Failed to inject checkbox")
+
+
+class DeleteFromFoldersPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        LOGGER[0] = self.logger
+        reset_state()
+
+        dialogs = find_class("org.telegram.ui.DialogsActivity")
+        self.hook_all_methods(
+            dialogs,
+            "performSelectedDialogsAction",
+            PerformActionHook(get_delete_const()),
+        )
+
+        alert = find_class("org.telegram.ui.ActionBar.AlertDialog")
+        self.hook_all_methods(alert, "show", DialogShowHook())
+
+        for name in WATCHED_REQUESTS:
+            self.add_hook(name)
+
+    def on_plugin_unload(self):
+        reset_state()
+        LOGGER[0] = None
+
+    def pre_request_hook(self, request_name, account, request):
+        try:
+            if STATE["cell"] is None or STATE["done"]:
+                return HookResult()
+            if time.time() - STATE["ts"] > CONFIRM_WINDOW:
+                return HookResult()
+
+            dialog_id = request_dialog_id(request_name, request, account)
+            if dialog_id is not None and dialog_id not in STATE["ids"]:
+                return HookResult()
+            if not STATE["checked"]:
+                return HookResult()
+
+            STATE["done"] = True
+            ids = list(STATE["ids"])
+            target_account = STATE["account"]
+            threading.Timer(10.0, reset_state).start()
+            remove_from_all_folders(target_account, ids)
+        except Exception:
+            self.logger.exception("pre_request_hook failed")
+        return HookResult()
