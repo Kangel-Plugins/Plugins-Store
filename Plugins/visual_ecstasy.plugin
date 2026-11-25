@@ -58,11 +58,12 @@ from ui.alert import AlertDialogBuilder
 
 __id__ = "visual_ecstasy"
 __name__ = "Visual Ecstasy"
-__description__ = "Различная визуальная кастомизация: разноцветный liquid glass, виньетка и тд.."
+__description__ = "Различная визуальная кастомизация: разноцветный liquid glass, виньетка и тд"
 __author__ = "@exoseo -> @HzzzPlugins"
-__version__ = "1.5"
+__version__ = "1.6"
 __icon__ = "HzzzIcons/7"
-__app_version__ = ">=12.5.1"
+__app_version__ = ">=12.10.6"
+__category__ = ["appearance"]
 __sdk_version__ = ">=1.3.3.3"
 
 
@@ -266,34 +267,32 @@ class _PassTouch(dynamic_proxy(jclass("android.view.View$OnTouchListener"))):
         return False
 
 
-class LiquidGlassUpdateHook(MethodHook):
+class GlassBackgroundHook(MethodHook):
+    """13.2.2 tints glass through BlurredBackgroundDrawable.backgroundColor.
+
+    LiquidGlassEffect.update(..., int foregroundColor, float, float, int downsample)
+    must not be rewritten: the last int is the downsample factor, and replacing it
+    allocates RenderEffect[downsample * downsample] and kills the process.
+    """
+
     def __init__(self, plugin):
         self.p = plugin
 
     def before_hooked_method(self, param):
         try:
-            p = self.p
-            if p._force_updating:
-                return
-
-            this_obj = param.thisObject
             method = param.method
-            args = param.args
-            if not args:
+            if method is None or str(method.getName()) != "draw":
                 return
+            self.p._sync_glass_drawable(param.thisObject)
+        except Exception:
+            pass
 
-            idx = len(args) - 1
-            orig = _to_int(args[idx])
-            if orig is None:
+    def after_hooked_method(self, param):
+        try:
+            method = param.method
+            if method is None or str(method.getName()) != "updateColors":
                 return
-
-            if this_obj is not None and method is not None:
-                p._register_glass_updater(this_obj, method, args, orig, idx)
-
-            if not p.glass_on:
-                return
-
-            param.args[idx] = Integer(_signed(p.mix_glass_fg(orig)))
+            self.p._capture_glass_base(param.thisObject)
         except Exception:
             pass
 
@@ -333,7 +332,6 @@ class ActivityAttachHook(MethodHook):
     def after_hooked_method(self, param):
         try:
             self.plugin.attach_activity(param.thisObject)
-            self.plugin._scan_tree_for_glass(param.thisObject)
         except Exception:
             pass
 
@@ -367,7 +365,6 @@ class FragmentResumeHook(MethodHook):
                 return
             if act is not None:
                 self.plugin.attach_activity(act)
-                self.plugin._scan_tree_for_glass(act)
         except Exception:
             pass
 
@@ -420,6 +417,9 @@ class VisualEcstasyPlugin(BasePlugin):
         self._force_updating = False
         self._lens_views = {}
         self._glass_updaters = {}
+        self._glass_drawables = {}
+        self._bg_field = None
+        self._bg_field_missing = False
         self._cycle_hsv_arr = None
 
         self._hw_tier = 1
@@ -490,6 +490,11 @@ class VisualEcstasyPlugin(BasePlugin):
             self._ensure_cycle()
 
     def on_plugin_unload(self):
+        try:
+            self.glass_on = False
+            self._recolor_glass_drawables()
+        except Exception:
+            pass
         try:
             self._unregister_lifecycle()
         except Exception:
@@ -831,59 +836,10 @@ class VisualEcstasyPlugin(BasePlugin):
             self._applying_lens = False
 
     def _push_glass_updates(self):
-        if not self.glass_on:
+        if not self.glass_on and not self._glass_drawables and not self._lens_views:
             return
-
         self._push_lens_colors()
-
-        if self._glass_updaters:
-            self._force_updating = True
-            alive_updaters = {}
-            try:
-                with self._lock:
-                    items = list(self._glass_updaters.items())
-
-                for key, data in items:
-                    ref = data["ref"]
-                    obj = ref.get() if hasattr(ref, "get") else ref
-                    if obj is None:
-                        continue
-
-                    method = data["method"]
-                    saved_args = data["args"]
-                    orig_color = data["orig_color"]
-                    idx = data["color_idx"]
-
-                    new_mixed = self.mix_glass_fg(orig_color)
-                    saved_args[idx] = Integer(_signed(new_mixed))
-
-                    try:
-                        method.setAccessible(True)
-                        arr = jarray(jclass("java.lang.Object"))(len(saved_args))
-                        for i, a in enumerate(saved_args):
-                            arr[i] = a
-                        method.invoke(obj, arr)
-                        alive_updaters[key] = data
-                    except Exception:
-                        try:
-                            method.invoke(obj, *saved_args)
-                            alive_updaters[key] = data
-                        except Exception:
-                            pass
-
-                    for vref in data.get("views", []):
-                        try:
-                            v = vref.get() if hasattr(vref, "get") else vref
-                            if v is not None:
-                                v.postInvalidateOnAnimation()
-                        except Exception:
-                            pass
-
-                with self._lock:
-                    self._glass_updaters = alive_updaters
-            finally:
-                self._force_updating = False
-
+        self._recolor_glass_drawables()
         self._invalidate_all_surfaces()
 
     def _invalidate_all_surfaces(self):
@@ -1006,6 +962,142 @@ class VisualEcstasyPlugin(BasePlugin):
             pass
         self._schedule_apply(0)
 
+    def _ensure_bg_field(self):
+        if self._bg_field is not None or self._bg_field_missing:
+            return self._bg_field
+        try:
+            loaded = None
+            try:
+                Class = jclass("java.lang.Class")
+                loader = ApplicationLoader.applicationContext.getClassLoader()
+                loaded = Class.forName(
+                    "org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawable",
+                    False,
+                    loader,
+                )
+            except Exception:
+                loaded = None
+            if loaded is None:
+                cls = find_class("org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawable")
+                if cls is not None and hasattr(cls, "getDeclaredField"):
+                    loaded = cls
+            if loaded is None:
+                self._bg_field_missing = True
+                return None
+            field = loaded.getDeclaredField("backgroundColor")
+            field.setAccessible(True)
+            self._bg_field = field
+            return field
+        except Exception:
+            self._bg_field_missing = True
+            return None
+
+    def _drawable_key(self, drawable):
+        try:
+            return int(drawable.hashCode())
+        except Exception:
+            return id(drawable)
+
+    def _read_bg(self, drawable):
+        field = self._ensure_bg_field()
+        if field is None or drawable is None:
+            return None
+        try:
+            return _u32(field.getInt(drawable))
+        except Exception:
+            return None
+
+    def _write_bg(self, drawable, color):
+        field = self._ensure_bg_field()
+        if field is None or drawable is None or color is None:
+            return False
+        try:
+            field.setInt(drawable, int(_signed(color)))
+            return True
+        except Exception:
+            return False
+
+    def _track_drawable(self, drawable, base):
+        key = self._drawable_key(drawable)
+        try:
+            ref = WeakReference(drawable)
+        except Exception:
+            ref = drawable
+        self._glass_drawables[key] = (ref, _u32(base))
+        if len(self._glass_drawables) > 48:
+            alive = {}
+            for k, packed in list(self._glass_drawables.items()):
+                ref, stored = packed
+                try:
+                    obj = ref.get() if hasattr(ref, "get") else ref
+                except Exception:
+                    obj = None
+                if obj is not None:
+                    alive[k] = packed
+            self._glass_drawables = alive
+
+    def _capture_glass_base(self, drawable):
+        # updateColors() just wrote the theme tint. Remember it, then mix.
+        cur = self._read_bg(drawable)
+        if cur is None:
+            return
+        self._track_drawable(drawable, cur)
+        if not self.glass_on:
+            return
+        mixed = _u32(self.mix_glass_fg(cur))
+        if mixed != cur and self._write_bg(drawable, mixed):
+            try:
+                drawable.invalidateDisplayList()
+            except Exception:
+                pass
+
+    def _sync_glass_drawable(self, drawable):
+        if drawable is None:
+            return
+        cur = self._read_bg(drawable)
+        if cur is None:
+            return
+        key = self._drawable_key(drawable)
+        packed = self._glass_drawables.get(key)
+        if packed is None:
+            base = cur
+            self._track_drawable(drawable, base)
+        else:
+            base = packed[1]
+        want = _u32(self.mix_glass_fg(base) if self.glass_on else base)
+        if cur != want and self._write_bg(drawable, want):
+            try:
+                drawable.invalidateDisplayList()
+            except Exception:
+                pass
+
+    def _recolor_glass_drawables(self):
+        alive = {}
+        for key, packed in list(self._glass_drawables.items()):
+            ref, base = packed
+            try:
+                drawable = ref.get() if hasattr(ref, "get") else ref
+            except Exception:
+                drawable = None
+            if drawable is None:
+                continue
+            alive[key] = (ref, _u32(base))
+            want = _u32(self.mix_glass_fg(base) if self.glass_on else base)
+            cur = self._read_bg(drawable)
+            if cur is None:
+                continue
+            if cur != want:
+                self._write_bg(drawable, want)
+            try:
+                drawable.invalidateDisplayList()
+            except Exception:
+                pass
+            try:
+                drawable.invalidateSelf()
+            except Exception:
+                pass
+        self._glass_drawables = alive
+
     def _hook_all(self, clazz, name, hook):
         if not clazz:
             return
@@ -1017,24 +1109,16 @@ class VisualEcstasyPlugin(BasePlugin):
             pass
 
     def _install_hooks(self):
-        glass_update_hook = LiquidGlassUpdateHook(self)
+        glass_bg_hook = GlassBackgroundHook(self)
         lens_color_hook = SetLensColorHook(self)
 
-        liquid_glass_classes = [
-            "org.telegram.ui.Components.blur3.LiquidGlassEffect",
-            "org.telegram.ui.Components.blur.LiquidGlassEffect",
-            "org.telegram.ui.Components.glass.LiquidGlassEffect",
-            "org.telegram.ui.ActionBar.LiquidGlassEffect",
-            "org.telegram.ui.Components.LiquidGlassView",
-            "org.telegram.ui.Components.blur3.LiquidGlassView",
-        ]
-        for cname in liquid_glass_classes:
-            cls = find_class(cname)
-            if cls:
-                self._hook_all(cls, "update", glass_update_hook)
-                self._hook_all(cls, "render", glass_update_hook)
-                self._hook_all(cls, "setGlassColor", glass_update_hook)
-                self._hook_all(cls, "setTint", glass_update_hook)
+        # exteraGram 13.2.2: the tint is BlurredBackgroundDrawable.backgroundColor,
+        # passed into LiquidGlassEffect.update as foregroundColor. Do not hook
+        # LiquidGlassEffect.update — its last int is downsample, not a color.
+        drawable_cls = find_class("org.telegram.ui.Components.blur3.drawable.BlurredBackgroundDrawable")
+        if drawable_cls:
+            self._hook_all(drawable_cls, "draw", glass_bg_hook)
+            self._hook_all(drawable_cls, "updateColors", glass_bg_hook)
 
         lens_classes = [
             "org.telegram.ui.Components.glass.GlassTabsView",
@@ -1046,8 +1130,6 @@ class VisualEcstasyPlugin(BasePlugin):
             cls = find_class(cname)
             if cls:
                 self._hook_all(cls, "setLensColor", lens_color_hook)
-                self._hook_all(cls, "setGlassColor", lens_color_hook)
-                self._hook_all(cls, "updateColors", lens_color_hook)
 
         attach = ActivityAttachHook(self)
         detach = ActivityDetachHook(self)
@@ -1075,12 +1157,10 @@ class VisualEcstasyPlugin(BasePlugin):
                 def onActivityStarted(self, activity):
                     plugin._app_in_foreground = True
                     plugin.attach_activity(activity)
-                    plugin._scan_tree_for_glass(activity)
 
                 def onActivityResumed(self, activity):
                     plugin._app_in_foreground = True
                     plugin.attach_activity(activity)
-                    plugin._scan_tree_for_glass(activity)
                     if plugin.cycle_on:
                         plugin._ensure_cycle()
 
@@ -1697,7 +1777,6 @@ class VisualEcstasyPlugin(BasePlugin):
             return
         if act is not None:
             self.attach_activity(act)
-            self._scan_tree_for_glass(act)
         with self._lock:
             roots = [triple[0] for triple in self._attached.values()]
         for root in roots:
@@ -1706,6 +1785,7 @@ class VisualEcstasyPlugin(BasePlugin):
                 self._attach_root_ui(root, ctx)
             except Exception:
                 pass
+        self._recolor_glass_drawables()
         self._refresh_previews()
 
     def _keep(self, factory):
@@ -2705,7 +2785,7 @@ class VisualEcstasyPlugin(BasePlugin):
         self._preview_hosts = []
         cycle_on = self._b("glass_cycle", False)
         items = [
-            Header(text="1.5-public"),
+            Header(text="1.6-public"),
             self._keep(self._preview_factory()),
             Header(text="ᅠ"),
             Header(text="Liquid glass"),
